@@ -124,8 +124,8 @@ test("test-build artifacts expire after one day", () => {
 });
 
 test("sets the declared macOS minimum everywhere", () => {
-  assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "13.3");
-  assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"13\.3"/);
+  assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "11.0");
+  assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"11\.0"/);
 });
 
 test("keeps Apple credentials step-scoped and fails official tags fast", () => {
@@ -170,6 +170,63 @@ test("uses locked desktop tooling and sanitized frontend output on every platfor
     assert.doesNotMatch(build, /npx (?:next|@tauri-apps\/cli)/);
     assert.match(build, /npm exec tauri build/);
   }
+});
+
+test("verifies the complete bundled Node toolchain before every Tauri build", () => {
+  const expectations = [
+    ["build-windows", "Download verified Node.js runtime", "Build Tauri NSIS installer"],
+    ["build-macos", "Download verified native Node.js runtime", "Build Tauri app for post-copy repair"],
+    ["build-linux", "Download verified Node.js runtime", "Build Tauri Linux installers"],
+  ];
+
+  for (const [jobName, downloadName, buildName] of expectations) {
+    const build = job(jobName);
+    const downloadIndex = build.indexOf(downloadName);
+    const verifyIndex = build.indexOf("Verify bundled Node.js toolchain");
+    const tauriBuildIndex = build.indexOf(buildName);
+    assert.ok(downloadIndex >= 0, `${jobName} does not download Node`);
+    assert.ok(verifyIndex > downloadIndex, `${jobName} verifies Node before download`);
+    assert.ok(tauriBuildIndex > verifyIndex, `${jobName} builds Tauri before Node verification`);
+    assert.match(
+      step(build, "Verify bundled Node.js toolchain"),
+      /node scripts\/verify-node-runtime\.mjs backend\/resources\/nodejs/,
+    );
+  }
+});
+
+test("re-extracts Linux installers and executes their packaged Node toolchain", () => {
+  const linux = job("build-linux");
+  assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /rpm2cpio/);
+  assert.match(linux, /nodejs\/bin\/node/);
+  assert.match(
+    linux,
+    /node scripts\/verify-node-runtime\.mjs "\$runtime"/,
+  );
+  assert.match(linux, /backend\/suxiaoyou-backend/);
+  assert.match(linux, /node scripts\/verify-bundle\.mjs/);
+});
+
+test("silently installs Windows NSIS and executes its packaged Node toolchain", () => {
+  const windows = job("build-windows");
+  const install = step(
+    windows,
+    "Install NSIS package and verify packaged Node.js toolchain",
+  );
+  assert.match(install, /Start-Process/);
+  assert.match(install, /"\/S"/);
+  assert.match(install, /Filter node\.exe/);
+  assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
+  assert.match(install, /suxiaoyou-backend\.exe/);
+  assert.match(install, /node scripts\/verify-bundle\.mjs/);
+});
+
+test("Windows native build validates lifecycle primitives before packaging", () => {
+  const windows = job("build-windows");
+  const buildBackend = step(windows, "Build backend with locked PyInstaller");
+
+  assert.match(buildBackend, /pytest==9\.1\.1/);
+  assert.match(buildBackend, /python -m pytest -q backend\/tests\/test_run\.py/);
 });
 
 test("uses Python 3.12 and full backend smoke on every build host", () => {
@@ -416,6 +473,7 @@ test("CI runs the frontend unit suite", () => {
   assert.match(ciWorkflow, /node --test tests\/unit\/\*\.test\.ts/);
   assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
   assert.match(ciWorkflow, /verify-macos-bundle\.test\.mjs/);
+  assert.match(ciWorkflow, /verify-node-runtime\.test\.mjs/);
   assert.match(ciWorkflow, /python -m pip install uv==0\.11\.28/);
   for (const target of [
     "x86_64-pc-windows-msvc",
