@@ -188,9 +188,9 @@ def _launch_unix_process_group_reaper(process_group: int, grace_seconds: float) 
     script = (
         'ticks="$1"; pgid="$2"; count=0; '
         'while [ "$count" -lt "$ticks" ]; do '
-        'kill -0 -- "-$pgid" 2>/dev/null || exit 0; '
+        '/bin/kill -0 -- "-$pgid" 2>/dev/null || exit 0; '
         f"sleep {tick_seconds}; count=$((count + 1)); "
-        "done; kill -KILL -- \"-$pgid\" 2>/dev/null || true"
+        "done; /bin/kill -KILL -- \"-$pgid\" 2>/dev/null || true"
     )
     subprocess.Popen(
         [
