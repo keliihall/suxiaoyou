@@ -1,0 +1,6 @@
+# Preserve upstream legal texts byte-for-byte without treating their original
+# line-ending whitespace as a source-formatting error.
+/release-licenses/** -whitespace
+# This generated aggregate contains an upstream RST title underline that Git
+# otherwise misidentifies as a merge-conflict marker during `git diff --check`.
+/release-licenses/PYTHON-LICENSES.txt -diff

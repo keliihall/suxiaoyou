@@ -1,0 +1,17 @@
+{
+  "name": "苏小有 Remote",
+  "short_name": "苏小有",
+  "description": "Remote control for your local-first 苏小有 desktop agent",
+  "start_url": "/m",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

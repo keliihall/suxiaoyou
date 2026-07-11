@@ -1,0 +1,289 @@
+import assert from "node:assert/strict";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { afterEach, test } from "node:test";
+
+import {
+  REQUIRED_RELEASE_LICENSE_FILES,
+  verifyMacOSBundle,
+} from "./verify-macos-bundle.mjs";
+
+const temporaryDirectories = [];
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function appFixture() {
+  const root = mkdtempSync(join(tmpdir(), "verify-macos-bundle-"));
+  temporaryDirectories.push(root);
+  const app = join(root, "苏小有.app");
+  const resources = join(app, "Contents", "Resources");
+  const backend = join(resources, "backend");
+  const nodeDirectory = join(resources, "nodejs", "bin");
+  const executableDirectory = join(app, "Contents", "MacOS");
+  mkdirSync(join(backend, "_internal"), { recursive: true });
+  mkdirSync(nodeDirectory, { recursive: true });
+  mkdirSync(executableDirectory, { recursive: true });
+
+  const info = join(app, "Contents", "Info.plist");
+  const executable = join(executableDirectory, "suxiaoyou-desktop");
+  const backendExecutable = join(backend, "suxiaoyou-backend");
+  const node = join(nodeDirectory, "node");
+  const text = join(resources, "README.txt");
+  for (const path of [info, executable, backendExecutable, node, text]) {
+    writeFileSync(path, basename(path));
+  }
+  const releaseLicenseFiles = REQUIRED_RELEASE_LICENSE_FILES.map((relativePath) =>
+    join(resources, relativePath),
+  );
+  for (const path of releaseLicenseFiles) {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, basename(path));
+  }
+
+  return {
+    app,
+    backend,
+    executable,
+    backendExecutable,
+    info,
+    node,
+    releaseLicenseFiles,
+    resources,
+    text,
+  };
+}
+
+function commandRunner(fixture, overrides = {}) {
+  const calls = [];
+  const machO = new Set([fixture.executable, fixture.backendExecutable, fixture.node]);
+  const runCommand = async (command, args, options = {}) => {
+    calls.push({ command, args, options });
+    if (command === "plutil") {
+      const key = args[1];
+      return {
+        stdout:
+          {
+            CFBundleIdentifier: "com.chaoyuanxinzhi.suxiaoyou",
+            CFBundleExecutable: "suxiaoyou-desktop",
+            CFBundleName: "苏小有",
+            CFBundleShortVersionString: "0.7.3",
+            LSMinimumSystemVersion: overrides.infoMinOS ?? "13.3",
+          }[key] + "\n",
+        stderr: "",
+      };
+    }
+    if (command === "file") {
+      return {
+        stdout: machO.has(args.at(-1)) ? "Mach-O 64-bit executable arm64\n" : "ASCII text\n",
+        stderr: "",
+      };
+    }
+    if (command === "lipo") {
+      return { stdout: `${overrides.arch ?? "arm64"}\n`, stderr: "" };
+    }
+    if (command === "vtool") {
+      return {
+        stdout:
+          "Load command 9\n" +
+          "      cmd LC_BUILD_VERSION\n" +
+          " platform MACOS\n" +
+          `    minos ${overrides.binaryMinOS ?? "13.3"}\n` +
+          "     tool LD\n" +
+          "  version 1267.0\n",
+        stderr: "",
+      };
+    }
+    if (command === fixture.node && args[0] === "--version") {
+      return { stdout: `${overrides.nodeVersion ?? "v22.22.0"}\n`, stderr: "" };
+    }
+    if (command === fixture.node && args[0] === "-p") {
+      return { stdout: `${overrides.nodeArch ?? "arm64"}\n`, stderr: "" };
+    }
+    if (command === process.execPath && args[0].endsWith("verify-bundle.mjs")) {
+      return { stdout: "bundle verified\n", stderr: "" };
+    }
+    if (command === "codesign") {
+      return { stdout: "", stderr: "" };
+    }
+    throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
+  };
+  return { calls, runCommand };
+}
+
+test("checks every Mach-O, Node, Info.plist, and the embedded backend", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture);
+
+  const result = await verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+    runCommand: runner.runCommand,
+    log: () => {},
+  });
+
+  assert.equal(result.machOCount, 3);
+  assert.equal(result.nodeVersion, "v22.22.0");
+  assert.equal(result.bundleIdentifier, "com.chaoyuanxinzhi.suxiaoyou");
+  assert.equal(result.releaseLicenseCount, REQUIRED_RELEASE_LICENSE_FILES.length);
+  assert.equal(
+    runner.calls.filter(({ command }) => command === "file").length,
+    5 + REQUIRED_RELEASE_LICENSE_FILES.length,
+    "every regular file must be classified with file(1)",
+  );
+  assert.equal(runner.calls.filter(({ command }) => command === "lipo").length, 3);
+  assert.equal(runner.calls.filter(({ command }) => command === "vtool").length, 3);
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === process.execPath &&
+        args[0].endsWith("verify-bundle.mjs") &&
+        args[1] === fixture.backend,
+    ),
+  );
+});
+
+test("rejects an app that omits a mandatory release-license resource", async () => {
+  const fixture = appFixture();
+  unlinkSync(fixture.releaseLicenseFiles[0]);
+  const runner = commandRunner(fixture);
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /bundled release license licenses\/LICENSE does not exist/,
+  );
+});
+
+test("can require a complete app-bundle signature", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture);
+
+  const result = await verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+    runCommand: runner.runCommand,
+    log: () => {},
+    verifySignature: true,
+  });
+
+  assert.equal(result.signatureVerified, true);
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === "codesign" &&
+        args.join(" ") === `--verify --deep --strict --verbose=2 ${fixture.app}`,
+    ),
+  );
+});
+
+test("can explicitly skip only the embedded backend smoke", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture);
+
+  const result = await verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+    runCommand: runner.runCommand,
+    log: () => {},
+    skipBackendSmoke: true,
+  });
+
+  assert.equal(result.backendSmokeSkipped, true);
+  const backendVerification = runner.calls.find(
+    ({ command, args }) =>
+      command === process.execPath && args[0].endsWith("verify-bundle.mjs"),
+  );
+  assert.equal(backendVerification.options.env.VERIFY_BUNDLE_SKIP_SMOKE, "1");
+});
+
+test("rejects a Mach-O that is not exactly the requested architecture", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, { arch: "arm64 x86_64" });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /expected exactly arm64.*arm64 x86_64/s,
+  );
+});
+
+test("rejects a Mach-O whose deployment target exceeds the declared minimum", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, { binaryMinOS: "14.0" });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /deployment target 14\.0 exceeds 13\.3/,
+  );
+});
+
+test("accepts a native x86_64 app with an x64 Node runtime", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, { arch: "x86_64", nodeArch: "x64" });
+
+  const result = await verifyMacOSBundle(fixture.app, "x86_64", "13.3", {
+    runCommand: runner.runCommand,
+    log: () => {},
+  });
+
+  assert.equal(result.nodeArchitecture, "x64");
+  assert.equal(result.machOCount, 3);
+});
+
+test("rejects Node when process.arch does not match the app architecture", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, { nodeArch: "x64" });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /expected Node process\.arch arm64, got x64/,
+  );
+});
+
+test("rejects the wrong bundled Node version before backend smoke", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, { nodeVersion: "v22.21.0" });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /expected Node v22\.22\.0.*v22\.21\.0/s,
+  );
+  assert.equal(
+    runner.calls.some(
+      ({ command, args }) => command === process.execPath && args[0].endsWith("verify-bundle.mjs"),
+    ),
+    false,
+  );
+});
+
+test("rejects an app whose declared main executable is missing", async () => {
+  const fixture = appFixture();
+  unlinkSync(fixture.executable);
+  const runner = commandRunner(fixture);
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /app executable does not exist/,
+  );
+});

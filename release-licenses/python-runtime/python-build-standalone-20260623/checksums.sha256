@@ -1,0 +1,4 @@
+3724aa4dafb5f7b6c2cf98e89914e4248dc6bd2fe40407df4a2d73de99615f16  cpython-3.12.13+20260623-aarch64-apple-darwin-install_only.tar.gz
+7c57fdd1fa675190093700eb0d8e7117e1f9eae7c30a46dea5f8d5266bcfc791  cpython-3.12.13+20260623-x86_64-apple-darwin-install_only.tar.gz
+ce5a2d552077d869f69dc25d834c2fe4d036f9d78e770fb5d916273db802cabc  cpython-3.12.13+20260623-aarch64-apple-darwin-pgo+lto-full.tar.zst
+3b2ee510354f51b6bda71fec7d5cf70dfad29ed672aa5847d1f5216ee22fc5ef  cpython-3.12.13+20260623-x86_64-apple-darwin-pgo+lto-full.tar.zst

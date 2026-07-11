@@ -1,0 +1,26 @@
+苏小有
+Copyright 2026 超元新智 and 苏小有 contributors.
+
+This product is derived from OpenYak:
+https://github.com/openyak/openyak
+
+OpenYak is Copyright 2026 W Axis Inc. and is licensed under the Apache
+License 2.0. 苏小有 contains substantial modifications, including
+product branding, localization, desktop integration, packaging, security,
+and workflow changes. The Apache License does not grant trademark rights in
+either the OpenYak or 苏小有 names and logos.
+
+Third-party components retain their respective copyrights and licenses. See
+THIRD_PARTY_NOTICES.md and the license files distributed with those
+components.
+
+Portions of the messaging-channel implementation are adapted from nanobot,
+Copyright (c) 2025-present Xubin Ren and the nanobot contributors, under the
+MIT License.
+
+Portions of the messaging bridge implementation are adapted from OpenClaw,
+Copyright (c) 2025 Peter Steinberger, under the MIT License.
+
+Portions of the personal WeChat channel implementation are adapted from
+@tencent-weixin/openclaw-weixin 1.0.3, Copyright (c) 2026 Tencent Inc., under
+the MIT License.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "苏小有桌面端打包"
+  short_description: "覆盖 macOS 本机打包与 CI 全平台发布。"
+  default_prompt: "Use $suxiaoyou-macos-dmg-packaging to build and verify the 苏小有 desktop installer for the requested version."

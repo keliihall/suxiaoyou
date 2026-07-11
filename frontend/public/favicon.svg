@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 156 156">
+                    <title>苏小有 96px 图标</title>
+                    <defs>
+                      <clipPath id="icon96Open">
+                        <path d="M50 128V72C50 51 61 39 78 39C95 39 106 51 106 72V128Z"/>
+                      </clipPath>
+                    </defs>
+                    <rect width="156" height="156" rx="38" fill="#0D5F58"/>
+                    <path d="M32 128V68C32 39 52 18 78 18C104 18 124 39 124 68V128Z" fill="#F8F7F2"/>
+                    <path d="M50 128V72C50 51 61 39 78 39C95 39 106 51 106 72V128" fill="#0D5F58"/>
+                    <g clip-path="url(#icon96Open)">
+                      <rect x="50" y="39" width="56" height="89" fill="#0D5F58"/>
+                      <path d="M55 84C63 78 71 78 79 84C87 90 95 90 103 84" fill="none" stroke="#F4C96B" stroke-width="9.5" stroke-linecap="round"/>
+                      <path d="M58 100C66 94 74 94 82 100C90 106 98 106 106 100" fill="none" stroke="#F8F7F2" stroke-width="9.5" stroke-linecap="round"/>
+                    </g>
+                  </svg>
