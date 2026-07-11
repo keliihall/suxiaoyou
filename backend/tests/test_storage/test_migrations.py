@@ -156,6 +156,83 @@ def test_new_database_closes_validation_handles_before_windows_replace(
     assert revision == (V080_HEAD_REVISION,)
 
 
+def test_existing_database_closes_all_handles_before_windows_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise live, backup, and staging handles with Windows replace rules."""
+
+    database = tmp_path / "suxiaoyou.db"
+    fixture_connection = sqlite3.connect(database)
+    try:
+        fixture_connection.executescript(FIXTURE_SQL.read_text(encoding="utf-8"))
+        fixture_connection.commit()
+    finally:
+        fixture_connection.close()
+
+    token = "windows-existing-handle-order"
+    staging = database.with_name(f".{database.name}.{token}.migrating")
+    backup = database.with_name(f"{database.name}.pre-v0.8.0-{token}.bak")
+    real_connect = migrations.sqlite3.connect
+    tracked: list[tuple[Path, sqlite3.Connection]] = []
+
+    def retaining_connect(database_path, *args, **kwargs):
+        connection = real_connect(database_path, *args, **kwargs)
+        tracked.append((Path(database_path).resolve(), connection))
+        return connection
+
+    def connection_is_open(connection: sqlite3.Connection) -> bool:
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return False
+        return True
+
+    monkeypatch.setattr(migrations, "_migration_token", lambda: token)
+    monkeypatch.setattr(migrations.sqlite3, "connect", retaining_connect)
+    real_replace = migrations.os.replace
+    replace_checked = False
+    tracked_paths_at_replace: set[Path] = set()
+
+    def windows_replace(source, destination) -> None:
+        nonlocal replace_checked, tracked_paths_at_replace
+        if Path(source) == staging and Path(destination) == database:
+            replace_checked = True
+            tracked_paths_at_replace = {path for path, _connection in tracked}
+            locked_paths = [
+                path
+                for path, connection in tracked
+                if connection_is_open(connection)
+            ]
+            if locked_paths:
+                raise PermissionError(
+                    32,
+                    "file is being used by another process: "
+                    + ", ".join(str(path) for path in locked_paths),
+                )
+        real_replace(source, destination)
+
+    monkeypatch.setattr(migrations.os, "replace", windows_replace)
+
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert result is not None and result.upgraded is True
+    assert replace_checked is True
+    assert database.resolve() in tracked_paths_at_replace
+    assert backup.resolve() in tracked_paths_at_replace
+    assert staging.resolve() in tracked_paths_at_replace
+    assert tracked and all(not connection_is_open(connection) for _, connection in tracked)
+
+    installed_connection = real_connect(database)
+    try:
+        revision = installed_connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+    finally:
+        installed_connection.close()
+    assert revision == (V080_HEAD_REVISION,)
+
+
 def test_failed_new_database_validation_closes_handles_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -196,6 +273,52 @@ def test_failed_new_database_validation_closes_handles_before_cleanup(
     assert cleanup_checked is True
     assert tracked and all(connection.closed for connection in tracked)
     assert not staging.exists()
+
+
+def test_failed_new_database_cleanup_error_preserves_migration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = tmp_path / "cleanup-locked.db"
+    token = "windows-cleanup-locked"
+    staging = database.with_name(f".{database.name}.{token}.migrating")
+
+    def fail_after_creating_staging(
+        path: Path,
+        *,
+        stamp_revision: str | None,
+    ) -> None:
+        del stamp_revision
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE incomplete (value TEXT)")
+            connection.commit()
+        finally:
+            connection.close()
+        raise RuntimeError("original migration failure")
+
+    def windows_locked_cleanup(path: Path) -> None:
+        assert path == staging
+        raise PermissionError(32, "staging file is being used by another process")
+
+    monkeypatch.setattr(migrations, "_migration_token", lambda: token)
+    monkeypatch.setattr(migrations, "_run_alembic", fail_after_creating_staging)
+    monkeypatch.setattr(migrations, "_remove_sqlite_files", windows_locked_cleanup)
+
+    with caplog.at_level(logging.WARNING, logger=migrations.__name__):
+        with pytest.raises(DatabaseMigrationError) as exc_info:
+            migrations._initialize_new_database(database)
+
+    error = exc_info.value
+    assert "original migration failure" in str(error)
+    assert "Cleanup of the failed staging database also failed" in str(error)
+    assert "staging file is being used by another process" in str(error)
+    assert isinstance(error.__cause__, RuntimeError)
+    assert str(error.__cause__) == "original migration failure"
+    assert error.failed_copy_path == staging
+    assert staging.is_file()
+    assert "Could not remove failed new-database staging files" in caplog.text
 
 
 def test_alembic_connection_reference_is_dropped_before_engine_dispose_on_error(

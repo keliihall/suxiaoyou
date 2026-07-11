@@ -292,10 +292,30 @@ def _initialize_new_database(database_path: Path) -> MigrationResult:
         _validate_head_database(staging_path)
         _atomic_install(staging_path, database_path)
     except Exception as exc:
-        _remove_sqlite_files(staging_path)
+        cleanup_failure: OSError | None = None
+        retained_failed_path: Path | None = None
+        try:
+            _remove_sqlite_files(staging_path)
+        except OSError as cleanup_exc:
+            cleanup_failure = cleanup_exc
+            if staging_path.exists():
+                retained_failed_path = staging_path
+            logger.warning(
+                "Could not remove failed new-database staging files at %s: %s",
+                staging_path,
+                cleanup_exc,
+                exc_info=True,
+            )
+        failure_message = f"A new database could not be initialized: {exc}"
+        if cleanup_failure is not None:
+            failure_message += (
+                " Cleanup of the failed staging database also failed: "
+                f"{cleanup_failure}."
+            )
         raise DatabaseMigrationError(
             database_path,
-            f"A new database could not be initialized: {exc}",
+            failure_message,
+            failed_copy_path=retained_failed_path,
         ) from exc
 
     logger.info("Initialized database at Alembic revision %s", V080_HEAD_REVISION)
