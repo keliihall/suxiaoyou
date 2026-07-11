@@ -16,6 +16,13 @@ const macArmConfig = JSON.parse(
 const macIntelConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/build.macos-x64.json"), "utf8"),
 );
+const linuxConfig = JSON.parse(
+  readFileSync(join(root, "desktop-tauri/src-tauri/build.linux-x64.json"), "utf8"),
+);
+const linuxDesktopTemplate = readFileSync(
+  join(root, "desktop-tauri/src-tauri/linux/suxiaoyou.desktop.hbs"),
+  "utf8",
+);
 const backendRequirements = readFileSync(
   join(root, "backend/requirements.txt"),
   "utf8",
@@ -169,6 +176,29 @@ test("installer artifacts expire after one day and lifecycle diagnostics after s
 test("sets the declared macOS minimum everywhere", () => {
   assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "11.0");
   assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"11\.0"/);
+});
+
+test("keeps the Chinese UI name while Linux packages use a stable ASCII identity", () => {
+  assert.equal(tauriConfig.productName, "苏小有");
+  assert.ok(tauriConfig.app.windows.every((window) => window.title === "苏小有"));
+  assert.equal(linuxConfig.productName, "suxiaoyou");
+  assert.equal(linuxConfig.mainBinaryName, undefined);
+  assert.deepEqual(linuxConfig.bundle.resources, tauriConfig.bundle.resources);
+
+  const templatePath = "linux/suxiaoyou.desktop.hbs";
+  assert.equal(linuxConfig.bundle.linux.deb.desktopTemplate, templatePath);
+  assert.equal(linuxConfig.bundle.linux.rpm.desktopTemplate, templatePath);
+  assert.match(linuxDesktopTemplate, /^\[Desktop Entry\]$/m);
+  assert.match(linuxDesktopTemplate, /^Categories=\{\{categories\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Comment=\{\{comment\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Exec=\{\{exec\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^StartupWMClass=\{\{exec\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Icon=\{\{icon\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Name=苏小有$/m);
+  assert.match(linuxDesktopTemplate, /^Terminal=false$/m);
+  assert.match(linuxDesktopTemplate, /^Type=Application$/m);
+  assert.match(linuxDesktopTemplate, /^MimeType=\{\{mime_type\}\}$/m);
+  assert.doesNotMatch(linuxDesktopTemplate, /^Name=\{\{name\}\}$/m);
 });
 
 test("keeps Apple credentials step-scoped and fails official tags fast", () => {
@@ -345,10 +375,15 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   );
   assert.match(step(linux, "Upload Linux artifacts"), /if:\s*always\(\)/);
   assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /DEB_PACKAGE=.*dpkg-deb -f .* Package/);
   assert.match(linux, /dpkg-deb -f .* Version/);
   assert.match(linux, /dpkg-deb -f .* Architecture/);
+  assert.match(linux, /RPM_PACKAGE=.*rpm -qp --queryformat '%\{NAME\}'/);
   assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
   assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
+  assert.match(linux, /EXPECTED_PACKAGE="suxiaoyou"/);
+  assert.match(linux, /DEB package is \$DEB_PACKAGE, expected \$EXPECTED_PACKAGE/);
+  assert.match(linux, /RPM package is \$RPM_PACKAGE, expected \$EXPECTED_PACKAGE/);
   assert.match(linux, /expected amd64/);
   assert.match(linux, /expected x86_64/);
   assert.match(linux, /rpm -K/);

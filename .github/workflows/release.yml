@@ -737,10 +737,21 @@ jobs:
           printf 'Verifying DEB %s and RPM %s\n' "${debs[0]}" "${rpms[0]}"
 
           VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_PACKAGE="suxiaoyou"
+          DEB_PACKAGE="$(dpkg-deb -f "${debs[0]}" Package)"
           DEB_VERSION="$(dpkg-deb -f "${debs[0]}" Version)"
           DEB_ARCH="$(dpkg-deb -f "${debs[0]}" Architecture)"
+          RPM_PACKAGE="$(rpm -qp --queryformat '%{NAME}' "${rpms[0]}")"
           RPM_VERSION="$(rpm -qp --queryformat '%{VERSION}' "${rpms[0]}")"
           RPM_ARCH="$(rpm -qp --queryformat '%{ARCH}' "${rpms[0]}")"
+          [[ "$DEB_PACKAGE" == "$EXPECTED_PACKAGE" ]] || {
+            echo "::error::DEB package is $DEB_PACKAGE, expected $EXPECTED_PACKAGE"
+            exit 1
+          }
+          [[ "$RPM_PACKAGE" == "$EXPECTED_PACKAGE" ]] || {
+            echo "::error::RPM package is $RPM_PACKAGE, expected $EXPECTED_PACKAGE"
+            exit 1
+          }
           [[ "$DEB_VERSION" == "$VERSION" ]] || {
             echo "::error::DEB version is $DEB_VERSION, expected $VERSION"
             exit 1
