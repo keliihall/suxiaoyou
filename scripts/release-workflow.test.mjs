@@ -230,9 +230,16 @@ test("Windows native build validates lifecycle primitives before packaging", () 
 });
 
 test("uses Python 3.12 and full backend smoke on every build host", () => {
-  for (const name of ["build-windows", "build-linux"]) {
+  const expectedPython = new Map([
+    ["build-windows", "3.12.10"],
+    ["build-linux", "3.12.13"],
+  ]);
+  for (const [name, version] of expectedPython) {
     const build = job(name);
-    assert.match(build, /python-version:\s*"3\.12\.13"/);
+    assert.match(
+      build,
+      new RegExp(`python-version:\\s*"${version.replaceAll(".", "\\.")}"`),
+    );
     assert.match(build, /node scripts\/verify-bundle\.mjs/);
     assert.doesNotMatch(build, /VERIFY_BUNDLE_SKIP_SMOKE/);
   }
