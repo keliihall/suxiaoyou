@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+
+from app.api.sessions import _extract_file_paths_from_messages
 
 pytestmark = pytest.mark.asyncio
 
@@ -134,3 +138,35 @@ class TestSearchSessions:
         assert resp.status_code == 200
         results = resp.json()
         assert len(results) >= 1
+
+
+async def test_recovered_file_paths_require_real_workspace_containment(tmp_path):
+    workspace = tmp_path / "workspace"
+    sibling = tmp_path / "workspace-evil"
+    workspace.mkdir()
+    sibling.mkdir()
+    legitimate = workspace / "report.txt"
+    impersonator = sibling / "stolen.txt"
+    legitimate.write_text("ok", encoding="utf-8")
+    impersonator.write_text("must not leak", encoding="utf-8")
+    output = (
+        f"Created {legitimate}\n"
+        f"Created {impersonator}\n"
+        f"created in {sibling}\n"
+        "- stolen.txt"
+    )
+    message = SimpleNamespace(
+        parts=[
+            SimpleNamespace(
+                data={
+                    "type": "tool",
+                    "tool": "code_execute",
+                    "state": {"output": output},
+                }
+            )
+        ]
+    )
+
+    recovered = _extract_file_paths_from_messages([message], str(workspace))
+
+    assert recovered == [str(legitimate.resolve())]

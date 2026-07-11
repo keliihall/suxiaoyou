@@ -8,6 +8,7 @@ import {
   XCircle,
 } from "lucide-react";
 import Link from "next/link";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { useAutomationRuns } from "@/hooks/use-automations";
 import { getChatRoute } from "@/lib/routes";
@@ -101,6 +102,7 @@ export function TriggeredByBadge({ triggeredBy, t }: { triggeredBy: string; t: (
 /* ------------------------------------------------------------------ */
 
 export function RunHistoryPanel({ automationId, t }: { automationId: string; t: TFunc }) {
+  const { i18n } = useTranslation();
   const { data: runs, isLoading } = useAutomationRuns(automationId);
 
   if (isLoading) {
@@ -118,7 +120,7 @@ export function RunHistoryPanel({ automationId, t }: { automationId: string; t: 
           <StatusBadge status={run.status} sessionId={run.session_id} t={t} />
           <TriggeredByBadge triggeredBy={run.triggered_by} t={t} />
           <span className="text-[var(--text-tertiary)]">
-            {formatDuration(run.started_at, run.finished_at)}
+            {formatDuration(run.started_at, run.finished_at, i18n.language)}
           </span>
           <span className="text-[var(--text-tertiary)] ml-auto">
             {relativeTime(run.started_at, t)}

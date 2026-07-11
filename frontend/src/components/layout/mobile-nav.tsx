@@ -9,10 +9,14 @@ import { SidebarHeader } from "./sidebar-header";
 import { SidebarNav } from "./sidebar-nav";
 import { SessionList } from "./session-list";
 import { SidebarFooter } from "./sidebar-footer";
+import { ProjectsToolbar } from "./projects-toolbar";
 import { useSidebarStore } from "@/stores/sidebar-store";
+import { useIsMacOS } from "@/hooks/use-platform";
+import { IS_DESKTOP, TITLE_BAR_HEIGHT } from "@/lib/constants";
 
 export function MobileNav() {
   const { isOpen, setOpen } = useSidebarStore();
+  const isMac = useIsMacOS();
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
@@ -28,6 +32,7 @@ export function MobileNav() {
           variant="ghost"
           size="icon"
           className="lg:hidden fixed top-3 left-3 z-40 h-8 w-8"
+          style={IS_DESKTOP && !isMac ? { top: TITLE_BAR_HEIGHT + 12 } : undefined}
         >
           <Menu className="h-5 w-5" />
           <span className="sr-only">Toggle sidebar</span>
@@ -38,6 +43,7 @@ export function MobileNav() {
           <div className="flex flex-col h-full">
             <SidebarHeader />
             <SidebarNav />
+            <ProjectsToolbar variant="primary" />
             <SessionList />
             <SidebarFooter />
           </div>

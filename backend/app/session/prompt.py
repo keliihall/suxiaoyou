@@ -10,8 +10,10 @@ Separation of concerns:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
@@ -35,6 +37,11 @@ from app.session.manager import (
     get_session,
     update_session_title,
 )
+from app.session.managed_workspace import (
+    managed_workspace_for_session,
+    snapshot_attachments,
+    snapshot_existing_session_attachments,
+)
 from app.session.system_prompt import (
     SystemPromptParts,
     active_skills_from_registry,
@@ -48,6 +55,8 @@ from app.session.system_prompt import (
 from app.streaming.events import (
     AGENT_ERROR,
     DONE,
+    INPUT_APPLIED,
+    INPUT_FAILED,
     STEP_START,
     TITLE_UPDATE,
     SSEEvent,
@@ -61,6 +70,22 @@ if TYPE_CHECKING:
     from app.session.processor import SessionProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def _uses_managed_workspace(
+    existing_directory: str | None,
+    requested_workspace: str | None,
+) -> bool:
+    """Return whether a turn belongs to the folderless managed boundary.
+
+    Once a session exists, its persisted directory is authoritative.  A stale
+    global frontend setting must never silently turn a ``.`` conversation into
+    a project or make outputs land in the previously visited folder.
+    """
+    return existing_directory == "." or (
+        existing_directory is None and not requested_workspace
+    )
+
 
 def _cfg():
     return get_settings()
@@ -105,6 +130,7 @@ class SessionPrompt:
         self.model_info: Any | None = None
         self.directory: str | None = None
         self.workspace: str | None = None
+        self.managed_workspace: Path | None = None
         self.fts_status: dict[str, Any] | None = None
         self.workspace_memory_section: str | None = None
         self.system_prompt_parts: SystemPromptParts | None = None
@@ -177,11 +203,11 @@ class SessionPrompt:
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def run(self) -> None:
+    async def run(self, *, publish_done: bool = True) -> None:
         """Main entry point: setup → loop → post-loop."""
         await self._setup()
         await self._loop()
-        await self._post_loop()
+        await self._post_loop(publish_done=publish_done)
 
     # ------------------------------------------------------------------
     # Setup phase (steps 1-5 from the original _run_generation_inner)
@@ -249,6 +275,34 @@ class SessionPrompt:
                 pass
 
         # --- 3. Create/load session and persist user message ---
+        # A conversation without a selected project must not inherit the
+        # attachment's parent directory as an implicit write location. Give it
+        # a stable managed workspace and snapshot referenced inputs before
+        # persisting their paths.
+        async with self.session_factory() as db:
+            existing_session = await get_session(db, self.job.session_id)
+        existing_directory = (
+            existing_session.directory if existing_session is not None else None
+        )
+        is_folderless = _uses_managed_workspace(
+            existing_directory,
+            self.request.workspace,
+        )
+        if is_folderless:
+            if existing_directory == ".":
+                self.request.workspace = None
+            self.managed_workspace = managed_workspace_for_session(self.job.session_id)
+            if existing_session is not None:
+                await snapshot_existing_session_attachments(
+                    self.session_factory, self.job.session_id
+                )
+            if self.request.attachments:
+                self.request.attachments = await asyncio.to_thread(
+                    snapshot_attachments,
+                    self.job.session_id,
+                    self.request.attachments,
+                )
+
         if self.skip_user_message:
             # Edit-and-resend reuses the existing user message, so we skip the
             # message write — but it can still change the model, so keep the
@@ -316,6 +370,8 @@ class SessionPrompt:
         self.workspace = (
             self.directory if self.directory and self.directory != "." else self.request.workspace
         )
+        if self.managed_workspace is not None:
+            self.workspace = str(self.managed_workspace)
 
         if self.index_manager is not None and self.workspace:
             try:
@@ -443,10 +499,126 @@ class SessionPrompt:
 
             if result == "stop":
                 if await self._handle_stop_result():
+                    if await self._apply_pending_steers():
+                        continue
                     break
                 continue
 
             # result == "continue": has tool calls, loop again with tool results
+
+            # A steer is deliberately consumed only after the current model and
+            # tool batch reached this safe boundary. It never interrupts a
+            # command or a partially-written file.
+            await self._apply_pending_steers()
+
+    async def _apply_pending_steers(self) -> int:
+        """Persist queued steer inputs as user messages at a safe boundary."""
+        async with self.job.session_input_lock:
+            return await self._apply_pending_steers_locked()
+
+    async def _apply_pending_steers_locked(self) -> int:
+        """Apply steer rows while holding the stream admission lock."""
+        from app.session.input_queue import (
+            claim_next_session_input,
+            finish_session_input,
+        )
+
+        applied = 0
+        while not self.job.abort_event.is_set():
+            # Claim in its own transaction.  If the process exits after this
+            # commit, startup recovery will move the durable ``applying`` row
+            # to ``blocked`` instead of replaying a possibly side-effecting
+            # instruction.
+            async with self.session_factory() as db:
+                async with db.begin():
+                    item = await claim_next_session_input(
+                        db,
+                        self.job.session_id,
+                        mode="steer",
+                        target_stream_id=self.job.stream_id,
+                    )
+            if item is None:
+                break
+
+            try:
+                # Message + all parts + terminal queue state are one atomic
+                # write.  A failed attachment part must not leave a partial
+                # steer visible in the conversation history.
+                async with self.session_factory() as db:
+                    async with db.begin():
+                        message = await create_message(
+                            db,
+                            session_id=self.job.session_id,
+                            data={
+                                "role": "user",
+                                "agent": item.agent,
+                                "session_input_id": item.id,
+                                "input_mode": "steer",
+                            },
+                        )
+                        if item.text:
+                            await create_part(
+                                db,
+                                message_id=message.id,
+                                session_id=self.job.session_id,
+                                data={"type": "text", "text": item.text},
+                            )
+                        for attachment in item.attachments or []:
+                            attachment_data = dict(attachment)
+                            attachment_data["type"] = "file"
+                            await create_part(
+                                db,
+                                message_id=message.id,
+                                session_id=self.job.session_id,
+                                data=attachment_data,
+                            )
+                        await finish_session_input(
+                            db,
+                            item.id,
+                            status="consumed",
+                            applied_stream_id=self.job.stream_id,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to apply steer input %s",
+                    item.id,
+                    exc_info=True,
+                )
+                try:
+                    async with self.session_factory() as db:
+                        async with db.begin():
+                            await finish_session_input(
+                                db,
+                                item.id,
+                                status="failed",
+                                error_message=str(exc),
+                            )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist steer failure %s",
+                        item.id,
+                        exc_info=True,
+                    )
+                self.job.publish(
+                    SSEEvent(
+                        INPUT_FAILED,
+                        {"input_id": item.id, "error": str(exc)},
+                    )
+                )
+                continue
+
+            self.job.publish(
+                SSEEvent(
+                    INPUT_APPLIED,
+                    {
+                        "input_id": item.id,
+                        "mode": "steer",
+                        "session_id": self.job.session_id,
+                    },
+                )
+            )
+            applied += 1
+        return applied
 
     # ------------------------------------------------------------------
     # _loop step helpers
@@ -807,7 +979,7 @@ class SessionPrompt:
     # Post-loop: cleanup, persist cost, DONE, auto-title
     # ------------------------------------------------------------------
 
-    async def _post_loop(self) -> None:
+    async def _post_loop(self, *, publish_done: bool = True) -> None:
         """Cleanup, persist accumulated cost/tokens, publish DONE, auto-title."""
         from app.session.processor import _delete_empty_assistant_messages
 
@@ -874,7 +1046,11 @@ class SessionPrompt:
             except Exception:
                 logger.warning("Workspace memory queue submission failed", exc_info=True)
 
-        # Publish DONE to unlock the frontend UI.
+        if publish_done:
+            self.publish_done()
+
+    def publish_done(self) -> None:
+        """Publish the terminal event after a queued-input chain is exhausted."""
         self.job.publish(
             SSEEvent(
                 DONE,

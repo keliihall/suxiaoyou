@@ -2,13 +2,30 @@
 
 import type { QueryClient, InfiniteData } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { SSEClient, type SSEConnectionStatus } from "@/lib/sse";
+import i18n from "@/i18n/config";
+import { SSEClient, type SSEConnectionStatus, type SSEEventHandler } from "@/lib/sse";
 import { API, IS_DESKTOP, getBackendToken, getBackendUrl, queryKeys } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
 import { desktopAPI } from "@/lib/tauri-api";
 import { api } from "@/lib/api";
 import { SSE_EVENTS } from "@/types/streaming";
 import { notifyBackgroundFinish } from "@/lib/background-notify";
+import {
+  hasProgressStalled,
+  isBusinessProgressEvent,
+  isWaitingForUserInteraction,
+} from "@/lib/stream-progress";
+import { StreamLeaseRegistry, type StreamLease } from "@/lib/stream-lifecycle";
+import {
+  canMarkInteractionContinuing,
+  INTERACTION_CONTINUATION_GRACE_MS,
+  INTERACTION_RECOVERY_VERIFY_MS,
+  isInteractionContinuationEvent,
+  isInteractionPendingContinuation,
+  matchesInteractionRecoveryTarget,
+  type InteractionPromptType,
+  type InteractionRecoveryTarget,
+} from "@/lib/interaction-response";
 import { useChatStore } from "@/stores/chat-store";
 import { useConnectionStore } from "@/stores/connection-store";
 import { useArtifactStore } from "@/stores/artifact-store";
@@ -34,6 +51,7 @@ import type { PaginatedMessages } from "@/types/message";
  */
 
 const PROGRESSIVE_BUFFER_INTERVAL_MS = 60;
+const DISCONNECTED_RECOVERY_DELAYS_MS = [1_000, 3_000, 10_000] as const;
 
 // After a desktop backend restart, wait a beat before reconciling: the
 // companion onBackendRestart handler in constants.ts (registered at module
@@ -88,6 +106,7 @@ class ProgressiveBuffer {
 interface StreamInstance {
   sessionId: string;
   streamId: string;
+  lease: StreamLease;
   client: SSEClient;
   textBuffer: ProgressiveBuffer;
   reasoningBuffer: ProgressiveBuffer;
@@ -95,16 +114,29 @@ interface StreamInstance {
   idleCheckTimer: ReturnType<typeof setInterval> | null;
   mobilePauseTimer: ReturnType<typeof setTimeout> | null;
   lastEventTimestamp: number;
+  lastProgressTimestamp: number;
+  disconnectRecoveryAttempt: number;
+  disconnectRecoveryEpoch: number;
+  disconnectRecoveryInFlight: boolean;
+  disconnectRecoveryTimer: ReturnType<typeof setTimeout> | null;
+  disconnectNotified: boolean;
+  connectionStatus: SSEConnectionStatus;
+  interactionRecoveryTimer: ReturnType<typeof setTimeout> | null;
+  interactionRecoveryWatch: InteractionRecoveryWatch | null;
+  interactionRecoverySequence: number;
+  retryInteractionRecovery: (
+    promptType: InteractionPromptType,
+    callId: string,
+  ) => boolean;
+}
+
+interface InteractionRecoveryWatch {
+  target: InteractionRecoveryTarget;
+  sequence: number;
 }
 
 const instances = new Map<string, StreamInstance>();
-
-// Sessions whose startStream() is mid-setup (parked on the async backend
-// url/token fetch). startStream only registers its instance *after* that await,
-// so without this guard a second concurrent start for the same session — e.g.
-// restart reconcile firing while a user prompt's start is still in flight —
-// would build a second SSEClient, duplicating deltas and leaking an EventSource.
-const pendingStarts = new Set<string>();
+const streamLeases = new StreamLeaseRegistry();
 
 let queryClientRef: QueryClient | null = null;
 let globalListenersInstalled = false;
@@ -130,18 +162,61 @@ export function getActiveStreamId(sessionId: string): string | null {
   return instances.get(sessionId)?.streamId ?? null;
 }
 
+/** Lease generation changes even if a future backend reuses a stream id. */
+export function getActiveStreamGeneration(sessionId: string): number | null {
+  return instances.get(sessionId)?.lease.generation ?? null;
+}
+
+/** User-requested reconnect; business progress time intentionally stays put. */
+export function reconnectStream(sessionId: string): boolean {
+  const instance = instances.get(sessionId);
+  if (!instance) return false;
+  // This is connection activity only. Deliberately do not touch
+  // lastProgressTimestamp / lastBusinessProgressAt.
+  instance.lastEventTimestamp = Date.now();
+  resetDisconnectedRecovery(instance);
+  return instance.client.reconnectNow();
+}
+
+/** Retry authoritative recovery for a resolved interaction that did not continue. */
+export function recoverInteractionState(
+  sessionId: string,
+  streamId: string,
+  promptType: InteractionPromptType,
+  callId: string,
+): boolean {
+  const instance = instances.get(sessionId);
+  if (!instance || instance.streamId !== streamId) return false;
+  return instance.retryInteractionRecovery(promptType, callId);
+}
+
 /** Stop a session's stream (used by the abort flow). Idempotent. */
 export function stopStream(sessionId: string): void {
   const instance = instances.get(sessionId);
-  if (!instance) return;
-  disposeInstance(instance);
-  instances.delete(sessionId);
+  if (instance) {
+    disposeInstance(instance);
+    instances.delete(sessionId);
+  }
+  // Invalidate async setup even when no client has attached yet. Clear after
+  // disposal so a live instance can flush its final buffered deltas first.
+  streamLeases.clear(sessionId);
   if (instances.size === 0) {
     useConnectionStore.getState().setStatus("idle");
   }
 }
 
 function disposeInstance(instance: StreamInstance): void {
+  instance.disconnectRecoveryEpoch += 1;
+  instance.interactionRecoverySequence += 1;
+  instance.interactionRecoveryWatch = null;
+  if (instance.interactionRecoveryTimer) {
+    clearTimeout(instance.interactionRecoveryTimer);
+    instance.interactionRecoveryTimer = null;
+  }
+  if (instance.disconnectRecoveryTimer) {
+    clearTimeout(instance.disconnectRecoveryTimer);
+    instance.disconnectRecoveryTimer = null;
+  }
   if (instance.idleCheckTimer) {
     clearInterval(instance.idleCheckTimer);
     instance.idleCheckTimer = null;
@@ -155,14 +230,25 @@ function disposeInstance(instance: StreamInstance): void {
     instance.stepFinishTimer = null;
   }
   // Flush any buffered text into the store so navigation doesn't lose it.
-  const isGenerating = useChatStore.getState().sessions[instance.sessionId]?.isGenerating;
-  if (isGenerating) {
+  const bucket = useChatStore.getState().sessions[instance.sessionId];
+  if (bucket?.isGenerating && bucket.streamId === instance.streamId) {
     instance.textBuffer.flush();
     instance.reasoningBuffer.flush();
   }
   instance.textBuffer.dispose();
   instance.reasoningBuffer.dispose();
   instance.client.close();
+}
+
+function resetDisconnectedRecovery(instance: StreamInstance): void {
+  instance.disconnectRecoveryEpoch += 1;
+  instance.disconnectRecoveryAttempt = 0;
+  instance.disconnectRecoveryInFlight = false;
+  instance.disconnectNotified = false;
+  if (instance.disconnectRecoveryTimer) {
+    clearTimeout(instance.disconnectRecoveryTimer);
+    instance.disconnectRecoveryTimer = null;
+  }
 }
 
 /**
@@ -172,37 +258,65 @@ function disposeInstance(instance: StreamInstance): void {
  */
 export async function startStream(sessionId: string, streamId: string): Promise<void> {
   const existing = instances.get(sessionId);
-  if (existing) {
-    if (existing.streamId === streamId) return;
-    // New stream id for the same session — replace.
-    stopStream(sessionId);
+  if (
+    existing?.streamId === streamId
+    && streamLeases.isCurrent(existing.lease)
+  ) {
+    return;
   }
 
-  // Reserve this session across the one async gap below. Everything from here
-  // to instances.set() is synchronous, so this is enough to serialize starts.
-  if (pendingStarts.has(sessionId)) return;
-  pendingStarts.add(sessionId);
+  // The latest request wins, including while an older request is parked on
+  // desktop URL/token discovery. Its unique lease gates setup and every later
+  // event continuation, so an out-of-order old start can never attach.
+  const lease = streamLeases.expect(sessionId, streamId);
+  if (existing) {
+    disposeInstance(existing);
+    if (instances.get(sessionId) === existing) instances.delete(sessionId);
+  }
 
   if (IS_DESKTOP) {
     try {
       await Promise.all([getBackendUrl(), getBackendToken()]);
     } catch (err) {
-      pendingStarts.delete(sessionId);
+      streamLeases.clear(sessionId, lease);
       throw err;
     }
   }
+  if (!streamLeases.isCurrent(lease)) return;
 
   ensureGlobalListeners();
 
   const store = useChatStore;
   const connectionStore = useConnectionStore;
 
+  const isCurrentStream = () =>
+    streamLeases.isCurrent(lease)
+    && instances.get(sessionId) === instance;
+
+  const isCurrentGeneration = () =>
+    isCurrentStream()
+    && store.getState().sessions[sessionId]?.streamId === streamId;
+
   const textBuffer = new ProgressiveBuffer((text) => {
-    store.getState().appendTextDelta(sessionId, text);
+    if (isCurrentGeneration()) store.getState().appendTextDelta(sessionId, text);
   });
   const reasoningBuffer = new ProgressiveBuffer((text) => {
-    store.getState().appendReasoningDelta(sessionId, text);
+    if (isCurrentGeneration()) store.getState().appendReasoningDelta(sessionId, text);
   });
+
+  const finishCurrentGeneration = () => {
+    if (!isCurrentGeneration()) return false;
+    store.getState().finishGeneration(sessionId);
+    return true;
+  };
+
+  const stopCurrentStream = () => {
+    if (!isCurrentStream()) return;
+    disposeInstance(instance);
+    instances.delete(sessionId);
+    streamLeases.clear(sessionId, lease);
+    if (instances.size === 0) connectionStore.getState().setStatus("idle");
+  };
 
   const waitForNextPaint = () =>
     new Promise<void>((r) =>
@@ -233,12 +347,15 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   };
 
   const finishFromDatabase = async (sid: string) => {
+    if (!isCurrentGeneration()) return false;
     textBuffer.flush();
     reasoningBuffer.flush();
     const qc = queryClientRef;
     if (qc) {
       await qc.invalidateQueries({ queryKey: queryKeys.messages.list(sid) });
+      if (!isCurrentGeneration()) return false;
       await waitForNextPaint();
+      if (!isCurrentGeneration()) return false;
     }
 
     // Do not finalize while the backend still reports this session as active.
@@ -246,6 +363,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       const activeJobs = await api.get<Array<{ stream_id: string; session_id: string }>>(
         API.CHAT.ACTIVE,
       );
+      if (!isCurrentGeneration()) return false;
       const ourStreamId = store.getState().sessions[sid]?.streamId;
       const stillActive = activeJobs.some(
         (job) =>
@@ -254,12 +372,15 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       );
       if (stillActive) return false;
     } catch {
-      // ignore — fall through to DB heuristic
+      // Without authoritative active-job state, an older terminal message in
+      // the session is not enough evidence that this generation finished.
+      return false;
     }
 
     if (!canFinalizeFromCache(sid)) {
       try {
         const latestPage = await api.get<PaginatedMessages>(API.MESSAGES.LIST(sid, 50, -1));
+        if (!isCurrentGeneration()) return false;
         if (qc) {
           qc.setQueryData<InfiniteData<PaginatedMessages>>(
             queryKeys.messages.list(sid),
@@ -275,6 +396,10 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       }
     }
 
+    // Network and DB reconciliation above contain await points. A user may
+    // have started another generation in this session meanwhile; an old DONE
+    // handler must never clear or close that newer stream.
+    if (!isCurrentGeneration()) return false;
     store.getState().finishGeneration(sid);
     if (instances.size === 0) connectionStore.getState().setStatus("idle");
     const workspace = useWorkspaceStore.getState();
@@ -288,30 +413,86 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     return true;
   };
 
+  const recoverDisconnectedStream = async () => {
+    if (!isCurrentStream()) return;
+    if (
+      instance.disconnectRecoveryInFlight
+      || instance.disconnectRecoveryTimer
+    ) {
+      return;
+    }
+
+    const recoveryEpoch = ++instance.disconnectRecoveryEpoch;
+    instance.disconnectRecoveryInFlight = true;
+    try {
+      const finished = await finishFromDatabase(sessionId);
+      if (
+        !isCurrentStream()
+        || instance.disconnectRecoveryEpoch !== recoveryEpoch
+      ) {
+        return;
+      }
+      if (finished) {
+        stopCurrentStream();
+        return;
+      }
+
+      // SSEClient already exhausted its bounded internal backoff. If the
+      // database cannot prove completion, keep the generation and its controls
+      // alive, then run a small bounded set of fresh reconnect cycles. After
+      // that the explicit reconnect button remains available to the user.
+      const delay = DISCONNECTED_RECOVERY_DELAYS_MS[
+        instance.disconnectRecoveryAttempt
+      ];
+      if (delay === undefined) return;
+      instance.disconnectRecoveryAttempt += 1;
+      instance.disconnectRecoveryTimer = setTimeout(() => {
+        instance.disconnectRecoveryTimer = null;
+        if (
+          !isCurrentStream()
+          || instance.disconnectRecoveryEpoch !== recoveryEpoch
+        ) {
+          return;
+        }
+        instance.client.reconnectNow();
+      }, delay);
+    } finally {
+      if (
+        isCurrentStream()
+        && instance.disconnectRecoveryEpoch === recoveryEpoch
+      ) {
+        instance.disconnectRecoveryInFlight = false;
+      }
+    }
+  };
+
   const client = new SSEClient({
     url: API.CHAT.STREAM(streamId),
     urlProvider: () => API.CHAT.STREAM(streamId),
     initialLastEventId: 0,
-    onEvent: () => {
-      const inst = instances.get(sessionId);
-      if (inst) inst.lastEventTimestamp = Date.now();
+    onEvent: (eventType) => {
+      if (!isCurrentStream()) return;
+      const now = Date.now();
+      instance.lastEventTimestamp = now;
+      if (isBusinessProgressEvent(eventType)) {
+        instance.lastProgressTimestamp = now;
+        store.getState().markBusinessProgress(sessionId, now);
+      }
     },
     onStatusChange: (status) => {
+      if (!isCurrentStream()) return;
+      instance.connectionStatus = status;
       connectionStore.getState().setStatus(status);
+      if (status === "connected") {
+        resetDisconnectedRecovery(instance);
+        return;
+      }
       if (status === "disconnected") {
-        toast.error("Connection lost. Response may be incomplete.");
-        (async () => {
-          try {
-            const finished = await finishFromDatabase(sessionId);
-            if (finished) {
-              stopStream(sessionId);
-              return;
-            }
-          } finally {
-            store.getState().finishGeneration(sessionId);
-            stopStream(sessionId);
-          }
-        })();
+        if (!instance.disconnectNotified) {
+          instance.disconnectNotified = true;
+          toast.error("Connection lost. Reconnecting while the task continues.");
+        }
+        void recoverDisconnectedStream();
       }
     },
   });
@@ -319,6 +500,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   const instance: StreamInstance = {
     sessionId,
     streamId,
+    lease,
     client,
     textBuffer,
     reasoningBuffer,
@@ -326,6 +508,19 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     idleCheckTimer: null,
     mobilePauseTimer: null,
     lastEventTimestamp: Date.now(),
+    lastProgressTimestamp:
+      store.getState().sessions[sessionId]?.lastBusinessProgressAt
+      ?? Date.now(),
+    disconnectRecoveryAttempt: 0,
+    disconnectRecoveryEpoch: 0,
+    disconnectRecoveryInFlight: false,
+    disconnectRecoveryTimer: null,
+    disconnectNotified: false,
+    connectionStatus: "connecting",
+    interactionRecoveryTimer: null,
+    interactionRecoveryWatch: null,
+    interactionRecoverySequence: 0,
+    retryInteractionRecovery: () => false,
   };
 
   const cancelPendingStepFinish = () => {
@@ -335,25 +530,303 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     }
   };
 
+  const getPendingInteraction = (promptType: InteractionPromptType) => {
+    const bucket = store.getState().sessions[sessionId];
+    if (promptType === "permission") return bucket?.pendingPermission ?? null;
+    if (promptType === "plan") return bucket?.pendingPlanReview ?? null;
+    return bucket?.pendingQuestion ?? null;
+  };
+
+  const clearInteractionRecovery = (watch?: InteractionRecoveryWatch) => {
+    if (watch && instance.interactionRecoveryWatch !== watch) return;
+    instance.interactionRecoverySequence += 1;
+    instance.interactionRecoveryWatch = null;
+    if (instance.interactionRecoveryTimer) {
+      clearTimeout(instance.interactionRecoveryTimer);
+      instance.interactionRecoveryTimer = null;
+    }
+  };
+
+  const isCurrentInteractionWatch = (watch: InteractionRecoveryWatch) => {
+    if (
+      !isCurrentGeneration()
+      || instance.interactionRecoveryWatch !== watch
+      || instance.interactionRecoverySequence !== watch.sequence
+    ) {
+      return false;
+    }
+    const pending = getPendingInteraction(watch.target.promptType);
+    if (
+      !pending
+      || !isInteractionPendingContinuation(pending.responseState)
+    ) {
+      return false;
+    }
+    return matchesInteractionRecoveryTarget(watch.target, {
+      sessionId,
+      streamId,
+      callId: pending.callId,
+      promptType: watch.target.promptType,
+      streamGeneration: lease.generation,
+    });
+  };
+
+  const runInteractionRecovery = async (
+    watch: InteractionRecoveryWatch,
+    finalAttempt: boolean,
+  ) => {
+    if (!isCurrentInteractionWatch(watch)) return;
+    store.getState().setInteractionResponseState(
+      sessionId,
+      watch.target.promptType,
+      watch.target.callId,
+      "recovering",
+    );
+
+    const qc = queryClientRef;
+    if (qc) {
+      await Promise.allSettled([
+        qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) }),
+        qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) }),
+        qc.invalidateQueries({ queryKey: queryKeys.sessions.detail(sessionId) }),
+      ]);
+      if (!isCurrentInteractionWatch(watch)) return;
+    }
+
+    let activeJobs: Array<{
+      stream_id: string;
+      session_id: string;
+      needs_input?: boolean;
+    }> | null = null;
+    try {
+      activeJobs = await api.get(API.CHAT.ACTIVE);
+    } catch {
+      // Unknown state is not completion. Reconnect below, then expose a
+      // recoverable state if the bounded verification still sees no progress.
+    }
+    if (!isCurrentInteractionWatch(watch)) return;
+
+    const jobStillActive = activeJobs?.some(
+      (job) =>
+        job.session_id === sessionId
+        && job.stream_id === streamId,
+    );
+    if (activeJobs !== null && !jobStillActive) {
+      const finished = await finishFromDatabase(sessionId);
+      if (
+        !isCurrentStream()
+        || instance.interactionRecoveryWatch !== watch
+        || instance.interactionRecoverySequence !== watch.sequence
+      ) {
+        return;
+      }
+      if (finished) {
+        clearInteractionRecovery(watch);
+        stopCurrentStream();
+        return;
+      }
+      if (!isCurrentInteractionWatch(watch)) return;
+      store.getState().setInteractionResponseState(
+        sessionId,
+        watch.target.promptType,
+        watch.target.callId,
+        "recovery_needed",
+      );
+      return;
+    }
+
+    // Replay from Last-Event-ID only when the job is still active or status is
+    // unknown. A confirmed-absent job is reconciled from the database above.
+    // This recovers missed events without resubmitting the user's choice.
+    instance.client.reconnectNow();
+
+    if (finalAttempt) {
+      store.getState().setInteractionResponseState(
+        sessionId,
+        watch.target.promptType,
+        watch.target.callId,
+        "recovery_needed",
+      );
+      instance.interactionRecoveryTimer = null;
+      return;
+    }
+
+    if (instance.interactionRecoveryTimer) {
+      clearTimeout(instance.interactionRecoveryTimer);
+    }
+    instance.interactionRecoveryTimer = setTimeout(() => {
+      instance.interactionRecoveryTimer = null;
+      if (!isCurrentInteractionWatch(watch)) return;
+      void runInteractionRecovery(watch, true);
+    }, INTERACTION_RECOVERY_VERIFY_MS);
+  };
+
+  const beginInteractionRecovery = (
+    promptType: InteractionPromptType,
+    callId: string,
+    explicitRetry = false,
+  ) => {
+    if (!isCurrentGeneration()) return false;
+    const pending = getPendingInteraction(promptType);
+    if (
+      !pending
+      || pending.callId !== callId
+    ) {
+      return false;
+    }
+    if (explicitRetry) {
+      if (pending.responseState !== "recovery_needed") return false;
+      store.getState().beginInteractionRecoveryRetry(
+        sessionId,
+        promptType,
+        callId,
+      );
+      if (getPendingInteraction(promptType)?.responseState !== "recovering") {
+        return false;
+      }
+    } else if (pending.responseState !== "resolved") {
+      // The automatic watchdog is single-shot. Recovering and actionable
+      // states require either continuation or an explicit user retry.
+      return false;
+    }
+    clearInteractionRecovery();
+    const sequence = ++instance.interactionRecoverySequence;
+    const watch: InteractionRecoveryWatch = {
+      sequence,
+      target: {
+        sessionId,
+        streamId,
+        callId,
+        promptType,
+        streamGeneration: lease.generation,
+      },
+    };
+    instance.interactionRecoveryWatch = watch;
+    void runInteractionRecovery(watch, false);
+    return true;
+  };
+
+  instance.retryInteractionRecovery = (promptType, callId) =>
+    beginInteractionRecovery(promptType, callId, true);
+
+  const markInteractionContinuing = (
+    promptType: InteractionPromptType,
+    callId: string,
+  ) => {
+    const watch = instance.interactionRecoveryWatch;
+    if (
+      watch?.target.promptType === promptType
+      && watch.target.callId === callId
+    ) {
+      clearInteractionRecovery(watch);
+    }
+    store.getState().setInteractionResponseState(
+      sessionId,
+      promptType,
+      callId,
+      "continuing",
+    );
+    // Keep the acknowledgement visible briefly instead of making the card
+    // disappear in the same render as the first continuation event.
+    setTimeout(() => {
+      if (!isCurrentStream()) return;
+      const bucket = store.getState().sessions[sessionId];
+      if (promptType === "permission") {
+        if (
+          bucket?.pendingPermission?.callId === callId
+          && bucket.pendingPermission.responseState === "continuing"
+        ) {
+          store.getState().clearPermissionRequest(sessionId);
+        }
+        return;
+      }
+      if (promptType === "plan") {
+        if (
+          bucket?.pendingPlanReview?.callId === callId
+          && bucket.pendingPlanReview.responseState === "continuing"
+        ) {
+          store.getState().clearPlanReview(sessionId);
+        }
+        return;
+      }
+      if (
+        bucket?.pendingQuestion?.callId === callId
+        && bucket.pendingQuestion.responseState === "continuing"
+      ) {
+        store.getState().clearQuestion(sessionId);
+      }
+    }, 1200);
+  };
+
+  const markToolContinuation = (toolCallId: string) => {
+    const bucket = store.getState().sessions[sessionId];
+    const permission = bucket?.pendingPermission;
+    if (
+      permission?.toolCallId === toolCallId
+      && canMarkInteractionContinuing(permission.responseState)
+    ) {
+      markInteractionContinuing("permission", permission.callId);
+    }
+    const question = bucket?.pendingQuestion;
+    if (
+      question?.callId === toolCallId
+      && canMarkInteractionContinuing(question.responseState)
+    ) {
+      markInteractionContinuing("question", question.callId);
+    }
+    const plan = bucket?.pendingPlanReview;
+    if (
+      plan?.callId === toolCallId
+      && canMarkInteractionContinuing(plan.responseState)
+    ) {
+      markInteractionContinuing("plan", plan.callId);
+    }
+  };
+
+  const markPendingInteractionsContinuing = () => {
+    const bucket = store.getState().sessions[sessionId];
+    const permission = bucket?.pendingPermission;
+    const question = bucket?.pendingQuestion;
+    const plan = bucket?.pendingPlanReview;
+    if (permission && canMarkInteractionContinuing(permission.responseState)) {
+      markInteractionContinuing("permission", permission.callId);
+    }
+    if (question && canMarkInteractionContinuing(question.responseState)) {
+      markInteractionContinuing("question", question.callId);
+    }
+    if (plan && canMarkInteractionContinuing(plan.responseState)) {
+      markInteractionContinuing("plan", plan.callId);
+    }
+  };
+
+  const onCurrent = (eventType: string, handler: SSEEventHandler) =>
+    client.on(eventType, (data, id) => {
+      if (!isCurrentStream()) return;
+      if (isInteractionContinuationEvent(eventType)) {
+        markPendingInteractionsContinuing();
+      }
+      handler(data, id);
+    });
+
   // ─── Event handlers ───
 
-  client.on(SSE_EVENTS.MODEL_LOADING, () => {
+  onCurrent(SSE_EVENTS.MODEL_LOADING, () => {
     store.getState().setModelLoading(sessionId, true);
   });
 
-  client.on(SSE_EVENTS.TEXT_DELTA, (data) => {
+  onCurrent(SSE_EVENTS.TEXT_DELTA, (data) => {
     cancelPendingStepFinish();
     const bucket = store.getState().sessions[sessionId];
     if (bucket?.isModelLoading) store.getState().setModelLoading(sessionId, false);
     if (data.text) textBuffer.push(data.text);
   });
 
-  client.on(SSE_EVENTS.REASONING_DELTA, (data) => {
+  onCurrent(SSE_EVENTS.REASONING_DELTA, (data) => {
     cancelPendingStepFinish();
     if (data.text) reasoningBuffer.push(data.text);
   });
 
-  client.on(SSE_EVENTS.TOOL_START, (data) => {
+  onCurrent(SSE_EVENTS.TOOL_START, (data) => {
     cancelPendingStepFinish();
     if (data.tool && data.call_id) {
       store.getState().addToolStart(
@@ -363,6 +836,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
         data.arguments ?? {},
         data.title,
       );
+      markToolContinuation(data.call_id);
 
       if (data.tool === "artifact" && data.arguments) {
         const args = data.arguments as Record<string, string>;
@@ -381,7 +855,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     }
   });
 
-  client.on(SSE_EVENTS.TOOL_RESULT, (data) => {
+  onCurrent(SSE_EVENTS.TOOL_RESULT, (data) => {
     cancelPendingStepFinish();
     if (!data.call_id) return;
     store.getState().setToolResult(
@@ -391,6 +865,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       data.title,
       data.metadata,
     );
+    markToolContinuation(data.call_id);
 
     if (data.tool === "todo" && data.metadata) {
       const meta = data.metadata as { todos?: Array<{ content: string; status: string; activeForm?: string }> };
@@ -406,6 +881,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       api.get<{ files: Array<{ name: string; path: string; type: string }> }>(
         API.SESSIONS.FILES(sessionId),
       ).then((res) => {
+        if (!isCurrentStream()) return;
         if (res.files) {
           useWorkspaceStore.getState().setWorkspaceFiles(
             res.files.map((f) => ({ name: f.name, path: f.path, type: f.type as WorkspaceFile["type"] })),
@@ -433,19 +909,20 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     }
   });
 
-  client.on(SSE_EVENTS.TOOL_ERROR, (data) => {
+  onCurrent(SSE_EVENTS.TOOL_ERROR, (data) => {
     cancelPendingStepFinish();
     if (data.call_id) {
       store.getState().setToolError(sessionId, data.call_id, data.output ?? data.error_message ?? "Error");
+      markToolContinuation(data.call_id);
     }
   });
 
-  client.on(SSE_EVENTS.STEP_START, (data) => {
+  onCurrent(SSE_EVENTS.STEP_START, (data) => {
     cancelPendingStepFinish();
     store.getState().addStepStart(sessionId, data.step ?? 0);
   });
 
-  client.on(SSE_EVENTS.STEP_FINISH, (data, id) => {
+  onCurrent(SSE_EVENTS.STEP_FINISH, (data, id) => {
     store.getState().addStepFinish(
       sessionId,
       data.reason ?? "stop",
@@ -464,30 +941,13 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     cancelPendingStepFinish();
     instance.stepFinishTimer = setTimeout(async () => {
       instance.stepFinishTimer = null;
-      if (!store.getState().sessions[sessionId]?.isGenerating) return;
+      if (!isCurrentGeneration()) return;
 
       const finished = await finishFromDatabase(sessionId);
+      if (!isCurrentStream()) return;
       if (finished) {
-        stopStream(sessionId);
-        return;
+        stopCurrentStream();
       }
-
-      // Hard safety net so truly terminal runs do not hang forever.
-      instance.stepFinishTimer = setTimeout(async () => {
-        instance.stepFinishTimer = null;
-        if (!store.getState().sessions[sessionId]?.isGenerating) return;
-        console.warn("SSE safety net: forcing finishGeneration after step_finish timeout");
-        try {
-          const f = await finishFromDatabase(sessionId);
-          if (f) {
-            stopStream(sessionId);
-            return;
-          }
-        } finally {
-          store.getState().finishGeneration(sessionId);
-        }
-        stopStream(sessionId);
-      }, 8_000);
     }, 1_200);
   });
 
@@ -503,38 +963,39 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     ws.expandSection("progress");
   };
 
-  client.on(SSE_EVENTS.TASK_BATCH_START, (data) => {
+  onCurrent(SSE_EVENTS.TASK_BATCH_START, (data) => {
     cancelPendingStepFinish();
     updateTaskBatch(data);
   });
-  client.on(SSE_EVENTS.TASK_BATCH_UPDATE, (data) => {
+  onCurrent(SSE_EVENTS.TASK_BATCH_UPDATE, (data) => {
     cancelPendingStepFinish();
     updateTaskBatch(data);
   });
-  client.on(SSE_EVENTS.TASK_BATCH_FINISH, (data) => {
+  onCurrent(SSE_EVENTS.TASK_BATCH_FINISH, (data) => {
     updateTaskBatch(data);
   });
 
-  client.on(SSE_EVENTS.COMPACTION_START, (data) => {
+  onCurrent(SSE_EVENTS.COMPACTION_START, (data) => {
     store.getState().startCompaction(sessionId, data.phases ?? ["prune", "summarize"]);
   });
-  client.on(SSE_EVENTS.COMPACTION_PHASE, (data) => {
+  onCurrent(SSE_EVENTS.COMPACTION_PHASE, (data) => {
     if (data.phase && data.status) {
       store.getState().updateCompactionPhase(sessionId, data.phase, data.status);
     }
   });
-  client.on(SSE_EVENTS.COMPACTION_PROGRESS, (data) => {
+  onCurrent(SSE_EVENTS.COMPACTION_PROGRESS, (data) => {
     if (data.phase && data.chars != null) {
       store.getState().updateCompactionProgress(sessionId, data.phase, data.chars);
     }
   });
-  client.on(SSE_EVENTS.COMPACTED, (data) => {
+  onCurrent(SSE_EVENTS.COMPACTED, (data) => {
     store.getState().addCompaction(sessionId, true);
     if (data.summary_created) toast.success("Context compacted");
   });
 
-  client.on(SSE_EVENTS.PERMISSION_REQUEST, (data) => {
+  onCurrent(SSE_EVENTS.PERMISSION_REQUEST, (data) => {
     if (!data.call_id) return;
+    clearInteractionRecovery();
     const workMode = useSettingsStore.getState().workMode;
     if (workMode === "auto") {
       api.post(API.CHAT.RESPOND, {
@@ -556,8 +1017,9 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     });
   });
 
-  client.on(SSE_EVENTS.QUESTION, (data) => {
+  onCurrent(SSE_EVENTS.QUESTION, (data) => {
     if (!data.call_id) return;
+    clearInteractionRecovery();
     store.getState().setQuestion(sessionId, {
       callId: data.call_id,
       tool: data.tool ?? "question",
@@ -565,22 +1027,48 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     });
   });
 
-  client.on(SSE_EVENTS.PERMISSION_RESOLVED, (data) => {
+  onCurrent(SSE_EVENTS.PERMISSION_RESOLVED, (data) => {
     const pending = store.getState().sessions[sessionId]?.pendingPermission;
     if (pending && data.call_id === pending.callId) {
-      store.getState().clearPermissionRequest(sessionId);
+      store.getState().setInteractionResponseState(
+        sessionId,
+        "permission",
+        pending.callId,
+        "resolved",
+        { decision: data.decision, source: data.source },
+      );
     }
   });
 
-  client.on(SSE_EVENTS.QUESTION_RESOLVED, (data) => {
+  onCurrent(SSE_EVENTS.QUESTION_RESOLVED, (data) => {
     const pending = store.getState().sessions[sessionId]?.pendingQuestion;
     if (pending && data.call_id === pending.callId) {
-      store.getState().clearQuestion(sessionId);
+      store.getState().setInteractionResponseState(
+        sessionId,
+        "question",
+        pending.callId,
+        "resolved",
+        { decision: data.decision, source: data.source },
+      );
     }
   });
 
-  client.on(SSE_EVENTS.PLAN_REVIEW, (data) => {
+  onCurrent(SSE_EVENTS.PLAN_REVIEW_RESOLVED, (data) => {
+    const pending = store.getState().sessions[sessionId]?.pendingPlanReview;
+    if (pending && data.call_id === pending.callId) {
+      store.getState().setInteractionResponseState(
+        sessionId,
+        "plan",
+        pending.callId,
+        "resolved",
+        { decision: data.decision, source: data.source },
+      );
+    }
+  });
+
+  onCurrent(SSE_EVENTS.PLAN_REVIEW, (data) => {
     if (!data.call_id) return;
+    clearInteractionRecovery();
     const reviewData = {
       callId: data.call_id,
       title: data.title ?? "Plan",
@@ -596,7 +1084,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     }
   });
 
-  client.on(SSE_EVENTS.TITLE_UPDATE, (data) => {
+  onCurrent(SSE_EVENTS.TITLE_UPDATE, (data) => {
     if (!data.title) return;
     const qc = queryClientRef;
     if (!qc) return;
@@ -618,20 +1106,39 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     );
   });
 
-  client.on("heartbeat", () => {
+  const refreshPendingInputs = () => {
+    const qc = queryClientRef;
+    if (qc) qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) });
+  };
+  onCurrent(SSE_EVENTS.INPUT_QUEUED, refreshPendingInputs);
+  onCurrent(SSE_EVENTS.INPUT_STARTED, refreshPendingInputs);
+  onCurrent(SSE_EVENTS.INPUT_APPLIED, refreshPendingInputs);
+  onCurrent(SSE_EVENTS.INPUT_FAILED, (data) => {
+    refreshPendingInputs();
+    toast.error(
+      data.error
+        ? i18n.t("inputExecutionFailedWithReason", {
+            ns: "chat",
+            reason: data.error,
+          })
+        : i18n.t("inputExecutionFailed", { ns: "chat" }),
+    );
+  });
+
+  onCurrent("heartbeat", () => {
     // No-op: the SSEClient resets its heartbeat timer on any event
   });
 
-  client.on(SSE_EVENTS.DESYNC, () => {
+  onCurrent(SSE_EVENTS.DESYNC, () => {
     const qc = queryClientRef;
     if (qc) qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) });
   });
 
-  client.on(SSE_EVENTS.COMPACTION_ERROR, (data) => {
+  onCurrent(SSE_EVENTS.COMPACTION_ERROR, (data) => {
     toast.warning(data.error_message || "Context compression failed. Consider starting a new chat.");
   });
 
-  client.on(SSE_EVENTS.DONE, async () => {
+  onCurrent(SSE_EVENTS.DONE, async () => {
     // Close synchronously before the awaits below: the stream ends right after
     // DONE, so the dying EventSource must not schedule a reconnect to a job
     // that is already complete (→ a spurious "Job not found").
@@ -642,8 +1149,9 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     try {
       await finishFromDatabase(sessionId);
     } finally {
-      store.getState().finishGeneration(sessionId);
+      finishCurrentGeneration();
     }
+    if (!isCurrentStream()) return;
     const qc = queryClientRef;
     if (qc) {
       setTimeout(() => {
@@ -651,9 +1159,10 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       }, 500);
       qc.invalidateQueries({ queryKey: queryKeys.sessions.all });
       qc.invalidateQueries({ queryKey: queryKeys.sessions.detail(sessionId) });
+      qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) });
     }
     maybeNotifyFinish(sessionId, "done");
-    stopStream(sessionId);
+    stopCurrentStream();
   });
 
   const handleAgentError = async (data: { error_message?: string | null; code?: string | null }) => {
@@ -682,48 +1191,94 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     try {
       await finishFromDatabase(sessionId);
     } finally {
-      store.getState().finishGeneration(sessionId);
+      finishCurrentGeneration();
     }
+    if (!isCurrentStream()) return;
     const qc = queryClientRef;
     if (qc) {
       setTimeout(() => {
         qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) });
       }, 500);
       qc.invalidateQueries({ queryKey: queryKeys.sessions.detail(sessionId) });
+      qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) });
     }
     if (!streamGone) maybeNotifyFinish(sessionId, "error", message);
-    stopStream(sessionId);
+    stopCurrentStream();
   };
-  client.on(SSE_EVENTS.AGENT_ERROR, handleAgentError);
-  client.on(SSE_EVENTS.ERROR, handleAgentError);
+  onCurrent(SSE_EVENTS.AGENT_ERROR, handleAgentError);
+  onCurrent(SSE_EVENTS.ERROR, handleAgentError);
 
+  // Publish ownership before connect(): SSEClient reports "connecting"
+  // synchronously, and every callback must already be able to validate it.
+  if (!streamLeases.isCurrent(lease)) {
+    disposeInstance(instance);
+    return;
+  }
+  instances.set(sessionId, instance);
   client.connect();
 
   // ─── Per-instance idle recovery ───
   const IDLE_RECOVERY_MS = 15_000;
   const IDLE_CHECK_INTERVAL_MS = 5_000;
   instance.idleCheckTimer = setInterval(async () => {
-    if (!store.getState().sessions[sessionId]?.isGenerating) {
+    if (!isCurrentStream()) return;
+    const bucket = store.getState().sessions[sessionId];
+    const isGenerating = bucket?.isGenerating ?? false;
+    if (!isGenerating) {
       if (instance.idleCheckTimer) {
         clearInterval(instance.idleCheckTimer);
         instance.idleCheckTimer = null;
       }
       return;
     }
-    if (instance.lastEventTimestamp > 0 && Date.now() - instance.lastEventTimestamp > IDLE_RECOVERY_MS) {
+    const now = Date.now();
+    const resolvedInteractions: Array<[
+      InteractionPromptType,
+      { callId: string; responseState?: string; responseResolvedAt?: number | null } | null | undefined,
+    ]> = [
+      ["permission", bucket?.pendingPermission],
+      ["question", bucket?.pendingQuestion],
+      ["plan", bucket?.pendingPlanReview],
+    ];
+    for (const [promptType, pending] of resolvedInteractions) {
+      if (
+        pending?.responseState === "resolved"
+        && pending.responseResolvedAt != null
+        && now - pending.responseResolvedAt >= INTERACTION_CONTINUATION_GRACE_MS
+      ) {
+        beginInteractionRecovery(promptType, pending.callId);
+      }
+    }
+    const waitingForUser = isWaitingForUserInteraction(
+      bucket?.pendingPermission,
+      bucket?.pendingQuestion,
+      bucket?.pendingPlanReview,
+    );
+    if (waitingForUser) {
+      store.getState().setProgressStalled(sessionId, false);
+    } else if (hasProgressStalled(
+      now,
+      instance.lastProgressTimestamp,
+      isGenerating,
+      waitingForUser,
+    )) {
+      store.getState().setProgressStalled(sessionId, true);
+    }
+    if (instance.lastEventTimestamp > 0 && now - instance.lastEventTimestamp > IDLE_RECOVERY_MS) {
       console.warn(`SSE idle recovery for ${sessionId}: no events for 15s, attempting DB recovery`);
       const finished = await finishFromDatabase(sessionId);
+      if (!isCurrentStream()) return;
       if (finished) {
-        stopStream(sessionId);
+        stopCurrentStream();
         return;
       }
       instance.lastEventTimestamp = Date.now();
-      client.checkHealth();
+      if (instance.connectionStatus !== "disconnected") {
+        client.checkHealth();
+      }
     }
   }, IDLE_CHECK_INTERVAL_MS);
 
-  instances.set(sessionId, instance);
-  pendingStarts.delete(sessionId);
 }
 
 // ─── Global cross-stream listeners (installed once on first start) ───
@@ -791,6 +1346,10 @@ function store_isGenerating(sessionId: string): boolean {
  */
 async function reconcileStreamsAfterRestart(): Promise<void> {
   if (instances.size === 0) return;
+  // Reconcile only streams that existed when this recovery began. A new
+  // generation created while /active is in flight must not be judged against
+  // that older snapshot.
+  const candidates = [...instances.values()];
 
   let activeJobs: Array<{ stream_id: string; session_id: string }> | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -804,11 +1363,18 @@ async function reconcileStreamsAfterRestart(): Promise<void> {
   }
 
   if (activeJobs === null) {
-    // Couldn't confirm backend state. Don't strand the UI in "generating":
-    // finalize each interrupted session from the DB so spinners clear and
-    // history is refetched. A later user action re-establishes streaming.
-    for (const inst of [...instances.values()]) {
-      await finalizeInterruptedStream(inst.sessionId);
+    // Unknown is not terminal. Preserve generation/Stop/queue controls and
+    // let the client continue its bounded recovery instead of pretending the
+    // task ended merely because the restarted backend was slow to answer.
+    for (const inst of candidates) {
+      if (
+        instances.get(inst.sessionId) !== inst
+        || !streamLeases.isCurrent(inst.lease)
+      ) {
+        continue;
+      }
+      inst.client.resumeReconnect();
+      inst.client.checkHealth();
     }
     return;
   }
@@ -818,9 +1384,15 @@ async function reconcileStreamsAfterRestart(): Promise<void> {
   // Sessions we already track are reconciled in the loop below; the final
   // attach loop must skip them so it can't double-start one whose async
   // startStream() has not yet re-registered its instance.
-  const handledSessions = new Set(instances.keys());
+  const handledSessions = new Set(candidates.map((inst) => inst.sessionId));
 
-  for (const inst of [...instances.values()]) {
+  for (const inst of candidates) {
+    if (
+      instances.get(inst.sessionId) !== inst
+      || !streamLeases.isCurrent(inst.lease)
+    ) {
+      continue;
+    }
     const liveStreamId = liveStreamBySession.get(inst.sessionId);
     if (liveStreamId === inst.streamId) {
       inst.client.resumeReconnect();
@@ -829,14 +1401,20 @@ async function reconcileStreamsAfterRestart(): Promise<void> {
       useChatStore.getState().startGeneration(inst.sessionId, liveStreamId);
       void startStream(inst.sessionId, liveStreamId);
     } else {
-      await finalizeInterruptedStream(inst.sessionId);
+      await finalizeInterruptedStream(inst);
     }
   }
 
   // Attach any still-running jobs we are not yet tracking (parity with boot
   // hydration — e.g. a background session started just before the restart).
   for (const job of activeJobs) {
-    if (handledSessions.has(job.session_id) || instances.has(job.session_id)) continue;
+    if (
+      handledSessions.has(job.session_id)
+      || instances.has(job.session_id)
+      || streamLeases.current(job.session_id)
+    ) {
+      continue;
+    }
     useChatStore.getState().startGeneration(job.session_id, job.stream_id);
     void startStream(job.session_id, job.stream_id);
   }
@@ -848,9 +1426,19 @@ async function reconcileStreamsAfterRestart(): Promise<void> {
  * state from the DB. No error toast — an interrupted local generation is a
  * recoverable, expected event, not a failure the user must act on.
  */
-async function finalizeInterruptedStream(sessionId: string): Promise<void> {
+async function finalizeInterruptedStream(instance: StreamInstance): Promise<void> {
+  const { sessionId, streamId } = instance;
+  if (
+    instances.get(sessionId) !== instance
+    || !streamLeases.isCurrent(instance.lease)
+    || useChatStore.getState().sessions[sessionId]?.streamId !== streamId
+  ) {
+    return;
+  }
   stopStream(sessionId); // disposeInstance flushes buffered text while still generating
-  useChatStore.getState().finishGeneration(sessionId);
+  if (useChatStore.getState().sessions[sessionId]?.streamId === streamId) {
+    useChatStore.getState().finishGeneration(sessionId);
+  }
   const qc = queryClientRef;
   if (qc) {
     await qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) });
@@ -885,7 +1473,7 @@ function maybeNotifyFinish(sessionId: string, kind: "done" | "error", errorMessa
 export function disposeAllStreams(): void {
   for (const inst of instances.values()) disposeInstance(inst);
   instances.clear();
-  pendingStarts.clear();
+  streamLeases.clearAll();
   unlistenBackendRestarting?.();
   unlistenBackendRestarted?.();
   unlistenVisibilityChange?.();

@@ -42,8 +42,8 @@ export interface SSEClientOptions {
   onClose?: () => void;
   /** Called when connection status changes */
   onStatusChange?: (status: SSEConnectionStatus) => void;
-  /** Called on any received event (for idle timeout tracking). */
-  onEvent?: () => void;
+  /** Called on any received event (for connection/progress tracking). */
+  onEvent?: (eventType: string) => void;
 }
 
 export class SSEClient {
@@ -123,6 +123,22 @@ export class SSEClient {
     }
   }
 
+  /** Force a user-requested reconnect while preserving Last-Event-ID replay. */
+  reconnectNow(): boolean {
+    if (this.closed) return false;
+    this.paused = false;
+    this.clearTimers();
+    this.eventSource?.close();
+    this.eventSource = null;
+    this.abortController?.abort();
+    this.abortController = null;
+    this.retryCount = 0;
+    this.nativeReconnectCount = 0;
+    this.options.onStatusChange?.("reconnecting");
+    this.doConnect();
+    return true;
+  }
+
   /** Pause reconnection attempts (e.g., backend is restarting). */
   pauseReconnect(): void {
     this.paused = true;
@@ -189,7 +205,7 @@ export class SSEClient {
     this.nativeReconnectCount = 0;
     this.lastEventTime = Date.now();
     this.resetHeartbeat();
-    this.options.onEvent?.();
+    this.options.onEvent?.(eventType);
 
     let parsed: SSEEventData;
     try {

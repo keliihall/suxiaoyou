@@ -12,6 +12,7 @@ import pytest
 from app.main import (
     _BackgroundTaskManager,
     _rebuild_upload_hash_index,
+    _shutdown_runtime,
     _start_models_dev_background_refresh,
     lifespan,
 )
@@ -274,3 +275,130 @@ async def test_upload_hash_scan_is_cooperatively_cancelled_on_shutdown() -> None
     await asyncio.wait_for(tasks.cancel_and_wait(), timeout=1)
 
     assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_stops_consumers_before_providers_and_database() -> None:
+    calls: list[str] = []
+
+    class Background:
+        async def cancel_and_wait(self):
+            calls.append("background")
+
+    class Scheduler:
+        async def stop(self):
+            calls.append("scheduler")
+
+    class Streams:
+        _jobs = {}
+
+        def abort_all(self):
+            calls.append("generations")
+            return 0
+
+    class Component:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def stop(self):
+            calls.append(self.name)
+
+        async def stop_all(self):
+            calls.append(self.name)
+
+        async def shutdown(self):
+            calls.append(self.name)
+
+        async def dispose(self):
+            calls.append(self.name)
+
+    ollama = Component("ollama")
+    ollama.is_running = True
+    rapid = Component("rapid")
+    rapid.is_managed_process_alive = True
+
+    await asyncio.wait_for(
+        _shutdown_runtime(
+            background_tasks=Background(),
+            task_scheduler=Scheduler(),
+            stream_manager=Streams(),
+            shutdown_timeout=0.1,
+            agent_adapter=Component("agent"),
+            channel_manager=Component("channels"),
+            workspace_memory_queue=Component("memory"),
+            tunnel_manager=Component("tunnel"),
+            connector_registry=Component("connectors"),
+            index_manager=Component("index"),
+            ollama_manager=ollama,
+            rapid_mlx_manager=rapid,
+            provider_registry=Component("providers"),
+            engine=Component("database"),
+        ),
+        timeout=1,
+    )
+
+    assert calls == [
+        "background",
+        "scheduler",
+        "generations",
+        "agent",
+        "channels",
+        "memory",
+        "tunnel",
+        "connectors",
+        "index",
+        "ollama",
+        "rapid",
+        "providers",
+        "database",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_reaches_database_after_component_failure() -> None:
+    calls: list[str] = []
+
+    class Background:
+        async def cancel_and_wait(self):
+            calls.append("background")
+
+    class Streams:
+        _jobs = {}
+
+        def abort_all(self):
+            calls.append("generations")
+            return 0
+
+    class FailingChannels:
+        async def stop_all(self):
+            calls.append("channels")
+            raise RuntimeError("channel shutdown failed")
+
+    class Component:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def shutdown(self):
+            calls.append(self.name)
+
+        async def dispose(self):
+            calls.append(self.name)
+
+    await _shutdown_runtime(
+        background_tasks=Background(),
+        task_scheduler=None,
+        stream_manager=Streams(),
+        shutdown_timeout=0.1,
+        agent_adapter=None,
+        channel_manager=FailingChannels(),
+        workspace_memory_queue=None,
+        tunnel_manager=None,
+        connector_registry=None,
+        index_manager=None,
+        ollama_manager=None,
+        rapid_mlx_manager=None,
+        provider_registry=Component("providers"),
+        engine=Component("database"),
+    )
+
+    assert calls == ["background", "generations", "channels", "providers", "database"]

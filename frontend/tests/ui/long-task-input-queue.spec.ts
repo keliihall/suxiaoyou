@@ -1,0 +1,330 @@
+import { expect, test, type Page, type Route } from "@playwright/test";
+
+import { mock苏小有Api, seed苏小有Storage } from "./fixtures/suxiaoyou-api";
+
+interface PendingInput {
+  id: string;
+  session_id: string;
+  client_request_id: string;
+  mode: "queue" | "steer";
+  status: "queued" | "applying" | "blocked";
+  position: number;
+  text: string;
+  attachments: unknown[];
+  target_stream_id: string | null;
+  error_message: string | null;
+}
+
+async function installSessionInputApi(
+  page: Page,
+  initial: PendingInput[] = [],
+  options: { idleOnPost?: boolean; loseDeleteResponse?: boolean } = {},
+) {
+  let items = [...initial];
+  const posts: Array<Record<string, unknown>> = [];
+  let getCount = 0;
+
+  await page.route("**/api/chat/inputs**", async (route: Route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    const path = url.pathname;
+
+    if (path === "/api/chat/inputs" && method === "POST") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      posts.push(body);
+      if (options.idleOnPost) {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({
+            detail: {
+              code: "session_idle",
+              message: "The current task already finished; send this as a normal message.",
+            },
+          }),
+        });
+        return;
+      }
+      const response: PendingInput = {
+        id: `input-${posts.length}`,
+        session_id: String(body.session_id),
+        client_request_id: String(body.client_request_id),
+        mode: body.mode === "steer" ? "steer" : "queue",
+        status: "queued",
+        position: items.length + 1,
+        text: String(body.text ?? ""),
+        attachments: Array.isArray(body.attachments) ? body.attachments : [],
+        target_stream_id: body.mode === "steer" ? "stream-slow" : null,
+        error_message: null,
+      };
+      items = [...items, response];
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(response),
+      });
+      return;
+    }
+
+    const match = path.match(/^\/api\/chat\/inputs\/([^/]+)(?:\/([^/]+))?$/);
+    if (match && method === "GET") {
+      getCount += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(items),
+      });
+      return;
+    }
+    if (match && match[2] && method === "DELETE") {
+      items = items.filter((item) => item.id !== decodeURIComponent(match[2]!));
+      if (options.loseDeleteResponse) {
+        await route.abort("connectionreset");
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "cancelled", input_id: match[2] }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  return {
+    posts,
+    get getCount() {
+      return getCount;
+    },
+  };
+}
+
+async function startSlowTask(page: Page) {
+  await page.goto("/c/new");
+  await page.getByPlaceholder(/Describe the result you want/i).fill("Start a slow stream");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page).toHaveURL(/\/c\/session-new/);
+  await expect(page.getByText("Starting a deliberately slow GUI stream.")).toBeVisible();
+}
+
+test.describe("long-task follow-up queue", () => {
+  test.skip(({ isMobile }) => isMobile, "Desktop composer queue is covered in the desktop project");
+
+  test.beforeEach(async ({ page }) => {
+    await seed苏小有Storage(page, { force: true });
+  });
+
+  test("keeps the composer active, separates stop/send, supports steer, order, and cancel", async ({ page }) => {
+    await mock苏小有Api(page);
+    const inputs = await installSessionInputApi(page);
+    await startSlowTask(page);
+
+    const composer = page.getByPlaceholder("The task is running — add a follow-up");
+    await expect(composer).toBeEditable();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+    await composer.fill("Run the validation suite after the current task");
+    await page.getByRole("button", { name: "Queue follow-up" }).click();
+    await expect.poll(() => inputs.posts.length).toBe(1);
+    expect(inputs.posts[0]?.mode).toBe("queue");
+    await expect(page.getByTestId("pending-inputs")).toContainText(
+      "Run the validation suite after the current task",
+    );
+    await expect(
+      page.getByRole("button", { name: "Move pending input 1 back to composer" }),
+    ).toHaveCount(0);
+
+    await page.getByTestId("input-delivery-mode").click();
+    await expect(page.getByText(/next safe boundary/i)).toBeVisible();
+    await page.getByText("Steer current task", { exact: true }).click();
+
+    await composer.fill("Prioritize the data-loss check first");
+    await page.getByRole("button", { name: "Steer current task", exact: true }).click();
+    await expect.poll(() => inputs.posts.length).toBe(2);
+    expect(inputs.posts[1]?.mode).toBe("steer");
+    await expect(page.getByTestId("pending-inputs")).toContainText(
+      "Prioritize the data-loss check first",
+    );
+
+    await page.getByRole("button", { name: "Cancel pending input 1" }).click();
+    await expect(page.getByTestId("pending-inputs")).not.toContainText(
+      "Run the validation suite after the current task",
+    );
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+  });
+
+  test("restores pending inputs with GET after remount/reconnect", async ({ page }) => {
+    await mock苏小有Api(page);
+    const inputs = await installSessionInputApi(page, [
+      {
+        id: "restored-input",
+        session_id: "session-alpha",
+        client_request_id: "restored-request",
+        mode: "queue",
+        status: "queued",
+        position: 1,
+        text: "This follow-up survived a reconnect",
+        attachments: [],
+        target_stream_id: null,
+        error_message: null,
+      },
+    ]);
+
+    await page.goto("/c/session-alpha");
+    await expect(page.getByText("This follow-up survived a reconnect")).toBeVisible();
+    await page.reload();
+    await expect(page.getByText("This follow-up survived a reconnect")).toBeVisible();
+    expect(inputs.getCount).toBeGreaterThanOrEqual(2);
+  });
+
+  test("falls back to a normal send when the task finished before enqueue", async ({ page }) => {
+    const apiState = await mock苏小有Api(page);
+    const inputs = await installSessionInputApi(page, [], { idleOnPost: true });
+    await startSlowTask(page);
+
+    await page.getByPlaceholder("The task is running — add a follow-up").fill(
+      "Send normally if the previous task already finished",
+    );
+    await page.getByRole("button", { name: "Queue follow-up" }).click();
+
+    await expect.poll(() => inputs.posts.length).toBe(1);
+    await expect.poll(() => apiState.promptBodies.length).toBeGreaterThanOrEqual(2);
+    expect(JSON.stringify(apiState.promptBodies.at(-1))).toContain(
+      "Send normally if the previous task already finished",
+    );
+    await expect(page.getByText(/sent as a normal message/i)).toBeVisible();
+  });
+
+  test("Stop retries a lost acknowledgement and clears the UI only after success", async ({ page }) => {
+    await mock苏小有Api(page);
+    await installSessionInputApi(page);
+    await startSlowTask(page);
+    let attempts = 0;
+    await page.route("**/api/chat/abort", async (route) => {
+      attempts += 1;
+      if (attempts === 1) {
+        await route.abort("connectionreset");
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "aborted" }),
+      });
+    });
+
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect.poll(() => attempts, { timeout: 10_000 }).toBe(2);
+    await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(0);
+  });
+
+  test("Stop failure keeps the truthful running state and offers a retry", async ({ page }) => {
+    await mock苏小有Api(page);
+    await installSessionInputApi(page);
+    await startSlowTask(page);
+    let attempts = 0;
+    await page.route("**/api/chat/abort", async (route) => {
+      attempts += 1;
+      await route.abort("connectionreset");
+    });
+
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect(
+      page.getByText(/Could not confirm that the task stopped/i),
+    ).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => attempts).toBe(4);
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect(page.getByPlaceholder("The task is running — add a follow-up")).toBeEditable();
+  });
+
+  test("blocked input is cancelled before its text and attachments return to the composer", async ({ page }) => {
+    await mock苏小有Api(page);
+    const inputs = await installSessionInputApi(page, [
+      {
+        id: "blocked-input",
+        session_id: "session-alpha",
+        client_request_id: "blocked-request",
+        mode: "queue",
+        status: "blocked",
+        position: 1,
+        text: "Review this interrupted follow-up before retrying",
+        attachments: [
+          {
+            file_id: "managed-blocked-file",
+            name: "interrupted-notes.txt",
+            path: "/managed/session-alpha/inputs/interrupted-notes.txt",
+            size: 64,
+            mime_type: "text/plain",
+            source: "managed",
+          },
+        ],
+        target_stream_id: null,
+        error_message: "Application exited before this input completed",
+      },
+    ], { loseDeleteResponse: true });
+
+    await page.goto("/c/session-alpha");
+    await page.getByRole("button", { name: "Move pending input 1 back to composer" }).click();
+
+    await expect(page.getByPlaceholder(/Describe the result you want/i)).toHaveValue(
+      "Review this interrupted follow-up before retrying",
+    );
+    await expect(page.getByText("interrupted-notes.txt")).toBeVisible();
+    await expect(page.getByTestId("pending-inputs")).toHaveCount(0);
+    expect(inputs.posts).toHaveLength(0);
+  });
+
+  test("an idle queued input can be moved back for explicit editing", async ({ page }) => {
+    await mock苏小有Api(page);
+    const inputs = await installSessionInputApi(page, [
+      {
+        id: "orphaned-queued-input",
+        session_id: "session-alpha",
+        client_request_id: "orphaned-queued-request",
+        mode: "queue",
+        status: "queued",
+        position: 1,
+        text: "Edit me before explicitly sending again",
+        attachments: [],
+        target_stream_id: null,
+        error_message: null,
+      },
+    ]);
+
+    await page.goto("/c/session-alpha");
+    await page.getByRole("button", { name: "Move pending input 1 back to composer" }).click();
+
+    await expect(page.getByPlaceholder(/Describe the result you want/i)).toHaveValue(
+      "Edit me before explicitly sending again",
+    );
+    await expect(page.getByTestId("pending-inputs")).toHaveCount(0);
+    expect(inputs.posts).toHaveLength(0);
+  });
+
+  test("folderless sessions never ingest attachments into the previous global project", async ({ page }) => {
+    await page.addInitScript(() => {
+      const raw = window.localStorage.getItem("suxiaoyou-settings");
+      if (!raw) return;
+      const persisted = JSON.parse(raw) as { state?: Record<string, unknown> };
+      persisted.state = {
+        ...(persisted.state ?? {}),
+        workspaceDirectory: "/Users/alex/previous-project",
+      };
+      window.localStorage.setItem("suxiaoyou-settings", JSON.stringify(persisted));
+    });
+    const apiState = await mock苏小有Api(page);
+
+    await page.goto("/c/session-default-directory");
+    await page.locator('input[type="file"]').setInputFiles({
+      name: "folderless-notes.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("folderless data"),
+    });
+
+    await expect(page.getByText("folderless-notes.txt")).toBeVisible();
+    await page.waitForTimeout(500);
+    expect(apiState.ingestRequests).toEqual([]);
+  });
+});

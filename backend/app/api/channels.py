@@ -245,7 +245,7 @@ async def login_channel(request: Request, body: ChannelLoginRequest):
 
     Unreleased channel names are rejected before any channel manager or
     channel-specific login code is consulted. In particular, the unfinished
-    WhatsApp bridge must remain unreachable in v0.7.3.
+    WhatsApp bridge must remain unreachable in v0.8.0.
     """
     if body.channel not in CHINA_READY_CHANNELS:
         raise HTTPException(400, "暂不支持该消息渠道")

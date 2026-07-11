@@ -137,6 +137,13 @@ async function installTauriMock(page: Page, platform: DesktopPlatform) {
       invoke: async (cmd, args = {}) => {
         if (cmd === "get_backend_url") return "http://localhost:8000";
         if (cmd === "get_backend_token") return "test-session-token";
+        if (cmd === "get_backend_status") {
+          return {
+            phase: "ready",
+            revision: 1,
+            url: "http://localhost:8000",
+          };
+        }
         if (cmd === "get_pending_navigation") return null;
         if (cmd === "get_platform") return mockedPlatform;
         if (cmd === "is_maximized") return false;
@@ -851,13 +858,17 @@ test.describe("苏小有 UI preflight", () => {
     await expect(
       page.getByText("Which release channel should this automation watch?"),
     ).toBeVisible();
+    await expect(page.getByText("Waiting for confirmation")).toBeVisible();
 
     const respond = page.waitForResponse(
       (res) => res.url().includes("/api/chat/respond") && res.status() === 200,
     );
     await page.getByRole("button", { name: /Stable/i }).click();
     await respond;
-    await expect(page.getByText("Agent is asking")).toBeHidden();
+    await expect(page.getByText("Waiting for confirmation")).toBeHidden();
+    await expect(
+      page.getByText(/Confirmed|Answer submitted/),
+    ).toBeVisible();
   });
 
   test("desktop interactive path: plan review is accepted through the GUI", async ({

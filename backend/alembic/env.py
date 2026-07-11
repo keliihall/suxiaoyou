@@ -9,13 +9,18 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.models.base import Base
+from app.models import Base
+from app.memory import workspace_memory_model as _workspace_memory_model  # noqa: F401
 
 # Alembic Config object
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Migrations run inside the desktop backend process during startup.  The
+    # logging.config default would disable every already-imported ``app.*``
+    # logger not named in alembic.ini, silently removing runtime diagnostics
+    # for the rest of the process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
@@ -53,6 +58,10 @@ async def run_async_migrations() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        do_run_migrations(supplied_connection)
+        return
     asyncio.run(run_async_migrations())
 
 

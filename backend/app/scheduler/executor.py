@@ -15,12 +15,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.dependencies import get_index_manager
+from app.dependencies import get_index_manager, get_stream_manager
 from app.models.scheduled_task import ScheduledTask
 from app.models.task_run import TaskRun
 from app.schemas.chat import PromptRequest
 from app.session.processor import run_generation
-from app.streaming.manager import GenerationJob
+from app.streaming.events import AGENT_ERROR, TEXT_DELTA
 from app.utils.id import generate_ulid
 
 logger = logging.getLogger(__name__)
@@ -204,7 +204,8 @@ async def _execute_loop(
 
     progress_entries: list[str] = []
     first_session_id: str | None = None
-    completed_iterations = 0
+    executed_iterations = 0
+    terminal_status: str | None = None
 
     for i in range(max_iterations):
         iteration_num = i + 1
@@ -256,7 +257,7 @@ async def _execute_loop(
         )
 
         # Extract output for progress tracking
-        output = _extract_session_output(app_state, session_id)
+        output = _extract_session_output(session_id)
         summary = output[:500] if len(output) > 500 else output
         progress_entries.append(summary if summary else f"[{status}]")
 
@@ -278,18 +279,23 @@ async def _execute_loop(
             f"[Loop {iteration_num}/{max_iterations}] {task_snapshot['name']}",
         )
 
-        completed_iterations += 1
+        executed_iterations += 1
 
         # Check stop conditions
-        if status == "error":
-            logger.warning("Loop iteration %d failed, stopping", iteration_num)
+        if status != "success":
+            terminal_status = status
+            logger.warning(
+                "Loop iteration %d finished with %s, stopping",
+                iteration_num,
+                status,
+            )
             break
         if stop_marker and stop_marker in output:
             logger.info("Loop stop marker found at iteration %d", iteration_num)
             break
 
     # Update final task stats
-    final_status = "success" if completed_iterations > 0 else "error"
+    final_status = terminal_status or ("success" if executed_iterations > 0 else "error")
     async with session_factory() as db:
         async with db.begin():
             task_obj = (
@@ -300,11 +306,11 @@ async def _execute_loop(
             if task_obj:
                 task_obj.last_run_at = datetime.now(timezone.utc)
                 task_obj.last_run_status = final_status
-                task_obj.run_count = (task_obj.run_count or 0) + completed_iterations
+                task_obj.run_count = (task_obj.run_count or 0) + executed_iterations
 
     logger.info(
         "Loop task %s (%s) finished: %d/%d iterations [triggered_by=%s]",
-        task_id, task_snapshot["name"], completed_iterations, max_iterations, triggered_by,
+        task_id, task_snapshot["name"], executed_iterations, max_iterations, triggered_by,
     )
     return first_session_id
 
@@ -318,7 +324,12 @@ async def _run_session(
 ) -> tuple[str, str | None]:
     """Run a single generation session. Returns (status, error_message)."""
     stream_id = generate_ulid()
-    job = GenerationJob(stream_id=stream_id, session_id=session_id)
+    # Register headless automation jobs in the same process-wide stream manager
+    # used by chat. This makes shutdown/abort and remote task visibility work
+    # consistently and keeps output extraction independent from FastAPI state.
+    stream_manager = get_stream_manager()
+    job = stream_manager.create_job(stream_id=stream_id, session_id=session_id)
+    job.task = asyncio.current_task()
 
     request = PromptRequest(
         session_id=session_id,
@@ -341,6 +352,22 @@ async def _run_session(
             ),
             timeout=task_snapshot.get("timeout", 1800),
         )
+
+        # run_generation intentionally converts provider/tool exceptions into
+        # an AGENT_ERROR event so browser streams stay well formed. Headless
+        # automation callers must translate that terminal event back into a
+        # persisted failure status instead of treating the returned coroutine
+        # as a successful run.
+        agent_error = next(
+            (event for event in reversed(job.events) if event.event == AGENT_ERROR),
+            None,
+        )
+        if agent_error is not None:
+            return "error", str(
+                agent_error.data.get("error_message") or "Automation generation failed"
+            )
+        if job.abort_event.is_set():
+            return "error", "Automation execution was stopped"
         return "success", None
     except asyncio.TimeoutError:
         timeout = task_snapshot.get("timeout", 1800)
@@ -351,19 +378,17 @@ async def _run_session(
         return "error", str(e)
 
 
-def _extract_session_output(app_state: Any, session_id: str) -> str:
+def _extract_session_output(session_id: str) -> str:
     """Extract text output from a completed session's job events."""
-    stream_mgr = getattr(app_state, "stream_manager", None)
-    if not stream_mgr:
-        return ""
+    stream_mgr = get_stream_manager()
 
-    # Find the job by session_id in completed jobs
-    for job_info in stream_mgr._completed:
-        job = stream_mgr._jobs.get(job_info) if isinstance(job_info, str) else None
+    # Session IDs are unique for automation iterations. Iterate newest first in
+    # case a test or imported legacy database contains a duplicate.
+    for job in reversed(list(stream_mgr._jobs.values())):
         if job and job.session_id == session_id:
             parts = []
             for event in job.events:
-                if event.event == "text-delta":
+                if event.event == TEXT_DELTA:
                     parts.append(event.data.get("text", ""))
             return "".join(parts)
     return ""

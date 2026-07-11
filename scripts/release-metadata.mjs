@@ -99,6 +99,17 @@ function readCargoLockPackageVersion(text, packageName, source) {
   throw new Error(`${source} is missing package ${packageName}`);
 }
 
+function readUniqueEmbeddedVersion(text, pattern, source) {
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length === 0) {
+    throw new Error(`${source} is missing its embedded release version`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`${source} contains multiple embedded release versions`);
+  }
+  return matches[0][1];
+}
+
 export function assertReleaseVersion(version) {
   if (!RELEASE_VERSION_PATTERN.test(version ?? "")) {
     throw new Error(`Invalid expected version "${version ?? ""}". Expected format: X.Y.Z`);
@@ -192,6 +203,36 @@ export function collectReleaseMetadata(rootDir) {
       source: "frontend/src/i18n/locales/zh/common.json poweredBy",
       read: () => readJson(rootDir, "frontend/src/i18n/locales/zh/common.json").poweredBy,
       kind: "poweredBy",
+    },
+    {
+      source: "THIRD_PARTY_NOTICES.md release graph",
+      read: () =>
+        readUniqueEmbeddedVersion(
+          readText(rootDir, "THIRD_PARTY_NOTICES.md"),
+          /\bv(\d+\.\d+\.\d+) production graphs\b/g,
+          "THIRD_PARTY_NOTICES.md",
+        ),
+      kind: "version",
+    },
+    {
+      source: "release-licenses/SOURCE_AVAILABILITY.md release",
+      read: () =>
+        readUniqueEmbeddedVersion(
+          readText(rootDir, "release-licenses/SOURCE_AVAILABILITY.md"),
+          /MPL-2\.0 components included in 苏小有 v(\d+\.\d+\.\d+)\./g,
+          "release-licenses/SOURCE_AVAILABILITY.md",
+        ),
+      kind: "version",
+    },
+    {
+      source: "release-licenses/RUST-LICENSES.html desktop crate",
+      read: () =>
+        readUniqueEmbeddedVersion(
+          readText(rootDir, "release-licenses/RUST-LICENSES.html"),
+          />suxiaoyou-desktop (\d+\.\d+\.\d+)<\/a>/g,
+          "release-licenses/RUST-LICENSES.html",
+        ),
+      kind: "version",
     },
   ];
 

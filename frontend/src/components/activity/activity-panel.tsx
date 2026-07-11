@@ -37,6 +37,7 @@ import { ACTIVITY_PANEL_WIDTH } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import { extractSourcesFromTool } from "@/lib/sources";
 import { getToolDisplayTitle, localizeVisibleProcessText } from "@/lib/activity-labels";
+import { formatElapsedDuration, formatElapsedMilliseconds } from "@/lib/duration";
 import type { ToolPart, StepFinishPart } from "@/types/message";
 
 // -- Helpers --
@@ -57,12 +58,12 @@ const TOOL_ICONS: Record<string, React.ComponentType<{ className?: string }>> = 
   task: Layers,
 };
 
-function getElapsed(tool: ToolPart): string {
+function getElapsed(tool: ToolPart, language: string): string {
   if (!tool.state.time_start || !tool.state.time_end) return "";
   const ms =
     new Date(tool.state.time_end).getTime() -
     new Date(tool.state.time_start).getTime();
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+  return formatElapsedMilliseconds(ms, language);
 }
 
 // -- Timeline item types --
@@ -155,12 +156,12 @@ function ThinkingGroup({ texts }: { texts: string[] }) {
 
 /** Individual tool row in the timeline */
 function ToolRow({ tool }: { tool: ToolPart }) {
-  const { t } = useTranslation("chat");
+  const { t, i18n } = useTranslation("chat");
   const [isOpen, setIsOpen] = useState(false);
   const ToolIcon = TOOL_ICONS[tool.tool] ?? Plug;
   const isRunning = tool.state.status === "running" || tool.state.status === "pending";
   const isError = tool.state.status === "error";
-  const elapsed = getElapsed(tool);
+  const elapsed = getElapsed(tool, i18n.language);
   const title = getToolDisplayTitle(tool, t);
 
   // Source badges for web tools
@@ -276,7 +277,7 @@ function ToolRow({ tool }: { tool: ToolPart }) {
 // -- Main panel content --
 
 function ActivityPanelContent() {
-  const { t } = useTranslation("chat");
+  const { t, i18n } = useTranslation("chat");
   const activeData = useActivityStore((s) => s.activeData);
   const close = useActivityStore((s) => s.close);
 
@@ -303,7 +304,9 @@ function ActivityPanelContent() {
 
   // Compute total duration
   const duration = computeDuration(activeData);
-  const durationLabel = duration != null && duration > 0 ? `${duration}s` : "";
+  const durationLabel = duration != null && duration > 0
+    ? formatElapsedDuration(duration, i18n.language)
+    : "";
   const hasRunningTools = activeData.toolParts.some(
     (tool) => tool.state.status === "running" || tool.state.status === "pending",
   );
@@ -363,7 +366,11 @@ function ActivityPanelContent() {
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--text-tertiary)]" />
               </div>
               <p className="text-[13px] font-medium text-[var(--text-secondary)]">
-                {hasRunningTools ? t("stageWorkingWithTools") : t("stageFinalizing")}
+                {activeData.isAwaitingConfirmation
+                  ? t("stageWaitingForConfirmation")
+                  : hasRunningTools
+                    ? t("stageWorkingWithTools")
+                    : t("stageFinalizing")}
               </p>
             </div>
           )}

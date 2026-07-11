@@ -64,6 +64,11 @@ test("supports tag releases and explicitly marked manual test builds", () => {
   const mac = job("build-macos");
   assert.match(mac, /--no-sign/);
   assert.match(mac, /ADHOC-TEST/);
+
+  const validate = job("validate-release");
+  assert.match(validate, /fetch-depth:\s*0/);
+  assert.match(validate, /Require official tag commit on main/);
+  assert.match(validate, /git merge-base --is-ancestor "\$GITHUB_SHA" refs\/remotes\/origin\/main/);
 });
 
 test("manual releases select one target while tags keep both native macOS builds", () => {
@@ -115,11 +120,40 @@ test("manual releases select one target while tags keep both native macOS builds
   );
 });
 
-test("test-build artifacts expire after one day", () => {
-  for (const name of ["build-windows", "build-macos", "build-linux"]) {
+test("installer artifacts expire after one day and lifecycle diagnostics after seven", () => {
+  const jobs = [
+    [
+      "build-windows",
+      "Upload Windows artifact",
+      "Upload Windows lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-windows",
+    ],
+    [
+      "build-macos",
+      "Upload macOS artifact",
+      "Upload macOS lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-macos-${{ env.DMG_ARCH }}",
+    ],
+    [
+      "build-linux",
+      "Upload Linux artifacts",
+      "Upload Linux lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-linux-*",
+    ],
+  ];
+  const diagnosticPaths = new Set();
+  for (const [name, installerStep, diagnosticsStep, diagnosticPath] of jobs) {
     const build = job(name);
-    assert.equal((build.match(/uses: actions\/upload-artifact@/g) ?? []).length, 1);
-    assert.match(build, /retention-days:\s*1/);
+    assert.equal((build.match(/uses: actions\/upload-artifact@/g) ?? []).length, 2);
+    assert.match(step(build, installerStep), /if:\s*always\(\)/);
+    assert.match(step(build, installerStep), /retention-days:\s*1/);
+    const diagnostics = step(build, diagnosticsStep);
+    assert.match(diagnostics, /if:\s*always\(\)/);
+    assert.match(diagnostics, /if-no-files-found:\s*ignore/);
+    assert.match(diagnostics, /retention-days:\s*7/);
+    assert.match(diagnostics, new RegExp(escapeRegExp(diagnosticPath)));
+    assert.equal(diagnosticPaths.has(diagnosticPath), false, diagnosticPath);
+    diagnosticPaths.add(diagnosticPath);
   }
 });
 
@@ -155,11 +189,16 @@ test("keeps Apple credentials step-scoped and fails official tags fast", () => {
   assert.match(credentials, /exit 1/);
 });
 
-test("has no updater artifacts, updater keys, or latest manifest", () => {
+test("publishes a manual-download manifest without updater artifacts or keys", () => {
   assert.doesNotMatch(
     workflow,
     /TAURI_SIGNING_PRIVATE_KEY|\.app\.tar\.gz|\.exe\.sig|latest\.json/,
   );
+  assert.match(workflow, /release-manifest\.json/);
+  assert.match(workflow, /manual-download/);
+  assert.match(workflow, /generate-release-manifest\.mjs/);
+  assert.match(workflow, /verify-release-manifest\.mjs/);
+  assert.match(workflow, /git rev-parse "\$GITHUB_SHA\^\{commit\}"/);
 });
 
 test("uses locked desktop tooling and sanitized frontend output on every platform", () => {
@@ -202,10 +241,17 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   );
   assert.ok(uploadIndex >= 0, "Linux artifacts are not uploaded");
   assert.ok(
-    verifyIndex > uploadIndex,
-    "Linux artifacts must remain available when installed-content verification fails",
+    uploadIndex > verifyIndex,
+    "always-run artifact upload must follow installed-content verification",
   );
+  assert.match(step(linux, "Upload Linux artifacts"), /if:\s*always\(\)/);
   assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /dpkg-deb -f .* Version/);
+  assert.match(linux, /dpkg-deb -f .* Architecture/);
+  assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
+  assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
+  assert.match(linux, /expected amd64/);
+  assert.match(linux, /expected x86_64/);
   assert.match(linux, /rpm -K/);
   assert.match(linux, /rpm2cpio/);
   assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
@@ -233,12 +279,45 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   );
   assert.match(install, /Start-Process/);
   assert.match(install, /"\/S"/);
+  assert.match(install, /require\('\.\/package\.json'\)\.version/);
+  assert.match(install, /Filter "苏小有\.exe"/);
+  assert.match(install, /VersionInfo\.ProductVersion/);
   assert.match(install, /Filter node\.exe/);
   assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
   assert.match(install, /npm\.cmd/);
   assert.match(install, /npx\.cmd/);
   assert.match(install, /suxiaoyou-backend\.exe/);
   assert.match(install, /node scripts\/verify-bundle\.mjs/);
+});
+
+test("launches every installed desktop, waits for backend ready, and proves clean exit", () => {
+  const windows = step(
+    job("build-windows"),
+    "Launch installed Windows desktop and verify clean shutdown",
+  );
+  assert.match(windows, /苏小有\.exe/);
+  assert.match(windows, /verify-desktop-lifecycle\.mjs/);
+  assert.match(windows, /suxiaoyou-desktop-lifecycle-windows/);
+
+  const mac = step(job("build-macos"), "Verify final DMG contents");
+  const copiedApp = mac.indexOf("ditto \"$MOUNT_DIRECTORY/苏小有.app\"");
+  const lifecycle = mac.indexOf("verify-desktop-lifecycle.mjs");
+  assert.ok(copiedApp >= 0 && lifecycle > copiedApp);
+  assert.match(mac, /CFBundleExecutable/);
+  assert.match(mac, /suxiaoyou-desktop-lifecycle-macos-\$DMG_ARCH/);
+
+  const linux = step(job("build-linux"), "Install Linux packages and verify desktop lifecycle");
+  assert.match(linux, /sudo dpkg -i/);
+  assert.match(linux, /sudo rpm -i --nodeps/);
+  assert.match(linux, /xvfb-run -a dbus-run-session/);
+  assert.equal((linux.match(/verify-desktop-lifecycle\.mjs/g) ?? []).length, 2);
+  assert.match(linux, /sudo dpkg --purge/);
+  assert.match(linux, /sudo rpm -e/);
+
+  for (const name of ["build-windows", "build-macos", "build-linux"]) {
+    assert.match(job(name), /lifecycle-diagnostics/);
+    assert.match(job(name), /if-no-files-found:\s*ignore/);
+  }
 });
 
 test("Windows native build validates lifecycle primitives before packaging", () => {
@@ -297,10 +376,14 @@ test("validates release metadata, production audits, and tests before building",
   assert.match(validate, /node --test scripts\/\*\.test\.mjs/);
   assert.match(validate, /npm audit --omit=dev/);
   assert.match(validate, /node --test tests\/unit\/\*\.test\.ts/);
+  assert.match(validate, /playwright install --with-deps chromium/);
+  assert.match(validate, /npm run test:ui:core/);
   assert.match(backend, /python -m pip check/);
   assert.match(backend, /pip-audit -r requirements\.txt/);
   assert.match(backend, /pytest -q/);
   assert.match(validate, /cargo metadata --locked --format-version 1/);
+  assert.match(validate, /cargo test --locked/);
+  assert.match(validate, /cargo clippy --locked --all-targets -- -D warnings/);
 
   for (const name of ["build-windows", "build-macos", "build-linux"]) {
     assert.match(job(name), /needs:\s*validate-release/);
@@ -378,10 +461,34 @@ test("verifies all five installer types before publishing checksums", () => {
   }
   assert.match(publish, /macos-aarch64/);
   assert.match(publish, /macos-x64/);
+  assert.match(publish, /VERSION="\$\{GITHUB_REF_NAME#v\}"/);
+  assert.match(publish, /\*\$\{VERSION\}\*_aarch64\.dmg/);
+  assert.match(publish, /\*\$\{VERSION\}\*_x64\.dmg/);
+  for (const stableName of [
+    "windows-x64-setup.exe",
+    "macos-aarch64.dmg",
+    "macos-x64.dmg",
+    "linux-amd64.deb",
+    "linux-x86_64.rpm",
+  ]) {
+    assert.match(publish, new RegExp(escapeRegExp(stableName)));
+  }
+  assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
 
   const release = step(publish, "Create draft GitHub Release");
   assert.match(release, /draft:\s*true/);
+  assert.match(release, /body_path:\s*RELEASE-BODY\.md/);
   assert.match(release, /files:[\s\S]*CHECKSUMS\.md/);
+  assert.match(release, /files:[\s\S]*release-manifest\.json/);
+  assert.match(release, /files:[\s\S]*release-assets\/\*/);
+
+  const trust = step(publish, "Record installer trust status");
+  assert.match(trust, /Developer ID/);
+  assert.match(trust, /Apple 公证/);
+  assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
+  assert.match(trust, /Linux DEB\/RPM[^\n]*未配置仓库签名/);
+  assert.match(trust, /release-manifest\.json[^\n]*手动下载/);
+  assert.match(trust, /cat CHECKSUMS\.md/);
 });
 
 test("repairs then signs inside-out and notarizes the final DMG", () => {
@@ -502,6 +609,11 @@ test("CI runs the frontend unit suite", () => {
   assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
   assert.match(ciWorkflow, /verify-macos-bundle\.test\.mjs/);
   assert.match(ciWorkflow, /verify-node-runtime\.test\.mjs/);
+  assert.match(ciWorkflow, /workflow-security\.test\.mjs/);
+  assert.match(ciWorkflow, /bump-version\.test\.mjs/);
+  assert.match(ciWorkflow, /release-manifest\.test\.mjs/);
+  assert.match(ciWorkflow, /release-metadata\.mjs/);
+  assert.match(ciWorkflow, /verify-desktop-lifecycle\.test\.mjs/);
   assert.match(ciWorkflow, /python -m pip install uv==0\.11\.28/);
   for (const target of [
     "x86_64-pc-windows-msvc",
@@ -515,4 +627,8 @@ test("CI runs the frontend unit suite", () => {
     ciWorkflow,
     /uv pip install[\s\S]*--system[\s\S]*--require-hashes[\s\S]*--only-binary=:all:/,
   );
+  assert.match(ciWorkflow, /cargo test --locked/);
+  assert.match(ciWorkflow, /cargo clippy --locked --all-targets -- -D warnings/);
+  assert.match(ciWorkflow, /playwright install --with-deps chromium/);
+  assert.match(ciWorkflow, /npm run test:ui:core/);
 });

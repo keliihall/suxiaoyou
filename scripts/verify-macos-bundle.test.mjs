@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -15,6 +16,9 @@ import {
   verifyMacOSBundle,
 } from "./verify-macos-bundle.mjs";
 
+const PRODUCT_VERSION = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 const temporaryDirectories = [];
 
 afterEach(() => {
@@ -81,7 +85,7 @@ function commandRunner(fixture, overrides = {}) {
             CFBundleIdentifier: "com.chaoyuanxinzhi.suxiaoyou",
             CFBundleExecutable: "suxiaoyou-desktop",
             CFBundleName: "苏小有",
-            CFBundleShortVersionString: "0.7.3",
+            CFBundleShortVersionString: PRODUCT_VERSION,
             LSMinimumSystemVersion: overrides.infoMinOS ?? "13.3",
           }[key] + "\n",
         stderr: "",

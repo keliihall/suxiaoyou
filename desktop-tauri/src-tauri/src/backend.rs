@@ -451,6 +451,12 @@ impl BackendState {
             .ok_or_else(|| "Backend session token not yet available".to_string())
     }
 
+    /// PID of the currently managed backend process, used only by the
+    /// opt-in packaged lifecycle smoke contract.
+    pub async fn process_id(&self) -> Option<u32> {
+        self.inner.lock().await.process.as_ref().and_then(Child::id)
+    }
+
     /// Start the Python backend process.
     pub async fn start(&self, app: &AppHandle) -> Result<String, String> {
         let mut inner = self.inner.lock().await;
@@ -483,10 +489,22 @@ impl BackendState {
             .map_err(|e| format!("Failed to get app data dir: {e}"))?;
         let data_dir = app_data_dir.join("data");
         let legacy_data_dir = predecessor_data_dir(&app_data_dir);
+        // Folderless conversations still need a stable, user-visible write
+        // boundary. Resolve the platform's real Documents directory through
+        // Tauri (important for OneDrive/redirection on Windows) and fall back
+        // to app data only on platforms that do not expose one.
+        let managed_workspace_root = app
+            .path()
+            .document_dir()
+            .unwrap_or_else(|_| app_data_dir.clone())
+            .join("苏小有")
+            .join("生成文件");
 
         // Ensure data directory exists
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
+        std::fs::create_dir_all(&managed_workspace_root)
+            .map_err(|e| format!("Failed to create managed workspace root: {e}"))?;
 
         // Set up log file
         let log_dir = app
@@ -499,9 +517,10 @@ impl BackendState {
         write_desktop_log(
             &desktop_log_path,
             &format!(
-                "Starting desktop backend | app_version={} | data_dir={} | log_dir={}",
+                "Starting desktop backend | app_version={} | data_dir={} | managed_workspace_root={} | log_dir={}",
                 app.package_info().version,
                 data_dir.display(),
+                managed_workspace_root.display(),
                 log_dir.display()
             ),
         );
@@ -542,6 +561,7 @@ impl BackendState {
             ])
             .current_dir(&backend_dir)
             .env("PYTHONUNBUFFERED", "1")
+            .env("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", &managed_workspace_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
@@ -601,6 +621,7 @@ impl BackendState {
             cmd.env("PYTHONUNBUFFERED", "1")
                 .env("PATH", backend_path_env)
                 .env("SUXIAOYOU_NODE_BIN_DIR", &node_bin_dir)
+                .env("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", &managed_workspace_root)
                 .env(
                     "SUXIAOYOU_DESKTOP_PARENT_PID",
                     std::process::id().to_string(),

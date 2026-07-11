@@ -5,7 +5,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { API, queryKeys } from "@/lib/constants";
 import { useChatStore } from "@/stores/chat-store";
-import { startStream, isStreamActive } from "@/lib/session-stream-registry";
+import {
+  getActiveStreamGeneration,
+  getActiveStreamId,
+  startStream,
+} from "@/lib/session-stream-registry";
+import {
+  canCommitRemoteStreamAttach,
+  needsRemoteStreamAttach,
+  type RemoteAttachSnapshot,
+} from "@/lib/stream-lifecycle";
 
 /**
  * Poll for active generations in the current session.
@@ -20,6 +29,7 @@ import { startStream, isStreamActive } from "@/lib/session-stream-registry";
  * generating state.
  */
 const POLL_INTERVAL = 5_000;
+const STALE_REPOLL_DELAY = 100;
 
 export function useRemoteGenerationSync(sessionId: string | undefined) {
   const queryClient = useQueryClient();
@@ -30,9 +40,22 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
 
     let active = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let pollSequence = 0;
+
+    const snapshot = (): RemoteAttachSnapshot => {
+      const bucket = useChatStore.getState().sessions[sessionId];
+      return {
+        registryStreamId: getActiveStreamId(sessionId),
+        registryGeneration: getActiveStreamGeneration(sessionId),
+        bucketStreamId: bucket?.streamId ?? null,
+        bucketGenerationStartedAt: bucket?.generationStartedAt ?? null,
+      };
+    };
 
     const poll = async () => {
       if (!active) return;
+      const sequence = ++pollSequence;
+      let nextDelay = POLL_INTERVAL;
 
       try {
         const jobs = await api.get<{ stream_id: string; session_id: string }[]>(
@@ -46,19 +69,48 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
         const bucket = chatState.sessions[sessionId];
 
         if (match) {
-          // Skip if we're already tracking this exact stream (either locally
-          // initiated or attached on a previous poll).
-          if (bucket?.streamId === match.stream_id || isStreamActive(sessionId)) {
+          const activeStreamId = getActiveStreamId(sessionId);
+          if (!needsRemoteStreamAttach(match.stream_id, activeStreamId)) {
+            // Update the hint only after the registry proves that this exact
+            // stream is attached. A session-level active boolean can refer to
+            // an older job that the backend has already replaced.
             knownStreamIdRef.current = match.stream_id;
-          } else if (knownStreamIdRef.current !== match.stream_id) {
-            knownStreamIdRef.current = match.stream_id;
-
+          } else {
+            const before = snapshot();
             await queryClient.invalidateQueries({
               queryKey: queryKeys.messages.list(sessionId),
             });
+            if (!active) return;
 
-            chatState.startGeneration(sessionId, match.stream_id);
-            void startStream(sessionId, match.stream_id);
+            // The first /active response may have become stale while message
+            // invalidation was in flight. Reconfirm backend authority, then
+            // ensure neither the registry lease nor the chat bucket changed.
+            const confirmedJobs = await api.get<{
+              stream_id: string;
+              session_id: string;
+            }[]>(API.CHAT.ACTIVE);
+            const confirmedMatch = confirmedJobs.find(
+              (job) => job.session_id === sessionId,
+            );
+            const after = snapshot();
+            if (!canCommitRemoteStreamAttach({
+              pollSequence: sequence,
+              currentPollSequence: pollSequence,
+              expectedBackendStreamId: match.stream_id,
+              confirmedBackendStreamId: confirmedMatch?.stream_id ?? null,
+              before,
+              after,
+            })) {
+              nextDelay = STALE_REPOLL_DELAY;
+              return;
+            }
+
+            useChatStore.getState().startGeneration(sessionId, match.stream_id);
+            await startStream(sessionId, match.stream_id);
+            if (!active) return;
+            if (getActiveStreamId(sessionId) === match.stream_id) {
+              knownStreamIdRef.current = match.stream_id;
+            }
           }
         } else {
           // No active generation server-side. If we were tracking one from a
@@ -74,10 +126,10 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
         }
       } catch {
         // ignore polling errors
-      }
-
-      if (active) {
-        timer = setTimeout(poll, POLL_INTERVAL);
+      } finally {
+        if (active && sequence === pollSequence) {
+          timer = setTimeout(poll, nextDelay);
+        }
       }
     };
 
@@ -85,6 +137,7 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
 
     return () => {
       active = false;
+      pollSequence += 1;
       knownStreamIdRef.current = null;
       if (timer) clearTimeout(timer);
     };

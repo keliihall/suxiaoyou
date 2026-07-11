@@ -239,6 +239,10 @@ export const API = {
     ABORT: "/api/chat/abort",
     ACTIVE: "/api/chat/active",
     RESPOND: "/api/chat/respond",
+    INPUTS: "/api/chat/inputs",
+    SESSION_INPUTS: (sessionId: string) => `/api/chat/inputs/${encodeURIComponent(sessionId)}`,
+    SESSION_INPUT: (sessionId: string, inputId: string) =>
+      `/api/chat/inputs/${encodeURIComponent(sessionId)}/${encodeURIComponent(inputId)}`,
   },
   SESSIONS: {
     BASE: "/api/sessions",
@@ -266,6 +270,7 @@ export const API = {
     CONTENT: "/api/files/content",
     CONTENT_BINARY: "/api/files/content-binary",
     OPEN_SYSTEM: "/api/files/open-system",
+    REVEAL_SYSTEM: "/api/files/reveal-system",
     SEARCH: "/api/files/search",
     INGEST: "/api/files/ingest",
   },
@@ -405,6 +410,7 @@ export const queryKeys = {
   messages: {
     list: (sessionId: string) => ["messages", sessionId] as const,
   },
+  sessionInputs: (sessionId: string) => ["session-inputs", sessionId] as const,
   models: ["models"] as const,
   agents: ["agents"] as const,
   tools: ["tools"] as const,

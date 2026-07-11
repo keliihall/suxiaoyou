@@ -14,6 +14,7 @@ from typing import Any
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
 from app.tool.workspace import WorkspaceViolation, resolve_for_write
+from app.utils.atomic_write import atomic_write_text
 from app.utils.diff import generate_unified_diff
 
 
@@ -162,9 +163,9 @@ class EditTool(ToolDefinition):
                 content = content.replace(old_string, new_string, 1)
                 total_replacements += 1
 
-        # All edits validated and applied — write atomically
-        with open(file_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
+        # All edits validated and applied — install the complete replacement in
+        # one rename so a disk/write failure cannot truncate the original.
+        atomic_write_text(file_path, content)
 
         diff = generate_unified_diff(original, content, file_path)
 

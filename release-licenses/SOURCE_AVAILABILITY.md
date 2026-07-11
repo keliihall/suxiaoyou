@@ -1,7 +1,7 @@
 # Source availability and provenance
 
 This document tells recipients where to obtain the Source Code Form for
-MPL-2.0 components included in 苏小有 v0.7.3. The exact-version links below
+MPL-2.0 components included in 苏小有 v0.8.0. The exact-version links below
 provide the source without charge. 苏小有 does not intentionally modify the
 listed upstream MPL-covered source files.
 

@@ -1,6 +1,5 @@
 "use client";
 
-import { AnimatePresence, motion } from "framer-motion";
 import { ArrowUp, Square } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -11,48 +10,51 @@ interface ChatActionsProps {
   canSend: boolean;
   onSend: () => void;
   onStop: () => void;
+  sendLabel?: string;
+  sendHint?: string;
 }
 
-export function ChatActions({ isBusy, canSend, onSend, onStop }: ChatActionsProps) {
+export function ChatActions({ isBusy, canSend, onSend, onStop, sendLabel, sendHint }: ChatActionsProps) {
   const { t } = useTranslation("chat");
-  const interactive = isBusy || canSend;
+  const resolvedSendLabel = sendLabel ?? t("sendAction");
+  const resolvedSendHint = sendHint ?? t("sendActionHint");
 
   return (
     <TooltipProvider delayDuration={200}>
       <div className="flex items-center gap-1">
+        {isBusy && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="h-8 w-8 rounded-full text-[var(--text-secondary)] hover:bg-[var(--surface-secondary)] hover:text-[var(--text-primary)]"
+                onClick={onStop}
+                aria-label={t("stopAction")}
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+                <span className="sr-only">{t("stopAction")}</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("stopAction")}</TooltipContent>
+          </Tooltip>
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
+              type="button"
               size="icon"
               className="h-8 w-8 rounded-full bg-[var(--text-primary)] text-[var(--surface-primary)] hover:bg-[var(--text-primary)]/90 disabled:bg-[var(--text-tertiary)]/30 disabled:text-[var(--surface-primary)] disabled:opacity-100"
-              onClick={isBusy ? onStop : onSend}
-              disabled={!interactive}
-              aria-label={isBusy ? t("stopAction") : t("sendAction")}
+              onClick={onSend}
+              disabled={!canSend}
+              aria-label={resolvedSendLabel}
             >
-              <AnimatePresence mode="wait" initial={false}>
-                <motion.span
-                  key={isBusy ? "stop" : "send"}
-                  initial={{ rotate: -90, opacity: 0 }}
-                  animate={{ rotate: 0, opacity: 1 }}
-                  exit={{ rotate: 90, opacity: 0 }}
-                  transition={{ duration: 0.15 }}
-                  className="flex items-center justify-center"
-                >
-                  {isBusy ? (
-                    <Square className="h-3.5 w-3.5 fill-current" />
-                  ) : (
-                    <ArrowUp className="h-[18px] w-[18px]" />
-                  )}
-                </motion.span>
-              </AnimatePresence>
-              <span className="sr-only">
-                {isBusy ? t("stopAction") : t("sendAction")}
-              </span>
+              <ArrowUp className="h-[18px] w-[18px]" />
+              <span className="sr-only">{resolvedSendLabel}</span>
             </Button>
           </TooltipTrigger>
-          <TooltipContent>
-            {isBusy ? t("stopAction") : t("sendActionHint")}
-          </TooltipContent>
+          <TooltipContent>{resolvedSendHint}</TooltipContent>
         </Tooltip>
       </div>
     </TooltipProvider>

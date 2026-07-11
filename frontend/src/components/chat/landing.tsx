@@ -20,6 +20,7 @@ import { useArtifactStore } from "@/stores/artifact-store";
 import { useActivityStore } from "@/stores/activity-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { cn } from "@/lib/utils";
+import { isInteractionAwaitingResolution } from "@/lib/interaction-response";
 
 const FEATURED_STARTERS = [
   { icon: Mail, textKey: "starterDraftFromNotes", promptKey: "starterDraftFromNotesPrompt" },
@@ -57,7 +58,20 @@ function pickRandomStarters(count: number): typeof FEATURED_STARTERS {
 
 export function Landing({ directoryParam = null }: LandingProps) {
   const { t } = useTranslation('chat');
-  const { sendMessage, sendTaskBatch, isGenerating, stopGeneration, pendingUserText, pendingAttachments, streamingParts, streamingText, streamingReasoning } = useChat();
+  const {
+    sendMessage,
+    sendTaskBatch,
+    isGenerating,
+    stopGeneration,
+    pendingUserText,
+    pendingAttachments,
+    streamingParts,
+    streamingText,
+    streamingReasoning,
+    pendingPermission,
+    pendingQuestion,
+    pendingPlanReview,
+  } = useChat();
   const globalWorkspace = useSettingsStore((s) => s.workspaceDirectory);
   const workspaceName = workspaceBasename(globalWorkspace);
   const activeProvider = useSettingsStore((s) => s.activeProvider);
@@ -146,6 +160,11 @@ export function Landing({ directoryParam = null }: LandingProps) {
                 parts={streamingParts}
                 streamingText={streamingText}
                 streamingReasoning={streamingReasoning}
+                isAwaitingConfirmation={
+                  (!!pendingPermission && isInteractionAwaitingResolution(pendingPermission.responseState)) ||
+                  (!!pendingQuestion && isInteractionAwaitingResolution(pendingQuestion.responseState)) ||
+                  (!!pendingPlanReview && isInteractionAwaitingResolution(pendingPlanReview.responseState))
+                }
               />
             </div>
           </div>

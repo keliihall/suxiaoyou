@@ -4,13 +4,14 @@ import { CheckCircle2, ChevronRight, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { SuxiaoyouLogo } from "@/components/ui/suxiaoyou-logo";
 import { useActivityStore, type ActivityData } from "@/stores/activity-store";
+import { formatElapsedDuration } from "@/lib/duration";
 
 interface ActivitySummaryProps {
   data: ActivityData;
 }
 
 export function ActivitySummary({ data }: ActivitySummaryProps) {
-  const { t } = useTranslation("chat");
+  const { t, i18n } = useTranslation("chat");
   const toggleForMessage = useActivityStore((s) => s.toggleForMessage);
   const isActiveOpen = useActivityStore(
     (s) => s.isOpen && !!data.sourceKey && s.activeKey === data.sourceKey,
@@ -36,7 +37,12 @@ export function ActivitySummary({ data }: ActivitySummaryProps) {
   } else if (hasReasoning) {
     parts.push(
       data.thinkingDuration != null
-        ? t("thoughtFor", { duration: `${data.thinkingDuration}s` })
+        ? t("thoughtFor", {
+            duration: formatElapsedDuration(
+              data.thinkingDuration,
+              i18n.language,
+            ),
+          })
         : t("reasoning"),
     );
   }

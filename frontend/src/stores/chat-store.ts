@@ -5,6 +5,14 @@ import { useMemo } from "react";
 import type { CompactionPart, CompactionPhase, CompactionPhaseStatus, PartData, ToolPart } from "@/types/message";
 import type { PermissionRequest, QuestionRequest, PlanReviewRequest } from "@/types/streaming";
 import type { FileAttachment } from "@/types/chat";
+import {
+  advanceInteractionRecoveryRetryState,
+  advanceInteractionResponseState,
+  canResetInteractionAfterFailure,
+  type InteractionResponseState,
+} from "@/lib/interaction-response";
+
+export type InteractionPromptType = "permission" | "question" | "plan";
 
 /**
  * Cumulative usage for a chat session (across multiple generations).
@@ -66,6 +74,12 @@ const DRAFT_KEY = "__draft__";
  */
 export interface ChatSessionState {
   streamId: string | null;
+  /** Wall-clock origin retained across route remounts for long-task timers. */
+  generationStartedAt: number | null;
+  /** Connection can be healthy while no business event has advanced the task. */
+  isProgressStalled: boolean;
+  /** Last non-heartbeat SSE event, retained across route remounts. */
+  lastBusinessProgressAt: number | null;
   isGenerating: boolean;
   isCompacting: boolean;
   isModelLoading: boolean;
@@ -86,6 +100,9 @@ export interface ChatSessionState {
 
 export const EMPTY_SESSION_STATE: ChatSessionState = {
   streamId: null,
+  generationStartedAt: null,
+  isProgressStalled: false,
+  lastBusinessProgressAt: null,
   isGenerating: false,
   isCompacting: false,
   isModelLoading: false,
@@ -153,7 +170,26 @@ interface ChatStore {
   clearQuestion: (sessionId: string | null) => void;
   setPlanReview: (sessionId: string | null, req: PlanReviewRequest) => void;
   clearPlanReview: (sessionId: string | null) => void;
+  setInteractionResponseState: (
+    sessionId: string | null,
+    promptType: InteractionPromptType,
+    callId: string,
+    responseState: InteractionResponseState,
+    metadata?: { decision?: string | null; source?: string | null },
+  ) => void;
+  resetInteractionResponseState: (
+    sessionId: string | null,
+    promptType: InteractionPromptType,
+    callId: string,
+  ) => void;
+  beginInteractionRecoveryRetry: (
+    sessionId: string | null,
+    promptType: InteractionPromptType,
+    callId: string,
+  ) => void;
   setModelLoading: (sessionId: string | null, loading: boolean) => void;
+  markBusinessProgress: (sessionId: string | null, timestamp?: number) => void;
+  setProgressStalled: (sessionId: string | null, stalled: boolean) => void;
   setCompacting: (sessionId: string | null, compacting: boolean) => void;
   clearStreamingContent: (sessionId: string | null) => void;
   finishGeneration: (sessionId: string | null) => void;
@@ -225,9 +261,13 @@ export const useChatStore = create<ChatStore>((set) => ({
   },
 
   beginSending: (sessionId, text, attachments) =>
-    set((s) =>
-      mutateBucket(s, sessionId, (prev) => ({
+    set((s) => {
+      const startedAt = Date.now();
+      return mutateBucket(s, sessionId, (prev) => ({
         ...prev,
+        generationStartedAt: startedAt,
+        isProgressStalled: false,
+        lastBusinessProgressAt: startedAt,
         isGenerating: true,
         isCompacting: false,
         isModelLoading: false,
@@ -239,8 +279,8 @@ export const useChatStore = create<ChatStore>((set) => ({
         pendingPermission: null,
         pendingQuestion: null,
         pendingPlanReview: null,
-      })),
-    ),
+      }));
+    }),
 
   startGeneration: (sessionId, streamId) =>
     set((s) => {
@@ -263,6 +303,19 @@ export const useChatStore = create<ChatStore>((set) => ({
       const next: ChatSessionState = {
         ...base,
         streamId,
+        // beginSending() already established the origin for a locally-started
+        // request, and a same-task reattach should retain it. A newly
+        // discovered remote run must not inherit the timestamp of an old,
+        // already-finished generation in this session.
+        generationStartedAt:
+          base.isGenerating && base.generationStartedAt !== null
+            ? base.generationStartedAt
+            : Date.now(),
+        isProgressStalled: false,
+        lastBusinessProgressAt:
+          base.isGenerating && base.lastBusinessProgressAt !== null
+            ? base.lastBusinessProgressAt
+            : Date.now(),
         isGenerating: true,
         isCompacting: false,
         streamingParts: [],
@@ -573,22 +626,147 @@ export const useChatStore = create<ChatStore>((set) => ({
     ),
 
   setPermissionRequest: (sessionId, req) =>
-    set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingPermission: req }))),
+    set((s) => mutateBucket(s, sessionId, (prev) => ({
+      ...prev,
+      pendingPermission: { ...req, responseState: "idle" },
+    }))),
   clearPermissionRequest: (sessionId) =>
     set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingPermission: null }))),
 
   setQuestion: (sessionId, req) =>
-    set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingQuestion: req }))),
+    set((s) => mutateBucket(s, sessionId, (prev) => ({
+      ...prev,
+      pendingQuestion: { ...req, responseState: "idle" },
+    }))),
   clearQuestion: (sessionId) =>
     set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingQuestion: null }))),
 
   setPlanReview: (sessionId, req) =>
-    set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingPlanReview: req }))),
+    set((s) => mutateBucket(s, sessionId, (prev) => ({
+      ...prev,
+      pendingPlanReview: { ...req, responseState: "idle" },
+    }))),
   clearPlanReview: (sessionId) =>
     set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, pendingPlanReview: null }))),
 
+  setInteractionResponseState: (
+    sessionId,
+    promptType,
+    callId,
+    responseState,
+    metadata,
+  ) =>
+    set((s) => mutateBucket(s, sessionId, (prev) => {
+      const update = <T extends PermissionRequest | QuestionRequest | PlanReviewRequest>(
+        request: T | null,
+      ): T | null => {
+        if (!request || request.callId !== callId) return request;
+        const nextState = advanceInteractionResponseState(
+          request.responseState,
+          responseState,
+        );
+        return {
+          ...request,
+          responseState: nextState,
+          responseResolvedAt:
+            nextState === "resolved"
+              ? (request.responseResolvedAt ?? Date.now())
+              : request.responseResolvedAt,
+          responseDecision: metadata?.decision ?? request.responseDecision,
+          responseSource: metadata?.source ?? request.responseSource,
+        };
+      };
+
+      if (promptType === "permission") {
+        return { ...prev, pendingPermission: update(prev.pendingPermission) };
+      }
+      if (promptType === "plan") {
+        return { ...prev, pendingPlanReview: update(prev.pendingPlanReview) };
+      }
+      return { ...prev, pendingQuestion: update(prev.pendingQuestion) };
+    })),
+
+  resetInteractionResponseState: (sessionId, promptType, callId) =>
+    set((s) => mutateBucket(s, sessionId, (prev) => {
+      const reset = <T extends PermissionRequest | QuestionRequest | PlanReviewRequest>(
+        request: T | null,
+      ): T | null => {
+        if (!request || request.callId !== callId) return request;
+        // A resolved SSE event may win the race while the POST itself reports
+        // a network failure.  In that case the server acknowledgement is
+        // authoritative; never reopen an already-resolved card.
+        if (!canResetInteractionAfterFailure(request.responseState)) return request;
+        return {
+          ...request,
+          responseState: "idle",
+          responseResolvedAt: null,
+          responseDecision: null,
+          responseSource: null,
+        };
+      };
+
+      if (promptType === "permission") {
+        return { ...prev, pendingPermission: reset(prev.pendingPermission) };
+      }
+      if (promptType === "plan") {
+        return { ...prev, pendingPlanReview: reset(prev.pendingPlanReview) };
+      }
+      return { ...prev, pendingQuestion: reset(prev.pendingQuestion) };
+    })),
+
+  beginInteractionRecoveryRetry: (sessionId, promptType, callId) =>
+    set((s) => mutateBucket(s, sessionId, (prev) => {
+      const retry = <T extends PermissionRequest | QuestionRequest | PlanReviewRequest>(
+        request: T | null,
+      ): T | null => {
+        if (!request || request.callId !== callId) return request;
+        const responseState = advanceInteractionRecoveryRetryState(
+          request.responseState,
+        );
+        return responseState === request.responseState
+          ? request
+          : { ...request, responseState };
+      };
+
+      if (promptType === "permission") {
+        return { ...prev, pendingPermission: retry(prev.pendingPermission) };
+      }
+      if (promptType === "plan") {
+        return { ...prev, pendingPlanReview: retry(prev.pendingPlanReview) };
+      }
+      return { ...prev, pendingQuestion: retry(prev.pendingQuestion) };
+    })),
+
   setModelLoading: (sessionId, loading) =>
     set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, isModelLoading: loading }))),
+
+  markBusinessProgress: (sessionId, timestamp = Date.now()) =>
+    set((s) => mutateBucket(s, sessionId, (prev) => {
+      if (!prev.isGenerating) return prev;
+      const nextTimestamp = Number.isFinite(timestamp) ? timestamp : Date.now();
+      // Token events can arrive many times per second. The stream instance
+      // keeps exact time; the UI store needs only second-level precision.
+      if (
+        !prev.isProgressStalled
+        && prev.lastBusinessProgressAt !== null
+        && nextTimestamp - prev.lastBusinessProgressAt < 1_000
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        isProgressStalled: false,
+        lastBusinessProgressAt: nextTimestamp,
+      };
+    })),
+
+  setProgressStalled: (sessionId, stalled) =>
+    set((s) => mutateBucket(s, sessionId, (prev) => {
+      const next = prev.isGenerating ? stalled : false;
+      return prev.isProgressStalled === next
+        ? prev
+        : { ...prev, isProgressStalled: next };
+    })),
 
   setCompacting: (sessionId, compacting) =>
     set((s) => mutateBucket(s, sessionId, (prev) => ({ ...prev, isCompacting: compacting }))),
@@ -619,6 +797,9 @@ export const useChatStore = create<ChatStore>((set) => ({
         return {
           ...prev,
           streamId: null,
+          generationStartedAt: null,
+          isProgressStalled: false,
+          lastBusinessProgressAt: null,
           isGenerating: false,
           isCompacting: false,
           isModelLoading: false,
@@ -667,4 +848,3 @@ export function useAnySessionGenerating(): boolean {
     return false;
   });
 }
-

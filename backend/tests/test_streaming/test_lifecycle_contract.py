@@ -154,6 +154,24 @@ class TestGenerationLifecycleContract:
         assert first.event == DESYNC
         assert first.id is not None
 
+    def test_active_reconnect_reports_gap_after_replay_buffer_trim(self) -> None:
+        job = GenerationJob("stream-1", "session-1")
+        for i in range(GenerationJob._MAX_EVENT_BUFFER + 10):
+            job.publish(SSEEvent(TEXT_DELTA, {"text": str(i)}))
+
+        assert not job.completed
+        assert job.events[0].id == 11
+        queue = job.subscribe(last_event_id=1)
+        first = queue.get_nowait()
+
+        assert first is not None
+        assert first.event == DESYNC
+        assert first.data["requested_last_event_id"] == 1
+        assert first.data["dropped_event_id"] == 11
+        assert first.data["first_available_event_id"] == 12
+        job.unsubscribe(queue)
+        assert job.subscribers == []
+
     def test_tool_use_step_finish_does_not_complete_generation(self) -> None:
         sm = StreamManager()
         job = sm.create_job("stream-1", "session-1")
@@ -176,6 +194,25 @@ class TestGenerationLifecycleContract:
 
 
 class TestChatStreamEndpointContract:
+    @pytest.mark.asyncio
+    async def test_closed_active_stream_unsubscribes_on_every_reconnect(self) -> None:
+        from starlette.requests import Request
+
+        from app.api.chat import stream_events
+
+        sm = StreamManager()
+        job = sm.create_job("stream-1", "session-1")
+        request = Request({"type": "http", "headers": []})
+
+        for _ in range(5):
+            response = await stream_events(request, sm, "stream-1")
+            iterator = response.body_iterator
+            padding = await anext(iterator)
+            assert str(padding).startswith(": ")
+            assert len(job.subscribers) == 1
+            await iterator.aclose()
+            assert job.subscribers == []
+
     @pytest.mark.asyncio
     async def test_stream_replays_from_last_event_id_query_param(self, app_client) -> None:
         sm = StreamManager()

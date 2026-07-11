@@ -113,6 +113,16 @@ class QuestionTool(ToolDefinition):
 
         # Access the GenerationJob for wait_for_response
         job = getattr(ctx, "_job", None)
+        should_wait = job is not None and job.interactive
+
+        if should_wait:
+            job.register_response_request(
+                ctx.call_id,
+                prompt_type="question",
+                timeout=300.0,
+                tool_call_id=ctx.call_id,
+                tool=self.id,
+            )
 
         # Publish question event to SSE stream
         if ctx._publish_fn:
@@ -133,7 +143,7 @@ class QuestionTool(ToolDefinition):
             if is_multi
             else f"已提问：{question}"
         )
-        if job is None or not job.interactive:
+        if not should_wait:
             return ToolResult(
                 output=f"[没有用户连接] {summary}",
                 title="提问（无监听）",

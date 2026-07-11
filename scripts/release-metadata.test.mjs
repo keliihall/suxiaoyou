@@ -23,6 +23,9 @@ const RELEASE_METADATA_SOURCES = [
   "desktop-tauri/src-tauri/Cargo.lock suxiaoyou-desktop",
   "frontend/src/i18n/locales/en/common.json poweredBy",
   "frontend/src/i18n/locales/zh/common.json poweredBy",
+  "THIRD_PARTY_NOTICES.md release graph",
+  "release-licenses/SOURCE_AVAILABILITY.md release",
+  "release-licenses/RUST-LICENSES.html desktop crate",
 ];
 
 function writeJson(rootDir, relativePath, value) {
@@ -52,6 +55,9 @@ function createFixture(overrides = {}) {
     cargoLock: VERSION,
     enPoweredBy: `苏小有 v${VERSION}`,
     zhPoweredBy: `苏小有 v${VERSION}`,
+    thirdParty: VERSION,
+    sourceAvailability: VERSION,
+    rustLicense: VERSION,
     ...overrides,
   };
 
@@ -99,6 +105,21 @@ function createFixture(overrides = {}) {
   writeJson(rootDir, "frontend/src/i18n/locales/zh/common.json", {
     poweredBy: values.zhPoweredBy,
   });
+  writeText(
+    rootDir,
+    "THIRD_PARTY_NOTICES.md",
+    `The v${values.thirdParty} production graphs include locked dependencies.\n`,
+  );
+  writeText(
+    rootDir,
+    "release-licenses/SOURCE_AVAILABILITY.md",
+    `MPL-2.0 components included in 苏小有 v${values.sourceAvailability}.\n`,
+  );
+  writeText(
+    rootDir,
+    "release-licenses/RUST-LICENSES.html",
+    `<a>suxiaoyou dependency</a><a href="#">suxiaoyou-desktop ${values.rustLicense}</a>\n`,
+  );
 
   return rootDir;
 }
@@ -124,6 +145,9 @@ test("reports every mismatched release consumer in one error", (t) => {
     cargoLock: "10.0.0",
     enPoweredBy: "Wrong product v0.7.3",
     zhPoweredBy: "苏小有 v9.0.0",
+    thirdParty: "11.0.0",
+    sourceAvailability: "12.0.0",
+    rustLicense: "13.0.0",
   });
   t.after(() => rmSync(rootDir, { recursive: true, force: true }));
 

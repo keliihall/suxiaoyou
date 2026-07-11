@@ -9,6 +9,7 @@ import {
   FolderClosed,
   FolderPlus,
   ListFilter,
+  Loader2,
   Maximize2,
   Minimize2,
   MessageSquare,
@@ -23,7 +24,7 @@ import { useSidebarStore, type OrganizeMode, type SortBy } from "@/stores/sideba
 
 interface ProjectsToolbarProps {
   projectDirectories?: string[];
-  variant?: "projects" | "chats";
+  variant?: "projects" | "chats" | "primary";
 }
 
 export function ProjectsToolbar({ projectDirectories = [], variant = "projects" }: ProjectsToolbarProps) {
@@ -68,24 +69,45 @@ export function ProjectsToolbar({ projectDirectories = [], variant = "projects" 
     router.push("/c/new");
   };
 
+  if (variant === "primary") {
+    return (
+      <nav
+        aria-label={`${t("addProject")} / ${t("newChat")}`}
+        data-testid="sidebar-primary-actions"
+        className="grid shrink-0 grid-cols-2 gap-1 border-b border-[var(--border-subtle)] px-3 pb-2 pt-1"
+      >
+        <button
+          type="button"
+          onClick={handleAddProject}
+          disabled={isPickingDirectory}
+          className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)] disabled:opacity-50"
+          aria-label={t("addProject")}
+        >
+          {isPickingDirectory ? (
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          ) : (
+            <FolderPlus className="h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="truncate">{t("addProject")}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={handleNewChat}
+          className="flex min-w-0 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)]"
+          aria-label={t("newChat")}
+        >
+          <SquarePen className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">{t("newChat")}</span>
+        </button>
+      </nav>
+    );
+  }
+
   if (variant === "chats") {
     return (
       <div className="flex items-center gap-0.5">
         <FilterPopover />
-
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={handleNewChat}
-              className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--sidebar-active)] hover:text-[var(--text-primary)]"
-              aria-label={t("newChat")}
-            >
-              <SquarePen className="h-3 w-3" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top">{t("newChat")}</TooltipContent>
-        </Tooltip>
       </div>
     );
   }
@@ -112,21 +134,6 @@ export function ProjectsToolbar({ projectDirectories = [], variant = "projects" 
       </Tooltip>
 
       <FilterPopover />
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            onClick={handleAddProject}
-            disabled={isPickingDirectory}
-            className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--sidebar-active)] hover:text-[var(--text-primary)] disabled:opacity-50"
-            aria-label={t("addProject")}
-          >
-            <FolderPlus className="h-3 w-3" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="top">{t("addProject")}</TooltipContent>
-      </Tooltip>
     </div>
   );
 }

@@ -13,6 +13,8 @@ export interface ActivityData {
   reasoningTexts: string[];
   toolParts: ToolPart[];
   thinkingDuration?: number;
+  /** True only while an unresolved interactive stream prompt exists. */
+  isAwaitingConfirmation?: boolean;
   stepParts: (StepStartPart | StepFinishPart)[];
   hasVisibleOutput?: boolean;
   /** Ordered chain of reasoning + tool items (preserves execution order). */

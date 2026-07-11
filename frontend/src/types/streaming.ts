@@ -1,5 +1,7 @@
 /** SSE event types — mirrors backend app/streaming/events.py */
 
+import type { InteractionResponseState } from "@/lib/interaction-response";
+
 export const SSE_EVENTS = {
   TEXT_DELTA: "text-delta",
   REASONING_DELTA: "reasoning-delta",
@@ -22,12 +24,17 @@ export const SSE_EVENTS = {
   ERROR: "error",
   COMPACTION_ERROR: "compaction-error",
   PLAN_REVIEW: "plan-review",
+  PLAN_REVIEW_RESOLVED: "plan-review-resolved",
   MODEL_LOADING: "model-loading",
   PERMISSION_RESOLVED: "permission-resolved",
   QUESTION_RESOLVED: "question-resolved",
   TASK_BATCH_START: "task-batch-start",
   TASK_BATCH_UPDATE: "task-batch-update",
   TASK_BATCH_FINISH: "task-batch-finish",
+  INPUT_QUEUED: "input-queued",
+  INPUT_APPLIED: "input-applied",
+  INPUT_STARTED: "input-started",
+  INPUT_FAILED: "input-failed",
 } as const;
 
 export interface TaskBatchProgressItem {
@@ -71,6 +78,12 @@ export interface SSEEventData {
   message?: string | null;
   arguments_truncated?: boolean | null;
 
+  // permission/question/plan resolved acknowledgement
+  prompt_type?: "permission" | "question" | "plan" | "unknown" | null;
+  decision?: string | null;
+  source?: string | null;
+  idempotent?: boolean | null;
+
   // question (legacy single-question mode)
   question?: string | null;
   options?: unknown[] | null;
@@ -103,8 +116,13 @@ export interface SSEEventData {
 
   // task-batch-start / task-batch-update / task-batch-finish
   batch_id?: string | null;
-  mode?: "sequential" | "parallel" | null;
+  mode?: "sequential" | "parallel" | "queue" | "steer" | null;
   tasks?: TaskBatchProgressItem[] | null;
+
+  // queued follow-up / steer lifecycle
+  input_id?: string | null;
+  position?: number | null;
+  error?: string | null;
 }
 
 /** Parsed SSE event with type and data. */
@@ -124,6 +142,10 @@ export interface PermissionRequest {
   arguments: Record<string, unknown>;
   message?: string | null;
   argumentsTruncated?: boolean;
+  responseState?: InteractionResponseState;
+  responseResolvedAt?: number | null;
+  responseDecision?: string | null;
+  responseSource?: string | null;
 }
 
 /** Single option within a multi-question item. */
@@ -146,6 +168,10 @@ export interface QuestionRequest {
   callId: string;
   tool: string;
   arguments: Record<string, unknown>;
+  responseState?: InteractionResponseState;
+  responseResolvedAt?: number | null;
+  responseDecision?: string | null;
+  responseSource?: string | null;
 }
 
 /** Plan review request from SSE stream. */
@@ -154,4 +180,8 @@ export interface PlanReviewRequest {
   title: string;
   plan: string;
   filesToModify: string[];
+  responseState?: InteractionResponseState;
+  responseResolvedAt?: number | null;
+  responseDecision?: string | null;
+  responseSource?: string | null;
 }

@@ -156,11 +156,11 @@ const required = [
 const forbidden = [
   {
     path: join(internal, "app", "channels", "bridge"),
-    why: "unfinished WhatsApp bridge must not be included in v0.7.3",
+    why: "unfinished WhatsApp bridge must not be included in release bundles",
   },
   {
     path: join(internal, "app", "data", "skills_catalog.json"),
-    why: "unreviewed remote skill catalog was removed from v0.7.3",
+    why: "unreviewed remote skill catalog must not be included in release bundles",
   },
   {
     path: join(internal, "app", "data", "skills", "doc-coauthoring"),

@@ -56,8 +56,10 @@ export interface 苏小有MockState {
   memoryUpdates: unknown[];
   fileUploads: string[];
   attachedPaths: string[];
+  ingestRequests: Array<Record<string, unknown>>;
   binaryReads: string[];
   systemOpenRequests: Array<Record<string, unknown>>;
+  systemRevealRequests: Array<Record<string, unknown>>;
   compactRequests: unknown[];
   sessionUpdates: unknown[];
   sessionDeletes: string[];
@@ -1626,8 +1628,10 @@ export async function mock苏小有Api(
     memoryUpdates: [],
     fileUploads: [],
     attachedPaths: [],
+    ingestRequests: [],
     binaryReads: [],
     systemOpenRequests: [],
+    systemRevealRequests: [],
     compactRequests: [],
     sessionUpdates: [],
     sessionDeletes: [],
@@ -2122,12 +2126,17 @@ export async function mock苏小有Api(
     }
     if (path === "/api/chat/abort") {
       state.abortRequests.push(requestJson(request));
-      return fulfillJson(route, { success: true });
+      return fulfillJson(route, { status: "aborted" });
     }
 
     if (path === "/api/files/open-system" && method === "POST") {
       const body = (requestJson(request) ?? {}) as Record<string, unknown>;
       state.systemOpenRequests.push(body);
+      return fulfillJson(route, { status: "ok" });
+    }
+    if (path === "/api/files/reveal-system" && method === "POST") {
+      const body = (requestJson(request) ?? {}) as Record<string, unknown>;
+      state.systemRevealRequests.push(body);
       return fulfillJson(route, { status: "ok" });
     }
 
@@ -2145,6 +2154,7 @@ export async function mock苏小有Api(
         "launch-board-deck.pptx",
         "vendor-terms-summary.pdf",
         "dragged-note.md",
+        "folderless-notes.txt",
       ];
       const filename =
         knownUploadNames.find((name) =>
@@ -2211,8 +2221,12 @@ export async function mock苏小有Api(
         }),
       );
     }
-    if (path === "/api/files/ingest")
+    if (path === "/api/files/ingest") {
+      state.ingestRequests.push(
+        (requestJson(request) ?? {}) as Record<string, unknown>,
+      );
       return fulfillJson(route, { success: true });
+    }
     if (path === "/api/files/content-binary") {
       const body = requestJson(request) as { path?: string } | null;
       const filePath = body?.path ?? "";

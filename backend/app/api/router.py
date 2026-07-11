@@ -11,6 +11,7 @@ from app.api import workspace_memory as workspace_memory_api
 from app.api import channels as channels_api
 from app.api import ollama as ollama_api
 from app.api import chat as chat_api
+from app.api import session_inputs as session_inputs_api
 from app.api import config as config_api
 from app.api import connectors as connectors_api
 from app.api import files as files_api
@@ -32,6 +33,7 @@ api_router = APIRouter()
 
 api_router.include_router(models_api.router, tags=["models"])
 api_router.include_router(chat_api.router, tags=["chat"])
+api_router.include_router(session_inputs_api.router, tags=["chat-inputs"])
 api_router.include_router(agents_api.router, tags=["agents"])
 api_router.include_router(tools_api.router, tags=["tools"])
 api_router.include_router(skills_api.router, tags=["skills"])

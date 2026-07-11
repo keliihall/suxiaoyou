@@ -51,6 +51,7 @@ from app.session.retry import (
 from app.streaming.events import (
     AGENT_ERROR,
     DONE,
+    INPUT_STARTED,
     MODEL_LOADING,
     PERMISSION_REQUEST,
     REASONING_DELTA,
@@ -73,6 +74,7 @@ from app.session.utils import (
     llm_messages_have_image_content as _llm_messages_have_image_content,
     repair_tool_call_payload as _repair_tool_call_payload,
 )
+from app.utils.atomic_write import atomic_write_text
 from app.utils.id import generate_ulid
 
 if TYPE_CHECKING:
@@ -313,7 +315,7 @@ async def _save_artifact_as_file(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_path = output_dir / filename
-        file_path.write_text(content, encoding="utf-8")
+        atomic_write_text(file_path, content)
 
         await _track_session_file(
             session_factory,
@@ -340,6 +342,7 @@ async def run_generation(
     tool_registry: ToolRegistry,
     index_manager: Any | None = None,
     skip_user_message: bool = False,
+    idempotency_record_id: str | None = None,
 ) -> None:
     """Run the full agent generation loop.
 
@@ -348,18 +351,176 @@ async def run_generation(
     """
     from app.session.prompt import SessionPrompt
 
+    from app.session.input_queue import (
+        block_unstarted_inputs_for_stream,
+        claim_next_generation_input,
+        finish_session_input,
+    )
+
+    current_request = request
+    current_input_id: str | None = None
+    current_skip_user_message = skip_user_message
+    prompt: SessionPrompt | None = None
+    chain_total_cost = 0.0
+    record_status = "accepted"
+    record_error: str | None = None
+    saw_generation_error = False
+
+    async def close_and_block_remaining_inputs(error_message: str) -> None:
+        async with job.session_input_lock:
+            job.close_session_input_admission()
+            try:
+                async with session_factory() as db:
+                    async with db.begin():
+                        await block_unstarted_inputs_for_stream(
+                            db,
+                            session_id=job.session_id,
+                            stream_id=job.stream_id,
+                            error_message=error_message,
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to block remaining inputs for stream %s",
+                    job.stream_id,
+                    exc_info=True,
+                )
+
     try:
-        prompt = SessionPrompt(
-            job,
-            request,
-            session_factory=session_factory,
-            provider_registry=provider_registry,
-            agent_registry=agent_registry,
-            tool_registry=tool_registry,
-            index_manager=index_manager,
-            skip_user_message=skip_user_message,
-        )
-        await prompt.run()
+        if idempotency_record_id is not None:
+            from app.session.idempotency import mark_idempotency_status
+
+            async with session_factory() as db:
+                async with db.begin():
+                    await mark_idempotency_status(
+                        db,
+                        idempotency_record_id,
+                        status="running",
+                    )
+            record_status = "running"
+
+        while True:
+            # The replay list is capped and trims from the front.  A list index
+            # captured here becomes invalid once a long task crosses 5,000
+            # events, so use the monotonic event id as the generation boundary.
+            event_start_id = job._event_counter
+            prompt = SessionPrompt(
+                job,
+                current_request,
+                session_factory=session_factory,
+                provider_registry=provider_registry,
+                agent_registry=agent_registry,
+                tool_registry=tool_registry,
+                index_manager=index_manager,
+                skip_user_message=current_skip_user_message,
+            )
+            await prompt.run(publish_done=False)
+            chain_total_cost += prompt.total_cost
+
+            generation_error = next(
+                (
+                    event
+                    for event in job.events
+                    if event.event == AGENT_ERROR
+                    and event.id is not None
+                    and event.id > event_start_id
+                ),
+                None,
+            )
+            if generation_error is not None:
+                saw_generation_error = True
+            if current_input_id is not None:
+                async with session_factory() as db:
+                    async with db.begin():
+                        if job.abort_event.is_set():
+                            await finish_session_input(
+                                db,
+                                current_input_id,
+                                status="blocked",
+                                applied_stream_id=job.stream_id,
+                                error_message="Task stopped before this queued input completed",
+                            )
+                        elif generation_error is not None:
+                            await finish_session_input(
+                                db,
+                                current_input_id,
+                                status="failed",
+                                applied_stream_id=job.stream_id,
+                                error_message=str(
+                                    generation_error.data.get("error_message")
+                                    or "Queued input failed"
+                                ),
+                            )
+                        else:
+                            await finish_session_input(
+                                db,
+                                current_input_id,
+                                status="consumed",
+                                applied_stream_id=job.stream_id,
+                            )
+
+            if job.abort_event.is_set() or generation_error is not None:
+                await close_and_block_remaining_inputs(
+                    "Task was stopped before this queued input started"
+                    if job.abort_event.is_set()
+                    else "The owning task failed before this queued input started"
+                )
+                break
+
+            # Admission and the final empty check must be atomic with respect
+            # to POST /chat/inputs, otherwise a just-accepted follow-up can be
+            # stranded as this stream exits.
+            async with job.session_input_lock:
+                if job.abort_event.is_set():
+                    next_input = None
+                else:
+                    async with session_factory() as db:
+                        async with db.begin():
+                            next_input = await claim_next_generation_input(
+                                db,
+                                job.session_id,
+                                target_stream_id=job.stream_id,
+                            )
+                if next_input is None:
+                    job.close_session_input_admission()
+            if next_input is None:
+                break
+
+            current_input_id = next_input.id
+            current_skip_user_message = False
+            current_request = PromptRequest(
+                session_id=job.session_id,
+                text=next_input.text,
+                model=next_input.model_id,
+                provider_id=next_input.provider_id,
+                agent=next_input.agent,
+                attachments=next_input.attachments or [],
+                permission_presets=next_input.permission_presets,
+                permission_rules=next_input.permission_rules,
+                reasoning=next_input.reasoning,
+                workspace=next_input.workspace,
+            )
+            job.publish(
+                SSEEvent(
+                    INPUT_STARTED,
+                    {
+                        "input_id": next_input.id,
+                        "mode": next_input.mode,
+                        "position": next_input.position,
+                        "session_id": job.session_id,
+                    },
+                )
+            )
+
+        if prompt is not None:
+            prompt.total_cost = chain_total_cost
+            prompt.publish_done()
+        if job.abort_event.is_set():
+            record_status = "stopped"
+        elif saw_generation_error:
+            record_status = "failed"
+            record_error = "Generation reported an agent error"
+        else:
+            record_status = "completed"
     except IntegrityError:
         # Session was deleted while generation was in-flight — notify frontend
         # so it can exit the generating state, then stop.
@@ -372,10 +533,80 @@ async def run_generation(
             "session_id": job.session_id,
             "finish_reason": "aborted",
         }))
+        record_status = "interrupted"
+        record_error = "Session was deleted while generation was running"
+    except asyncio.CancelledError:
+        record_status = "interrupted"
+        record_error = "Generation was cancelled before completion"
+        if current_input_id is not None:
+            try:
+                async with session_factory() as db:
+                    async with db.begin():
+                        await finish_session_input(
+                            db,
+                            current_input_id,
+                            status="blocked",
+                            applied_stream_id=job.stream_id,
+                            error_message=(
+                                "Task was cancelled before this queued input completed"
+                            ),
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to block cancelled queued input %s",
+                    current_input_id,
+                    exc_info=True,
+                )
+        await close_and_block_remaining_inputs(
+            "Task was cancelled before this queued input started"
+        )
+        raise
     except Exception:
         logger.exception("Generation error for stream %s", job.stream_id)
+        if current_input_id is not None:
+            try:
+                async with session_factory() as db:
+                    async with db.begin():
+                        await finish_session_input(
+                            db,
+                            current_input_id,
+                            status="failed",
+                            applied_stream_id=job.stream_id,
+                            error_message="Queued input failed with an internal error",
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to persist queued input failure %s",
+                    current_input_id,
+                    exc_info=True,
+                )
+        await close_and_block_remaining_inputs(
+            "The owning task failed before this queued input started"
+        )
         job.publish(SSEEvent(AGENT_ERROR, {"error_message": "An internal error occurred. Please try again."}))
+        record_status = "failed"
+        record_error = "Generation failed with an internal error"
     finally:
+        async with job.session_input_lock:
+            job.close_session_input_admission()
+        if idempotency_record_id is not None:
+            try:
+                from app.session.idempotency import mark_idempotency_status
+
+                async with session_factory() as db:
+                    async with db.begin():
+                        await mark_idempotency_status(
+                            db,
+                            idempotency_record_id,
+                            status=record_status,
+                            error_message=record_error,
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to finalize idempotency record %s",
+                    idempotency_record_id,
+                    exc_info=True,
+                )
         job.complete()
 
 
@@ -1486,6 +1717,13 @@ async def _ask_permission(
     permission_call_id = generate_ulid()
     arguments, truncated = _permission_arguments_for_event(tool_args)
     message = _permission_message(tool_name, arguments, truncated)
+    job.register_response_request(
+        permission_call_id,
+        prompt_type="permission",
+        timeout=300.0,
+        tool_call_id=call_id,
+        tool=tool_name,
+    )
     job.publish(
         SSEEvent(
             PERMISSION_REQUEST,

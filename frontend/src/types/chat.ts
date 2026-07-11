@@ -7,11 +7,12 @@ export interface FileAttachment {
   path: string;
   size: number;
   mime_type: string;
-  source?: "referenced" | "uploaded";
+  source?: "referenced" | "uploaded" | "managed";
   content_hash?: string;
 }
 
 export interface PromptRequest {
+  client_request_id?: string;
   session_id?: string | null;
   text: string;
   model?: string | null;
@@ -27,6 +28,38 @@ export interface PromptRequest {
 export interface PromptResponse {
   stream_id: string;
   session_id: string;
+}
+
+export type SessionInputMode = "queue" | "steer";
+export type SessionInputStatus = "queued" | "applying" | "blocked" | "consumed" | "failed" | "cancelled";
+
+/** A follow-up submitted while the session already has an active generation. */
+export interface SessionInputRequest {
+  session_id: string;
+  client_request_id: string;
+  mode: SessionInputMode;
+  text: string;
+  attachments?: FileAttachment[];
+  model?: string | null;
+  provider_id?: string | null;
+  agent?: string;
+  workspace?: string | null;
+  reasoning?: boolean | null;
+  permission_presets?: Record<string, boolean> | null;
+  permission_rules?: Array<{ action: "allow" | "deny"; permission: string; pattern?: string }> | null;
+}
+
+export interface SessionInputResponse {
+  id: string;
+  session_id: string;
+  client_request_id: string;
+  mode: SessionInputMode;
+  status: SessionInputStatus;
+  position: number;
+  text: string;
+  attachments: FileAttachment[];
+  target_stream_id?: string | null;
+  error_message?: string | null;
 }
 
 export type TaskBatchMode = "sequential" | "parallel";
@@ -68,4 +101,15 @@ export interface RespondRequest {
   stream_id: string;
   call_id: string;
   response: unknown;
+}
+
+export interface RespondResult {
+  status: "accepted" | "already_resolved";
+  call_id: string;
+  tool_call_id?: string | null;
+  tool?: string | null;
+  prompt_type: "permission" | "question" | "plan" | "unknown";
+  decision: string;
+  source: string;
+  idempotent: boolean;
 }

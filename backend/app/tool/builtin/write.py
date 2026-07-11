@@ -8,6 +8,7 @@ from typing import Any
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
 from app.tool.workspace import WorkspaceViolation, resolve_for_write
+from app.utils.atomic_write import atomic_write_text
 
 
 class WriteTool(ToolDefinition):
@@ -59,8 +60,7 @@ class WriteTool(ToolDefinition):
 
             existed = os.path.exists(file_path)
 
-            with open(file_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(content)
+            atomic_write_text(file_path, content)
 
             lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
             action = "已更新" if existed else "已创建"

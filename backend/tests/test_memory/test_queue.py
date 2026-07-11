@@ -246,6 +246,7 @@ class TestProcess:
             assert not h1_task.done()
 
             q.clear()
+
             q.add("new", "/new", [{"role": "user", "content": "new"}])
             h2 = q._timer
             assert h2 is not None
@@ -267,6 +268,36 @@ class TestProcess:
             assert q._processing is False
         finally:
             q.clear()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_inflight_refresh(self, session_factory):
+        q = WorkspaceMemoryUpdateQueue(
+            session_factory,
+            MagicMock(),
+            debounce_seconds=0,
+        )
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def refresh(_ctx):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        q._refresh_workspace_memory = refresh
+        q.add("s1", "/project", [{"role": "user", "content": "remember"}])
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await asyncio.wait_for(q.shutdown(), timeout=1)
+
+        assert cancelled.is_set()
+        assert q._timer is None
+        assert q._pending == {}
+        assert q._process_tasks == set()
+        assert q._processing is False
 
 
 class TestRefreshWorkspaceMemory:
