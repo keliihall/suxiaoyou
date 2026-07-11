@@ -29,6 +29,10 @@ const EXPECTED_NODE_VERSION = `v${nodeVersionMatch[1]}`;
 const EXPECTED_BUNDLE_IDENTIFIER = "com.chaoyuanxinzhi.suxiaoyou";
 const EXPECTED_PRODUCT_NAME = "苏小有";
 const SUPPORTED_ARCHITECTURES = new Set(["arm64", "x86_64"]);
+const DISALLOWED_BUNDLE_XATTRS = Object.freeze([
+  "com.apple.FinderInfo",
+  "com.apple.ResourceFork",
+]);
 
 export const REQUIRED_RELEASE_LICENSE_FILES = Object.freeze([
   "licenses/LICENSE",
@@ -106,15 +110,26 @@ export async function verifyMacOSBundle(
   const resources = join(contents, "Resources");
   const infoPlist = join(contents, "Info.plist");
   const backend = join(resources, "backend");
+  const backendExecutable = join(backend, "suxiaoyou-backend");
   const nodeBinary = join(resources, "nodejs", "bin", "node");
   requirePath(infoPlist, "Info.plist");
   requirePath(backend, "embedded backend");
+  requirePath(backendExecutable, "embedded backend executable");
   requirePath(nodeBinary, "bundled Node binary");
   for (const relativePath of REQUIRED_RELEASE_LICENSE_FILES) {
     requirePath(
       join(resources, relativePath),
       `bundled release license ${relativePath}`,
     );
+  }
+
+  const recursiveXattrs = await commandText(runCommand, "xattr", ["-lr", app]);
+  for (const attribute of DISALLOWED_BUNDLE_XATTRS) {
+    if (recursiveXattrs.includes(`${attribute}:`)) {
+      throw new Error(
+        `app bundle contains disallowed extended attribute ${attribute}`,
+      );
+    }
   }
 
   const info = {};
@@ -202,6 +217,11 @@ export async function verifyMacOSBundle(
     ]);
   }
 
+  const backendHelp = await commandText(runCommand, backendExecutable, ["--help"]);
+  if (!backendHelp.includes("--port") || !backendHelp.includes("--data-dir")) {
+    throw new Error("embedded backend --help output is incomplete");
+  }
+
   await runCommand(process.execPath, [verifyBundleScript, backend], {
     env: {
       ...process.env,
@@ -215,6 +235,7 @@ export async function verifyMacOSBundle(
       `minOS=${expectedMinimumSystemVersion}, Node=${nodeVersion}/${nodeArchitecture}, ` +
       `signature=${verifySignature ? "verified" : "not requested"}, ` +
       `${REQUIRED_RELEASE_LICENSE_FILES.length} license resources present, ` +
+      "backend preflight=passed, " +
       `backend smoke=${skipBackendSmoke ? "explicitly skipped" : "passed"}`,
   );
   return {
@@ -226,6 +247,7 @@ export async function verifyMacOSBundle(
     nodeArchitecture,
     nodeVersion,
     signatureVerified: verifySignature,
+    backendPreflightPassed: true,
     backendSmokeSkipped: skipBackendSmoke,
     releaseLicenseCount: REQUIRED_RELEASE_LICENSE_FILES.length,
   };

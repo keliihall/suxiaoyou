@@ -104,11 +104,25 @@ function commandRunner(fixture, overrides = {}) {
         stderr: "",
       };
     }
+    if (command === "xattr") {
+      return { stdout: overrides.xattrs ?? "", stderr: "" };
+    }
     if (command === fixture.node && args[0] === "--version") {
       return { stdout: `${overrides.nodeVersion ?? "v22.22.0"}\n`, stderr: "" };
     }
     if (command === fixture.node && args[0] === "-p") {
       return { stdout: `${overrides.nodeArch ?? "arm64"}\n`, stderr: "" };
+    }
+    if (command === fixture.backendExecutable && args[0] === "--help") {
+      if (overrides.backendHelpError) {
+        throw new Error(overrides.backendHelpError);
+      }
+      return {
+        stdout:
+          overrides.backendHelp ??
+          "usage: suxiaoyou-backend [-h] [--port PORT] [--data-dir DATA_DIR]\n",
+        stderr: "",
+      };
     }
     if (command === process.execPath && args[0].endsWith("verify-bundle.mjs")) {
       return { stdout: "bundle verified\n", stderr: "" };
@@ -133,6 +147,7 @@ test("checks every Mach-O, Node, Info.plist, and the embedded backend", async ()
   assert.equal(result.machOCount, 3);
   assert.equal(result.nodeVersion, "v22.22.0");
   assert.equal(result.bundleIdentifier, "com.chaoyuanxinzhi.suxiaoyou");
+  assert.equal(result.backendPreflightPassed, true);
   assert.equal(result.releaseLicenseCount, REQUIRED_RELEASE_LICENSE_FILES.length);
   assert.equal(
     runner.calls.filter(({ command }) => command === "file").length,
@@ -141,6 +156,18 @@ test("checks every Mach-O, Node, Info.plist, and the embedded backend", async ()
   );
   assert.equal(runner.calls.filter(({ command }) => command === "lipo").length, 3);
   assert.equal(runner.calls.filter(({ command }) => command === "vtool").length, 3);
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === "xattr" && args.join(" ") === `-lr ${fixture.app}`,
+    ),
+  );
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === fixture.backendExecutable && args.join(" ") === "--help",
+    ),
+  );
   assert.ok(
     runner.calls.some(
       ({ command, args }) =>
@@ -196,12 +223,67 @@ test("can explicitly skip only the embedded backend smoke", async () => {
   });
 
   assert.equal(result.backendSmokeSkipped, true);
+  assert.equal(result.backendPreflightPassed, true);
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === fixture.backendExecutable && args.join(" ") === "--help",
+    ),
+    "the no-port backend preflight must never be skipped",
+  );
   const backendVerification = runner.calls.find(
     ({ command, args }) =>
       command === process.execPath && args[0].endsWith("verify-bundle.mjs"),
   );
   assert.equal(backendVerification.options.env.VERIFY_BUNDLE_SKIP_SMOKE, "1");
 });
+
+test("rejects a backend that cannot execute even when full smoke is skipped", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, {
+    backendHelpError: "different Team IDs while loading libpython3.12.dylib",
+  });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+      skipBackendSmoke: true,
+    }),
+    /different Team IDs.*libpython3\.12\.dylib/,
+  );
+  assert.equal(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === process.execPath && args[0].endsWith("verify-bundle.mjs"),
+    ),
+    false,
+  );
+});
+
+for (const attribute of ["com.apple.FinderInfo", "com.apple.ResourceFork"]) {
+  test(`rejects disallowed recursive xattr ${attribute}`, async () => {
+    const fixture = appFixture();
+    const runner = commandRunner(fixture, {
+      xattrs: `${fixture.backendExecutable}: ${attribute}:\n00000000`,
+    });
+
+    await assert.rejects(
+      verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+        runCommand: runner.runCommand,
+        log: () => {},
+      }),
+      new RegExp(`disallowed extended attribute ${attribute.replaceAll(".", "\\.")}`),
+    );
+    assert.equal(
+      runner.calls.some(
+        ({ command, args }) =>
+          command === fixture.backendExecutable && args.join(" ") === "--help",
+      ),
+      false,
+    );
+  });
+}
 
 test("rejects a Mach-O that is not exactly the requested architecture", async () => {
   const fixture = appFixture();

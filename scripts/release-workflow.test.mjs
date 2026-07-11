@@ -21,6 +21,10 @@ const backendRequirements = readFileSync(
   "utf8",
 );
 const backendProject = readFileSync(join(root, "backend/pyproject.toml"), "utf8");
+const backendAdHocEntitlements = readFileSync(
+  join(root, "desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"),
+  "utf8",
+);
 const nodeEntitlements = readFileSync(
   join(root, "desktop-tauri/src-tauri/entitlements.node.plist"),
   "utf8",
@@ -301,8 +305,13 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   const verify = mac.indexOf("Verify repaired app before signing");
   const importCertificate = mac.indexOf("Import Apple certificate and discover signing identity");
   const sign = mac.indexOf("Sign nested Mach-O files and app");
+  const verifySigned = mac.indexOf("Verify signed app runtime");
   const createDmg = mac.indexOf("Create final DMG");
   const notarize = mac.indexOf("Notarize and staple final DMG");
+  const signStep = step(mac, "Sign nested Mach-O files and app");
+  const verifySignedStep = step(mac, "Verify signed app runtime");
+  const createDmgStep = step(mac, "Create final DMG");
+  const finalDmgStep = step(mac, "Verify final DMG contents");
 
   assert.ok(repair >= 0 && sign > repair, "signing must follow framework repair");
   assert.ok(verify > repair, "the repaired app must be verified before secrets are imported");
@@ -310,7 +319,8 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
     importCertificate > verify && sign > importCertificate,
     "the Apple certificate must only be imported after build verification and immediately before signing",
   );
-  assert.ok(createDmg > sign, "DMG must be created after app signing");
+  assert.ok(verifySigned > sign, "signed app runtime must be verified after signing");
+  assert.ok(createDmg > verifySigned, "DMG must be created after signed runtime verification");
   assert.ok(notarize > createDmg, "the final DMG must be the notarized object");
   assert.match(mac, /security find-identity/);
   assert.match(mac, /\^Developer ID Application:/);
@@ -326,6 +336,21 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
     assert.match(mac, new RegExp(`${escapeRegExp(entitlement)}[\\s\\S]*grep -q`));
   }
   assert.match(mac, /desktop-tauri\/src-tauri\/entitlements\.node\.plist/);
+  assert.match(
+    backendAdHocEntitlements,
+    /<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\/>/,
+  );
+  assert.equal((backendAdHocEntitlements.match(/<true\/>/g) ?? []).length, 1);
+  assert.equal((backendAdHocEntitlements.match(/<key>/g) ?? []).length, 1);
+  for (const entitlement of [
+    "com.apple.security.get-task-allow",
+    "com.apple.security.cs.allow-dyld-environment-variables",
+    "com.apple.security.cs.disable-executable-page-protection",
+    "com.apple.security.cs.allow-jit",
+    "com.apple.security.cs.allow-unsigned-executable-memory",
+  ]) {
+    assert.doesNotMatch(backendAdHocEntitlements, new RegExp(escapeRegExp(entitlement)));
+  }
   assert.match(nodeEntitlements, /com\.apple\.security\.cs\.allow-jit/);
   assert.match(nodeEntitlements, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
   assert.equal((nodeEntitlements.match(/<true\/>/g) ?? []).length, 2);
@@ -340,6 +365,42 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.doesNotMatch(mac, /codesign -d --entitlements :-/);
   assert.doesNotMatch(mac, /plutil -(?:extract|remove) com\.apple\.security/);
   assert.doesNotMatch(mac, /codesign --force[^\n]*--deep/);
+  assert.match(
+    signStep,
+    /BACKEND_BINARY="\$APP_PATH\/Contents\/Resources\/backend\/suxiaoyou-backend"/,
+  );
+  assert.match(
+    signStep,
+    /BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri\/src-tauri\/entitlements\.backend-adhoc\.plist"/,
+  );
+  assert.match(
+    signStep,
+    /elif \[\[ "\$SIGNING_IDENTITY" == "-" && "\$candidate" == "\$BACKEND_BINARY" \]\]; then\s+codesign "\$\{SIGN_ARGS\[@\]\}" --entitlements "\$BACKEND_ADHOC_ENTITLEMENTS" "\$candidate"/,
+  );
+  assert.equal(
+    (signStep.match(/--entitlements "\$BACKEND_ADHOC_ENTITLEMENTS"/g) ?? []).length,
+    1,
+    "backend library-validation entitlement must only be applied by the ad-hoc branch",
+  );
+  assert.match(
+    signStep,
+    /if \[\[ "\$SIGNING_IDENTITY" == "-" \]\]; then[\s\S]*grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*elif grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*Developer ID backend must not disable library validation/,
+  );
+  assert.match(verifySignedStep, /verify-macos-bundle\.mjs[^\n]*--verify-signature/);
+  assert.doesNotMatch(verifySignedStep, /--skip-backend-smoke|VERIFY_BUNDLE_SKIP_SMOKE/);
+  assert.match(createDmgStep, /hdiutil create[^\n]*-fs APFS[^\n]*-format UDZO/);
+  assert.match(
+    finalDmgStep,
+    /ditto "\$MOUNT_DIRECTORY\/苏小有\.app" "\$INSTALL_TEST_DIRECTORY\/苏小有\.app"/,
+  );
+  assert.match(
+    finalDmgStep,
+    /verify-macos-bundle\.mjs "\$MOUNT_DIRECTORY\/苏小有\.app"[^\n]*--verify-signature/,
+  );
+  assert.match(
+    finalDmgStep,
+    /verify-macos-bundle\.mjs "\$INSTALL_TEST_DIRECTORY\/苏小有\.app"[^\n]*--verify-signature/,
+  );
   assert.match(mac, /notarytool submit "\$DMG_PATH"/);
   assert.match(mac, /stapler staple "\$DMG_PATH"/);
   assert.match(mac, /stapler validate "\$DMG_PATH"/);

@@ -316,8 +316,11 @@ jobs:
         run: |
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
+          BACKEND_BINARY="$APP_PATH/Contents/Resources/backend/suxiaoyou-backend"
+          BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"
           NODE_BINARY="$APP_PATH/Contents/Resources/nodejs/bin/node"
           NODE_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.node.plist"
+          SIGNED_BACKEND_ENTITLEMENTS="$RUNNER_TEMP/signed-backend-entitlements.plist"
           SIGNED_NODE_ENTITLEMENTS="$RUNNER_TEMP/signed-node-entitlements.plist"
           MACHO_LIST="$RUNNER_TEMP/macho-files.txt"
 
@@ -351,6 +354,8 @@ jobs:
             if file -b "$candidate" | grep -q "Mach-O"; then
               if [[ "$candidate" == "$NODE_BINARY" ]]; then
                 codesign "${SIGN_ARGS[@]}" --entitlements "$NODE_ENTITLEMENTS" "$candidate"
+              elif [[ "$SIGNING_IDENTITY" == "-" && "$candidate" == "$BACKEND_BINARY" ]]; then
+                codesign "${SIGN_ARGS[@]}" --entitlements "$BACKEND_ADHOC_ENTITLEMENTS" "$candidate"
               else
                 codesign "${SIGN_ARGS[@]}" "$candidate"
               fi
@@ -362,6 +367,14 @@ jobs:
           done < <(find "$APP_PATH" -type d -name '*.framework' -print0)
 
           codesign "${SIGN_ARGS[@]}" "$APP_PATH"
+
+          codesign -d --entitlements - "$BACKEND_BINARY" > "$SIGNED_BACKEND_ENTITLEMENTS" 2>/dev/null
+          if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+            grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"
+          elif grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"; then
+            echo "::error::Developer ID backend must not disable library validation"
+            exit 1
+          fi
 
           codesign -d --entitlements - "$NODE_BINARY" > "$SIGNED_NODE_ENTITLEMENTS" 2>/dev/null
           for required in \
@@ -385,6 +398,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign -dv --verbose=4 "$APP_PATH" 2>&1
 
+      - name: Verify signed app runtime
+        run: |
+          set -euo pipefail
+          APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
+          node scripts/verify-macos-bundle.mjs "$APP_PATH" "$BUNDLE_ARCH" 13.3 --verify-signature
+
       - name: Create final DMG
         run: |
           set -euo pipefail
@@ -399,7 +418,7 @@ jobs:
           rm -f "$DMG_DIRECTORY"/*.dmg
           ditto "$APP_PATH" "$STAGING_DIRECTORY/苏小有.app"
           ln -s /Applications "$STAGING_DIRECTORY/Applications"
-          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -ov -format UDZO "$DMG_PATH"
+          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH"
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG
@@ -443,18 +462,21 @@ jobs:
           VERSION="$(node -p "require('./package.json').version")"
           DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
           MOUNT_DIRECTORY="$(mktemp -d)"
+          INSTALL_TEST_DIRECTORY="$(mktemp -d)"
           cleanup() {
             hdiutil detach "$MOUNT_DIRECTORY" >/dev/null 2>&1 || true
-            rm -rf "$MOUNT_DIRECTORY"
+            rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
           }
           trap cleanup EXIT
 
           hdiutil verify "$DMG_PATH"
           hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIRECTORY" "$DMG_PATH"
           node scripts/verify-macos-bundle.mjs "$MOUNT_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 13.3 --verify-signature
+          ditto "$MOUNT_DIRECTORY/苏小有.app" "$INSTALL_TEST_DIRECTORY/苏小有.app"
+          node scripts/verify-macos-bundle.mjs "$INSTALL_TEST_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 13.3 --verify-signature
           hdiutil detach "$MOUNT_DIRECTORY"
           trap - EXIT
-          rm -rf "$MOUNT_DIRECTORY"
+          rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
 
       - name: Remove temporary Apple keychain
         if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
