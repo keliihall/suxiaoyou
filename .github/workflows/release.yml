@@ -115,6 +115,13 @@ jobs:
           pip-audit -r requirements.txt
           pytest -q
 
+      - name: Prepare placeholder Tauri resources for Rust validation
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          mkdir -p \
+            ../../backend/dist/suxiaoyou-backend \
+            ../../backend/resources/nodejs
+
       - name: Validate Rust desktop graph
         run: |
           cargo metadata --locked --format-version 1 >/dev/null

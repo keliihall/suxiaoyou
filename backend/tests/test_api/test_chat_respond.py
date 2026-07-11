@@ -207,6 +207,25 @@ async def test_response_commit_wins_over_timeout_in_commit_wake_window(
         tool_call_id="question-tool-timeout-race",
         tool="question",
     )
+
+    class ObservableLock:
+        """Expose when the timed-out waiter blocks behind the DB commit."""
+
+        def __init__(self) -> None:
+            self._lock = asyncio.Lock()
+            self.contended = asyncio.Event()
+
+        async def __aenter__(self):
+            if self._lock.locked():
+                self.contended.set()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            self._lock.release()
+
+    resolution_lock = ObservableLock()
+    job.response_resolution_lock = resolution_lock
     persist_entered = asyncio.Event()
     release_persist = asyncio.Event()
     original_persist = chat_api._persist_interaction_resolution
@@ -221,7 +240,6 @@ async def test_response_commit_wins_over_timeout_in_commit_wake_window(
         "_persist_interaction_resolution",
         gated_persist,
     )
-    waiter = asyncio.create_task(job.wait_for_response(prompt.call_id, timeout=0.01))
     submit = asyncio.create_task(
         app_client.post(
             "/api/chat/respond",
@@ -232,15 +250,33 @@ async def test_response_commit_wins_over_timeout_in_commit_wake_window(
             },
         )
     )
-    await asyncio.wait_for(persist_entered.wait(), timeout=1)
-    await asyncio.sleep(0.03)
-    assert not waiter.done()
+    waiter: asyncio.Task[str] | None = None
+    try:
+        # Start the submitter first so it deterministically owns the response
+        # lock before the short waiter timeout begins.  The wider deadline is
+        # for overloaded shared CI runners, not product timing semantics.
+        await asyncio.wait_for(persist_entered.wait(), timeout=10)
+        waiter = asyncio.create_task(
+            job.wait_for_response(prompt.call_id, timeout=0.01)
+        )
+        await asyncio.wait_for(resolution_lock.contended.wait(), timeout=10)
+        assert not waiter.done()
 
-    release_persist.set()
-    response = await asyncio.wait_for(submit, timeout=1)
+        release_persist.set()
+        response = await asyncio.wait_for(submit, timeout=10)
 
-    assert response.status_code == 200
-    assert await asyncio.wait_for(waiter, timeout=1) == "Accepted before timeout"
+        assert response.status_code == 200
+        assert (
+            await asyncio.wait_for(waiter, timeout=10)
+            == "Accepted before timeout"
+        )
+    finally:
+        release_persist.set()
+        tasks = [task for task in (submit, waiter) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

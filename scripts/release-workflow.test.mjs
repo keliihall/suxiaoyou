@@ -43,6 +43,15 @@ function job(name) {
   return next === -1 ? rest : rest.slice(0, next);
 }
 
+function ciJob(name) {
+  const heading = `  ${name}:`;
+  const start = ciWorkflow.indexOf(`${heading}\n`);
+  assert.notEqual(start, -1, `missing CI ${name} job`);
+  const rest = ciWorkflow.slice(start + heading.length + 1);
+  const next = rest.search(/^  [a-zA-Z0-9_-]+:\s*$/m);
+  return next === -1 ? rest : rest.slice(0, next);
+}
+
 function step(jobText, name) {
   const heading = `      - name: ${name}`;
   const start = jobText.indexOf(`${heading}\n`);
@@ -208,6 +217,96 @@ test("uses locked desktop tooling and sanitized frontend output on every platfor
     assert.match(build, /npm run build:frontend/);
     assert.doesNotMatch(build, /npx (?:next|@tauri-apps\/cli)/);
     assert.match(build, /npm exec tauri build/);
+  }
+});
+
+test("prepares exactly the ignored Tauri resource roots only in validation jobs", () => {
+  const expectedResources = [
+    "../../backend/dist/suxiaoyou-backend",
+    "../../backend/resources/nodejs",
+  ];
+  const configuredBackendResources = Object.keys(
+    tauriConfig.bundle.resources,
+  )
+    .filter((path) => path.startsWith("../../backend/"))
+    .sort();
+  assert.deepEqual(configuredBackendResources, expectedResources);
+
+  const prepName = "Prepare placeholder Tauri resources for Rust validation";
+  const validations = [
+    [ciWorkflow, ciJob("rust"), "Run Rust tests"],
+    [workflow, job("validate-release"), "Validate Rust desktop graph"],
+  ];
+
+  for (const [source, validation, rustStepName] of validations) {
+    assert.equal(source.split(prepName).length - 1, 1);
+    const prep = step(validation, prepName);
+    const preparedResources = [
+      ...prep.matchAll(/\.\.\/\.\.\/backend\/[A-Za-z0-9_./-]+/g),
+    ]
+      .map((match) => match[0])
+      .sort();
+    assert.deepEqual(preparedResources, expectedResources);
+    assert.match(prep, /mkdir -p/);
+    assert.doesNotMatch(prep, /touch|printf|frontend\/out/);
+    assert.ok(validation.indexOf(prepName) < validation.indexOf(rustStepName));
+  }
+
+  assert.match(ciJob("rust"), /working-directory:\s*desktop-tauri\/src-tauri/);
+  assert.match(
+    step(job("validate-release"), prepName),
+    /working-directory:\s*desktop-tauri\/src-tauri/,
+  );
+  for (const name of ["build-windows", "build-macos", "build-linux", "publish"]) {
+    assert.doesNotMatch(job(name), new RegExp(escapeRegExp(prepName)));
+  }
+});
+
+test("formal platform builds replace validation placeholders with verified real resources", () => {
+  const expectations = [
+    [
+      "build-windows",
+      "Build backend with locked PyInstaller",
+      "Verify backend bundle",
+      "Download verified Node.js runtime",
+      "Build Tauri NSIS installer",
+    ],
+    [
+      "build-macos",
+      "Build native backend with locked PyInstaller",
+      "Verify backend bundle with full smoke",
+      "Download verified native Node.js runtime",
+      "Build Tauri app for post-copy repair",
+    ],
+    [
+      "build-linux",
+      "Build backend with locked PyInstaller",
+      "Verify backend bundle",
+      "Download verified Node.js runtime",
+      "Build Tauri Linux installers",
+    ],
+  ];
+
+  for (const [jobName, backendName, backendVerifyName, nodeName, tauriName] of
+    expectations) {
+    const build = job(jobName);
+    const orderedSteps = [
+      backendName,
+      backendVerifyName,
+      nodeName,
+      "Verify bundled Node.js toolchain",
+      tauriName,
+    ].map((name) => build.indexOf(`      - name: ${name}`));
+    assert.ok(orderedSteps.every((index) => index >= 0), `${jobName} is missing a resource step`);
+    assert.deepEqual(orderedSteps, [...orderedSteps].sort((a, b) => a - b));
+    assert.match(step(build, backendName), /PyInstaller/);
+    assert.match(step(build, backendVerifyName), /verify-bundle\.mjs/);
+    assert.match(step(build, nodeName), /download_node\.py/);
+    assert.match(
+      step(build, "Verify bundled Node.js toolchain"),
+      /verify-node-runtime\.mjs backend\/resources\/nodejs/,
+    );
+    assert.doesNotMatch(build, /placeholder Tauri resources|\.ci-resource-placeholder/);
   }
 });
 

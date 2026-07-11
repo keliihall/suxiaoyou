@@ -141,6 +141,12 @@ jobs:
           toolchain: "1.96.1"
           components: clippy
 
+      - name: Prepare placeholder Tauri resources for Rust validation
+        run: |
+          mkdir -p \
+            ../../backend/dist/suxiaoyou-backend \
+            ../../backend/resources/nodejs
+
       - name: Run Rust tests
         run: cargo test --locked
 
