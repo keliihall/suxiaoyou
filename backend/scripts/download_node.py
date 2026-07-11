@@ -291,13 +291,17 @@ def _runtime_paths(output: Path, is_windows: bool) -> dict[str, Path]:
 
 def _version_command(executable: Path, is_windows: bool) -> list[str]:
     if is_windows and executable.suffix.lower() == ".cmd":
-        command_line = subprocess.list2cmdline([str(executable), "--version"])
+        # ``cmd.exe /s /c`` needs an outer quote pair around the command and
+        # a separate inner pair around the batch-file path.  Quoting the
+        # entire ``path --version`` string makes cmd treat it as one missing
+        # executable whenever the path itself contains no spaces.
+        command_line = f'""{executable}" --version"'
         return [
             os.environ.get("COMSPEC", "cmd.exe"),
             "/d",
             "/s",
             "/c",
-            f'"{command_line}"',
+            command_line,
         ]
     return [str(executable), "--version"]
 

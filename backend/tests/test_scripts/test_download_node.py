@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -398,6 +399,44 @@ def test_runtime_acceptance_executes_node_npm_and_npx_with_bundled_path_first(
     assert versions == {"node": "v22.22.0", "npm": "10.9.4", "npx": "10.9.4"}
     assert [Path(command[0]).name for command, _ in calls] == ["node", "npm", "npx"]
     assert all(env["PATH"].split(os.pathsep)[0] == str(bin_dir) for _, env in calls)
+
+
+@pytest.mark.parametrize(
+    "executable",
+    [
+        Path(r"D:\a\suxiaoyou\backend\resources\.nodejs.staging-123\npm.cmd"),
+        Path(r"C:\Program Files\苏小有\resources\nodejs\npm.cmd"),
+    ],
+)
+def test_windows_cmd_launcher_quotes_path_separately_from_arguments(
+    executable: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comspec = r"C:\Windows\System32\cmd.exe"
+    monkeypatch.setenv("COMSPEC", comspec)
+
+    assert download_node._version_command(executable, True) == [
+        comspec,
+        "/d",
+        "/s",
+        "/c",
+        f'""{executable}" --version"',
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
+def test_windows_cmd_launcher_executes_real_batch_file(tmp_path: Path) -> None:
+    executable = tmp_path / "npm.cmd"
+    executable.write_text("@echo off\necho 10.9.4\n", encoding="utf-8")
+
+    result = subprocess.run(
+        download_node._version_command(executable, True),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "10.9.4"
 
 
 def test_runtime_acceptance_rejects_missing_npx(tmp_path: Path) -> None:
