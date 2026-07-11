@@ -73,6 +73,24 @@ class TestRefreshModels:
         assert len(reg.all_models()) == 1
 
     @pytest.mark.asyncio
+    async def test_partial_failure_preserves_last_known_good_provider_cache(self):
+        reg = ProviderRegistry()
+        good = _make_provider("good", [_model("good-v1", "good")])
+        flaky = _make_provider("flaky", [_model("flaky-v1", "flaky")])
+        reg.register(good)
+        reg.register(flaky)
+        await reg.refresh_models()
+
+        good.list_models = AsyncMock(return_value=[_model("good-v2", "good")])
+        flaky.list_models = AsyncMock(side_effect=RuntimeError("temporarily offline"))
+
+        result = await reg.refresh_models()
+
+        assert [model.id for model in result["flaky"]] == ["flaky-v1"]
+        assert {model.id for model in reg.all_models()} == {"good-v2", "flaky-v1"}
+        assert reg.resolve_model("flaky-v1", provider_id="flaky") is not None
+
+    @pytest.mark.asyncio
     async def test_all_fail_raises(self):
         reg = ProviderRegistry()
         bad = _make_provider("bad")
@@ -101,6 +119,45 @@ class TestRefreshModels:
         assert len(result["good"]) == 1
         assert result["slow"] == []
         assert len(reg.all_models()) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_full_refresh_is_single_flight(self):
+        refresh_started = asyncio.Event()
+        finish_refresh = asyncio.Event()
+
+        async def slow_models():
+            refresh_started.set()
+            await finish_refresh.wait()
+            return [_model("m1")]
+
+        reg = ProviderRegistry()
+        provider = _make_provider("p1")
+        provider.list_models = AsyncMock(side_effect=slow_models)
+        reg.register(provider)
+
+        first = asyncio.create_task(reg.refresh_models())
+        await asyncio.wait_for(refresh_started.wait(), timeout=1)
+        second = asyncio.create_task(reg.refresh_models())
+        await asyncio.sleep(0)
+        finish_refresh.set()
+
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result == second_result
+        assert provider.list_models.await_count == 1
+
+
+class TestLocalSeed:
+    def test_seed_is_immediately_resolvable_without_provider_io(self):
+        reg = ProviderRegistry()
+        provider = _make_provider("p1")
+        provider.local_models = MagicMock(return_value=[_model("seed", "p1")])
+        reg.register(provider)
+
+        counts = reg.seed_registered_models()
+
+        assert counts == {"p1": 1}
+        assert reg.resolve_model("seed", provider_id="p1") is not None
+        provider.list_models.assert_not_awaited()
 
 class TestRefreshProvider:
     """Single-provider refresh — used by heal-on-read so we don't pay

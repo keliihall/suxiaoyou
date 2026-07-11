@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import tarfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,20 +36,170 @@ def test_matching_official_checksum_is_verified_before_extraction(tmp_path: Path
         (output / "bin").mkdir(parents=True)
         (output / "bin" / "node").write_bytes(b"node")
 
+    def fake_verify(output: Path, runtime_key: tuple[str, str]) -> dict[str, str]:
+        events.append("verify")
+        assert output.parent == tmp_path
+        assert output.name.startswith(".nodejs.staging-")
+        assert runtime_key == key
+        return {"node": "v22.22.0", "npm": "10.9.4", "npx": "10.9.4"}
+
     output = tmp_path / "nodejs"
     download_node.install_node_runtime(
         key,
         output,
         download=fake_download,
         extract_unix=fake_extract,
+        verify_runtime=fake_verify,
     )
 
     assert events == [
         f"download:{archive_name}",
         "download:SHASUMS256.txt",
         "extract",
+        "verify",
     ]
     assert (output / "bin" / "node").is_file()
+
+
+def test_runtime_verification_failure_preserves_existing_runtime(tmp_path: Path) -> None:
+    key = ("Darwin", "arm64")
+    archive_url = download_node._URLS[key]
+    archive_name = archive_url.rsplit("/", 1)[-1]
+    archive = b"trusted but unusable Node archive"
+    checksum = hashlib.sha256(archive).hexdigest()
+    downloads = {
+        archive_url: archive,
+        download_node._shasums_url(archive_url): f"{checksum}  {archive_name}\n".encode(),
+    }
+    output = tmp_path / "nodejs"
+    output.mkdir()
+    sentinel = output / "known-good-node"
+    sentinel.write_text("preserve me", encoding="utf-8")
+
+    def fake_extract(_data: bytes, staging: Path) -> None:
+        (staging / "bin").mkdir(parents=True)
+        (staging / "bin" / "node").write_text("broken replacement", encoding="utf-8")
+
+    def reject_runtime(_staging: Path, _key: tuple[str, str]) -> dict[str, str]:
+        raise ValueError("npm --version failed")
+
+    with pytest.raises(ValueError, match="npm --version failed"):
+        download_node.install_node_runtime(
+            key,
+            output,
+            download=downloads.__getitem__,
+            extract_unix=fake_extract,
+            verify_runtime=reject_runtime,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve me"
+    assert not list(tmp_path.glob(".nodejs.staging-*"))
+    assert not list(tmp_path.glob(".nodejs.backup-*"))
+
+
+def test_replacement_failure_rolls_back_existing_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("Linux", "x86_64")
+    archive_url = download_node._URLS[key]
+    archive_name = archive_url.rsplit("/", 1)[-1]
+    archive = b"trusted replacement archive"
+    checksum = hashlib.sha256(archive).hexdigest()
+    downloads = {
+        archive_url: archive,
+        download_node._shasums_url(archive_url): f"{checksum}  {archive_name}\n".encode(),
+    }
+    output = tmp_path / "nodejs"
+    output.mkdir()
+    sentinel = output / "known-good-node"
+    sentinel.write_text("restore me", encoding="utf-8")
+
+    def fake_extract(_data: bytes, staging: Path) -> None:
+        (staging / "bin").mkdir(parents=True)
+        (staging / "bin" / "node").write_text("replacement", encoding="utf-8")
+
+    real_replace = os.replace
+
+    def fail_staging_replace(source, destination) -> None:
+        if Path(source).name.startswith(".nodejs.staging-"):
+            raise OSError("simulated atomic replacement failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(download_node.os, "replace", fail_staging_replace)
+
+    with pytest.raises(OSError, match="simulated atomic replacement failure"):
+        download_node.install_node_runtime(
+            key,
+            output,
+            download=downloads.__getitem__,
+            extract_unix=fake_extract,
+            verify_runtime=lambda _staging, _key: {
+                "node": "v22.22.0",
+                "npm": "10.9.4",
+                "npx": "10.9.4",
+            },
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "restore me"
+    assert not list(tmp_path.glob(".nodejs.staging-*"))
+    assert not list(tmp_path.glob(".nodejs.backup-*"))
+
+
+def test_double_replacement_failure_preserves_backup_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("Linux", "x86_64")
+    archive_url = download_node._URLS[key]
+    archive_name = archive_url.rsplit("/", 1)[-1]
+    archive = b"trusted replacement archive"
+    checksum = hashlib.sha256(archive).hexdigest()
+    downloads = {
+        archive_url: archive,
+        download_node._shasums_url(archive_url): (
+            f"{checksum}  {archive_name}\n".encode()
+        ),
+    }
+    output = tmp_path / "nodejs"
+    output.mkdir()
+    (output / "known-good-node").write_text("preserve me", encoding="utf-8")
+
+    def fake_extract(_data: bytes, staging: Path) -> None:
+        (staging / "bin").mkdir(parents=True)
+        (staging / "bin" / "node").write_text("replacement", encoding="utf-8")
+
+    real_replace = os.replace
+
+    def fail_install_and_rollback(source, destination) -> None:
+        source_path = Path(source)
+        if source_path.name.startswith(".nodejs.staging-"):
+            raise OSError("install failed")
+        if source_path.name.startswith(".nodejs.backup-"):
+            raise OSError("rollback failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(download_node.os, "replace", fail_install_and_rollback)
+
+    with pytest.raises(RuntimeError, match="previous runtime is preserved at"):
+        download_node.install_node_runtime(
+            key,
+            output,
+            download=downloads.__getitem__,
+            extract_unix=fake_extract,
+            verify_runtime=lambda _staging, _key: {
+                "node": "v22.22.0",
+                "npm": "10.9.4",
+                "npx": "10.9.4",
+            },
+        )
+
+    backups = list(tmp_path.glob(".nodejs.backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "known-good-node").read_text(encoding="utf-8") == (
+        "preserve me"
+    )
+    assert not output.exists()
 
 
 def test_checksum_mismatch_aborts_before_deleting_or_extracting(tmp_path: Path) -> None:
@@ -131,6 +283,70 @@ def test_unix_extractor_rejects_path_traversal(tmp_path: Path) -> None:
     assert not (tmp_path / "escaped").exists()
 
 
+def test_unix_extractor_replaces_npm_symlinks_with_relocatable_launchers(
+    tmp_path: Path,
+) -> None:
+    archive = io.BytesIO()
+    root = "node-v22.22.0-darwin-arm64"
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for name, payload in [
+            (f"{root}/bin/node", b"node"),
+            (f"{root}/lib/node_modules/npm/bin/npm-cli.js", b"npm cli"),
+            (f"{root}/lib/node_modules/npm/bin/npx-cli.js", b"npx cli"),
+        ]:
+            member = tarfile.TarInfo(name)
+            member.mode = 0o755
+            member.size = len(payload)
+            bundle.addfile(member, io.BytesIO(payload))
+
+        for name, target in [
+            (f"{root}/bin/npm", "../lib/node_modules/npm/bin/npm-cli.js"),
+            (f"{root}/bin/npx", "../lib/node_modules/npm/bin/npx-cli.js"),
+        ]:
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.SYMTYPE
+            member.linkname = target
+            bundle.addfile(member)
+
+    output = tmp_path / "nodejs"
+    download_node._extract_unix(archive.getvalue(), output)
+
+    npm_launcher = output / "bin" / "npm"
+    npx_launcher = output / "bin" / "npx"
+    assert npm_launcher.is_file() and not npm_launcher.is_symlink()
+    assert npx_launcher.is_file() and not npx_launcher.is_symlink()
+    assert os.access(npm_launcher, os.X_OK)
+    assert os.access(npx_launcher, os.X_OK)
+    assert '"$script_dir/node"' in npm_launcher.read_text(encoding="utf-8")
+    assert "npm-cli.js" in npm_launcher.read_text(encoding="utf-8")
+    assert "npx-cli.js" in npx_launcher.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/tmp/escaped-npm",
+        "../../../../escaped-npm",
+    ],
+)
+def test_unix_extractor_rejects_unsafe_symlink_target(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        member = tarfile.TarInfo("node-v22.22.0-darwin-arm64/bin/npm")
+        member.type = tarfile.SYMTYPE
+        member.linkname = target
+        bundle.addfile(member)
+
+    output = tmp_path / "nodejs"
+    with pytest.raises(ValueError, match="unsafe archive symlink target"):
+        download_node._extract_unix(archive.getvalue(), output)
+
+    assert not (tmp_path / "escaped-npm").exists()
+
+
 def test_extractors_keep_the_node_distribution_license(tmp_path: Path) -> None:
     windows_archive = io.BytesIO()
     with zipfile.ZipFile(windows_archive, "w") as bundle:
@@ -154,3 +370,83 @@ def test_extractors_keep_the_node_distribution_license(tmp_path: Path) -> None:
     unix_output = tmp_path / "unix-nodejs"
     download_node._extract_unix(unix_archive.getvalue(), unix_output)
     assert (unix_output / "LICENSE").read_bytes() == b"Node.js license"
+
+
+def test_runtime_acceptance_executes_node_npm_and_npx_with_bundled_path_first(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "nodejs"
+    bin_dir = output / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("node", "npm", "npx"):
+        (bin_dir / name).write_text(name, encoding="utf-8")
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs["env"]))
+        name = Path(command[0]).name
+        version = "v22.22.0" if name == "node" else "10.9.4"
+        return SimpleNamespace(stdout=f"{version}\n", stderr="")
+
+    versions = download_node._verify_node_runtime(
+        output,
+        ("Darwin", "arm64"),
+        run=fake_run,
+    )
+
+    assert versions == {"node": "v22.22.0", "npm": "10.9.4", "npx": "10.9.4"}
+    assert [Path(command[0]).name for command, _ in calls] == ["node", "npm", "npx"]
+    assert all(env["PATH"].split(os.pathsep)[0] == str(bin_dir) for _, env in calls)
+
+
+@pytest.mark.parametrize(
+    ("runtime_name", "launcher_name", "cli_name"),
+    [
+        ("nodejs", "npm.cmd", "npm-cli.js"),
+        ("runtime with spaces", "npx.cmd", "npx-cli.js"),
+    ],
+)
+def test_windows_npm_tools_execute_with_bundled_node_without_a_shell(
+    tmp_path: Path,
+    runtime_name: str,
+    launcher_name: str,
+    cli_name: str,
+) -> None:
+    runtime = tmp_path / runtime_name
+    executable = runtime / launcher_name
+
+    assert download_node._version_command(executable, True) == [
+        str(runtime / "node.exe"),
+        str(runtime / "node_modules" / "npm" / "bin" / cli_name),
+        "--version",
+    ]
+
+
+def test_runtime_acceptance_rejects_missing_npx(tmp_path: Path) -> None:
+    output = tmp_path / "nodejs"
+    bin_dir = output / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "node").write_text("node", encoding="utf-8")
+    (bin_dir / "npm").write_text("npm", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="npx executable not found"):
+        download_node._verify_node_runtime(output, ("Linux", "x86_64"))
+
+
+def test_runtime_acceptance_rejects_wrong_node_version(tmp_path: Path) -> None:
+    output = tmp_path / "nodejs"
+    bin_dir = output / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("node", "npm", "npx"):
+        (bin_dir / name).write_text(name, encoding="utf-8")
+
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(stdout="v22.21.0\n", stderr="")
+
+    with pytest.raises(ValueError, match=r"expected Node v22\.22\.0, got v22\.21\.0"):
+        download_node._verify_node_runtime(
+            output,
+            ("Darwin", "arm64"),
+            run=fake_run,
+        )

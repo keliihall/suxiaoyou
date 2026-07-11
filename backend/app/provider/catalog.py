@@ -20,6 +20,9 @@ class ProviderDef:
     kind: str  # "openai_compat" | "native_anthropic" | "native_gemini"
     base_url: str = ""  # Only used by openai_compat providers
     default_headers: dict[str, str] = field(default_factory=dict)
+    # Small, conservative network-free seed used until remote model metadata
+    # has refreshed.  Keep this intentionally narrower than the live catalog.
+    seed_models: tuple[tuple[str, str], ...] = ()
 
 
 # All remote providers that can be configured via direct API key (BYOK).
@@ -32,6 +35,10 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="deepseek_api_key",
         kind="openai_compat",
         base_url="https://api.deepseek.com/v1",
+        seed_models=(
+            ("deepseek-chat", "DeepSeek Chat"),
+            ("deepseek-reasoner", "DeepSeek Reasoner"),
+        ),
     ),
     "qwen": ProviderDef(
         id="qwen",
@@ -39,6 +46,10 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="qwen_api_key",
         kind="openai_compat",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        seed_models=(
+            ("qwen-plus", "Qwen Plus"),
+            ("qwen-max", "Qwen Max"),
+        ),
     ),
     "kimi": ProviderDef(
         id="kimi",
@@ -46,6 +57,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="kimi_api_key",
         kind="openai_compat",
         base_url="https://api.moonshot.cn/v1",
+        seed_models=(("kimi-k2.5", "Kimi K2.5"),),
     ),
     "minimax": ProviderDef(
         id="minimax",
@@ -53,6 +65,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="minimax_api_key",
         kind="openai_compat",
         base_url="https://api.minimaxi.com/v1",
+        seed_models=(("MiniMax-M2.5", "MiniMax M2.5"),),
     ),
     "zhipu": ProviderDef(
         id="zhipu",
@@ -60,6 +73,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="zhipu_api_key",
         kind="openai_compat",
         base_url="https://open.bigmodel.cn/api/paas/v4",
+        seed_models=(("glm-4.7", "GLM-4.7"),),
     ),
     "siliconflow": ProviderDef(
         id="siliconflow",
@@ -67,6 +81,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="siliconflow_api_key",
         kind="openai_compat",
         base_url="https://api.siliconflow.cn/v1",
+        seed_models=(("deepseek-ai/DeepSeek-V3.2", "DeepSeek V3.2"),),
     ),
     "xiaomi": ProviderDef(
         id="xiaomi",
@@ -74,5 +89,6 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         settings_key="xiaomi_api_key",
         kind="openai_compat",
         base_url="https://api.xiaomimimo.com/v1",
+        seed_models=(("mimo-v2-flash", "MiMo V2 Flash"),),
     ),
 }

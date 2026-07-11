@@ -99,5 +99,16 @@
   "modelsUnavailableHint": "Check your provider connection, firewall, or VPN settings.",
   "setupProvider": "Set up provider",
   "setUpProvider": "Set up provider",
-  "apiKey": "API Key"
+  "apiKey": "API Key",
+  "backendInitializingTitle": "Starting 苏小有",
+  "backendInitializingDescription": "Preparing the local service. This may take a moment.",
+  "backendRestartingTitle": "Recovering the local service",
+  "backendRestartingDescription": "The local service stopped unexpectedly. 苏小有 is recovering it automatically.",
+  "backendRestartingProgress": "The local service stopped unexpectedly. Recovery attempt {{attempt}} of {{max}} is in progress.",
+  "backendFailedTitle": "Local service failed to start",
+  "backendFailedDescription": "苏小有 could not start its local service. Relaunch the app, or open the log directory if the problem continues.",
+  "backendRetry": "Relaunch app",
+  "backendRelaunching": "Relaunching",
+  "backendOpenLogs": "Open log directory",
+  "backendTechnicalDetails": "Technical details"
 }

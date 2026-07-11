@@ -177,8 +177,11 @@ class ConnectorRegistry:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def startup(self) -> None:
-        """Build McpManager config from enabled connectors and start connections."""
+    def prepare(self) -> None:
+        """Build local connector state without opening network/process connections."""
+        if self._mcp_manager is not None:
+            return
+
         # Restore custom connectors from persisted state
         for custom in self._persisted_state.get("custom", []):
             cid = custom.get("id", "")
@@ -214,13 +217,26 @@ class ConnectorRegistry:
                 }
 
         self._mcp_manager = McpManager(mcp_config, project_dir=self._project_dir)
-        await self._mcp_manager.startup()
 
         logger.info(
-            "ConnectorRegistry: %d connectors (%d enabled)",
+            "ConnectorRegistry prepared: %d connectors (%d enabled)",
             len(self._connectors),
             sum(1 for c in self._connectors.values() if c.enabled),
         )
+
+    async def connect_enabled(self) -> None:
+        """Connect enabled servers, then publish their discovered tools."""
+        if self._mcp_manager is None:
+            self.prepare()
+        if self._mcp_manager is None:  # pragma: no cover - defensive invariant
+            return
+        await self._mcp_manager.startup()
+        self.sync_tools()
+
+    async def startup(self) -> None:
+        """Backward-compatible combined prepare/connect lifecycle."""
+        self.prepare()
+        await self.connect_enabled()
 
     async def shutdown(self) -> None:
         """Disconnect all MCP servers."""

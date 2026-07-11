@@ -114,7 +114,9 @@ jobs:
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12.13"
+          # CPython 3.12.10 is the final 3.12 release with an official
+          # Windows binary; later 3.12 security releases are source-only.
+          python-version: "3.12.10"
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -136,7 +138,8 @@ jobs:
       - name: Build backend with locked PyInstaller
         run: |
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0
+          python -m pip install pyinstaller==6.21.0 pytest==9.1.1
+          python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py
           cd backend
           python -m PyInstaller suxiaoyou.spec --noconfirm
 
@@ -147,6 +150,9 @@ jobs:
         run: |
           cd backend
           python scripts/download_node.py
+
+      - name: Verify bundled Node.js toolchain
+        run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
 
       - name: Build Tauri NSIS installer
         shell: bash
@@ -160,6 +166,51 @@ jobs:
           shopt -s nullglob
           installers=(desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe)
           [[ ${#installers[@]} -eq 1 ]]
+
+      - name: Install NSIS package and verify packaged Node.js toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = @(Get-ChildItem "desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe")
+          if ($installer.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installer.Count)"
+          }
+
+          $installDirectory = Join-Path $env:RUNNER_TEMP "suxiaoyou-nsis-install"
+          Remove-Item -Recurse -Force $installDirectory -ErrorAction SilentlyContinue
+          $process = Start-Process `
+            -FilePath $installer[0].FullName `
+            -ArgumentList @("/S", "/D=$installDirectory") `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS installer exited with code $($process.ExitCode)"
+          }
+
+          $nodeBinaries = @(
+            Get-ChildItem $installDirectory -Recurse -File -Filter node.exe |
+              Where-Object { $_.FullName -match '[\\/]nodejs[\\/]node\.exe$' }
+          )
+          if ($nodeBinaries.Count -ne 1) {
+            throw "Expected one packaged node.exe, found $($nodeBinaries.Count)"
+          }
+          $nodeRuntime = $nodeBinaries[0].Directory.FullName
+          node scripts/verify-node-runtime.mjs $nodeRuntime
+          foreach ($launcher in @("npm.cmd", "npx.cmd")) {
+            & (Join-Path $nodeRuntime $launcher) --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged $launcher exited with code $LASTEXITCODE"
+            }
+          }
+
+          $backendBinaries = @(
+            Get-ChildItem $installDirectory -Recurse -File -Filter suxiaoyou-backend.exe |
+              Where-Object { $_.FullName -match '[\\/]backend[\\/]suxiaoyou-backend\.exe$' }
+          )
+          if ($backendBinaries.Count -ne 1) {
+            throw "Expected one packaged suxiaoyou-backend.exe, found $($backendBinaries.Count)"
+          }
+          node scripts/verify-bundle.mjs $backendBinaries[0].Directory.FullName
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -182,7 +233,7 @@ jobs:
       matrix:
         target: ${{ fromJSON(github.event_name == 'push' && '["aarch64-apple-darwin","x86_64-apple-darwin"]' || inputs.target == 'macos-aarch64' && '["aarch64-apple-darwin"]' || '["x86_64-apple-darwin"]') }}
     env:
-      MACOSX_DEPLOYMENT_TARGET: "13.3"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
       BUNDLE_ARCH: ${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || 'x86_64' }}
       DMG_ARCH: ${{ matrix.target == 'aarch64-apple-darwin' && 'aarch64' || 'x64' }}
       NODE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'Darwin-arm64' || 'Darwin-x86_64' }}
@@ -241,6 +292,9 @@ jobs:
           cd backend
           python scripts/download_node.py --platform "$NODE_PLATFORM"
 
+      - name: Verify bundled Node.js toolchain
+        run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
+
       - name: Build Tauri app for post-copy repair
         run: |
           cd desktop-tauri
@@ -280,7 +334,7 @@ jobs:
       - name: Verify repaired app before signing
         run: |
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
-          node scripts/verify-macos-bundle.mjs "$APP_PATH" "$BUNDLE_ARCH" 13.3
+          node scripts/verify-macos-bundle.mjs "$APP_PATH" "$BUNDLE_ARCH" 11.0
 
       - name: Import Apple certificate and discover signing identity
         id: apple-signing
@@ -316,8 +370,11 @@ jobs:
         run: |
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
+          BACKEND_BINARY="$APP_PATH/Contents/Resources/backend/suxiaoyou-backend"
+          BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"
           NODE_BINARY="$APP_PATH/Contents/Resources/nodejs/bin/node"
           NODE_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.node.plist"
+          SIGNED_BACKEND_ENTITLEMENTS="$RUNNER_TEMP/signed-backend-entitlements.plist"
           SIGNED_NODE_ENTITLEMENTS="$RUNNER_TEMP/signed-node-entitlements.plist"
           MACHO_LIST="$RUNNER_TEMP/macho-files.txt"
 
@@ -351,6 +408,8 @@ jobs:
             if file -b "$candidate" | grep -q "Mach-O"; then
               if [[ "$candidate" == "$NODE_BINARY" ]]; then
                 codesign "${SIGN_ARGS[@]}" --entitlements "$NODE_ENTITLEMENTS" "$candidate"
+              elif [[ "$SIGNING_IDENTITY" == "-" && "$candidate" == "$BACKEND_BINARY" ]]; then
+                codesign "${SIGN_ARGS[@]}" --entitlements "$BACKEND_ADHOC_ENTITLEMENTS" "$candidate"
               else
                 codesign "${SIGN_ARGS[@]}" "$candidate"
               fi
@@ -362,6 +421,14 @@ jobs:
           done < <(find "$APP_PATH" -type d -name '*.framework' -print0)
 
           codesign "${SIGN_ARGS[@]}" "$APP_PATH"
+
+          codesign -d --entitlements - "$BACKEND_BINARY" > "$SIGNED_BACKEND_ENTITLEMENTS" 2>/dev/null
+          if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+            grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"
+          elif grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"; then
+            echo "::error::Developer ID backend must not disable library validation"
+            exit 1
+          fi
 
           codesign -d --entitlements - "$NODE_BINARY" > "$SIGNED_NODE_ENTITLEMENTS" 2>/dev/null
           for required in \
@@ -385,6 +452,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign -dv --verbose=4 "$APP_PATH" 2>&1
 
+      - name: Verify signed app runtime
+        run: |
+          set -euo pipefail
+          APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
+          node scripts/verify-macos-bundle.mjs "$APP_PATH" "$BUNDLE_ARCH" 11.0 --verify-signature
+
       - name: Create final DMG
         run: |
           set -euo pipefail
@@ -399,7 +472,7 @@ jobs:
           rm -f "$DMG_DIRECTORY"/*.dmg
           ditto "$APP_PATH" "$STAGING_DIRECTORY/苏小有.app"
           ln -s /Applications "$STAGING_DIRECTORY/Applications"
-          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -ov -format UDZO "$DMG_PATH"
+          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH"
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG
@@ -443,18 +516,21 @@ jobs:
           VERSION="$(node -p "require('./package.json').version")"
           DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
           MOUNT_DIRECTORY="$(mktemp -d)"
+          INSTALL_TEST_DIRECTORY="$(mktemp -d)"
           cleanup() {
             hdiutil detach "$MOUNT_DIRECTORY" >/dev/null 2>&1 || true
-            rm -rf "$MOUNT_DIRECTORY"
+            rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
           }
           trap cleanup EXIT
 
           hdiutil verify "$DMG_PATH"
           hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIRECTORY" "$DMG_PATH"
-          node scripts/verify-macos-bundle.mjs "$MOUNT_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 13.3 --verify-signature
+          node scripts/verify-macos-bundle.mjs "$MOUNT_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 11.0 --verify-signature
+          ditto "$MOUNT_DIRECTORY/苏小有.app" "$INSTALL_TEST_DIRECTORY/苏小有.app"
+          node scripts/verify-macos-bundle.mjs "$INSTALL_TEST_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 11.0 --verify-signature
           hdiutil detach "$MOUNT_DIRECTORY"
           trap - EXIT
-          rm -rf "$MOUNT_DIRECTORY"
+          rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
 
       - name: Remove temporary Apple keychain
         if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -483,7 +559,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm cpio file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -521,18 +597,13 @@ jobs:
           cd backend
           python scripts/download_node.py
 
+      - name: Verify bundled Node.js toolchain
+        run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
+
       - name: Build Tauri Linux installers
         run: |
           cd desktop-tauri
           npm exec tauri build -- --config src-tauri/build.linux-x64.json --no-sign
-
-      - name: Verify Linux artifact completeness
-        run: |
-          shopt -s nullglob
-          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
-          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
-          [[ ${#debs[@]} -eq 1 ]]
-          [[ ${#rpms[@]} -eq 1 ]]
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -543,6 +614,90 @@ jobs:
             desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
           retention-days: 1
+
+      - name: Verify Linux installers and packaged Node.js toolchain
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
+          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
+          if (( ${#debs[@]} != 1 )); then
+            printf '::error::Expected exactly one DEB installer, found %d: %s\n' "${#debs[@]}" "${debs[*]-}"
+            exit 1
+          fi
+          if (( ${#rpms[@]} != 1 )); then
+            printf '::error::Expected exactly one RPM installer, found %d: %s\n' "${#rpms[@]}" "${rpms[*]-}"
+            exit 1
+          fi
+          printf 'Verifying DEB %s and RPM %s\n' "${debs[0]}" "${rpms[0]}"
+
+          DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
+          RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
+          RPM_PAYLOAD="$RUNNER_TEMP/suxiaoyou-rpm-payload.cpio"
+          RPM_CPIO_LIST="$RUNNER_TEMP/suxiaoyou-rpm-cpio.list"
+          RPM_QUERY_LIST="$RUNNER_TEMP/suxiaoyou-rpm-query.list"
+          rm -rf "$DEB_ROOT" "$RPM_ROOT"
+          rm -f "$RPM_PAYLOAD" "$RPM_CPIO_LIST" "$RPM_QUERY_LIST"
+          mkdir -p "$DEB_ROOT" "$RPM_ROOT"
+          dpkg-deb -x "${debs[0]}" "$DEB_ROOT"
+          rpm -K "${rpms[0]}"
+
+          # Tauri RPMs do not currently carry ARCHIVESIZE/LONGARCHIVESIZE.
+          # Ubuntu 22.04's rpm2cpio 4.17 therefore copies the complete payload
+          # but returns 1 after comparing its byte count with a missing header
+          # value.  Capture that documented status, then independently require
+          # valid RPM digests, a complete CPIO index, matching package entry
+          # counts, successful extraction, and executable installed runtimes.
+          set +e
+          rpm2cpio "${rpms[0]}" > "$RPM_PAYLOAD"
+          rpm2cpio_status=$?
+          set -e
+          if (( rpm2cpio_status != 0 && rpm2cpio_status != 1 )); then
+            printf '::error::rpm2cpio exited with unexpected status %d\n' "$rpm2cpio_status"
+            exit 1
+          fi
+          if (( rpm2cpio_status == 1 )); then
+            echo '::warning::rpm2cpio returned 1 for a Tauri RPM without an archive-size header; validating the emitted payload independently'
+          fi
+          if [[ ! -s "$RPM_PAYLOAD" ]]; then
+            echo '::error::rpm2cpio produced an empty payload'
+            exit 1
+          fi
+          cpio -it --quiet < "$RPM_PAYLOAD" > "$RPM_CPIO_LIST"
+          rpm -qpl "${rpms[0]}" > "$RPM_QUERY_LIST"
+          cpio_entries="$(wc -l < "$RPM_CPIO_LIST")"
+          rpm_entries="$(wc -l < "$RPM_QUERY_LIST")"
+          if (( cpio_entries == 0 || cpio_entries != rpm_entries )); then
+            printf '::error::RPM/CPIO entry-count mismatch: rpm=%d cpio=%d\n' "$rpm_entries" "$cpio_entries"
+            exit 1
+          fi
+          printf 'Validated RPM payload: %d package entries, %s bytes\n' "$cpio_entries" "$(stat -c %s "$RPM_PAYLOAD")"
+          (cd "$RPM_ROOT" && cpio -idm --quiet < "$RPM_PAYLOAD")
+
+          for root in "$DEB_ROOT" "$RPM_ROOT"; do
+            printf 'Inspecting extracted installer root: %s\n' "$root"
+            mapfile -t node_binaries < <(find -L "$root" -type f -path '*/nodejs/bin/node')
+            if (( ${#node_binaries[@]} != 1 )); then
+              printf '::error::Expected exactly one packaged Node binary under %s, found %d\n' "$root" "${#node_binaries[@]}"
+              printf '%s\n' "${node_binaries[@]-}"
+              find "$root" -path '*nodejs*' \( -type f -o -type l \) -print | sort
+              exit 1
+            fi
+            printf 'Packaged Node binary: %s\n' "${node_binaries[0]}"
+            runtime="$(dirname "$(dirname "${node_binaries[0]}")")"
+            node scripts/verify-node-runtime.mjs "$runtime"
+
+            mapfile -t backend_binaries < <(find -L "$root" -type f -path '*/backend/suxiaoyou-backend')
+            if (( ${#backend_binaries[@]} != 1 )); then
+              printf '::error::Expected exactly one packaged backend under %s, found %d\n' "$root" "${#backend_binaries[@]}"
+              printf '%s\n' "${backend_binaries[@]-}"
+              find "$root" -path '*backend*' \( -type f -o -type l \) -print | sort
+              exit 1
+            fi
+            printf 'Packaged backend binary: %s\n' "${backend_binaries[0]}"
+            node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
+          done
+          rm -f "$RPM_PAYLOAD" "$RPM_CPIO_LIST" "$RPM_QUERY_LIST"
 
   publish:
     name: Create draft GitHub Release

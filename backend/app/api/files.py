@@ -10,6 +10,7 @@ import mimetypes
 import os
 import platform
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -61,6 +62,7 @@ UPLOAD_DIR = Path("data/uploads")
 
 # In-memory hash → path index for deduplication of uploaded files
 _hash_index: dict[str, Path] = {}
+_hash_index_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -94,25 +96,55 @@ class FileMetadata(BaseModel):
 # Hash-index management
 # ---------------------------------------------------------------------------
 
-def rebuild_hash_index() -> None:
-    """Scan data/uploads and rebuild the dedup hash index."""
-    _hash_index.clear()
+def rebuild_hash_index(*, cancel_event: threading.Event | None = None) -> None:
+    """Scan uploads and atomically rebuild the dedup hash index.
+
+    The optional event lets the lifespan-owned worker stop promptly during
+    shutdown.  Building into a private dict prevents requests from observing a
+    half-populated index now that startup scanning runs in the background.
+    """
     if not UPLOAD_DIR.exists():
+        with _hash_index_lock:
+            # Preserve a file concurrently uploaded after the existence check.
+            current = {
+                digest: path
+                for digest, path in _hash_index.items()
+                if path.exists()
+            }
+            _hash_index.clear()
+            _hash_index.update(current)
         return
+    rebuilt: dict[str, Path] = {}
     for f in UPLOAD_DIR.iterdir():
+        if cancel_event is not None and cancel_event.is_set():
+            return
         if f.is_file():
             try:
-                digest = hashlib.sha256(f.read_bytes()).hexdigest()
-                _hash_index[digest] = f
+                digest_builder = hashlib.sha256()
+                with f.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
+                        digest_builder.update(chunk)
+                rebuilt[digest_builder.hexdigest()] = f
             except OSError:
                 pass
-    logger.info("Upload hash index rebuilt: %d entries", len(_hash_index))
+    with _hash_index_lock:
+        # Do not erase entries added by an upload while the scan was running.
+        for digest, path in _hash_index.items():
+            if path.exists():
+                rebuilt.setdefault(digest, path)
+        _hash_index.clear()
+        _hash_index.update(rebuilt)
+        count = len(_hash_index)
+    logger.info("Upload hash index rebuilt: %d entries", count)
 
 
 def remove_from_hash_index(content_hash: str | None) -> None:
     """Remove a hash entry (called when an uploaded file is deleted)."""
-    if content_hash and content_hash in _hash_index:
-        del _hash_index[content_hash]
+    if content_hash:
+        with _hash_index_lock:
+            _hash_index.pop(content_hash, None)
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +755,8 @@ async def upload_file(file: UploadFile) -> dict:
     digest = hashlib.sha256(content).hexdigest()
 
     # Check dedup index
-    existing = _hash_index.get(digest)
+    with _hash_index_lock:
+        existing = _hash_index.get(digest)
     if existing and existing.exists():
         meta = _file_metadata(existing, source="uploaded", content_hash=digest)
         return meta.model_dump()
@@ -736,7 +769,8 @@ async def upload_file(file: UploadFile) -> dict:
     dest.write_bytes(content)
 
     # Update index
-    _hash_index[digest] = dest
+    with _hash_index_lock:
+        _hash_index[digest] = dest
 
     mime_type = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
 

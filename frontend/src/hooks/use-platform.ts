@@ -13,15 +13,37 @@ function normalize(p: string): Platform {
   return p === "macos" || p === "windows" || p === "linux" ? p : "unknown";
 }
 
+function detectBrowserPlatform(): Platform {
+  if (typeof navigator === "undefined") return "unknown";
+  const nav = navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  };
+  const description = [nav.userAgentData?.platform, nav.platform, nav.userAgent]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (/mac|darwin/.test(description)) return "macos";
+  if (/win/.test(description)) return "windows";
+  if (/linux|x11/.test(description)) return "linux";
+  return "unknown";
+}
+
 export function usePlatform(): Platform {
   const [platform, setPlatform] = useState<Platform>(cached ?? "unknown");
 
   useEffect(() => {
     if (!IS_DESKTOP || cached) return;
-    pending ??= desktopAPI.getPlatform().then((p) => {
-      cached = normalize(p);
-      return cached;
-    });
+    pending ??= desktopAPI
+      .getPlatform()
+      .then(normalize)
+      .catch((error) => {
+        console.warn("[Platform] Native lookup failed; using browser fallback", error);
+        return detectBrowserPlatform();
+      })
+      .then((resolved) => {
+        cached = resolved;
+        return resolved;
+      });
     pending.then(setPlatform);
   }, []);
 

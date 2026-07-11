@@ -28,6 +28,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
+from app.api.oauth_redirect import loopback_redirect_uri
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/google")
@@ -82,8 +84,7 @@ async def google_auth_start(request: Request) -> dict[str, Any]:
     if not settings.google_client_id:
         return {"success": False, "error": "Google OAuth not configured (missing SUXIAOYOU_GOOGLE_CLIENT_ID)"}
 
-    host = settings.host if settings.host != "0.0.0.0" else "localhost"
-    redirect_uri = f"http://{host}:{settings.port}/api/google/callback"
+    redirect_uri = loopback_redirect_uri(settings, "/api/google/callback")
 
     state = secrets.token_urlsafe(32)
     _pending_states[state] = {"redirect_uri": redirect_uri}

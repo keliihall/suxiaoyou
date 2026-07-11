@@ -105,3 +105,16 @@ class TestOAuthCallback:
         resp = await app_client.get("/api/connectors/oauth/callback", params={"code": "c", "state": "s"})
         assert resp.status_code == 200
         _mock_cr.complete_auth.assert_awaited_once_with("s", "c")
+
+
+class TestOAuthStart:
+    async def test_uses_actual_runtime_port(self, app_client, _mock_cr):
+        app_client.app.state.settings.port = 17321
+
+        resp = await app_client.post("/api/connectors/slack/connect")
+
+        assert resp.status_code == 200
+        _mock_cr.connect.assert_awaited_once_with(
+            "slack",
+            "http://localhost:17321/api/connectors/oauth/callback",
+        )

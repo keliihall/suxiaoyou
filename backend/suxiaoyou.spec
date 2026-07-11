@@ -383,7 +383,10 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    # Windows must use the console bootloader so redirected stdin/stdout/stderr
+    # remain real pipe handles for Tauri. The Rust launcher adds
+    # CREATE_NO_WINDOW, so users still never see a console window.
+    console=sys.platform == 'win32',
 )
 
 coll = COLLECT(

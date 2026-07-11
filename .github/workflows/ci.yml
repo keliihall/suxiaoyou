@@ -84,7 +84,7 @@ jobs:
         run: node --test ../scripts/sanitize-build-brand.test.mjs
 
       - name: Release workflow tests
-        run: node --test ../scripts/release-workflow.test.mjs ../scripts/verify-macos-bundle.test.mjs
+        run: node --test ../scripts/release-workflow.test.mjs ../scripts/verify-macos-bundle.test.mjs ../scripts/verify-node-runtime.test.mjs
 
       - name: Unit tests
         run: node --test tests/unit/*.test.ts

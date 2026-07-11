@@ -95,8 +95,14 @@ class OllamaProvider(OpenAICompatProvider):
     uses the native ``/api/tags`` endpoint for richer metadata.
     """
 
-    def __init__(self, base_url: str = "http://localhost:11434"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        *,
+        seed_model: str = "",
+    ):
         self._base_url = base_url.rstrip("/")
+        self._seed_model = seed_model.removeprefix("ollama/").strip()
         # Ollama requires no real API key, but the OpenAI SDK mandates a
         # non-empty string.
         super().__init__(
@@ -173,6 +179,21 @@ class OllamaProvider(OpenAICompatProvider):
         self._models_cache = models
         logger.info("Ollama: discovered %d local model(s)", len(models))
         return models
+
+    def local_models(self) -> list[ModelInfo]:
+        """Seed the last-used local model without contacting Ollama."""
+        if not self._seed_model:
+            return []
+        return [
+            ModelInfo(
+                id=f"ollama/{self._seed_model}",
+                name=self._seed_model,
+                provider_id=self.id,
+                capabilities=_infer_capabilities(self._seed_model, None),
+                pricing=ModelPricing(prompt=0.0, completion=0.0),
+                metadata={"local": True, "source": "last-used-seed"},
+            )
+        ]
 
     # -- Streaming override ----------------------------------------------------
 

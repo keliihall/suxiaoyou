@@ -6,7 +6,7 @@ import { usePathname } from "next/navigation";
 import { Minus, Square, X, Copy } from "lucide-react";
 import { IS_DESKTOP, TITLE_BAR_HEIGHT } from "@/lib/constants";
 import { desktopAPI } from "@/lib/tauri-api";
-import { useIsMacOS } from "@/hooks/use-platform";
+import { usePlatform } from "@/hooks/use-platform";
 
 function SuxiaoyouLogo() {
   return (
@@ -29,30 +29,47 @@ function SuxiaoyouLogo() {
  *   overlay title bar style; page headers provide the visible content.
  * - Windows/Linux: full custom title bar with brand + min/max/close controls.
  */
-export function TitleBar() {
+export function TitleBar({ recoveryActive = false }: { recoveryActive?: boolean }) {
   const [isMaximized, setIsMaximized] = useState(false);
-  const isMac = useIsMacOS();
+  const platform = usePlatform();
+  const isMac = platform === "macos";
   const pathname = usePathname();
 
   useEffect(() => {
-    if (!IS_DESKTOP || isMac) return;
+    if (!IS_DESKTOP || platform === "unknown" || isMac) return;
     desktopAPI.isMaximized().then(setIsMaximized);
     const cleanup = desktopAPI.onMaximizeChange(setIsMaximized);
     return () => cleanup();
-  }, [isMac]);
+  }, [isMac, platform]);
 
   if (!IS_DESKTOP) return null;
 
+  // Platform detection is asynchronous. Until it resolves, expose only a
+  // neutral drag strip so macOS never flashes Windows-style window controls.
+  if (platform === "unknown") {
+    return (
+      <div
+        data-tauri-drag-region
+        className="fixed top-0 left-0 right-0 z-[10000] select-none"
+        style={{ height: TITLE_BAR_HEIGHT }}
+        aria-hidden="true"
+      />
+    );
+  }
+
   if (isMac) {
     // Chat pages already have a ChatHeader that acts as the window drag
-    // region, so we skip the strip there to avoid it blocking buttons.
+    // region. During recovery that header may be inert or not mounted, so the
+    // persistent chrome must supply its own drag strip.
     const isChatPage = pathname?.startsWith("/c/") ?? false;
-    if (isChatPage) return null;
+    if (isChatPage && !recoveryActive) return null;
 
     return (
       <div
         data-tauri-drag-region
-        className="fixed top-0 left-0 right-0 z-[5] select-none"
+        className={`fixed top-0 left-0 right-0 select-none ${
+          recoveryActive ? "z-[10000]" : "z-[5]"
+        }`}
         style={{ height: TITLE_BAR_HEIGHT }}
         aria-hidden="true"
       />
@@ -62,7 +79,7 @@ export function TitleBar() {
   return (
     <div
       data-tauri-drag-region
-      className="fixed top-0 left-0 right-0 z-50 flex items-center select-none"
+      className="fixed top-0 left-0 right-0 z-[10000] flex items-center select-none"
       style={{
         height: TITLE_BAR_HEIGHT,
         backgroundColor: "var(--surface-primary)",

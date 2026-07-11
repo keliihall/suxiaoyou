@@ -140,6 +140,11 @@ fn format_title(raw: Option<&str>) -> String {
     format!("{truncated}…")
 }
 
+fn recent_chat_route(session_id: &str) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect();
+    format!("/c/_?sessionId={encoded}")
+}
+
 fn handle_menu_event(app: &AppHandle, event_id: &str) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -153,7 +158,7 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
 
     if let Some(session_id) = event_id.strip_prefix(RECENT_PREFIX) {
         show_and_focus();
-        let _ = window.emit("navigate", format!("/c/{session_id}"));
+        let _ = window.emit("navigate", recent_chat_route(session_id));
         return;
     }
 
@@ -177,5 +182,18 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
             app.exit(0);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recent_chat_route;
+
+    #[test]
+    fn recent_chat_uses_static_export_compatible_route() {
+        assert_eq!(
+            recent_chat_route("session/with spaces"),
+            "/c/_?sessionId=session%2Fwith+spaces"
+        );
     }
 }

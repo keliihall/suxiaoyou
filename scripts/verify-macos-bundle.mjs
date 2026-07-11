@@ -10,25 +10,21 @@ import { readdir } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { verifyNodeRuntime } from "./verify-node-runtime.mjs";
+
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const verifyBundleScript = join(scriptDirectory, "verify-bundle.mjs");
 const expectedProductVersion = JSON.parse(
   readFileSync(join(repositoryRoot, "package.json"), "utf8"),
 ).version;
-const nodeDownloader = readFileSync(
-  join(repositoryRoot, "backend/scripts/download_node.py"),
-  "utf8",
-);
-const nodeVersionMatch = /^NODE_VERSION\s*=\s*["']([^"']+)["']/m.exec(nodeDownloader);
-if (!nodeVersionMatch) {
-  throw new Error("cannot read NODE_VERSION from backend/scripts/download_node.py");
-}
-
-const EXPECTED_NODE_VERSION = `v${nodeVersionMatch[1]}`;
 const EXPECTED_BUNDLE_IDENTIFIER = "com.chaoyuanxinzhi.suxiaoyou";
 const EXPECTED_PRODUCT_NAME = "苏小有";
 const SUPPORTED_ARCHITECTURES = new Set(["arm64", "x86_64"]);
+const DISALLOWED_BUNDLE_XATTRS = Object.freeze([
+  "com.apple.FinderInfo",
+  "com.apple.ResourceFork",
+]);
 
 export const REQUIRED_RELEASE_LICENSE_FILES = Object.freeze([
   "licenses/LICENSE",
@@ -106,15 +102,27 @@ export async function verifyMacOSBundle(
   const resources = join(contents, "Resources");
   const infoPlist = join(contents, "Info.plist");
   const backend = join(resources, "backend");
-  const nodeBinary = join(resources, "nodejs", "bin", "node");
+  const backendExecutable = join(backend, "suxiaoyou-backend");
+  const nodeRuntimeDirectory = join(resources, "nodejs");
+  const nodeBinary = join(nodeRuntimeDirectory, "bin", "node");
   requirePath(infoPlist, "Info.plist");
   requirePath(backend, "embedded backend");
+  requirePath(backendExecutable, "embedded backend executable");
   requirePath(nodeBinary, "bundled Node binary");
   for (const relativePath of REQUIRED_RELEASE_LICENSE_FILES) {
     requirePath(
       join(resources, relativePath),
       `bundled release license ${relativePath}`,
     );
+  }
+
+  const recursiveXattrs = await commandText(runCommand, "xattr", ["-lr", app]);
+  for (const attribute of DISALLOWED_BUNDLE_XATTRS) {
+    if (recursiveXattrs.includes(`${attribute}:`)) {
+      throw new Error(
+        `app bundle contains disallowed extended attribute ${attribute}`,
+      );
+    }
   }
 
   const info = {};
@@ -180,17 +188,19 @@ export async function verifyMacOSBundle(
     throw new Error(`bundled Node was not recognized as Mach-O: ${nodeBinary}`);
   }
 
-  const nodeVersion = await commandText(runCommand, nodeBinary, ["--version"]);
-  if (nodeVersion !== EXPECTED_NODE_VERSION) {
-    throw new Error(`expected Node ${EXPECTED_NODE_VERSION}, got ${nodeVersion}`);
-  }
   const expectedNodeArchitecture = expectedArchitecture === "x86_64" ? "x64" : "arm64";
-  const nodeArchitecture = await commandText(runCommand, nodeBinary, ["-p", "process.arch"]);
-  if (nodeArchitecture !== expectedNodeArchitecture) {
-    throw new Error(
-      `expected Node process.arch ${expectedNodeArchitecture}, got ${nodeArchitecture}`,
-    );
-  }
+  const nodeRuntime = await verifyNodeRuntime(nodeRuntimeDirectory, {
+    platform: "darwin",
+    expectedArchitecture: expectedNodeArchitecture,
+    runCommand,
+    log: () => {},
+  });
+  const {
+    nodeArchitecture,
+    nodeVersion,
+    npmVersion,
+    npxVersion,
+  } = nodeRuntime;
 
   if (verifySignature) {
     await runCommand("codesign", [
@@ -200,6 +210,11 @@ export async function verifyMacOSBundle(
       "--verbose=2",
       app,
     ]);
+  }
+
+  const backendHelp = await commandText(runCommand, backendExecutable, ["--help"]);
+  if (!backendHelp.includes("--port") || !backendHelp.includes("--data-dir")) {
+    throw new Error("embedded backend --help output is incomplete");
   }
 
   await runCommand(process.execPath, [verifyBundleScript, backend], {
@@ -213,8 +228,10 @@ export async function verifyMacOSBundle(
     `[verify-macos-bundle] ${EXPECTED_PRODUCT_NAME} ${expectedProductVersion}: ` +
       `${machOFiles.length} Mach-O files are exactly ${expectedArchitecture}, ` +
       `minOS=${expectedMinimumSystemVersion}, Node=${nodeVersion}/${nodeArchitecture}, ` +
+      `npm=${npmVersion}, npx=${npxVersion}, ` +
       `signature=${verifySignature ? "verified" : "not requested"}, ` +
       `${REQUIRED_RELEASE_LICENSE_FILES.length} license resources present, ` +
+      "backend preflight=passed, " +
       `backend smoke=${skipBackendSmoke ? "explicitly skipped" : "passed"}`,
   );
   return {
@@ -225,7 +242,10 @@ export async function verifyMacOSBundle(
     machOCount: machOFiles.length,
     nodeArchitecture,
     nodeVersion,
+    npmVersion,
+    npxVersion,
     signatureVerified: verifySignature,
+    backendPreflightPassed: true,
     backendSmokeSkipped: skipBackendSmoke,
     releaseLicenseCount: REQUIRED_RELEASE_LICENSE_FILES.length,
   };

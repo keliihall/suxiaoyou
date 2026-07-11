@@ -21,6 +21,10 @@ const backendRequirements = readFileSync(
   "utf8",
 );
 const backendProject = readFileSync(join(root, "backend/pyproject.toml"), "utf8");
+const backendAdHocEntitlements = readFileSync(
+  join(root, "desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"),
+  "utf8",
+);
 const nodeEntitlements = readFileSync(
   join(root, "desktop-tauri/src-tauri/entitlements.node.plist"),
   "utf8",
@@ -120,8 +124,8 @@ test("test-build artifacts expire after one day", () => {
 });
 
 test("sets the declared macOS minimum everywhere", () => {
-  assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "13.3");
-  assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"13\.3"/);
+  assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "11.0");
+  assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"11\.0"/);
 });
 
 test("keeps Apple credentials step-scoped and fails official tags fast", () => {
@@ -168,10 +172,95 @@ test("uses locked desktop tooling and sanitized frontend output on every platfor
   }
 });
 
+test("verifies the complete bundled Node toolchain before every Tauri build", () => {
+  const expectations = [
+    ["build-windows", "Download verified Node.js runtime", "Build Tauri NSIS installer"],
+    ["build-macos", "Download verified native Node.js runtime", "Build Tauri app for post-copy repair"],
+    ["build-linux", "Download verified Node.js runtime", "Build Tauri Linux installers"],
+  ];
+
+  for (const [jobName, downloadName, buildName] of expectations) {
+    const build = job(jobName);
+    const downloadIndex = build.indexOf(downloadName);
+    const verifyIndex = build.indexOf("Verify bundled Node.js toolchain");
+    const tauriBuildIndex = build.indexOf(buildName);
+    assert.ok(downloadIndex >= 0, `${jobName} does not download Node`);
+    assert.ok(verifyIndex > downloadIndex, `${jobName} verifies Node before download`);
+    assert.ok(tauriBuildIndex > verifyIndex, `${jobName} builds Tauri before Node verification`);
+    assert.match(
+      step(build, "Verify bundled Node.js toolchain"),
+      /node scripts\/verify-node-runtime\.mjs backend\/resources\/nodejs/,
+    );
+  }
+});
+
+test("re-extracts Linux installers and executes their packaged Node toolchain", () => {
+  const linux = job("build-linux");
+  const uploadIndex = linux.indexOf("Upload Linux artifacts");
+  const verifyIndex = linux.indexOf(
+    "Verify Linux installers and packaged Node.js toolchain",
+  );
+  assert.ok(uploadIndex >= 0, "Linux artifacts are not uploaded");
+  assert.ok(
+    verifyIndex > uploadIndex,
+    "Linux artifacts must remain available when installed-content verification fails",
+  );
+  assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /rpm -K/);
+  assert.match(linux, /rpm2cpio/);
+  assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
+  assert.match(linux, /rpm2cpio_status/);
+  assert.match(linux, /cpio -it --quiet/);
+  assert.match(linux, /RPM\/CPIO entry-count mismatch/);
+  assert.match(linux, /cpio -idm --quiet < "\$RPM_PAYLOAD"/);
+  assert.doesNotMatch(linux, /rpm2cpio[^\n]*\|/);
+  assert.match(linux, /nodejs\/bin\/node/);
+  assert.match(linux, /Expected exactly one packaged Node binary/);
+  assert.match(
+    linux,
+    /node scripts\/verify-node-runtime\.mjs "\$runtime"/,
+  );
+  assert.match(linux, /backend\/suxiaoyou-backend/);
+  assert.match(linux, /Expected exactly one packaged backend/);
+  assert.match(linux, /node scripts\/verify-bundle\.mjs/);
+});
+
+test("silently installs Windows NSIS and executes its packaged Node toolchain", () => {
+  const windows = job("build-windows");
+  const install = step(
+    windows,
+    "Install NSIS package and verify packaged Node.js toolchain",
+  );
+  assert.match(install, /Start-Process/);
+  assert.match(install, /"\/S"/);
+  assert.match(install, /Filter node\.exe/);
+  assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
+  assert.match(install, /npm\.cmd/);
+  assert.match(install, /npx\.cmd/);
+  assert.match(install, /suxiaoyou-backend\.exe/);
+  assert.match(install, /node scripts\/verify-bundle\.mjs/);
+});
+
+test("Windows native build validates lifecycle primitives before packaging", () => {
+  const windows = job("build-windows");
+  const buildBackend = step(windows, "Build backend with locked PyInstaller");
+
+  assert.match(buildBackend, /pytest==9\.1\.1/);
+  assert.match(buildBackend, /python -m pytest -q backend\/tests\/test_run\.py/);
+  assert.match(buildBackend, /backend\/tests\/test_scripts\/test_download_node\.py/);
+});
+
 test("uses Python 3.12 and full backend smoke on every build host", () => {
-  for (const name of ["build-windows", "build-linux"]) {
+  const expectedPython = new Map([
+    ["build-windows", "3.12.10"],
+    ["build-linux", "3.12.13"],
+  ]);
+  for (const [name, version] of expectedPython) {
     const build = job(name);
-    assert.match(build, /python-version:\s*"3\.12\.13"/);
+    assert.match(
+      build,
+      new RegExp(`python-version:\\s*"${version.replaceAll(".", "\\.")}"`),
+    );
     assert.match(build, /node scripts\/verify-bundle\.mjs/);
     assert.doesNotMatch(build, /VERIFY_BUNDLE_SKIP_SMOKE/);
   }
@@ -301,8 +390,13 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   const verify = mac.indexOf("Verify repaired app before signing");
   const importCertificate = mac.indexOf("Import Apple certificate and discover signing identity");
   const sign = mac.indexOf("Sign nested Mach-O files and app");
+  const verifySigned = mac.indexOf("Verify signed app runtime");
   const createDmg = mac.indexOf("Create final DMG");
   const notarize = mac.indexOf("Notarize and staple final DMG");
+  const signStep = step(mac, "Sign nested Mach-O files and app");
+  const verifySignedStep = step(mac, "Verify signed app runtime");
+  const createDmgStep = step(mac, "Create final DMG");
+  const finalDmgStep = step(mac, "Verify final DMG contents");
 
   assert.ok(repair >= 0 && sign > repair, "signing must follow framework repair");
   assert.ok(verify > repair, "the repaired app must be verified before secrets are imported");
@@ -310,7 +404,8 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
     importCertificate > verify && sign > importCertificate,
     "the Apple certificate must only be imported after build verification and immediately before signing",
   );
-  assert.ok(createDmg > sign, "DMG must be created after app signing");
+  assert.ok(verifySigned > sign, "signed app runtime must be verified after signing");
+  assert.ok(createDmg > verifySigned, "DMG must be created after signed runtime verification");
   assert.ok(notarize > createDmg, "the final DMG must be the notarized object");
   assert.match(mac, /security find-identity/);
   assert.match(mac, /\^Developer ID Application:/);
@@ -326,6 +421,21 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
     assert.match(mac, new RegExp(`${escapeRegExp(entitlement)}[\\s\\S]*grep -q`));
   }
   assert.match(mac, /desktop-tauri\/src-tauri\/entitlements\.node\.plist/);
+  assert.match(
+    backendAdHocEntitlements,
+    /<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\/>/,
+  );
+  assert.equal((backendAdHocEntitlements.match(/<true\/>/g) ?? []).length, 1);
+  assert.equal((backendAdHocEntitlements.match(/<key>/g) ?? []).length, 1);
+  for (const entitlement of [
+    "com.apple.security.get-task-allow",
+    "com.apple.security.cs.allow-dyld-environment-variables",
+    "com.apple.security.cs.disable-executable-page-protection",
+    "com.apple.security.cs.allow-jit",
+    "com.apple.security.cs.allow-unsigned-executable-memory",
+  ]) {
+    assert.doesNotMatch(backendAdHocEntitlements, new RegExp(escapeRegExp(entitlement)));
+  }
   assert.match(nodeEntitlements, /com\.apple\.security\.cs\.allow-jit/);
   assert.match(nodeEntitlements, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
   assert.equal((nodeEntitlements.match(/<true\/>/g) ?? []).length, 2);
@@ -340,6 +450,42 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.doesNotMatch(mac, /codesign -d --entitlements :-/);
   assert.doesNotMatch(mac, /plutil -(?:extract|remove) com\.apple\.security/);
   assert.doesNotMatch(mac, /codesign --force[^\n]*--deep/);
+  assert.match(
+    signStep,
+    /BACKEND_BINARY="\$APP_PATH\/Contents\/Resources\/backend\/suxiaoyou-backend"/,
+  );
+  assert.match(
+    signStep,
+    /BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri\/src-tauri\/entitlements\.backend-adhoc\.plist"/,
+  );
+  assert.match(
+    signStep,
+    /elif \[\[ "\$SIGNING_IDENTITY" == "-" && "\$candidate" == "\$BACKEND_BINARY" \]\]; then\s+codesign "\$\{SIGN_ARGS\[@\]\}" --entitlements "\$BACKEND_ADHOC_ENTITLEMENTS" "\$candidate"/,
+  );
+  assert.equal(
+    (signStep.match(/--entitlements "\$BACKEND_ADHOC_ENTITLEMENTS"/g) ?? []).length,
+    1,
+    "backend library-validation entitlement must only be applied by the ad-hoc branch",
+  );
+  assert.match(
+    signStep,
+    /if \[\[ "\$SIGNING_IDENTITY" == "-" \]\]; then[\s\S]*grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*elif grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*Developer ID backend must not disable library validation/,
+  );
+  assert.match(verifySignedStep, /verify-macos-bundle\.mjs[^\n]*--verify-signature/);
+  assert.doesNotMatch(verifySignedStep, /--skip-backend-smoke|VERIFY_BUNDLE_SKIP_SMOKE/);
+  assert.match(createDmgStep, /hdiutil create[^\n]*-fs APFS[^\n]*-format UDZO/);
+  assert.match(
+    finalDmgStep,
+    /ditto "\$MOUNT_DIRECTORY\/苏小有\.app" "\$INSTALL_TEST_DIRECTORY\/苏小有\.app"/,
+  );
+  assert.match(
+    finalDmgStep,
+    /verify-macos-bundle\.mjs "\$MOUNT_DIRECTORY\/苏小有\.app"[^\n]*--verify-signature/,
+  );
+  assert.match(
+    finalDmgStep,
+    /verify-macos-bundle\.mjs "\$INSTALL_TEST_DIRECTORY\/苏小有\.app"[^\n]*--verify-signature/,
+  );
   assert.match(mac, /notarytool submit "\$DMG_PATH"/);
   assert.match(mac, /stapler staple "\$DMG_PATH"/);
   assert.match(mac, /stapler validate "\$DMG_PATH"/);
@@ -355,6 +501,7 @@ test("CI runs the frontend unit suite", () => {
   assert.match(ciWorkflow, /node --test tests\/unit\/\*\.test\.ts/);
   assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
   assert.match(ciWorkflow, /verify-macos-bundle\.test\.mjs/);
+  assert.match(ciWorkflow, /verify-node-runtime\.test\.mjs/);
   assert.match(ciWorkflow, /python -m pip install uv==0\.11\.28/);
   for (const target of [
     "x86_64-pc-windows-msvc",

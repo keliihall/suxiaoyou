@@ -46,27 +46,31 @@ class ProviderRegistry:
 
     def __init__(self) -> None:
         self._providers: dict[str, BaseProvider] = {}
+        # Last known-good models are retained independently for each provider.
+        # A partial network failure must never erase another provider's cache.
+        self._provider_models: dict[str, list[ModelInfo]] = {}
         # Quick lookup: model_id → best (provider, model) — used when no provider_id given
         self._model_index: dict[str, tuple[BaseProvider, ModelInfo]] = {}
         # Full list: ALL (provider, model) pairs — used for all_models() and provider-aware resolve
         self._full_models: list[tuple[BaseProvider, ModelInfo]] = []
+        # Full refreshes are single-flight: concurrent GET /models callers join
+        # the same task instead of multiplying remote requests.
+        self._refresh_task: asyncio.Task[dict[str, list[ModelInfo]]] | None = None
+        self._refresh_task_lock = asyncio.Lock()
+        # Serialize full and per-provider refresh mutations.
+        self._refresh_operation_lock = asyncio.Lock()
 
     def register(self, provider: BaseProvider) -> None:
         """Register a provider."""
         self._providers[provider.id] = provider
+        self._rebuild_indexes()
         logger.info("Registered provider: %s", provider.id)
 
     def unregister(self, provider_id: str) -> None:
         """Remove a provider and its models from the index."""
         self._providers.pop(provider_id, None)
-        self._model_index = {
-            mid: (p, m)
-            for mid, (p, m) in self._model_index.items()
-            if p.id != provider_id
-        }
-        self._full_models = [
-            (p, m) for p, m in self._full_models if p.id != provider_id
-        ]
+        self._provider_models.pop(provider_id, None)
+        self._rebuild_indexes()
         logger.info("Unregistered provider: %s", provider_id)
 
     def get_provider(self, provider_id: str) -> BaseProvider | None:
@@ -74,54 +78,129 @@ class ProviderRegistry:
         return self._providers.get(provider_id)
 
     async def refresh_models(self) -> dict[str, list[ModelInfo]]:
-        """Refresh model lists from all providers."""
-        result: dict[str, list[ModelInfo]] = {}
-        new_index: dict[str, tuple[BaseProvider, ModelInfo]] = {}
-        new_full: list[tuple[BaseProvider, ModelInfo]] = []
+        """Refresh every provider, joining any already in-flight refresh."""
+        async with self._refresh_task_lock:
+            task = self._refresh_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._refresh_models_once(),
+                    name="provider-model-refresh",
+                )
+                self._refresh_task = task
+                task.add_done_callback(self._observe_refresh_completion)
 
-        failed: list[tuple[str, Exception]] = []
-        refreshes = await asyncio.gather(
-            *(
-                self._refresh_provider_models(pid, provider)
-                for pid, provider in self._providers.items()
-            ),
-        )
-        for pid, provider, models, error in refreshes:
-            if error is not None:
-                logger.error("Failed to refresh models for %s: %s", pid, error)
-                result[pid] = []
-                failed.append((pid, error))
+        # A cancelled HTTP client must not cancel the refresh shared by other
+        # callers.  ``shutdown()`` explicitly cancels it during app teardown.
+        return await asyncio.shield(task)
+
+    async def _refresh_models_once(self) -> dict[str, list[ModelInfo]]:
+        """Perform one serialized full refresh."""
+        async with self._refresh_operation_lock:
+            providers = list(self._providers.items())
+            if not providers:
+                return {}
+
+            refreshes = await asyncio.gather(
+                *(
+                    self._refresh_provider_models(pid, provider)
+                    for pid, provider in providers
+                ),
+            )
+
+            result: dict[str, list[ModelInfo]] = {}
+            failed: list[tuple[str, Exception]] = []
+            for pid, provider, models, error in refreshes:
+                # Ignore a stale result if configuration replaced the provider
+                # instance while its request was in flight.
+                if self._providers.get(pid) is not provider:
+                    result[pid] = list(self._provider_models.get(pid, []))
+                    continue
+                if error is not None:
+                    logger.error("Failed to refresh models for %s: %s", pid, error)
+                    result[pid] = list(self._provider_models.get(pid, []))
+                    failed.append((pid, error))
+                    continue
+
+                result[pid] = list(models)
+                self._provider_models[pid] = list(models)
+
+            self._rebuild_indexes()
+
+            if failed and len(failed) == len(providers) and not self._full_models:
+                raise failed[0][1]
+
+            logger.info(
+                "Model index: %d unique models, %d total across %d providers",
+                len(self._model_index),
+                len(self._full_models),
+                len(self._providers),
+            )
+            return result
+
+    def seed_registered_models(self) -> dict[str, int]:
+        """Populate last-known-good caches using network-free provider data."""
+        counts: dict[str, int] = {}
+        for pid, provider in self._providers.items():
+            try:
+                models = provider.local_models()
+            except Exception as exc:
+                logger.warning("Failed to build local model seed for %s: %s", pid, exc)
+                counts[pid] = 0
                 continue
-
-            result[pid] = models
-            for m in models:
-                # Full list keeps everything (including duplicates)
-                new_full.append((provider, m))
-
-                # Quick index: direct providers win over aggregators
-                existing = new_index.get(m.id)
-                if existing is not None:
-                    existing_priority = _provider_priority(existing[0].id)
-                    new_priority = _provider_priority(pid)
-                    if new_priority < existing_priority:
-                        new_index[m.id] = (provider, m)
-                else:
-                    new_index[m.id] = (provider, m)
-
-        if new_index or not failed:
-            self._model_index = new_index
-            self._full_models = new_full
-
-        if failed and not new_index:
-            raise failed[0][1]
-
+            if models:
+                _promote_vision_capability(models)
+                self._provider_models[pid] = list(models)
+            counts[pid] = len(models)
+        self._rebuild_indexes()
         logger.info(
-            "Model index: %d unique models, %d total across %d providers",
+            "Seeded model index locally: %d unique models, %d total",
             len(self._model_index),
             len(self._full_models),
-            len(self._providers),
         )
-        return result
+        return counts
+
+    def _rebuild_indexes(self) -> None:
+        new_index: dict[str, tuple[BaseProvider, ModelInfo]] = {}
+        new_full: list[tuple[BaseProvider, ModelInfo]] = []
+        for pid, provider in self._providers.items():
+            for model in self._provider_models.get(pid, []):
+                new_full.append((provider, model))
+                existing = new_index.get(model.id)
+                if existing is None or (
+                    _provider_priority(pid) < _provider_priority(existing[0].id)
+                ):
+                    new_index[model.id] = (provider, model)
+        self._model_index = new_index
+        self._full_models = new_full
+
+    def _observe_refresh_completion(
+        self,
+        task: asyncio.Task[dict[str, list[ModelInfo]]],
+    ) -> None:
+        """Retrieve task exceptions even if every HTTP waiter disconnected."""
+        if self._refresh_task is task:
+            self._refresh_task = None
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def refresh_in_progress(self) -> bool:
+        task = self._refresh_task
+        return task is not None and not task.done()
+
+    async def shutdown(self) -> None:
+        """Cancel and retrieve any shared refresh task during app shutdown."""
+        async with self._refresh_task_lock:
+            task = self._refresh_task
+            self._refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
 
     async def refresh_provider(self, provider_id: str) -> list[ModelInfo]:
         """Refresh just one provider's models, leaving the rest untouched.
@@ -133,46 +212,21 @@ class ProviderRegistry:
         Returns the provider's model list, or ``[]`` if the provider is
         absent or refresh failed.
         """
-        provider = self._providers.get(provider_id)
-        if provider is None:
-            return []
+        async with self._refresh_operation_lock:
+            provider = self._providers.get(provider_id)
+            if provider is None:
+                return []
 
-        pid, _, models, error = await self._refresh_provider_models(provider_id, provider)
-        if error is not None:
-            logger.warning("Failed to refresh models for %s: %s", pid, error)
-            return []
+            pid, _, models, error = await self._refresh_provider_models(provider_id, provider)
+            if error is not None:
+                logger.warning("Failed to refresh models for %s: %s", pid, error)
+                return []
 
-        # Drop this provider's prior rows, then append fresh ones.
-        self._full_models = [
-            (p, m) for p, m in self._full_models if p.id != pid
-        ]
-        # Rebuild the quick-lookup index entries that came from this
-        # provider — direct providers still win over aggregators on
-        # collision. We only touch keys this provider can affect.
-        affected_ids = {
-            mid for mid, (p, _) in self._model_index.items() if p.id == pid
-        } | {m.id for m in models}
+            if self._providers.get(pid) is not provider:
+                return list(self._provider_models.get(pid, []))
 
-        for m in models:
-            self._full_models.append((provider, m))
-
-        # Rebuild the index entries for every model id this provider can
-        # affect — re-scan all (provider, model) rows for each id and pick
-        # the lowest-priority winner (direct beats aggregator).
-        for mid in affected_ids:
-            best_entry: tuple[BaseProvider, ModelInfo] | None = None
-            best_priority: int | None = None
-            for p, m in self._full_models:
-                if m.id != mid:
-                    continue
-                pri = _provider_priority(p.id)
-                if best_priority is None or pri < best_priority:
-                    best_entry = (p, m)
-                    best_priority = pri
-            if best_entry is None:
-                self._model_index.pop(mid, None)
-            else:
-                self._model_index[mid] = best_entry
+            self._provider_models[pid] = list(models)
+            self._rebuild_indexes()
 
         logger.info(
             "Refreshed provider %s: %d models (index=%d, total=%d)",

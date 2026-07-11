@@ -9,11 +9,11 @@ the essential files (~30 MB), and places them in the output directory.
 
 The resulting layout:
     resources/nodejs/
-        node.exe          (Windows)
-        node              (macOS / Linux)
-        npm.cmd / npm     (Windows / Unix)
-        npx.cmd / npx     (Windows / Unix)
-        node_modules/npm/ (npm package)
+        node.exe / bin/node             (Windows / Unix)
+        npm.cmd / bin/npm               (Windows / Unix)
+        npx.cmd / bin/npx               (Windows / Unix)
+        node_modules/npm/                (Windows npm package)
+        lib/node_modules/npm/            (Unix npm package)
 """
 
 from __future__ import annotations
@@ -23,10 +23,13 @@ import hashlib
 import io
 import os
 import platform
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -60,6 +63,31 @@ _KEEP_PREFIXES_UNIX = {
     "bin/npx",
     "lib/node_modules/npm/",
 }
+
+_UNIX_NPM_LAUNCHERS = {
+    "bin/npm": "npm-cli.js",
+    "bin/npx": "npx-cli.js",
+}
+
+
+def _write_unix_npm_launcher(destination: Path, cli_name: str) -> None:
+    """Write a relocation-safe launcher that survives Tauri resource copying.
+
+    The official Node archive exposes ``bin/npm`` and ``bin/npx`` as symlinks.
+    Desktop bundlers may dereference resource symlinks into plain JavaScript
+    files, which changes ``__dirname`` and breaks npm's relative imports.  A
+    small shell launcher always invokes the packaged sibling Node binary and
+    the stable npm CLI path instead.
+    """
+    destination.write_text(
+        "#!/bin/sh\n"
+        'script_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1\n'
+        f'exec "$script_dir/node" '
+        f'"$script_dir/../lib/node_modules/npm/bin/{cli_name}" "$@"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    destination.chmod(0o755)
 
 
 def _platform_key() -> tuple[str, str]:
@@ -156,6 +184,28 @@ def _safe_destination(output: Path, relative_path: str) -> Path:
     return destination
 
 
+def _validate_symlink_target(output: Path, destination: Path, link_name: str) -> None:
+    """Reject absolute or escaping archive symlinks.
+
+    Official Node.js archives use relative ``..`` links for ``bin/npm`` and
+    ``bin/npx``. Those are safe because they still resolve below the runtime
+    root, so validate the resolved destination instead of rejecting every
+    parent component.
+    """
+    if not link_name or "\\" in link_name or "\x00" in link_name:
+        raise ValueError(f"unsafe archive symlink target: {link_name}")
+    link_path = PurePosixPath(link_name)
+    if link_path.is_absolute():
+        raise ValueError(f"unsafe archive symlink target: {link_name}")
+
+    root = output.resolve()
+    target = destination.parent.joinpath(*link_path.parts).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"unsafe archive symlink target: {link_name}") from exc
+
+
 def _extract_windows(archive_bytes: bytes, output: Path) -> None:
     """Extract minimal files from Windows .zip archive."""
     output.mkdir(parents=True, exist_ok=True)
@@ -193,6 +243,28 @@ def _extract_unix(archive_bytes: bytes, output: Path) -> None:
                 continue
             dest = _safe_destination(output, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
+
+            if member.issym():
+                _validate_symlink_target(output, dest, member.linkname)
+                launcher_cli = _UNIX_NPM_LAUNCHERS.get(rel)
+                if launcher_cli is None:
+                    raise ValueError(
+                        f"unsupported retained archive symlink: {rel} -> "
+                        f"{member.linkname}"
+                    )
+                expected_target = f"../lib/node_modules/npm/bin/{launcher_cli}"
+                if member.linkname != expected_target:
+                    raise ValueError(
+                        f"unexpected archive symlink target for {rel}: "
+                        f"{member.linkname}"
+                    )
+                dest.unlink(missing_ok=True)
+                _write_unix_npm_launcher(dest, launcher_cli)
+                print(f"  {rel} (relocation-safe launcher)")
+                continue
+            if not member.isfile():
+                raise ValueError(f"unsupported archive entry type: {rel}")
+
             src = tf.extractfile(member)
             if src:
                 with open(dest, "wb") as dst:
@@ -203,6 +275,88 @@ def _extract_unix(archive_bytes: bytes, output: Path) -> None:
             print(f"  {rel}")
 
 
+def _runtime_paths(output: Path, is_windows: bool) -> dict[str, Path]:
+    if is_windows:
+        return {
+            "node": output / "node.exe",
+            "npm": output / "npm.cmd",
+            "npx": output / "npx.cmd",
+        }
+    return {
+        "node": output / "bin" / "node",
+        "npm": output / "bin" / "npm",
+        "npx": output / "bin" / "npx",
+    }
+
+
+def _version_command(executable: Path, is_windows: bool) -> list[str]:
+    if is_windows and executable.suffix.lower() == ".cmd":
+        # Python's Windows argv encoding and cmd.exe both interpret quotes,
+        # which makes direct .cmd acceptance checks path-dependent.  Execute
+        # npm's authenticated JavaScript entry point with the bundled
+        # node.exe instead.  The .cmd launcher is still required above as a
+        # packaged entry point, while this command validates npm/npx itself
+        # without a shell in the middle.
+        cli = (
+            executable.parent
+            / "node_modules"
+            / "npm"
+            / "bin"
+            / f"{executable.stem}-cli.js"
+        )
+        return [
+            str(executable.parent / "node.exe"),
+            str(cli),
+            "--version",
+        ]
+    return [str(executable), "--version"]
+
+
+def _verify_node_runtime(
+    output: Path,
+    key: tuple[str, str],
+    *,
+    run=subprocess.run,
+) -> dict[str, str]:
+    """Execute the extracted node, npm and npx entry points."""
+    is_windows = key[0] == "Windows"
+    paths = _runtime_paths(output, is_windows)
+    for name, executable in paths.items():
+        if not executable.exists():
+            raise ValueError(f"{name} executable not found at {executable}")
+
+    bin_dir = output if is_windows else output / "bin"
+    env = os.environ.copy()
+    prior_path = env.get("PATH", "")
+    env["PATH"] = str(bin_dir) + (os.pathsep + prior_path if prior_path else "")
+
+    versions: dict[str, str] = {}
+    for name, executable in paths.items():
+        command = _version_command(executable, is_windows)
+        try:
+            result = run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
+            raise ValueError(f"{name} --version failed: {str(detail).strip()}") from exc
+
+        version = (result.stdout or result.stderr or "").strip()
+        if name == "node":
+            expected = f"v{NODE_VERSION}"
+            if version != expected:
+                raise ValueError(f"expected Node {expected}, got {version or 'no output'}")
+        elif not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+            raise ValueError(f"invalid {name} version output: {version or 'no output'}")
+        versions[name] = version
+
+    return versions
+
+
 def install_node_runtime(
     key: tuple[str, str],
     output: Path,
@@ -210,6 +364,7 @@ def install_node_runtime(
     download=_download,
     extract_windows=_extract_windows,
     extract_unix=_extract_unix,
+    verify_runtime=_verify_node_runtime,
 ) -> Path:
     """Download, authenticate, and extract the Node runtime for ``key``."""
     url = _URLS.get(key)
@@ -222,23 +377,79 @@ def install_node_runtime(
     shasums = download(_shasums_url(url))
     _verify_archive_checksum(data, shasums, archive_name)
 
-    # Keep an existing known-good runtime until the replacement has been
-    # authenticated. A network or checksum failure must not destroy it.
-    if output.exists():
-        print(f"Removing existing {output} ...")
-        shutil.rmtree(output)
-
     is_win = key[0] == "Windows"
-    if is_win:
-        extract_windows(data, output)
-    else:
-        extract_unix(data, output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}.staging-",
+            dir=output.parent,
+        )
+    )
+    backup: Path | None = None
+    replacement_succeeded = False
+    try:
+        if is_win:
+            extract_windows(data, staging)
+        else:
+            extract_unix(data, staging)
 
-    node_bin = output / ("node.exe" if is_win else "bin/node")
-    if not node_bin.exists():
-        raise ValueError(f"node binary not found at {node_bin}")
+        versions = verify_runtime(staging, key)
 
-    print(f"\nNode.js {NODE_VERSION} ready at: {output}")
+        # Only replace a known-good existing runtime after the complete new
+        # toolchain has passed execution checks. Both renames stay on the same
+        # filesystem, and a failed second rename restores the previous tree.
+        if output.exists() or output.is_symlink():
+            backup = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{output.name}.backup-",
+                    dir=output.parent,
+                )
+            )
+            backup.rmdir()
+            os.replace(output, backup)
+        try:
+            os.replace(staging, output)
+        except Exception:
+            if backup is not None and backup.exists():
+                try:
+                    os.replace(backup, output)
+                except Exception as rollback_error:
+                    # Never delete the user's only known-good runtime after a
+                    # double filesystem failure.  Leave it at the reported
+                    # backup path for manual recovery.
+                    preserved_backup = backup
+                    backup = None
+                    raise RuntimeError(
+                        "Node runtime replacement and rollback both failed; "
+                        f"the previous runtime is preserved at {preserved_backup}"
+                    ) from rollback_error
+                else:
+                    backup = None
+            raise
+        else:
+            replacement_succeeded = True
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and backup.exists():
+            if replacement_succeeded:
+                try:
+                    shutil.rmtree(backup)
+                except OSError as exc:
+                    print(
+                        f"WARNING: could not remove Node runtime backup "
+                        f"{backup}: {exc}"
+                    )
+            else:
+                print(
+                    f"WARNING: previous Node runtime preserved at {backup} "
+                    "after an incomplete replacement"
+                )
+
+    print(
+        f"\nNode.js {NODE_VERSION} ready at: {output} "
+        f"(npm {versions['npm']}, npx {versions['npx']})"
+    )
     total_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
     print(f"Total size: {total_size // (1024 * 1024)} MB")
     return output

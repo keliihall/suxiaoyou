@@ -10,6 +10,10 @@ mod tray;
 
 use backend::BackendState;
 use log::{error, info};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 #[cfg(target_os = "macos")]
@@ -39,6 +43,8 @@ pub fn run() {
 
     let backend_state = BackendState::new();
     let pending_navigation = PendingNavigationState::new();
+    let exit_cleanup_started = Arc::new(AtomicBool::new(false));
+    let exit_cleanup_complete = Arc::new(AtomicBool::new(false));
 
     tauri::Builder::default()
         // -- Plugins --
@@ -68,7 +74,6 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_process::init())
         // -- Managed state --
         .manage(backend_state)
         .manage(pending_navigation)
@@ -76,6 +81,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_backend_url,
             commands::get_backend_token,
+            commands::get_backend_status,
             commands::get_pending_navigation,
             commands::window_minimize,
             commands::window_maximize,
@@ -83,6 +89,8 @@ pub fn run() {
             commands::is_maximized,
             commands::get_platform,
             commands::open_external,
+            commands::open_backend_logs,
+            commands::relaunch_app,
             commands::download_and_save,
             commands::update_tray_recents,
         ])
@@ -189,6 +197,14 @@ pub fn run() {
                 });
             }
 
+            // Make the loading/failure UI visible immediately. Backend startup
+            // (including first-run PyInstaller extraction) continues in the
+            // async task below and reports progress through backend-status.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.center();
+                let _ = window.show();
+            }
+
             // Start backend
             let app_handle = handle.clone();
             if cfg!(debug_assertions) {
@@ -221,34 +237,52 @@ pub fn run() {
                 );
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<BackendState>();
+                    state.publish_initializing(&app_handle).await;
                     state.set_dev_port(dev_port).await;
-                    if let Err(e) = state.set_dev_data_dir(dev_data_dir).await {
-                        error!("Dev mode: failed to load backend session token: {e}");
-                    }
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.center();
-                        let _ = window.show();
+                    match state.set_dev_data_dir(dev_data_dir).await {
+                        Ok(_) => {
+                            state.publish_dev_ready(&app_handle).await;
+                        }
+                        Err(err) => {
+                            error!("Dev mode: failed to load backend session token: {err}");
+                            let snapshot = state
+                                .publish_failed(
+                                    &app_handle,
+                                    "dev_backend_unavailable",
+                                    &format!("Development backend is unavailable: {err}"),
+                                )
+                                .await;
+                            let _ = app_handle.emit(
+                                "backend-crash",
+                                snapshot
+                                    .detail
+                                    .as_deref()
+                                    .unwrap_or("Development backend is unavailable"),
+                            );
+                        }
                     }
                 });
             } else {
                 // Production: spawn and manage backend process
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<BackendState>();
+                    state.publish_initializing(&app_handle).await;
                     match state.start(&app_handle).await {
                         Ok(url) => {
                             info!("Backend started at {url}");
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.center();
-                                let _ = window.show();
-                            }
                         }
                         Err(err) => {
                             error!("Failed to start backend: {err}");
-                            let _ = app_handle.emit("backend-crash", &err);
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.center();
-                                let _ = window.show();
-                            }
+                            let snapshot = state
+                                .publish_failed(&app_handle, "backend_start_failed", &err)
+                                .await;
+                            let _ = app_handle.emit(
+                                "backend-crash",
+                                snapshot
+                                    .detail
+                                    .as_deref()
+                                    .unwrap_or("Backend failed to start"),
+                            );
                         }
                     }
                 });
@@ -260,16 +294,33 @@ pub fn run() {
         .on_window_event(|_window, _event| {})
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
+        .run(move |app_handle, event| {
             match event {
-                tauri::RunEvent::ExitRequested { .. } => {
-                    // Gracefully stop backend on exit
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    // Tauri's event-loop callback cannot reliably block on an
+                    // async child shutdown: the process may exit while the
+                    // future is still waiting, orphaning the backend. Keep the
+                    // event loop alive until stop() has reaped the process,
+                    // then issue one final exit request that is allowed through.
+                    if exit_cleanup_complete.load(Ordering::Acquire) {
+                        return;
+                    }
+                    api.prevent_exit();
+                    if exit_cleanup_started.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    info!("Exit requested; waiting for backend cleanup");
+
                     let handle = app_handle.clone();
-                    tauri::async_runtime::block_on(async {
+                    let exit_cleanup_complete = exit_cleanup_complete.clone();
+                    tauri::async_runtime::spawn(async move {
                         let state = handle.state::<BackendState>();
                         if let Err(e) = state.stop().await {
                             error!("Error stopping backend: {e}");
                         }
+                        info!("Backend cleanup complete; exiting desktop process");
+                        exit_cleanup_complete.store(true, Ordering::Release);
+                        handle.exit(code.unwrap_or(0));
                     });
                 }
                 #[cfg(target_os = "macos")]

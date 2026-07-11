@@ -12,7 +12,6 @@ import { PlanReviewPanel } from "@/components/plan-review/plan-review-panel";
 import { WorkspacePanel } from "@/components/workspace/workspace-panel";
 import { usePlanReviewStore } from "@/stores/plan-review-store";
 import { SplashScreen } from "@/components/layout/splash-screen";
-import { TitleBar } from "@/components/desktop/title-bar";
 import { WindowTopIcons } from "@/components/layout/window-top-icons";
 import { OnboardingScreen } from "@/components/onboarding/onboarding-screen";
 import { useSidebarStore } from "@/stores/sidebar-store";
@@ -177,9 +176,6 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
 
       {/* Onboarding flow for first-run users */}
       {needsOnboarding && <OnboardingScreen />}
-
-      {/* Desktop title bar (Electron only) */}
-      <TitleBar />
 
       {/* Desktop sidebar — Settings swaps in its own nav */}
       <div className="hidden lg:block">

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 import httpx
 
@@ -47,6 +47,35 @@ from app.tool.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+class _BackgroundTaskManager:
+    """Own startup jobs so failures are observed and shutdown is bounded."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def create(self, awaitable: Awaitable[object], *, name: str) -> asyncio.Task[None]:
+        async def _run() -> None:
+            try:
+                await awaitable
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Background startup job failed: %s", name)
+
+        task = asyncio.create_task(_run(), name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def cancel_and_wait(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+
+
 def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     """Custom handler for unhandled asyncio exceptions.
 
@@ -64,11 +93,12 @@ async def _models_dev_background_refresh_loop(
     service: object,
     *,
     interval_seconds: float,
+    registry: ProviderRegistry | None = None,
 ) -> None:
     """Refresh models.dev immediately, then hourly, without gating startup."""
     while True:
         try:
-            await service.refresh()  # type: ignore[attr-defined]
+            refreshed = await service.refresh()  # type: ignore[attr-defined]
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -76,6 +106,17 @@ async def _models_dev_background_refresh_loop(
                 "models.dev background refresh failed: %s — using cached/hardcoded data",
                 exc,
             )
+        else:
+            if refreshed and registry is not None:
+                try:
+                    await registry.refresh_models()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Provider refresh after models.dev update failed: %s",
+                        exc,
+                    )
         await asyncio.sleep(interval_seconds)
 
 
@@ -83,15 +124,151 @@ def _start_models_dev_background_refresh(
     service: object,
     *,
     interval_seconds: float = 3600,
+    registry: ProviderRegistry | None = None,
+    task_manager: _BackgroundTaskManager | None = None,
 ) -> asyncio.Task[None]:
     """Schedule models.dev refresh and return immediately to the caller."""
-    return asyncio.create_task(
-        _models_dev_background_refresh_loop(
-            service,
-            interval_seconds=interval_seconds,
-        ),
-        name="models-dev-background-refresh",
+    awaitable = _models_dev_background_refresh_loop(
+        service,
+        interval_seconds=interval_seconds,
+        registry=registry,
     )
+    if task_manager is not None:
+        return task_manager.create(
+            awaitable,
+            name="models-dev-background-refresh",
+        )
+    return asyncio.create_task(awaitable, name="models-dev-background-refresh")
+
+
+async def _initialize_subscription_provider(provider: object) -> None:
+    """Refresh OAuth after liveness is available."""
+    try:
+        await provider._ensure_valid_token()  # type: ignore[attr-defined]
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Background subscription token refresh failed: %s — re-authorization may be required",
+            exc,
+        )
+
+
+async def _initialize_ollama_runtime(
+    *,
+    manager: object,
+    settings: Settings,
+    registry: ProviderRegistry,
+) -> None:
+    """Auto-start and discover Ollama without gating application startup."""
+    from app.provider.ollama import OllamaProvider
+
+    base_url = settings.ollama_base_url
+    if manager.is_binary_installed and settings.ollama_auto_start:  # type: ignore[attr-defined]
+        try:
+            base_url = await manager.start()  # type: ignore[attr-defined]
+            settings.ollama_base_url = base_url
+            registry.register(
+                OllamaProvider(
+                    base_url=base_url,
+                    seed_model=settings.ollama_last_model,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to auto-start managed Ollama: %s — trying configured URL",
+                exc,
+            )
+
+    await registry.refresh_provider("ollama")
+
+    last_model = settings.ollama_last_model
+    if last_model:
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                await client.post(
+                    f"{base_url.rstrip('/')}/api/generate",
+                    json={"model": last_model, "prompt": "", "keep_alive": "10m"},
+                )
+            logger.info("Ollama: pre-warmed model %s", last_model)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Ollama warmup skipped for %s: %s", last_model, exc)
+
+
+async def _initialize_rapid_mlx_runtime(
+    *,
+    manager: object,
+    settings: Settings,
+    registry: ProviderRegistry,
+) -> None:
+    """Auto-start and discover Rapid-MLX without gating liveness."""
+    from app.provider.rapid_mlx import RapidMLXProvider
+
+    if (
+        manager.platform_supported  # type: ignore[attr-defined]
+        and manager.is_binary_installed  # type: ignore[attr-defined]
+        and settings.rapid_mlx_auto_start
+    ):
+        try:
+            from app.rapid_mlx.manager import DEFAULT_PORT, _port_from_base_url
+
+            port = _port_from_base_url(settings.rapid_mlx_base_url) or DEFAULT_PORT
+            settings.rapid_mlx_base_url = await manager.start(  # type: ignore[attr-defined]
+                model=settings.rapid_mlx_model,
+                port=port,
+            )
+            registry.register(
+                RapidMLXProvider(
+                    base_url=settings.rapid_mlx_base_url,
+                    seed_model=settings.rapid_mlx_model,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to auto-start Rapid-MLX: %s — trying configured URL",
+                exc,
+            )
+
+    await registry.refresh_provider("rapid-mlx")
+
+
+async def _start_remote_tunnel(tunnel_manager: object) -> None:
+    """Start the optional network tunnel after the app is live."""
+    try:
+        tunnel_url = await tunnel_manager.start()  # type: ignore[attr-defined]
+        logger.info("Remote access tunnel: %s", tunnel_url)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to start remote tunnel in background: %s — remote access disabled",
+            exc,
+        )
+
+
+async def _rebuild_upload_hash_index(
+    rebuild: Callable[..., None],
+) -> None:
+    """Run the upload scan off-loop and cooperatively stop it on shutdown."""
+    import threading
+
+    cancel_event = threading.Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(rebuild, cancel_event=cancel_event),
+        name="upload-hash-index-worker",
+    )
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        await asyncio.gather(worker, return_exceptions=True)
+        raise
 
 
 @asynccontextmanager
@@ -110,6 +287,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Install global asyncio exception handler
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_asyncio_exception_handler)
+
+    background_tasks = _BackgroundTaskManager()
+    app.state.background_tasks = background_tasks
 
     # Session token — generate fresh on every startup, 0600 file so a
     # different local user on the same host cannot read it. Stored on
@@ -160,7 +340,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     models_dev.load_cached_for_startup()
 
-    # Register OpenAI subscription provider if configured
+    # Register OpenAI subscription provider from local state only.  Token
+    # refresh is a background concern and must never delay /livez.
+    sub_provider = None
     if settings.openai_oauth_access_token and settings.openai_oauth_account_id:
         from app.provider.openai_subscription import OpenAISubscriptionProvider
 
@@ -174,17 +356,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         registry.register(sub_provider)
         logger.info("OpenAI subscription provider registered from saved tokens")
 
-        # Proactively refresh token on startup if it's expired/expiring
-        try:
-            await sub_provider._ensure_valid_token()
-        except Exception as e:
-            logger.warning("Startup token refresh failed: %s — user may need to re-authorize", e)
-
-        try:
-            await registry.refresh_models()
-        except Exception as e:
-            logger.warning("Failed to refresh models after subscription provider registration: %s", e)
-
     # Ollama runtime manager (always created — manages binary + process)
     from app.ollama.manager import OllamaManager
 
@@ -192,45 +363,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ollama_manager = OllamaManager(data_dir=data_dir)
     app.state.ollama_manager = ollama_manager
 
-    # If Ollama URL is configured, register provider.
-    # If the managed binary is installed and auto-start is on, start the process.
+    # Register the configured Ollama endpoint immediately.  Managed process
+    # startup and discovery happen in a tracked background task after yield.
     if settings.ollama_base_url:
         from app.provider.ollama import OllamaProvider
 
-        # Try to auto-start managed Ollama if binary exists
-        if ollama_manager.is_binary_installed and settings.ollama_auto_start:
-            try:
-                base_url = await ollama_manager.start()
-                ollama_provider = OllamaProvider(base_url=base_url)
-                # Update settings in case port changed
-                settings.ollama_base_url = base_url
-            except Exception as e:
-                logger.warning("Failed to auto-start managed Ollama: %s — trying configured URL", e)
-                ollama_provider = OllamaProvider(base_url=settings.ollama_base_url)
-        else:
-            ollama_provider = OllamaProvider(base_url=settings.ollama_base_url)
-
+        ollama_provider = OllamaProvider(
+            base_url=settings.ollama_base_url,
+            seed_model=settings.ollama_last_model,
+        )
         registry.register(ollama_provider)
-        try:
-            await registry.refresh_models()
-        except Exception as e:
-            logger.warning("Ollama connection failed on startup: %s — will retry on first request", e)
-
-        # Pre-warm last-used model so the first chat request is fast
-        last_model = settings.ollama_last_model
-        if last_model:
-            async def _warmup_model(base_url: str, model: str) -> None:
-                try:
-                    async with httpx.AsyncClient(timeout=120.0) as client:
-                        await client.post(
-                            f"{base_url}/api/generate",
-                            json={"model": model, "prompt": "", "keep_alive": "10m"},
-                        )
-                    logger.info("Ollama: pre-warmed model %s", model)
-                except Exception as exc:
-                    logger.debug("Ollama warmup skipped for %s: %s", model, exc)
-
-            asyncio.create_task(_warmup_model(ollama_provider._base_url, last_model))
 
     # Rapid-MLX runtime manager (Apple Silicon macOS, user-installed via brew/pip)
     from app.rapid_mlx.manager import RapidMLXManager
@@ -248,28 +390,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _update_env_file("SUXIAOYOU_RAPID_MLX_MODEL", normalized_rapid_mlx_model)
         settings.rapid_mlx_model = normalized_rapid_mlx_model
 
-        if (
-            rapid_mlx_manager.platform_supported
-            and rapid_mlx_manager.is_binary_installed
-            and settings.rapid_mlx_auto_start
-        ):
-            try:
-                from app.rapid_mlx.manager import DEFAULT_PORT, _port_from_base_url
-
-                port = _port_from_base_url(settings.rapid_mlx_base_url) or DEFAULT_PORT
-                settings.rapid_mlx_base_url = await rapid_mlx_manager.start(
-                    model=settings.rapid_mlx_model,
-                    port=port,
-                )
-            except Exception as e:
-                logger.warning("Failed to auto-start Rapid-MLX: %s — trying configured URL", e)
-
-        rapid_mlx_provider = RapidMLXProvider(base_url=settings.rapid_mlx_base_url)
+        rapid_mlx_provider = RapidMLXProvider(
+            base_url=settings.rapid_mlx_base_url,
+            seed_model=settings.rapid_mlx_model,
+        )
         registry.register(rapid_mlx_provider)
-        try:
-            await registry.refresh_models()
-        except Exception as e:
-            logger.warning("Rapid-MLX connection failed on startup: %s — will retry on status check", e)
 
     # Auto-register BYOK providers (OpenAI, Anthropic, Gemini, Groq, etc.)
     from app.provider.catalog import PROVIDER_CATALOG
@@ -277,8 +402,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     disabled = {s.strip() for s in settings.disabled_providers.split(",") if s.strip()}
 
-    byok_registered = 0
-    should_refresh_models = False
     for pid, pdef in PROVIDER_CATALOG.items():
         if pid in disabled:
             continue
@@ -297,8 +420,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             provider = create_desktop_provider(pid, api_key, **extra_kwargs)
             registry.register(provider)
-            byok_registered += 1
-            should_refresh_models = True
             logger.info("Registered BYOK provider: %s", pid)
         except Exception as e:
             logger.warning("Failed to register provider %s: %s", pid, e)
@@ -320,8 +441,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 extra_headers=ce.get("headers") or None,
             )
             registry.register(provider)
-            byok_registered += 1
-            should_refresh_models = True
             logger.info("Registered custom provider: %s (%s)", pid, ce.get("name"))
         except Exception as e:
             logger.warning("Failed to register custom provider %s: %s", ce.get("id"), e)
@@ -330,16 +449,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             local_provider = create_local_provider(settings.local_base_url)
             registry.register(local_provider)
-            should_refresh_models = True
             logger.info("Registered local provider at %s", settings.local_base_url)
         except Exception as e:
             logger.warning("Failed to register local provider %s: %s", settings.local_base_url, e)
 
-    if should_refresh_models:
-        try:
-            await registry.refresh_models()
-        except Exception as e:
-            logger.warning("Model refresh failed after provider registration: %s", e)
+    # Prime a usable model index from cached/bundled/user-declared metadata.
+    # This path is synchronous and guaranteed not to touch the network.
+    registry.seed_registered_models()
 
     app.state.provider_registry = registry
     set_provider_registry(registry)
@@ -397,8 +513,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if plugin_manager.status():
         logger.info("Plugin manager: %d plugins loaded", len(plugin_manager.status()))
 
-    # Start connector connections (MCP servers)
-    await connector_registry.startup()
+    # Build connector/MCP state locally.  Enabled connections are opened in a
+    # tracked background job after yield so a slow server cannot block /livez.
+    connector_registry.prepare()
     app.state.connector_registry = connector_registry
     set_connector_registry(connector_registry)
     # Backward compat: expose mcp_manager for any code that still uses it
@@ -408,15 +525,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     tool_registry = ToolRegistry()
     _register_builtin_tools(tool_registry, skill_registry=skill_registry, settings=settings)
 
-    # Register MCP tools from connected connectors + bind for dynamic refresh
+    # Bind before background connection. ``connect_enabled`` calls sync_tools
+    # after discovery, so tools appear incrementally without restarting.
     connector_registry.set_tool_registry(tool_registry)
-    for mcp_tool in connector_registry.tools():
-        tool_registry.register(mcp_tool)
-    if connector_registry.tools():
-        # Register ToolSearch so LLM can discover deferred MCP tool schemas on demand
-        from app.tool.builtin.tool_search import ToolSearchTool
-        tool_registry.register(ToolSearchTool(tool_registry))
-        logger.info("MCP integration enabled (%d tools, ToolSearch active)", len(connector_registry.tools()))
+    connector_registry.sync_tools()
 
     app.state.tool_registry = tool_registry
     set_tool_registry(tool_registry)
@@ -425,21 +537,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.tool.truncation import cleanup_old_outputs
     cleanup_old_outputs(workspace=settings.project_dir)
 
-    # Rebuild upload file hash index for dedup (run in thread to avoid blocking the event loop)
+    # Prepare the callable now; the potentially large scan runs after yield.
     from app.api.files import rebuild_hash_index
-    await asyncio.to_thread(rebuild_hash_index)
 
-    # Remote access tunnel (optional — only when enabled in settings)
+    # Construct the optional tunnel manager locally, but defer its network
+    # startup until after the app can answer /livez.
+    tunnel_mgr = None
     if settings.remote_access_enabled and settings.remote_tunnel_mode == "cloudflare":
-        from app.auth.tunnel import TunnelManager
+        from app.api.remote import get_or_create_tunnel_manager
 
-        tunnel_mgr = TunnelManager(backend_port=settings.port)
-        try:
-            tunnel_url = await tunnel_mgr.start()
-            app.state.tunnel_manager = tunnel_mgr
-            logger.info("Remote access tunnel: %s", tunnel_url)
-        except Exception as e:
-            logger.warning("Failed to start remote tunnel on startup: %s — remote access disabled", e)
+        tunnel_mgr = get_or_create_tunnel_manager(app)
 
     # Built-in FTS5 search (enabled by default)
     if settings.fts_enabled:
@@ -488,17 +595,63 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     set_workspace_memory_queue(ws_memory_queue)
     app.state.ws_memory_queue = ws_memory_queue
 
-    # Remote model metadata is useful but not a liveness dependency. Start its
-    # initial fetch only as a background task immediately before yielding so
-    # /livez and the desktop UI are not held behind a slow/offline network.
-    models_dev_refresh_task = _start_models_dev_background_refresh(models_dev)
+    # Every network/process-bound provider startup action is tracked and
+    # scheduled immediately before yield.  The registry already contains its
+    # local seed, so the UI has a usable snapshot while these jobs run.
+    background_tasks.create(
+        connector_registry.connect_enabled(),
+        name="mcp-connect-enabled",
+    )
+    background_tasks.create(
+        _rebuild_upload_hash_index(rebuild_hash_index),
+        name="upload-hash-index-rebuild",
+    )
+    background_tasks.create(
+        registry.refresh_models(),
+        name="provider-initial-model-refresh",
+    )
+    _start_models_dev_background_refresh(
+        models_dev,
+        registry=registry,
+        task_manager=background_tasks,
+    )
+    if sub_provider is not None:
+        background_tasks.create(
+            _initialize_subscription_provider(sub_provider),
+            name="subscription-token-refresh",
+        )
+    if settings.ollama_base_url:
+        background_tasks.create(
+            _initialize_ollama_runtime(
+                manager=ollama_manager,
+                settings=settings,
+                registry=registry,
+            ),
+            name="ollama-startup",
+        )
+    if settings.rapid_mlx_base_url:
+        background_tasks.create(
+            _initialize_rapid_mlx_runtime(
+                manager=rapid_mlx_manager,
+                settings=settings,
+                registry=registry,
+            ),
+            name="rapid-mlx-startup",
+        )
+    if tunnel_mgr is not None:
+        background_tasks.create(
+            _start_remote_tunnel(tunnel_mgr),
+            name="remote-tunnel-startup",
+        )
+
     try:
         yield
     finally:
-        # Always retrieve cancellation, including exceptional lifespan exits,
-        # so tests and production never leak an un-awaited background task.
-        models_dev_refresh_task.cancel()
-        await asyncio.gather(models_dev_refresh_task, return_exceptions=True)
+        # Stop and retrieve every liveness-independent startup task.  A shared
+        # registry refresh is shielded from individual request cancellation,
+        # so cancel it explicitly after its owning wrapper is stopped.
+        await background_tasks.cancel_and_wait()
+        await registry.shutdown()
 
     # --- Shutdown ---
 
@@ -551,6 +704,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ollama_mgr = getattr(app.state, "ollama_manager", None)
     if ollama_mgr and ollama_mgr.is_running:
         await ollama_mgr.stop()
+
+    rapid_mlx_mgr = getattr(app.state, "rapid_mlx_manager", None)
+    if rapid_mlx_mgr and rapid_mlx_mgr.is_managed_process_alive:
+        await rapid_mlx_mgr.stop()
 
     await engine.dispose()
 
