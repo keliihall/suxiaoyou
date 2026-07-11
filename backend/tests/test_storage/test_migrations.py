@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,43 @@ def _quick_check(path: Path) -> str:
         return str(connection.execute("PRAGMA quick_check").fetchone()[0])
 
 
+class _TrackedSQLiteConnection:
+    """Proxy preserving sqlite3's non-closing context-manager semantics."""
+
+    def __init__(self, inner: sqlite3.Connection) -> None:
+        self.inner = inner
+        self.closed = False
+
+    def __enter__(self):
+        self.inner.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self.inner.__exit__(*exc_info)
+
+    def close(self) -> None:
+        self.closed = True
+        self.inner.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+
+def _track_migration_sqlite_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[_TrackedSQLiteConnection], object]:
+    real_connect = migrations.sqlite3.connect
+    tracked: list[_TrackedSQLiteConnection] = []
+
+    def tracking_connect(*args, **kwargs):
+        connection = _TrackedSQLiteConnection(real_connect(*args, **kwargs))
+        tracked.append(connection)
+        return connection
+
+    monkeypatch.setattr(migrations.sqlite3, "connect", tracking_connect)
+    return tracked, real_connect
+
+
 def test_new_database_is_initialized_at_v080_head(tmp_path: Path) -> None:
     database = tmp_path / "new.db"
 
@@ -72,6 +110,140 @@ def test_new_database_is_initialized_at_v080_head(tmp_path: Path) -> None:
         "idempotency_record",
         "alembic_version",
     } <= _table_names(database)
+
+
+def test_new_database_closes_validation_handles_before_windows_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model Windows sharing semantics: replacing an open DB must fail."""
+
+    database = tmp_path / "new.db"
+    token = "windows-handle-order"
+    staging = database.with_name(f".{database.name}.{token}.migrating")
+    # Build a real valid staging DB before installing connection tracking.
+    migrations._run_alembic(staging, stamp_revision=None)
+    monkeypatch.setattr(migrations, "_migration_token", lambda: token)
+    monkeypatch.setattr(migrations, "_run_alembic", lambda *_args, **_kwargs: None)
+    tracked, real_connect = _track_migration_sqlite_connections(monkeypatch)
+    real_replace = migrations.os.replace
+    replace_checked = False
+
+    def windows_replace(source, destination) -> None:
+        nonlocal replace_checked
+        if Path(source) == staging and Path(destination) == database:
+            replace_checked = True
+            if any(not connection.closed for connection in tracked):
+                raise PermissionError(32, "file is being used by another process")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(migrations.os, "replace", windows_replace)
+
+    result = migrations._initialize_new_database(database)
+
+    assert result.created is True
+    assert replace_checked is True
+    assert tracked and all(connection.closed for connection in tracked)
+    # Avoid the test module's intentionally non-closing sqlite context helper
+    # while the module-level connect function is patched.
+    connection = real_connect(database)
+    try:
+        revision = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert revision == (V080_HEAD_REVISION,)
+
+
+def test_failed_new_database_validation_closes_handles_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "invalid.db"
+    token = "windows-failed-cleanup"
+    staging = database.with_name(f".{database.name}.{token}.migrating")
+    real_connect = migrations.sqlite3.connect
+
+    def create_invalid_staging(path: Path, *, stamp_revision: str | None) -> None:
+        del stamp_revision
+        connection = real_connect(path)
+        try:
+            connection.execute("CREATE TABLE incomplete (value TEXT)")
+            connection.commit()
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(migrations, "_migration_token", lambda: token)
+    monkeypatch.setattr(migrations, "_run_alembic", create_invalid_staging)
+    tracked, _ = _track_migration_sqlite_connections(monkeypatch)
+    real_remove = migrations._remove_sqlite_files
+    cleanup_checked = False
+
+    def windows_remove(path: Path) -> None:
+        nonlocal cleanup_checked
+        cleanup_checked = True
+        if any(not connection.closed for connection in tracked):
+            raise PermissionError(32, "file is being used by another process")
+        real_remove(path)
+
+    monkeypatch.setattr(migrations, "_remove_sqlite_files", windows_remove)
+
+    with pytest.raises(DatabaseMigrationError) as exc_info:
+        migrations._initialize_new_database(database)
+
+    assert "unexpected revision" in str(exc_info.value)
+    assert cleanup_checked is True
+    assert tracked and all(connection.closed for connection in tracked)
+    assert not staging.exists()
+
+
+def test_alembic_connection_reference_is_dropped_before_engine_dispose_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeConnection:
+        def __enter__(self):
+            events.append("connection-open")
+            return self
+
+        def __exit__(self, *_exc_info) -> None:
+            events.append("connection-close")
+
+    connection = FakeConnection()
+
+    class FakeEngine:
+        def connect(self) -> FakeConnection:
+            return connection
+
+        def dispose(self) -> None:
+            events.append("engine-dispose")
+
+    engine = FakeEngine()
+    config = SimpleNamespace(attributes={"connection": connection})
+
+    def fail_upgrade(received_config, revision: str) -> None:
+        assert received_config.attributes["connection"] is connection
+        assert revision == "head"
+        events.append("upgrade")
+        raise RuntimeError("forced Alembic failure")
+
+    monkeypatch.setattr(migrations, "create_sync_engine", lambda *_args: engine)
+    monkeypatch.setattr(migrations, "_alembic_config", lambda _connection: config)
+    monkeypatch.setattr(migrations.command, "upgrade", fail_upgrade)
+
+    with pytest.raises(RuntimeError, match="forced Alembic failure"):
+        migrations._run_alembic(tmp_path / "staging.db", stamp_revision=None)
+
+    assert "connection" not in config.attributes
+    assert events == [
+        "connection-open",
+        "upgrade",
+        "connection-close",
+        "engine-dispose",
+    ]
 
 
 def test_embedded_migration_does_not_disable_application_loggers(tmp_path: Path) -> None:

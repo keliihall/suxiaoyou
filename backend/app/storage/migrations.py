@@ -14,6 +14,8 @@ import logging
 import os
 import sqlite3
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -399,16 +401,45 @@ def _run_alembic(database_path: Path, *, stamp_revision: str | None) -> None:
     try:
         with engine.connect() as connection:
             config = _alembic_config(connection)
-            if stamp_revision is not None:
-                command.stamp(config, stamp_revision)
-            command.upgrade(config, "head")
+            try:
+                if stamp_revision is not None:
+                    command.stamp(config, stamp_revision)
+                command.upgrade(config, "head")
+            finally:
+                # Alembic's Config is mutable and otherwise retains a strong
+                # reference to the supplied SQLAlchemy Connection.  Drop it
+                # before the context closes the connection and the engine is
+                # disposed, making the handle-release order explicit.
+                config.attributes.pop("connection", None)
     finally:
         engine.dispose()
 
 
+@contextmanager
+def _sqlite_connection(
+    database_path: Path,
+    *,
+    timeout: float = 30,
+) -> Iterator[sqlite3.Connection]:
+    """Yield a transactional SQLite connection and always close its handle.
+
+    ``sqlite3.Connection``'s own context manager commits or rolls back but
+    deliberately does *not* close the connection.  Relying on refcounting to
+    release that file handle happened to work with Unix rename semantics, but
+    fails with ``WinError 32`` when the migrated staging file is replaced.
+    """
+
+    connection = sqlite3.connect(database_path, timeout=timeout)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def _quick_check(database_path: Path) -> None:
     try:
-        with sqlite3.connect(database_path, timeout=30) as connection:
+        with _sqlite_connection(database_path) as connection:
             connection.execute("PRAGMA busy_timeout=30000")
             rows = connection.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as exc:
@@ -428,7 +459,7 @@ def _online_backup(
 ) -> None:
     _remove_sqlite_files(destination_path)
     try:
-        with sqlite3.connect(source_path, timeout=30) as source:
+        with _sqlite_connection(source_path) as source:
             source.execute("PRAGMA busy_timeout=30000")
             if checkpoint_source:
                 journal_mode = str(source.execute("PRAGMA journal_mode").fetchone()[0])
@@ -441,7 +472,7 @@ def _online_backup(
                             "SQLite database is busy; close other app instances and retry"
                         )
             _quick_check_connection(source, source_path)
-            with sqlite3.connect(destination_path, timeout=30) as destination:
+            with _sqlite_connection(destination_path) as destination:
                 source.backup(destination)
                 destination.commit()
         _quick_check(destination_path)
@@ -457,7 +488,7 @@ def _quick_check_connection(connection: sqlite3.Connection, path: Path) -> None:
 
 
 def _prepare_staging_journal(database_path: Path) -> None:
-    with sqlite3.connect(database_path, timeout=30) as connection:
+    with _sqlite_connection(database_path) as connection:
         mode = str(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
         if mode.casefold() != "delete":
             raise RuntimeError(
@@ -466,7 +497,7 @@ def _prepare_staging_journal(database_path: Path) -> None:
 
 
 def _read_revision(database_path: Path) -> str | None:
-    with sqlite3.connect(database_path, timeout=30) as connection:
+    with _sqlite_connection(database_path) as connection:
         tables = _table_names(connection)
         if "alembic_version" not in tables:
             return None
@@ -475,7 +506,7 @@ def _read_revision(database_path: Path) -> str | None:
 
 
 def _validate_v073_schema(database_path: Path) -> None:
-    with sqlite3.connect(database_path, timeout=30) as connection:
+    with _sqlite_connection(database_path) as connection:
         tables = _table_names(connection)
         missing_tables = sorted(set(V073_REQUIRED_COLUMNS) - tables)
         missing_columns: list[str] = []
@@ -502,7 +533,7 @@ def _validate_v073_schema(database_path: Path) -> None:
 
 
 def _has_valid_v080_session_input(database_path: Path) -> bool:
-    with sqlite3.connect(database_path, timeout=30) as connection:
+    with _sqlite_connection(database_path) as connection:
         if "session_input" not in _table_names(connection):
             return False
         columns = {
@@ -526,7 +557,7 @@ def _has_valid_v080_session_input(database_path: Path) -> bool:
 
 
 def _has_valid_v080_idempotency_record(database_path: Path) -> bool:
-    with sqlite3.connect(database_path, timeout=30) as connection:
+    with _sqlite_connection(database_path) as connection:
         if "idempotency_record" not in _table_names(connection):
             return False
         columns = {
