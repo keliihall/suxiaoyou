@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -9,6 +17,7 @@ import {
   buildIsolatedEnvironment,
   descendantProcessIds,
   parsePosixProcessTable,
+  resolveDesktopExecutable,
   validateReadyMarker,
   verifyDesktopLifecycle,
 } from "./verify-desktop-lifecycle.mjs";
@@ -64,6 +73,27 @@ test("collects the complete descendant tree without unrelated processes", () => 
   `);
   assert.deepEqual(descendantProcessIds(processes, 10), [11, 13, 12]);
 });
+
+test(
+  "canonicalizes a desktop executable beneath a symlinked ancestor",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const directory = mkdtempSync(join(tmpdir(), "suxiaoyou-desktop-realpath-"));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const realDirectory = join(directory, "installed");
+    const linkedDirectory = join(directory, "installed-link");
+    mkdirSync(realDirectory);
+    const executable = join(realDirectory, "desktop");
+    writeFileSync(executable, "desktop\n");
+    symlinkSync(realDirectory, linkedDirectory, "dir");
+
+    const requested = join(linkedDirectory, "desktop");
+    const canonical = resolveDesktopExecutable(requested);
+
+    assert.equal(canonical, realpathSync(executable));
+    assert.notEqual(canonical, resolve(requested));
+  },
+);
 
 test(
   "probes readiness, requests graceful exit, and observes descendant cleanup end to end",

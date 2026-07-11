@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -148,6 +149,19 @@ export function parsePosixProcessTable(output) {
   return processes;
 }
 
+export function resolveDesktopExecutable(executable) {
+  const requested = resolve(executable);
+  if (!existsSync(requested)) {
+    throw new Error(`desktop executable does not exist: ${requested}`);
+  }
+
+  // macOS /var is a symlink to /private/var, and Tauri intentionally rejects
+  // a starting executable whose path contains any symlink ancestor. CI's
+  // mktemp uses /var/folders, so launch the exact same installed binary
+  // through its canonical path instead of weakening Tauri's safety check.
+  return realpathSync(requested);
+}
+
 export async function verifyDesktopLifecycle({
   executable,
   workDirectory,
@@ -155,9 +169,8 @@ export async function verifyDesktopLifecycle({
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
   shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
 }) {
-  const application = resolve(executable);
+  const application = resolveDesktopExecutable(executable);
   const work = resolve(workDirectory);
-  if (!existsSync(application)) throw new Error(`desktop executable does not exist: ${application}`);
   if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) {
     throw new Error("startup timeout must be a positive integer");
   }
