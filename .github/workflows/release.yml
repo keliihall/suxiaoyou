@@ -23,6 +23,12 @@ jobs:
   validate-release:
     name: Validate release contract
     runs-on: ubuntu-22.04
+    outputs:
+      app_version: ${{ steps.release-context.outputs.app_version }}
+      release_version: ${{ steps.release-context.outputs.release_version }}
+      release_channel: ${{ steps.release-context.outputs.release_channel }}
+      is_stable: ${{ steps.release-context.outputs.is_stable }}
+      macos_artifact_profile: ${{ steps.release-context.outputs.macos_artifact_profile }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -38,8 +44,51 @@ jobs:
             exit 1
           fi
 
-      - name: Require Apple credentials for an official tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Resolve and validate release context
+        id: release-context
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(node -p "require('./package.json').version")"
+          if [[ ! "$APP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::package.json version must use X.Y.Z form, got $APP_VERSION"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            APP_VERSION_REGEX="${APP_VERSION//./\\.}"
+            if [[ "$GITHUB_REF_NAME" == "v$APP_VERSION" ]]; then
+              RELEASE_VERSION="$APP_VERSION"
+              RELEASE_CHANNEL="stable"
+              IS_STABLE="true"
+              MACOS_ARTIFACT_PROFILE="release"
+            elif [[ "$GITHUB_REF_NAME" =~ ^v${APP_VERSION_REGEX}-rc\.([1-9][0-9]*)$ ]]; then
+              RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+              RELEASE_CHANNEL="prerelease"
+              IS_STABLE="false"
+              MACOS_ARTIFACT_PROFILE="RC-ADHOC-NOT-NOTARIZED"
+            else
+              echo "::error::tag must be v$APP_VERSION or v$APP_VERSION-rc.N with N >= 1; got $GITHUB_REF_NAME"
+              exit 1
+            fi
+          else
+            RELEASE_VERSION="$APP_VERSION"
+            RELEASE_CHANNEL="manual-test"
+            IS_STABLE="false"
+            MACOS_ARTIFACT_PROFILE="ADHOC-TEST"
+          fi
+
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "is_stable=$IS_STABLE" >> "$GITHUB_OUTPUT"
+          echo "macos_artifact_profile=$MACOS_ARTIFACT_PROFILE" >> "$GITHUB_OUTPUT"
+
+      - name: Require Apple credentials for a stable tag
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -55,13 +104,9 @@ jobs:
           [[ -n "$APPLE_PASSWORD" ]] || missing+=("APPLE_PASSWORD")
           [[ -n "$APPLE_TEAM_ID" ]] || missing+=("APPLE_TEAM_ID")
           if (( ${#missing[@]} > 0 )); then
-            echo "::error::official tags require Apple credentials: ${missing[*]}"
+            echo "::error::stable tags require Apple credentials: ${missing[*]}"
             exit 1
           fi
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -89,14 +134,11 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Validate metadata and workflow contracts
+        env:
+          APP_VERSION: ${{ steps.release-context.outputs.app_version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            EXPECTED_VERSION="${GITHUB_REF_NAME#v}"
-          else
-            EXPECTED_VERSION="$(node -p "require('./package.json').version")"
-          fi
-          node scripts/release-metadata.mjs "$EXPECTED_VERSION"
+          node scripts/release-metadata.mjs "$APP_VERSION"
           node --test scripts/*.test.mjs
 
       - name: Audit and test frontend production graph
@@ -313,6 +355,8 @@ jobs:
       NODE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'Darwin-arm64' || 'Darwin-x86_64' }}
       BACKEND_DIST: dist
       BUILD_CONFIG: ${{ matrix.target == 'aarch64-apple-darwin' && 'src-tauri/build.macos-aarch64.json' || 'src-tauri/build.macos-x64.json' }}
+      IS_STABLE_RELEASE: ${{ needs.validate-release.outputs.is_stable }}
+      MACOS_ARTIFACT_PROFILE: ${{ needs.validate-release.outputs.macos_artifact_profile }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -412,7 +456,7 @@ jobs:
 
       - name: Import Apple certificate and discover signing identity
         id: apple-signing
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -452,7 +496,7 @@ jobs:
           SIGNED_NODE_ENTITLEMENTS="$RUNNER_TEMP/signed-node-entitlements.plist"
           MACHO_LIST="$RUNNER_TEMP/macho-files.txt"
 
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
             [[ -n "$DEVELOPER_IDENTITY" ]]
             SIGNING_IDENTITY="$DEVELOPER_IDENTITY"
             SIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
@@ -524,7 +568,14 @@ jobs:
           done
 
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-          codesign -dv --verbose=4 "$APP_PATH" 2>&1
+          APP_SIGNATURE="$RUNNER_TEMP/app-signature-$DMG_ARCH.txt"
+          codesign -dv --verbose=4 "$APP_PATH" 2> "$APP_SIGNATURE"
+          cat "$APP_SIGNATURE"
+          if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
+            grep -Fxq "Authority=$SIGNING_IDENTITY" "$APP_SIGNATURE"
+          else
+            grep -Fxq "Signature=adhoc" "$APP_SIGNATURE"
+          fi
 
       - name: Verify signed app runtime
         run: |
@@ -584,7 +635,7 @@ jobs:
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
         env:
           SIGNING_IDENTITY: ${{ steps.apple-signing.outputs.identity }}
         run: |
@@ -593,7 +644,7 @@ jobs:
           codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$DMG_PATH"
 
       - name: Notarize and staple final DMG
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -607,7 +658,7 @@ jobs:
           xcrun stapler validate "$DMG_PATH"
 
       - name: Verify official signatures and Gatekeeper
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
         run: |
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
@@ -617,6 +668,21 @@ jobs:
           codesign --verify --strict --verbose=2 "$DMG_PATH"
           spctl --assess --type open --context context:primary-signature -vv "$DMG_PATH"
           hdiutil verify "$DMG_PATH"
+
+      - name: Verify RC ad-hoc trust boundary
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'false'
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          if codesign --verify --strict --verbose=2 "$DMG_PATH"; then
+            echo "::error::RC DMG unexpectedly has a code signature"
+            exit 1
+          fi
+          if xcrun stapler validate "$DMG_PATH"; then
+            echo "::error::RC DMG unexpectedly has a stapled notarization ticket"
+            exit 1
+          fi
 
       - name: Verify final DMG contents
         run: |
@@ -645,7 +711,7 @@ jobs:
           rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
 
       - name: Remove temporary Apple keychain
-        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: always() && github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
         run: |
           security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/apple-certificate.p12"
@@ -663,7 +729,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: macos-${{ env.DMG_ARCH }}-${{ github.event_name == 'workflow_dispatch' && 'ADHOC-TEST' || 'release' }}
+          name: macos-${{ env.DMG_ARCH }}-${{ env.MACOS_ARTIFACT_PROFILE }}
           path: desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 1
@@ -933,12 +999,17 @@ jobs:
           retention-days: 1
 
   publish:
-    name: Create draft GitHub Release
+    name: Prepare GitHub Release
     needs: [validate-release, build-windows, build-macos, build-linux]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      APP_VERSION: ${{ needs.validate-release.outputs.app_version }}
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+      RELEASE_CHANNEL: ${{ needs.validate-release.outputs.release_channel }}
+      MACOS_ARTIFACT_PROFILE: ${{ needs.validate-release.outputs.macos_artifact_profile }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -958,7 +1029,6 @@ jobs:
       - name: Verify artifact completeness
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
           require_one() {
             local label="$1"
             local directory="$2"
@@ -974,20 +1044,24 @@ jobs:
           }
 
           require_one "Windows NSIS installer (*.exe)" artifacts/windows-release "*.exe"
-          require_one "macOS Apple Silicon installer (*.dmg)" artifacts/macos-aarch64-release "*.dmg"
-          require_one "macOS Intel installer (*.dmg)" artifacts/macos-x64-release "*.dmg"
+          require_one "macOS Apple Silicon installer (*.dmg)" "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg"
+          require_one "macOS Intel installer (*.dmg)" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg"
           require_one "Linux Debian installer (*.deb)" artifacts/linux-x64-release "*.deb"
           require_one "Linux RPM installer (*.rpm)" artifacts/linux-x64-release "*.rpm"
-          require_one "Windows NSIS installer for $VERSION" artifacts/windows-release "*${VERSION}*.exe"
-          require_one "macOS Apple Silicon installer for $VERSION" artifacts/macos-aarch64-release "*${VERSION}*_aarch64.dmg"
-          require_one "macOS Intel installer for $VERSION" artifacts/macos-x64-release "*${VERSION}*_x64.dmg"
-          require_one "Linux Debian installer for $VERSION" artifacts/linux-x64-release "*${VERSION}*.deb"
-          require_one "Linux RPM installer for $VERSION" artifacts/linux-x64-release "*${VERSION}*.rpm"
+          require_one "Windows NSIS installer for app $APP_VERSION" artifacts/windows-release "*${APP_VERSION}*.exe"
+          require_one "macOS Apple Silicon installer for app $APP_VERSION" "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_aarch64.dmg"
+          require_one "macOS Intel installer for app $APP_VERSION" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_x64.dmg"
+          require_one "Linux Debian installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.deb"
+          require_one "Linux RPM installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.rpm"
 
-      - name: Stage stable release asset names
+      - name: Stage release asset names
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          case "$RELEASE_CHANNEL" in
+            stable) MACOS_TRUST_SUFFIX="" ;;
+            prerelease) MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED" ;;
+            *) echo "::error::unsupported publish channel $RELEASE_CHANNEL"; exit 1 ;;
+          esac
           rm -rf release-assets
           mkdir release-assets
           copy_one() {
@@ -999,11 +1073,11 @@ jobs:
             [[ -n "$source" ]]
             cp -- "$source" "release-assets/$destination"
           }
-          copy_one artifacts/windows-release "*.exe" "suxiaoyou-${VERSION}-windows-x64-setup.exe"
-          copy_one artifacts/macos-aarch64-release "*.dmg" "suxiaoyou-${VERSION}-macos-aarch64.dmg"
-          copy_one artifacts/macos-x64-release "*.dmg" "suxiaoyou-${VERSION}-macos-x64.dmg"
-          copy_one artifacts/linux-x64-release "*.deb" "suxiaoyou-${VERSION}-linux-amd64.deb"
-          copy_one artifacts/linux-x64-release "*.rpm" "suxiaoyou-${VERSION}-linux-x86_64.rpm"
+          copy_one artifacts/windows-release "*.exe" "suxiaoyou-${RELEASE_VERSION}-windows-x64-setup.exe"
+          copy_one "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suxiaoyou-${RELEASE_VERSION}-macos-aarch64${MACOS_TRUST_SUFFIX}.dmg"
+          copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suxiaoyou-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
+          copy_one artifacts/linux-x64-release "*.deb" "suxiaoyou-${RELEASE_VERSION}-linux-amd64.deb"
+          copy_one artifacts/linux-x64-release "*.rpm" "suxiaoyou-${RELEASE_VERSION}-linux-x86_64.rpm"
           [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "5" ]]
 
       - name: Generate SHA-256 checksums
@@ -1030,23 +1104,38 @@ jobs:
       - name: Record installer trust status
         run: |
           {
+            if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+              cat <<EOF
+          > [!WARNING]
+          > 这是 v${RELEASE_VERSION} 候选测试版，不是正式 v${APP_VERSION}。macOS 应用仅使用 ad-hoc 临时签名，DMG 未使用 Developer ID 签名、未经过 Apple 公证，Gatekeeper 可能拦截。
+
+          候选版安装包内部版本仍为 ${APP_VERSION}。未来安装正式 v${APP_VERSION} 时，系统或包管理器可能不会将其识别为升级；请先卸载候选版，或显式执行覆盖安装。
+
+          EOF
+            fi
             cat <<'EOF'
           ## 安装包信任与验证状态
 
-          - macOS Apple Silicon 与 Intel：Developer ID 签名，已通过 Apple 公证并 stapled。
           - Windows NSIS：当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
           - Linux DEB/RPM：当前未配置仓库签名；已验证包元数据、完整解包和内置运行时。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 
           EOF
+            if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
+              printf '%s\n\n' '- macOS Apple Silicon 与 Intel：Developer ID 签名，已通过 Apple 公证并 stapled。'
+            else
+              printf '%s\n\n' '- macOS Apple Silicon 与 Intel：应用仅使用 ad-hoc 临时签名；DMG 未使用 Developer ID 签名、未经过 Apple 公证，也没有 stapled ticket。'
+            fi
             cat CHECKSUMS.md
           } > RELEASE-BODY.md
 
-      - name: Create draft GitHub Release
+      - name: Prepare GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           draft: true
+          prerelease: ${{ needs.validate-release.outputs.release_channel == 'prerelease' }}
+          make_latest: false
           generate_release_notes: true
           body_path: RELEASE-BODY.md
           append_body: true

@@ -11,6 +11,7 @@ import {
   parseChecksumMarkdown,
   RELEASE_MANIFEST_KIND,
   RELEASE_MANIFEST_SCHEMA_VERSION,
+  releaseIdentityFromVersion,
   releaseVersionFromTag,
 } from "./generate-release-manifest.mjs";
 import { isMainModule } from "./release-metadata.mjs";
@@ -25,15 +26,18 @@ export function verifyReleaseManifest({
 }) {
   const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
   const version = releaseVersionFromTag(expectedTag);
+  const { appVersion, channel } = releaseIdentityFromVersion(version);
   requireExactKeys(
     manifest,
     [
       "schemaVersion",
       "kind",
       "updateMode",
+      "channel",
       "repository",
       "tag",
       "version",
+      "appVersion",
       "commit",
       "releaseUrl",
       "checksumUrl",
@@ -48,8 +52,10 @@ export function verifyReleaseManifest({
   if (manifest.updateMode !== "manual-download") {
     throw new Error("release manifest must not claim automatic-update capability");
   }
+  requireEqual(manifest.channel, channel, "channel");
   requireEqual(manifest.tag, expectedTag, "tag");
   requireEqual(manifest.version, version, "version");
+  requireEqual(manifest.appVersion, appVersion, "app version");
   requireEqual(manifest.commit, expectedCommit, "commit");
   requireEqual(manifest.repository, expectedRepository, "repository");
   const releaseBase = `https://github.com/${expectedRepository}/releases`;

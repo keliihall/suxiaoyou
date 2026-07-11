@@ -35,6 +35,7 @@
 - PR 门禁覆盖完整后端、前端 unit/type/lint、Rust test/clippy 和 Chromium 核心交互回归。
 - Release 门禁在原生 runner 构建并真实安装 Windows NSIS、macOS arm64/x64 DMG、Linux DEB/RPM，启动桌面应用、等待内置后端 ready、执行正常退出并验证无孤儿进程。
 - 正式 Release 统一生成五个稳定 ASCII 安装包名、`CHECKSUMS.md` 和只读 `release-manifest.json`；macOS 正式 tag 强制 Developer ID 签名与 Apple 公证，Windows/Linux 未签名状态在发布说明中明确披露。
+- `v0.8.0-rc.N` 候选版允许在没有 Apple 凭据时发布 macOS ad-hoc 构建，但应用、DMG 文件名和 Release 说明必须醒目标注未使用 Developer ID、未公证；正式 `v0.8.0` 的签名与公证门禁不会因此放宽。
 
 ### 已知限制
 
@@ -43,6 +44,7 @@
 - 上传孤儿文件在应用启动维护阶段回收，长时间不重启时清理可能延后。
 - 本地大文件“另存为”仍会经过 base64、JavaScript 数组和桌面 IPC，单次内容限制为 50 MB；后续版本改为原生路径复制或流式传输以降低内存峰值。
 - v0.8.0 提供可信版本发现和手动下载入口，不包含应用内自动安装更新。
+- 候选版与正式版的安装包内部版本同为 `0.8.0`；从 RC 切换到正式版时，部分系统或包管理器可能要求先卸载 RC 或显式覆盖安装。
 
 ## v0.7.3 — 2026-07-11
 
