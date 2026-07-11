@@ -25,6 +25,7 @@ import {
   useRunAutomation,
 } from "@/hooks/use-automations";
 import { queryKeys } from "@/lib/constants";
+import { getChatRoute } from "@/lib/routes";
 import { humanizeSchedule, relativeTime, formatTime } from "./helpers";
 import { StatusBadge, RunHistoryPanel, DeleteConfirmDialog } from "./shared-ui";
 import type { AutomationResponse, ScheduleConfig } from "@/types/automation";
@@ -155,7 +156,7 @@ export function AutomationCard({ automation: a, onEdit }: { automation: Automati
             </span>
             {a.last_session_id && a.last_run_status !== "running" && (
               <Link
-                href={`/c/${a.last_session_id}`}
+                href={getChatRoute(a.last_session_id)}
                 className="ml-auto text-ui-3xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)] inline-flex items-center gap-0.5"
               >
                 {t("viewResult")}

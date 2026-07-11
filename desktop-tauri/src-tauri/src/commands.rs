@@ -1,9 +1,12 @@
 //! Tauri command handlers — the IPC bridge between frontend and Rust.
 
-use tauri::{AppHandle, WebviewWindow};
+use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::{backend::BackendState, tray, PendingNavigationState};
+use crate::{
+    backend::{BackendState, BackendStatus},
+    tray, PendingNavigationState,
+};
 
 /// Get the backend URL (http://127.0.0.1:{port}).
 #[tauri::command]
@@ -20,6 +23,14 @@ pub async fn get_backend_url(state: tauri::State<'_, BackendState>) -> Result<St
 #[tauri::command]
 pub async fn get_backend_token(state: tauri::State<'_, BackendState>) -> Result<String, String> {
     state.token().await
+}
+
+/// Get the latest revisioned native backend lifecycle snapshot.
+#[tauri::command]
+pub async fn get_backend_status(
+    state: tauri::State<'_, BackendState>,
+) -> Result<BackendStatus, String> {
+    Ok(state.status().await)
 }
 
 #[tauri::command]
@@ -69,6 +80,35 @@ pub fn open_external(app: AppHandle, url: String) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+/// Open the application's fixed log directory in the system file manager.
+/// No caller-supplied path is accepted across IPC.
+#[tauri::command]
+pub fn open_backend_logs(app: AppHandle) -> Result<(), String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("Failed to get app log directory: {e}"))?;
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| format!("Failed to create app log directory: {e}"))?;
+
+    app.opener()
+        .open_path(log_dir.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|e| format!("Failed to open app log directory: {e}"))
+}
+
+/// Stop and reap the backend before restarting the desktop process.
+///
+/// The generic process-plugin restart exits immediately and can bypass the
+/// asynchronous ExitRequested cleanup, so recovery UI must use this command.
+#[tauri::command]
+pub async fn relaunch_app(
+    app: AppHandle,
+    state: tauri::State<'_, BackendState>,
+) -> Result<(), String> {
+    state.stop().await?;
+    app.restart()
 }
 
 /// Save a file via a native save dialog.

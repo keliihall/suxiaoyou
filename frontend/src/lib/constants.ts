@@ -18,6 +18,7 @@ export const TITLE_BAR_HEIGHT = 32;
  */
 let _backendUrl: string | null = null;
 let _backendUrlPromise: Promise<string> | null = null;
+let _backendUrlGeneration = 0;
 
 // Session bearer token for the desktop backend. Desktop-only: the backend
 // writes this to a 0600 file on startup and the Tauri shell hands it to
@@ -25,6 +26,7 @@ let _backendUrlPromise: Promise<string> | null = null;
 // so this cache stays null.
 let _backendToken: string | null = null;
 let _backendTokenPromise: Promise<string> | null = null;
+let _backendTokenGeneration = 0;
 
 /** Direct backend URL for SSE streams (avoids Next.js proxy buffering). */
 const FALLBACK_BACKEND_URL =
@@ -45,14 +47,18 @@ export function getBackendUrl(): Promise<string> {
   if (_backendUrlPromise) return _backendUrlPromise;
 
   if (IS_DESKTOP) {
+    const generation = _backendUrlGeneration;
     _backendUrlPromise = desktopAPI
       .getBackendUrl()
       .then((url) => {
+        if (generation !== _backendUrlGeneration) return getBackendUrl();
         _backendUrl = url;
         return url;
       })
       .catch((err) => {
-        _backendUrlPromise = null;
+        if (generation === _backendUrlGeneration) {
+          _backendUrlPromise = null;
+        }
         throw err;
       });
     return _backendUrlPromise;
@@ -67,6 +73,7 @@ export function getBackendUrl(): Promise<string> {
  * on a new port so the next `getBackendUrl()` re-fetches via IPC.
  */
 export function resetBackendUrl(newUrl?: string): void {
+  _backendUrlGeneration += 1;
   if (newUrl) {
     _backendUrl = newUrl;
   } else {
@@ -102,6 +109,7 @@ export function getBackendToken(): Promise<string> {
     );
   }
 
+  const generation = _backendTokenGeneration;
   const fetchWithRetry = async (): Promise<string> => {
     const maxAttempts = 10;
     let delay = 300;
@@ -126,11 +134,14 @@ export function getBackendToken(): Promise<string> {
 
   _backendTokenPromise = fetchWithRetry()
     .then((token) => {
+      if (generation !== _backendTokenGeneration) return getBackendToken();
       _backendToken = token;
       return token;
     })
     .catch((err) => {
-      _backendTokenPromise = null;
+      if (generation === _backendTokenGeneration) {
+        _backendTokenPromise = null;
+      }
       throw err;
     });
   return _backendTokenPromise;
@@ -148,6 +159,7 @@ export function getBackendTokenSync(): string | null {
  * old one is invalid.
  */
 export function resetBackendToken(): void {
+  _backendTokenGeneration += 1;
   _backendToken = null;
   _backendTokenPromise = null;
 }

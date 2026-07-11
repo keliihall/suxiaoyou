@@ -6,6 +6,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { BackendStatus } from "./backend-lifecycle";
 
 export interface TrayRecent {
   id: string;
@@ -15,8 +16,11 @@ export interface TrayRecent {
 export interface DesktopAPI {
   getBackendUrl: () => Promise<string>;
   getBackendToken: () => Promise<string>;
+  getBackendStatus: () => Promise<BackendStatus>;
   getPendingNavigation: () => Promise<string | null>;
   getPlatform: () => Promise<string>;
+  openBackendLogs: () => Promise<void>;
+  relaunch: () => Promise<void>;
   openExternal: (url: string) => Promise<void>;
   downloadAndSave: (opts: { url?: string; data?: number[]; defaultName: string }) => Promise<boolean>;
   minimize: () => Promise<void>;
@@ -28,6 +32,9 @@ export interface DesktopAPI {
   onBackendRestarting: (callback: () => void) => () => void;
   onBackendRestart: (callback: (newUrl: string) => void) => () => void;
   onBackendCrashLog: (callback: (log: string) => void) => () => void;
+  onBackendStatus: (
+    callback: (status: BackendStatus) => void,
+  ) => Promise<() => void>;
   onNavigate: (callback: (path: string) => void) => () => void;
   onToggleSidebar: (callback: () => void) => () => void;
   onOpenSearch: (callback: () => void) => () => void;
@@ -58,8 +65,11 @@ function listenSync<T>(
 export const desktopAPI: DesktopAPI = {
   getBackendUrl: () => invoke<string>("get_backend_url"),
   getBackendToken: () => invoke<string>("get_backend_token"),
+  getBackendStatus: () => invoke<BackendStatus>("get_backend_status"),
   getPendingNavigation: () => invoke<string | null>("get_pending_navigation"),
   getPlatform: () => invoke<string>("get_platform"),
+  openBackendLogs: () => invoke<void>("open_backend_logs"),
+  relaunch: () => invoke<void>("relaunch_app"),
   openExternal: (url) => invoke("open_external", { url }),
   downloadAndSave: ({ url, data, defaultName }) => invoke<boolean>("download_and_save", { url, data, defaultName }),
   minimize: () => invoke("window_minimize"),
@@ -75,6 +85,8 @@ export const desktopAPI: DesktopAPI = {
     listenSync<string>("backend-restart", callback),
   onBackendCrashLog: (callback) =>
     listenSync<string>("backend-crash-log", callback),
+  onBackendStatus: async (callback) =>
+    listen<BackendStatus>("backend-status", (event) => callback(event.payload)),
   onNavigate: (callback) => listenSync<string>("navigate", callback),
   onToggleSidebar: (callback) => listenSync<void>("toggle-sidebar", callback),
   onOpenSearch: (callback) => listenSync<void>("open-search", callback),

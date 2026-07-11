@@ -9,6 +9,10 @@ pub fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // 文件菜单
     let new_chat = MenuItem::with_id(app, "menu_new_chat", "新对话", true, Some("CmdOrCtrl+N"))?;
     let settings = MenuItem::with_id(app, "menu_settings", "设置", true, Some("CmdOrCtrl+,"))?;
+    // Use an application-owned quit item. The native predefined quit action
+    // can terminate Cocoa directly before Tauri's async backend cleanup has
+    // completed, leaving the Python process orphaned.
+    let quit = MenuItem::with_id(app, "menu_quit", "退出", true, Some("CmdOrCtrl+Q"))?;
     let file_menu = Submenu::with_items(
         app,
         "文件",
@@ -18,7 +22,7 @@ pub fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::separator(app)?,
             &settings,
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::quit(app, Some("退出"))?,
+            &quit,
         ],
     )?;
 
@@ -96,6 +100,11 @@ pub fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 /// Handle menu events.
 pub fn handle_menu_event(app: &AppHandle, event_id: &str) {
+    if event_id == "menu_quit" {
+        app.exit(0);
+        return;
+    }
+
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
