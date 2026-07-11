@@ -194,7 +194,14 @@ jobs:
           if ($nodeBinaries.Count -ne 1) {
             throw "Expected one packaged node.exe, found $($nodeBinaries.Count)"
           }
-          node scripts/verify-node-runtime.mjs $nodeBinaries[0].Directory.FullName
+          $nodeRuntime = $nodeBinaries[0].Directory.FullName
+          node scripts/verify-node-runtime.mjs $nodeRuntime
+          foreach ($launcher in @("npm.cmd", "npx.cmd")) {
+            & (Join-Path $nodeRuntime $launcher) --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged $launcher exited with code $LASTEXITCODE"
+            }
+          }
 
           $backendBinaries = @(
             Get-ChildItem $installDirectory -Recurse -File -Filter suxiaoyou-backend.exe |

@@ -43,10 +43,23 @@ export async function verifyNodeRuntime(
   const node = join(binDirectory, isWindows ? "node.exe" : "node");
   const npm = join(binDirectory, isWindows ? "npm.cmd" : "npm");
   const npx = join(binDirectory, isWindows ? "npx.cmd" : "npx");
+  const npmCli = isWindows
+    ? join(runtime, "node_modules", "npm", "bin", "npm-cli.js")
+    : null;
+  const npxCli = isWindows
+    ? join(runtime, "node_modules", "npm", "bin", "npx-cli.js")
+    : null;
 
   for (const [name, executable] of Object.entries({ node, npm, npx })) {
     if (!existsSync(executable)) {
       throw new Error(`bundled ${name} executable does not exist: ${executable}`);
+    }
+  }
+  if (isWindows) {
+    for (const [name, cli] of Object.entries({ npm: npmCli, npx: npxCli })) {
+      if (!existsSync(cli)) {
+        throw new Error(`bundled ${name} CLI does not exist: ${cli}`);
+      }
     }
   }
 
@@ -89,8 +102,22 @@ export async function verifyNodeRuntime(
     );
   }
 
-  const npmVersion = await runToolVersion(runCommand, npm, platform, runtimeEnv);
-  const npxVersion = await runToolVersion(runCommand, npx, platform, runtimeEnv);
+  // On Windows, run the official npm/npx JavaScript entry points with the
+  // bundled node.exe.  This validates the tools without layering Python or
+  // Node argv escaping on top of cmd.exe's own quote parser.  The .cmd files
+  // remain mandatory packaged launchers above.
+  const npmVersion = await commandText(
+    runCommand,
+    isWindows ? node : npm,
+    isWindows ? [npmCli, "--version"] : ["--version"],
+    { env: runtimeEnv },
+  );
+  const npxVersion = await commandText(
+    runCommand,
+    isWindows ? node : npx,
+    isWindows ? [npxCli, "--version"] : ["--version"],
+    { env: runtimeEnv },
+  );
   for (const [name, version] of Object.entries({ npm: npmVersion, npx: npxVersion })) {
     if (!SEMVER_OUTPUT.test(version)) {
       throw new Error(`invalid ${name} version output: ${version || "no output"}`);
@@ -122,19 +149,6 @@ function normalizeExecutable(path, isWindows) {
     normalized = resolve(path);
   }
   return isWindows ? normalized.toLowerCase() : normalized;
-}
-
-async function runToolVersion(runCommand, executable, platform, env) {
-  if (platform === "win32") {
-    const commandLine = `""${executable}" --version"`;
-    return commandText(
-      runCommand,
-      env.ComSpec || env.COMSPEC || "cmd.exe",
-      ["/d", "/s", "/c", commandLine],
-      { env },
-    );
-  }
-  return commandText(runCommand, executable, ["--version"], { env });
 }
 
 async function commandText(runCommand, command, args, options) {

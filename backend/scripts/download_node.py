@@ -291,17 +291,23 @@ def _runtime_paths(output: Path, is_windows: bool) -> dict[str, Path]:
 
 def _version_command(executable: Path, is_windows: bool) -> list[str]:
     if is_windows and executable.suffix.lower() == ".cmd":
-        # ``cmd.exe /s /c`` needs an outer quote pair around the command and
-        # a separate inner pair around the batch-file path.  Quoting the
-        # entire ``path --version`` string makes cmd treat it as one missing
-        # executable whenever the path itself contains no spaces.
-        command_line = f'""{executable}" --version"'
+        # Python's Windows argv encoding and cmd.exe both interpret quotes,
+        # which makes direct .cmd acceptance checks path-dependent.  Execute
+        # npm's authenticated JavaScript entry point with the bundled
+        # node.exe instead.  The .cmd launcher is still required above as a
+        # packaged entry point, while this command validates npm/npx itself
+        # without a shell in the middle.
+        cli = (
+            executable.parent
+            / "node_modules"
+            / "npm"
+            / "bin"
+            / f"{executable.stem}-cli.js"
+        )
         return [
-            os.environ.get("COMSPEC", "cmd.exe"),
-            "/d",
-            "/s",
-            "/c",
-            command_line,
+            str(executable.parent / "node.exe"),
+            str(cli),
+            "--version",
         ]
     return [str(executable), "--version"]
 

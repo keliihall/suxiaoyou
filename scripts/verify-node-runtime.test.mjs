@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, test } from "node:test";
 
 import { verifyNodeRuntime } from "./verify-node-runtime.mjs";
@@ -26,7 +26,17 @@ function runtimeFixture(platform) {
     npx: join(binDirectory, isWindows ? "npx.cmd" : "npx"),
   };
   for (const path of Object.values(paths)) writeFileSync(path, "fixture");
-  return { binDirectory, paths, runtime };
+  const cliPaths = isWindows
+    ? {
+        npm: join(runtime, "node_modules", "npm", "bin", "npm-cli.js"),
+        npx: join(runtime, "node_modules", "npm", "bin", "npx-cli.js"),
+      }
+    : {};
+  for (const path of Object.values(cliPaths)) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "fixture");
+  }
+  return { binDirectory, cliPaths, paths, runtime };
 }
 
 function commandRunner(fixture, platform, overrides = {}) {
@@ -48,8 +58,8 @@ function commandRunner(fixture, platform, overrides = {}) {
     if (platform !== "win32" && command === fixture.paths.npx) {
       return { stdout: `${overrides.npxVersion ?? "10.9.4"}\n` };
     }
-    if (platform === "win32" && command === "cmd.exe") {
-      const tool = args.at(-1).includes("npm.cmd") ? "npm" : "npx";
+    if (platform === "win32" && command === fixture.paths.node) {
+      const tool = args[0] === fixture.cliPaths.npm ? "npm" : "npx";
       return { stdout: `${overrides[`${tool}Version`] ?? "10.9.4"}\n` };
     }
     throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
@@ -79,7 +89,7 @@ test("verifies a Unix node, npm and npx runtime with bundled PATH first", async 
   );
 });
 
-test("uses cmd.exe for Windows npm.cmd and npx.cmd", async () => {
+test("uses bundled node.exe for Windows npm and npx CLIs", async () => {
   const fixture = runtimeFixture("win32");
   const runner = commandRunner(fixture, "win32", { nodeArchitecture: "x64" });
 
@@ -92,11 +102,14 @@ test("uses cmd.exe for Windows npm.cmd and npx.cmd", async () => {
   });
 
   assert.equal(result.nodeArchitecture, "x64");
-  const cmdCalls = runner.calls.filter(({ command }) => command === "cmd.exe");
-  assert.equal(cmdCalls.length, 2);
-  assert.match(cmdCalls[0].args.at(-1), /npm\.cmd" --version/);
-  assert.match(cmdCalls[1].args.at(-1), /npx\.cmd" --version/);
-  assert.ok(cmdCalls.every(({ options }) => options.env.PATH.startsWith(fixture.runtime)));
+  const cliCalls = runner.calls.filter(
+    ({ args }) => args[0] === fixture.cliPaths.npm || args[0] === fixture.cliPaths.npx,
+  );
+  assert.equal(cliCalls.length, 2);
+  assert.deepEqual(cliCalls[0].args, [fixture.cliPaths.npm, "--version"]);
+  assert.deepEqual(cliCalls[1].args, [fixture.cliPaths.npx, "--version"]);
+  assert.ok(cliCalls.every(({ command }) => command === fixture.paths.node));
+  assert.ok(cliCalls.every(({ options }) => options.env.PATH.startsWith(fixture.runtime)));
 });
 
 test("rejects a missing npm entry point", async () => {
@@ -111,6 +124,21 @@ test("rejects a missing npm entry point", async () => {
       log: () => {},
     }),
     /bundled npm executable does not exist/,
+  );
+});
+
+test("rejects a missing Windows npm CLI", async () => {
+  const fixture = runtimeFixture("win32");
+  unlinkSync(fixture.cliPaths.npm);
+
+  await assert.rejects(
+    verifyNodeRuntime(fixture.runtime, {
+      platform: "win32",
+      expectedArchitecture: "x64",
+      runCommand: async () => assert.fail("must not execute an incomplete runtime"),
+      log: () => {},
+    }),
+    /bundled npm CLI does not exist/,
   );
 });
 

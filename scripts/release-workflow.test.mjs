@@ -231,6 +231,8 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /"\/S"/);
   assert.match(install, /Filter node\.exe/);
   assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
+  assert.match(install, /npm\.cmd/);
+  assert.match(install, /npx\.cmd/);
   assert.match(install, /suxiaoyou-backend\.exe/);
   assert.match(install, /node scripts\/verify-bundle\.mjs/);
 });

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -402,44 +401,26 @@ def test_runtime_acceptance_executes_node_npm_and_npx_with_bundled_path_first(
 
 
 @pytest.mark.parametrize(
-    "executable",
+    ("runtime_name", "launcher_name", "cli_name"),
     [
-        Path(r"D:\a\suxiaoyou\backend\resources\.nodejs.staging-123\npm.cmd"),
-        Path(r"C:\Program Files\苏小有\resources\nodejs\npm.cmd"),
+        ("nodejs", "npm.cmd", "npm-cli.js"),
+        ("runtime with spaces", "npx.cmd", "npx-cli.js"),
     ],
 )
-def test_windows_cmd_launcher_quotes_path_separately_from_arguments(
-    executable: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_windows_npm_tools_execute_with_bundled_node_without_a_shell(
+    tmp_path: Path,
+    runtime_name: str,
+    launcher_name: str,
+    cli_name: str,
 ) -> None:
-    comspec = r"C:\Windows\System32\cmd.exe"
-    monkeypatch.setenv("COMSPEC", comspec)
+    runtime = tmp_path / runtime_name
+    executable = runtime / launcher_name
 
     assert download_node._version_command(executable, True) == [
-        comspec,
-        "/d",
-        "/s",
-        "/c",
-        f'""{executable}" --version"',
+        str(runtime / "node.exe"),
+        str(runtime / "node_modules" / "npm" / "bin" / cli_name),
+        "--version",
     ]
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
-def test_windows_cmd_launcher_executes_real_batch_file(tmp_path: Path) -> None:
-    for directory_name in ("runtime", "runtime with spaces"):
-        runtime = tmp_path / directory_name
-        runtime.mkdir()
-        executable = runtime / "npm.cmd"
-        executable.write_text("@echo off\necho 10.9.4\n", encoding="utf-8")
-
-        result = subprocess.run(
-            download_node._version_command(executable, True),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        assert result.stdout.strip() == "10.9.4"
 
 
 def test_runtime_acceptance_rejects_missing_npx(tmp_path: Path) -> None:
