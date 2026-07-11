@@ -5,6 +5,7 @@
 
 mod backend;
 mod commands;
+mod lifecycle_smoke;
 mod menu;
 mod tray;
 
@@ -270,9 +271,30 @@ pub fn run() {
                     match state.start(&app_handle).await {
                         Ok(url) => {
                             info!("Backend started at {url}");
+                            match lifecycle_smoke::publish_ready(
+                                &app_handle,
+                                &url,
+                                state.process_id().await,
+                            ) {
+                                Ok(Some(directory)) => lifecycle_smoke::arm_exit_request(
+                                    app_handle.clone(),
+                                    directory,
+                                ),
+                                Ok(None) => {}
+                                Err(err) => {
+                                    error!("Could not publish lifecycle-smoke readiness: {err}")
+                                }
+                            }
                         }
                         Err(err) => {
                             error!("Failed to start backend: {err}");
+                            if let Err(marker_error) =
+                                lifecycle_smoke::publish_start_failure(&err)
+                            {
+                                error!(
+                                    "Could not publish lifecycle-smoke startup failure: {marker_error}"
+                                );
+                            }
                             let snapshot = state
                                 .publish_failed(&app_handle, "backend_start_failed", &err)
                                 .await;
@@ -315,8 +337,15 @@ pub fn run() {
                     let exit_cleanup_complete = exit_cleanup_complete.clone();
                     tauri::async_runtime::spawn(async move {
                         let state = handle.state::<BackendState>();
-                        if let Err(e) = state.stop().await {
-                            error!("Error stopping backend: {e}");
+                        let cleanup_error = state.stop().await.err();
+                        if let Some(error) = cleanup_error.as_deref() {
+                            error!("Error stopping backend: {error}");
+                        }
+                        if let Err(marker_error) = lifecycle_smoke::publish_cleanup(
+                            cleanup_error.is_none(),
+                            cleanup_error.as_deref(),
+                        ) {
+                            error!("Could not publish lifecycle-smoke cleanup: {marker_error}");
                         }
                         info!("Backend cleanup complete; exiting desktop process");
                         exit_cleanup_complete.store(true, Ordering::Release);

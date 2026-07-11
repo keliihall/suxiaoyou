@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
@@ -17,6 +17,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.agent.agent import AgentRegistry
 from app.errors import Conflict, NotFound, UpstreamError
 from app.models.message import Message, Part
+from app.models.idempotency_record import IdempotencyRecord
 from app.models.session import Session
 from app.provider.registry import ProviderRegistry
 from app.schemas.session import (
@@ -229,34 +230,15 @@ async def update_part_data(
     return part
 
 
-def _delete_upload_files(parts: list[Part]) -> None:
-    """Delete physical upload files referenced by the given parts.
-
-    Only deletes files with source == "uploaded" (or missing source field,
-    for backward compat).  Referenced files are NEVER deleted.
-    """
-    from app.api.files import remove_from_hash_index
-
-    for part in parts:
-        data = part.data or {}
-        if data.get("type") == "file":
-            source = data.get("source", "uploaded")
-            if source != "uploaded":
-                continue  # Never delete referenced files
-            file_path = data.get("path")
-            if file_path:
-                try:
-                    Path(file_path).unlink(missing_ok=True)
-                    remove_from_hash_index(data.get("content_hash"))
-                except OSError:
-                    logger.warning("Failed to delete upload file: %s", file_path)
-
-
 async def delete_session_uploads(db: AsyncSession, session_id: str) -> None:
-    """Delete all physical upload files associated with a session."""
-    stmt = select(Part).where(Part.session_id == session_id)
-    result = await db.execute(stmt)
-    _delete_upload_files(list(result.scalars().all()))
+    """Compatibility hook for session deletion.
+
+    Physical files are intentionally not removed inside this transaction.
+    Uploads are content-deduplicated across sessions, and the transaction may
+    still roll back. The lifespan-owned reference-aware GC removes committed
+    orphans after a grace period.
+    """
+    del db, session_id
 
 
 async def delete_messages_after(
@@ -266,8 +248,8 @@ async def delete_messages_after(
 ) -> int:
     """Delete all messages in a session created after the given message.
 
-    Parts cascade-delete automatically via the ORM relationship.
-    Upload files are cleaned up from disk before deletion.
+    Parts cascade-delete automatically via the ORM relationship. Physical
+    uploads are collected later from committed database state.
     Returns the number of messages deleted.
     """
     target = await get_by_id(db, Message, after_message_id)
@@ -284,10 +266,6 @@ async def delete_messages_after(
     )
     result = await db.execute(stmt)
     messages_to_delete = list(result.scalars().all())
-
-    # Clean up upload files before deleting DB records
-    for msg in messages_to_delete:
-        _delete_upload_files(msg.parts)
 
     for msg in messages_to_delete:
         await db.delete(msg)
@@ -889,6 +867,17 @@ async def delete_session_cascade(
     deleted = await delete_by_id(db, Session, session_id)
     if not deleted:
         raise NotFound("Session not found")
+
+    # Interactive confirmations can contain free-form answers.  They use the
+    # existing durable idempotency ledger so retries survive a restart, but
+    # they must not outlive the conversation the user explicitly deleted.
+    # Keep this in the same route-owned transaction as the Session deletion.
+    await db.execute(
+        delete(IdempotencyRecord).where(
+            IdempotencyRecord.scope.like("chat.respond:%"),
+            IdempotencyRecord.response["session_id"].as_string() == session_id,
+        )
+    )
 
     index_manager = get_index_manager()
     if index_manager is not None:

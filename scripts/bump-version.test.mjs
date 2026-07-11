@@ -1,10 +1,19 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  prepareEmbeddedReleaseVersionUpdates,
+  replaceRequiredReleaseReference,
   updateCargoLockVersion,
   updateNpmLockVersion,
 } from "./bump-version.mjs";
@@ -57,4 +66,48 @@ dependencies = [
 test("version bump script cannot invoke dependency-upgrade commands", () => {
   const source = readFileSync(join(root, "scripts", "bump-version.mjs"), "utf8");
   assert.doesNotMatch(source, /npm["']?,\s*\[["']install|cargo["']?,\s*\[["']update/);
+});
+
+test("updates embedded release references without changing dependency versions", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "suxiaoyou-version-references-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "release-licenses"));
+  writeFileSync(
+    join(directory, "THIRD_PARTY_NOTICES.md"),
+    "The v0.7.3 production graphs include dependency 0.7.3.\n",
+  );
+  writeFileSync(
+    join(directory, "release-licenses", "SOURCE_AVAILABILITY.md"),
+    "MPL-2.0 components included in 苏小有 v0.7.3. dependency 0.7.3\n",
+  );
+  writeFileSync(
+    join(directory, "release-licenses", "RUST-LICENSES.html"),
+    ">suxiaoyou-desktop 0.7.3</a><a>rand 0.7.3</a>\n",
+  );
+
+  const updates = prepareEmbeddedReleaseVersionUpdates(directory, "0.7.3", "0.8.0");
+  assert.equal(updates.length, 3);
+  const combined = updates.map(({ updated }) => updated).join("\n");
+  assert.match(combined, /v0\.8\.0 production graphs/);
+  assert.match(combined, /苏小有 v0\.8\.0/);
+  assert.match(combined, />suxiaoyou-desktop 0\.8\.0<\/a>/);
+  assert.match(combined, /dependency 0\.7\.3/);
+  assert.match(combined, /rand 0\.7\.3/);
+});
+
+test("rejects missing or ambiguous embedded release references", () => {
+  assert.throws(
+    () => replaceRequiredReleaseReference("none", "v0.7.3", "v0.8.0", "fixture"),
+    /found 0/,
+  );
+  assert.throws(
+    () =>
+      replaceRequiredReleaseReference(
+        "v0.7.3 and v0.7.3",
+        "v0.7.3",
+        "v0.8.0",
+        "fixture",
+      ),
+    /found 2/,
+  );
 });

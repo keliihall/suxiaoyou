@@ -66,6 +66,7 @@ class WorkspaceMemoryUpdateQueue:
         self._debounce_seconds = debounce_seconds
         self._pending: dict[str, WorkspaceConversationContext] = {}
         self._timer: asyncio.TimerHandle | None = None
+        self._process_tasks: set[asyncio.Task[None]] = set()
         self._processing = False
         self._lock = asyncio.Lock()
 
@@ -109,7 +110,12 @@ class WorkspaceMemoryUpdateQueue:
 
         def start_processing() -> None:
             if timer is not None:
-                asyncio.ensure_future(self._process(timer))
+                task = asyncio.create_task(
+                    self._process(timer),
+                    name="workspace-memory-refresh",
+                )
+                self._process_tasks.add(task)
+                task.add_done_callback(self._process_tasks.discard)
 
         loop = asyncio.get_event_loop()
         timer = loop.call_later(delay, start_processing)
@@ -337,6 +343,22 @@ class WorkspaceMemoryUpdateQueue:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
+
+    async def shutdown(self) -> None:
+        """Cancel timers and in-flight provider/DB work before app teardown."""
+
+        self.clear()
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._process_tasks
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._process_tasks.clear()
 
 
 # Module-level singleton (initialized by app lifespan)

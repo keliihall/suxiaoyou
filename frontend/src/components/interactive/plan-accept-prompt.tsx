@@ -3,26 +3,33 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { isRemoteMode } from "@/lib/remote-connection";
+import { canSubmitInteraction } from "@/lib/interaction-response";
+import type { PlanReviewRequest } from "@/types/streaming";
+import { InteractionAcknowledgement } from "./interaction-acknowledgement";
 
 interface PlanAcceptPromptProps {
+  review: PlanReviewRequest;
   onRespond: (action: "accept" | "revise" | "stop", options?: { mode?: "auto" | "ask"; feedback?: string }) => void;
+  onRecover?: () => void;
+  onStop?: () => void;
 }
 
 /**
  * Replaces the chat input bar when a plan review is pending.
  * Shows 3 options (matching Claude Code's UX) + a text input for feedback.
  */
-export function PlanAcceptPrompt({ onRespond }: PlanAcceptPromptProps) {
+export function PlanAcceptPrompt({ review, onRespond, onRecover, onStop }: PlanAcceptPromptProps) {
   const { t } = useTranslation("chat");
   const [feedback, setFeedback] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
   const isMobile = isRemoteMode();
+  const responseState = review.responseState ?? "idle";
 
   // Keyboard shortcuts: 1/2/3 for options, Esc to stop.
   // Only fire when the event target is within this component or on <body>
   // (i.e. no modal/dropdown/overlay is focused).
   useEffect(() => {
-    if (isMobile) return; // Skip keyboard handlers on mobile
+    if (isMobile || !canSubmitInteraction(review.responseState)) return;
     const handler = (e: KeyboardEvent) => {
       // Skip if the user is typing in an unrelated input/textarea/contenteditable
       const target = e.target as HTMLElement;
@@ -51,14 +58,26 @@ export function PlanAcceptPrompt({ onRespond }: PlanAcceptPromptProps) {
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [isMobile, onRespond]);
+  }, [isMobile, onRespond, review.responseState]);
 
   const handleFeedbackSubmit = useCallback(() => {
+    if (!canSubmitInteraction(review.responseState)) return;
     const text = feedback.trim();
     if (!text) return;
     onRespond("revise", { feedback: text });
-    setFeedback("");
-  }, [feedback, onRespond]);
+  }, [feedback, onRespond, review.responseState]);
+
+  if (responseState !== "idle") {
+    return (
+      <InteractionAcknowledgement
+        state={responseState}
+        decision={review.responseDecision}
+        source={review.responseSource}
+        onRecover={onRecover}
+        onStop={onStop}
+      />
+    );
+  }
 
   // Mobile layout
   if (isMobile) {

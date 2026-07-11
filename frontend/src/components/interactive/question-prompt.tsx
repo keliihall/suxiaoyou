@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { isRemoteMode } from "@/lib/remote-connection";
 import type { QuestionRequest, QuestionItem, QuestionOptionItem } from "@/types/streaming";
+import { InteractionAcknowledgement } from "./interaction-acknowledgement";
 
 /* ------------------------------------------------------------------ */
 /*  Props                                                              */
@@ -16,6 +17,8 @@ import type { QuestionRequest, QuestionItem, QuestionOptionItem } from "@/types/
 interface QuestionPromptProps {
   question: QuestionRequest;
   onRespond: (answer: string | Record<string, string>) => void;
+  onRecover?: () => void;
+  onStop?: () => void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -71,7 +74,6 @@ function LegacyQuestionPrompt({
   const handleSubmit = () => {
     if (!answer.trim()) return;
     onRespond(answer);
-    setAnswer("");
   };
 
   return (
@@ -97,7 +99,10 @@ function LegacyQuestionPrompt({
                   {options.map((opt, i) => (
                     <button
                       key={`${opt.label}-${i}`}
-                      onClick={() => onRespond(opt.label)}
+                      onClick={() => {
+                        setAnswer(opt.label);
+                        onRespond(opt.label);
+                      }}
                       className={`w-full text-left rounded-${isMobile ? "xl" : "lg"} border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 ${isMobile ? "py-3 min-h-[48px]" : "py-2"} text-sm hover:bg-[var(--surface-tertiary)] active:scale-[0.98] transition-all`}
                     >
                       <span className="font-medium text-[var(--text-primary)]">
@@ -627,19 +632,36 @@ function OtherOption({
 /*  Top-level export: auto-detects mode                                */
 /* ------------------------------------------------------------------ */
 
-export function QuestionPrompt({ question, onRespond }: QuestionPromptProps) {
+export function QuestionPrompt({ question, onRespond, onRecover, onStop }: QuestionPromptProps) {
+  const responseState = question.responseState ?? "idle";
   const rawQuestions = question.arguments?.questions;
   const isMultiMode =
     Array.isArray(rawQuestions) && rawQuestions.length > 0;
 
-  if (isMultiMode) {
-    return (
-      <MultiQuestionPrompt
-        questions={rawQuestions as QuestionItem[]}
-        onRespond={onRespond}
+  return (
+    <>
+      {responseState !== "idle" && (
+      <InteractionAcknowledgement
+        state={responseState}
+        decision={question.responseDecision}
+        source={question.responseSource}
+        onRecover={onRecover}
+        onStop={onStop}
       />
-    );
-  }
-
-  return <LegacyQuestionPrompt question={question} onRespond={onRespond as (answer: string) => void} />;
+      )}
+      <div className={responseState === "idle" ? "contents" : "hidden"}>
+        {isMultiMode ? (
+          <MultiQuestionPrompt
+            questions={rawQuestions as QuestionItem[]}
+            onRespond={onRespond}
+          />
+        ) : (
+          <LegacyQuestionPrompt
+            question={question}
+            onRespond={onRespond as (answer: string) => void}
+          />
+        )}
+      </div>
+    </>
+  );
 }

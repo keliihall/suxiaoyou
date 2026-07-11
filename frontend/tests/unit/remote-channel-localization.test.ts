@@ -4,7 +4,7 @@ import test from "node:test";
 
 const remoteSource = readFileSync("src/app/(main)/remote/content.tsx", "utf8");
 
-test("v0.7.3 does not expose unfinished messaging channel setup", () => {
+test("v0.8.0 does not expose unfinished messaging channel setup", () => {
   for (const hidden of [
     "weixin",
     "feishu",

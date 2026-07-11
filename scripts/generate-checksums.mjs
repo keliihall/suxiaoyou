@@ -3,8 +3,9 @@
  * Generate a SHA-256 checksum table for release artifacts, formatted as
  * Markdown ready to append to GitHub release notes. Power users (package
  * maintainers, security researchers, enterprise IT) get a verifiable
- * anchor; normal users ignore it. v0.7.3 uses an installer-only release
- * contract, so updater archives and signatures are intentionally excluded.
+ * anchor; normal users ignore it. This project currently uses an
+ * installer-only release contract, so updater archives and signatures are
+ * intentionally excluded.
  *
  * Usage:
  *   node scripts/generate-checksums.mjs <artifacts-dir> [out-file]

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Internal modules that are not channel implementations
 _INTERNAL = frozenset({"base", "manager", "registry", "adapter", "config", "bus"})
-# No messaging channel is release-ready in v0.7.3. The source modules remain
+# No messaging channel is release-ready in v0.8.0. The source modules remain
 # available for development, but the public API and packaged runtime must not
 # expose them until their SDK, credential and login flows pass end-to-end QA.
 CHINA_READY_CHANNELS: frozenset[str] = frozenset()

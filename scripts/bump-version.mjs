@@ -27,6 +27,50 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+export function replaceRequiredReleaseReference(text, current, next, source) {
+  const occurrences = text.split(current).length - 1;
+  if (occurrences !== 1) {
+    throw new Error(
+      `${source} must contain exactly one ${JSON.stringify(current)} reference, found ${occurrences}`,
+    );
+  }
+  return text.replace(current, next);
+}
+
+export function prepareEmbeddedReleaseVersionUpdates(rootDir, currentVersion, nextVersion) {
+  assertReleaseVersion(currentVersion);
+  assertReleaseVersion(nextVersion);
+  if (currentVersion === nextVersion) return [];
+
+  const references = [
+    {
+      relativePath: "THIRD_PARTY_NOTICES.md",
+      current: `v${currentVersion} production graphs`,
+      next: `v${nextVersion} production graphs`,
+    },
+    {
+      relativePath: path.join("release-licenses", "SOURCE_AVAILABILITY.md"),
+      current: `MPL-2.0 components included in 苏小有 v${currentVersion}.`,
+      next: `MPL-2.0 components included in 苏小有 v${nextVersion}.`,
+    },
+    {
+      relativePath: path.join("release-licenses", "RUST-LICENSES.html"),
+      current: `>suxiaoyou-desktop ${currentVersion}</a>`,
+      next: `>suxiaoyou-desktop ${nextVersion}</a>`,
+    },
+  ];
+
+  return references.map(({ relativePath, current, next }) => {
+    const filePath = path.join(rootDir, relativePath);
+    const original = fs.readFileSync(filePath, "utf8");
+    return {
+      filePath,
+      relativePath,
+      updated: replaceRequiredReleaseReference(original, current, next, relativePath),
+    };
+  });
+}
+
 export function updateNpmLockVersion(lock, version, label = "package-lock.json") {
   assertReleaseVersion(version);
   const updated = JSON.parse(JSON.stringify(lock));
@@ -112,6 +156,13 @@ export function updateProjectVersion(rootDir, version) {
 
   const rootPkgPath = path.join(rootDir, "package.json");
   const rootPkg = readJson(rootPkgPath);
+  const currentVersion = rootPkg.version;
+  assertReleaseVersion(currentVersion);
+  const embeddedReleaseUpdates = prepareEmbeddedReleaseVersionUpdates(
+    rootDir,
+    currentVersion,
+    version,
+  );
   rootPkg.version = version;
   writeJson(rootPkgPath, rootPkg);
   console.log("  ✓ package.json");
@@ -157,6 +208,11 @@ export function updateProjectVersion(rootDir, version) {
     updateCargoLockVersion(fs.readFileSync(cargoLockPath, "utf8"), version),
   );
   console.log("  ✓ desktop-tauri/src-tauri/Cargo.lock");
+
+  for (const { filePath, relativePath, updated } of embeddedReleaseUpdates) {
+    fs.writeFileSync(filePath, updated);
+    console.log(`  ✓ ${relativePath}`);
+  }
 
   updatePoweredBy(rootDir, version);
   console.log("  ✓ localized poweredBy strings");

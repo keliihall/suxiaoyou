@@ -4,12 +4,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, ArrowUp, Loader2, Paperclip, Camera, X, ChevronDown, FolderOpen } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { isRemoteMode, getRemoteConfig } from "@/lib/remote-connection";
 import { useProviderModels } from "@/hooks/use-provider-models";
 import { useSettingsStore } from "@/stores/settings-store";
 import { MobileDirectoryBrowser } from "@/components/mobile/directory-browser";
+import {
+  clearPromptRequestId,
+  promptRequestFingerprint,
+  reservePromptRequestId,
+  uploadSelectionFingerprint,
+} from "@/lib/prompt-idempotency";
+import type { FileAttachment, PromptRequest } from "@/types/chat";
 
 const VISION_MODEL_REQUIRED_MESSAGE = "The selected model does not support images. Choose a vision model and try again.";
 
@@ -28,6 +35,10 @@ export default function MobileNewTaskPage() {
   const [sending, setSending] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [browsingDirs, setBrowsingDirs] = useState(false);
+  const uploadedAttachmentsRef = useRef<{
+    selectionFingerprint: string;
+    attachments: FileAttachment[];
+  } | null>(null);
 
   // Workspace directory — read from settings store (persisted in localStorage)
   const workspaceDirectory = useSettingsStore((s) => s.workspaceDirectory);
@@ -58,64 +69,89 @@ export default function MobileNewTaskPage() {
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
+      uploadedAttachmentsRef.current = null;
       setFiles((prev) => [...prev, ...Array.from(e.target.files!)]);
     }
   }, []);
 
   const removeFile = useCallback((index: number) => {
+    uploadedAttachmentsRef.current = null;
     setFiles((prev) => prev.filter((_, i) => i !== index));
   }, []);
 
   const handleSubmit = useCallback(async () => {
-    if (!text.trim() || sending) return;
+    if ((!text.trim() && files.length === 0) || sending) return;
     const selectedModelInfo = models.find((model) => model.id === selectedModel);
     if (files.some((file) => file.type.startsWith("image/")) && selectedModelInfo?.capabilities.vision !== true) {
       toast.error(VISION_MODEL_REQUIRED_MESSAGE);
       return;
     }
     setSending(true);
+    let promptRequestId: string | null = null;
 
     try {
-      const attachments: { type: string; path: string; name: string }[] = [];
+      const selectionFingerprint = uploadSelectionFingerprint(files);
+      let attachments = uploadedAttachmentsRef.current?.selectionFingerprint === selectionFingerprint
+        ? uploadedAttachmentsRef.current.attachments
+        : null;
       const remoteConfig = getRemoteConfig();
 
-      for (const file of files) {
-        const formData = new FormData();
-        formData.append("file", file);
-        const uploadUrl = remoteConfig
-          ? `${remoteConfig.url}${API.FILES.UPLOAD}`
-          : API.FILES.UPLOAD;
-        const result = await fetch(uploadUrl, {
-          method: "POST",
-          headers: remoteConfig
-            ? { Authorization: `Bearer ${remoteConfig.token}` }
-            : {},
-          body: formData,
-        });
-        if (result.ok) {
-          const data = await result.json();
-          attachments.push({
-            type: data.mime_type?.startsWith("image/") ? "image" : "file",
-            path: data.path,
-            name: data.name,
+      if (!attachments) {
+        attachments = [];
+        for (const file of files) {
+          const formData = new FormData();
+          formData.append("file", file);
+          const uploadUrl = remoteConfig
+            ? `${remoteConfig.url}${API.FILES.UPLOAD}`
+            : API.FILES.UPLOAD;
+          const result = await fetch(uploadUrl, {
+            method: "POST",
+            headers: remoteConfig
+              ? { Authorization: `Bearer ${remoteConfig.token}` }
+              : {},
+            body: formData,
           });
+          if (!result.ok) {
+            throw new Error(`Attachment upload failed: ${result.status}`);
+          }
+          attachments.push(await result.json() as FileAttachment);
         }
+        uploadedAttachmentsRef.current = {
+          selectionFingerprint,
+          attachments,
+        };
       }
 
+      const promptPayload: PromptRequest = {
+        text: text.trim(),
+        model: selectedModel || null,
+        provider_id: useSettingsStore.getState().selectedProviderId || null,
+        attachments,
+        workspace: workspaceDirectory || null,
+      };
+      promptRequestId = reservePromptRequestId(
+        "mobile-new",
+        promptRequestFingerprint(promptPayload),
+      );
       const response = await api.post<{ stream_id: string; session_id: string }>(
         API.CHAT.PROMPT,
-        {
-          text: text.trim(),
-          model: selectedModel || null,
-          provider_id: useSettingsStore.getState().selectedProviderId || null,
-          attachments,
-          workspace: workspaceDirectory || null,
-        },
+        { ...promptPayload, client_request_id: promptRequestId },
+        { retryNetworkErrors: true },
       );
+      clearPromptRequestId("mobile-new", promptRequestId);
+      uploadedAttachmentsRef.current = null;
 
       router.push(`/m/task/_?sessionId=${encodeURIComponent(response.session_id)}&stream_id=${response.stream_id}`);
     } catch (err) {
       console.error("Failed to send task:", err);
+      if (
+        promptRequestId
+        && err instanceof ApiError
+        && err.status >= 400
+        && err.status < 500
+      ) {
+        clearPromptRequestId("mobile-new", promptRequestId);
+      }
       toast.error("Failed to send task. Check your connection.");
       setSending(false);
     }

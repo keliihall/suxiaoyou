@@ -6,12 +6,15 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { PERMISSION_TIMEOUT } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
-import { useSettingsStore } from "@/stores/settings-store";
+import { canSubmitInteraction } from "@/lib/interaction-response";
+import { InteractionAcknowledgement } from "./interaction-acknowledgement";
 import type { PermissionRequest } from "@/types/streaming";
 
 interface PermissionDialogProps {
   permission: PermissionRequest;
   onRespond: (allow: boolean, remember?: boolean) => void;
+  onRecover?: () => void;
+  onStop?: () => void;
 }
 
 const TOOL_EXPLANATIONS: Record<string, {
@@ -156,7 +159,7 @@ function useRequestNotificationPermission() {
   }, []);
 }
 
-export function PermissionDialog({ permission, onRespond }: PermissionDialogProps) {
+export function PermissionDialog({ permission, onRespond, onRecover, onStop }: PermissionDialogProps) {
   const [remainingMs, setRemainingMs] = useState(PERMISSION_TIMEOUT);
   const [rememberChoice, setRememberChoice] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -164,19 +167,16 @@ export function PermissionDialog({ permission, onRespond }: PermissionDialogProp
   const expired = remainingMs <= 0;
   const hasDeniedRef = useRef(false);
   const respondRef = useRef<(allow: boolean) => void>(undefined);
-  const savePermissionRule = useSettingsStore((s) => s.savePermissionRule);
   const displayTool = permission.tool || permission.permission || "this action";
   const details = getToolExplanation(permission.tool || permission.permission);
   const isMobile = isRemoteMode();
+  const responseState = permission.responseState ?? "idle";
 
   useRequestNotificationPermission();
 
   const handleRespond = useCallback(async (allow: boolean) => {
-    if (submitting) return;
+    if (submitting || !canSubmitInteraction(permission.responseState)) return;
     setSubmitting(true);
-    if (rememberChoice) {
-      savePermissionRule(permission.tool || permission.permission, allow);
-    }
     try {
       await onRespond(allow, rememberChoice);
     } finally {
@@ -184,10 +184,8 @@ export function PermissionDialog({ permission, onRespond }: PermissionDialogProp
     }
   }, [
     onRespond,
-    permission.permission,
-    permission.tool,
+    permission.responseState,
     rememberChoice,
-    savePermissionRule,
     submitting,
   ]);
 
@@ -242,11 +240,15 @@ export function PermissionDialog({ permission, onRespond }: PermissionDialogProp
   }, [permission.callId]);
 
   useEffect(() => {
-    if (expired && !hasDeniedRef.current) {
+    if (
+      expired
+      && canSubmitInteraction(permission.responseState)
+      && !hasDeniedRef.current
+    ) {
       hasDeniedRef.current = true;
       handleRespond(false);
     }
-  }, [expired, handleRespond]);
+  }, [expired, handleRespond, permission.responseState]);
 
   const remainingSec = Math.ceil(remainingMs / 1000);
   const remainingMin = Math.floor(remainingSec / 60);
@@ -256,6 +258,18 @@ export function PermissionDialog({ permission, onRespond }: PermissionDialogProp
   // Show warning when < 60s remaining
   const isUrgent = remainingSec <= 60 && !expired;
   const progressPercent = expired ? 0 : (remainingMs / PERMISSION_TIMEOUT) * 100;
+
+  if (responseState !== "idle") {
+    return (
+      <InteractionAcknowledgement
+        state={responseState}
+        decision={permission.responseDecision}
+        source={permission.responseSource}
+        onRecover={onRecover}
+        onStop={onStop}
+      />
+    );
+  }
 
   // Mobile: bottom-sheet style anchored to bottom
   if (isMobile) {

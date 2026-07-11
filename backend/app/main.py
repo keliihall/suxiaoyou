@@ -271,6 +271,121 @@ async def _rebuild_upload_hash_index(
         raise
 
 
+async def _maintain_upload_store(
+    rebuild: Callable[..., None],
+    session_factory,
+    upload_dir: Path,
+) -> None:
+    """Rebuild dedup state, collect committed orphans, then resync the index."""
+    from app.session.upload_gc import collect_orphan_uploads
+
+    await _rebuild_upload_hash_index(rebuild)
+    deleted = await collect_orphan_uploads(session_factory, upload_dir)
+    if deleted:
+        await _rebuild_upload_hash_index(rebuild)
+
+
+async def _stop_active_generation_jobs(stream_manager, timeout: float) -> None:
+    if stream_manager is None:
+        return
+    aborted = stream_manager.abort_all()
+    if aborted:
+        logger.info(
+            "Shutdown: aborted %d active generation job(s), waiting up to %.1fs",
+            aborted,
+            timeout,
+        )
+    current = asyncio.current_task()
+    tasks = {
+        job.task
+        for job in stream_manager._jobs.values()
+        if job.task is not None
+        and job.task is not current
+        and not job.task.done()
+    }
+    if not tasks:
+        return
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    if pending:
+        logger.warning(
+            "Shutdown: force-cancelled %d lingering task(s)",
+            len(pending),
+        )
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _shutdown_runtime(
+    *,
+    background_tasks,
+    task_scheduler,
+    stream_manager,
+    shutdown_timeout: float,
+    agent_adapter,
+    channel_manager,
+    workspace_memory_queue,
+    tunnel_manager,
+    connector_registry,
+    index_manager,
+    ollama_manager,
+    rapid_mlx_manager,
+    provider_registry,
+    engine,
+) -> None:
+    """Stop producers/consumers before their provider and database resources."""
+
+    pending_cancel: asyncio.CancelledError | None = None
+
+    async def step(name: str, operation: Callable[[], Awaitable[object]]) -> None:
+        nonlocal pending_cancel
+        try:
+            await operation()
+        except asyncio.CancelledError as exc:
+            # Finish the remaining teardown before honoring cancellation; an
+            # interrupted cleanup must not leave providers or SQLite open.
+            pending_cancel = pending_cancel or exc
+            logger.warning("Shutdown step was cancelled: %s", name)
+        except Exception:
+            logger.exception("Shutdown step failed: %s", name)
+
+    await step("startup background tasks", background_tasks.cancel_and_wait)
+    if task_scheduler is not None:
+        await step("task scheduler", task_scheduler.stop)
+    await step(
+        "active generations",
+        lambda: _stop_active_generation_jobs(stream_manager, shutdown_timeout),
+    )
+    if agent_adapter is not None:
+        await step("channel agent adapter", agent_adapter.stop)
+    if channel_manager is not None:
+        await step("channels", channel_manager.stop_all)
+    if workspace_memory_queue is not None:
+        shutdown = getattr(workspace_memory_queue, "shutdown", None)
+        if shutdown is not None:
+            await step("workspace memory queue", shutdown)
+        else:
+            workspace_memory_queue.clear()
+    if tunnel_manager is not None:
+        await step("remote tunnel", tunnel_manager.stop)
+    if connector_registry is not None:
+        await step("connector registry", connector_registry.shutdown)
+    if index_manager is not None:
+        await step("index manager", index_manager.shutdown)
+    if ollama_manager is not None and ollama_manager.is_running:
+        await step("Ollama runtime", ollama_manager.stop)
+    if rapid_mlx_manager is not None and rapid_mlx_manager.is_managed_process_alive:
+        await step("Rapid-MLX runtime", rapid_mlx_manager.stop)
+
+    # Providers can be in use by every component above; the DB must outlive all
+    # status/recovery writes.  These are intentionally the final two steps.
+    await step("provider registry", provider_registry.shutdown)
+    await step("database engine", engine.dispose)
+
+    if pending_cancel is not None:
+        raise pending_cancel
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: startup and shutdown."""
@@ -314,18 +429,60 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if settings.remote_access_enabled and settings.remote_tunnel_mode == "manual" and settings.remote_tunnel_url:
         app.state.runtime_allowed_origins.add(settings.remote_tunnel_url.rstrip("/"))
 
-    # Database
+    # Database.  File-backed desktop SQLite stores are upgraded in a staging
+    # copy and atomically installed only after Alembic and quick_check pass.
+    # Run the synchronous SQLite backup/migration work off the event loop, but
+    # keep startup gated on it so no request can observe a half-upgraded schema.
+    from app.storage.migrations import upgrade_sqlite_database
+
+    migration_result = await asyncio.to_thread(
+        upgrade_sqlite_database,
+        settings.database_url,
+    )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     set_session_factory(session_factory)
 
-    # Ensure all models are registered with Base.metadata before create_all
-    from app.memory import workspace_memory_model as _ws_memory_models  # noqa: F401 — registers WorkspaceMemory
+    if migration_result is None:
+        # In-memory SQLite is used by tests and cannot be migrated through a
+        # second file connection.  It is always empty, so create_all is an
+        # initializer rather than the removed guess-based upgrade mechanism.
+        import app.models as _models  # noqa: F401 — registers all ORM models
+        from app.memory import workspace_memory_model as _ws_memory_models  # noqa: F401
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Add any missing columns to existing tables (lightweight auto-migration)
-        await conn.run_sync(_add_missing_columns)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    # A process can exit after an input is durably claimed but before it is
+    # safe to say whether its tools ran.  Never auto-replay that ambiguous
+    # instruction on restart: surface it as blocked so the user can review and
+    # explicitly retry or cancel it.
+    from app.session.idempotency import interrupt_inflight_idempotency_records
+    from app.session.input_queue import block_interrupted_inputs
+    from app.session.recovery import interrupt_inflight_tool_parts
+
+    async with session_factory() as recovery_db:
+        async with recovery_db.begin():
+            blocked_inputs = await block_interrupted_inputs(recovery_db)
+            interrupted_requests = await interrupt_inflight_idempotency_records(
+                recovery_db
+            )
+            interrupted_tools = await interrupt_inflight_tool_parts(recovery_db)
+    if blocked_inputs:
+        logger.warning(
+            "Recovered %d interrupted queued input(s) as blocked",
+            blocked_inputs,
+        )
+    if interrupted_requests:
+        logger.warning(
+            "Recovered %d in-flight request(s) as interrupted",
+            interrupted_requests,
+        )
+    if interrupted_tools:
+        logger.warning(
+            "Recovered %d in-flight tool call(s) as interrupted",
+            interrupted_tools,
+        )
 
     app.state.engine = engine
     app.state.session_factory = session_factory
@@ -538,7 +695,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     cleanup_old_outputs(workspace=settings.project_dir)
 
     # Prepare the callable now; the potentially large scan runs after yield.
-    from app.api.files import rebuild_hash_index
+    from app.api.files import UPLOAD_DIR, rebuild_hash_index
 
     # Construct the optional tunnel manager locally, but defer its network
     # startup until after the app can answer /livez.
@@ -603,8 +760,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         name="mcp-connect-enabled",
     )
     background_tasks.create(
-        _rebuild_upload_hash_index(rebuild_hash_index),
-        name="upload-hash-index-rebuild",
+        _maintain_upload_store(rebuild_hash_index, session_factory, UPLOAD_DIR),
+        name="upload-store-maintenance",
     )
     background_tasks.create(
         registry.refresh_models(),
@@ -647,69 +804,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        # Stop and retrieve every liveness-independent startup task.  A shared
-        # registry refresh is shielded from individual request cancellation,
-        # so cancel it explicitly after its owning wrapper is stopped.
-        await background_tasks.cancel_and_wait()
-        await registry.shutdown()
-
-    # --- Shutdown ---
-
-    # Graceful shutdown: abort active generation jobs and wait for them.
-    # Reads the module-level singleton (per ADR-0008); previously read from
-    # app.state.stream_manager which was never set in production, so this
-    # block was dead code.
-    sm = get_stream_manager()
-    if sm is not None:
-        aborted = sm.abort_all()
-        if aborted:
-            logger.info("Shutdown: aborted %d active generation job(s), waiting up to %.1fs", aborted, settings.shutdown_timeout)
-            tasks = [
-                j.task for j in sm._jobs.values()
-                if j.task is not None and not j.task.done()
-            ]
-            if tasks:
-                done, pending = await asyncio.wait(tasks, timeout=settings.shutdown_timeout)
-                # Force-cancel any tasks that didn't finish in time
-                for t in pending:
-                    t.cancel()
-                if pending:
-                    logger.warning("Shutdown: force-cancelled %d lingering task(s)", len(pending))
-                    await asyncio.gather(*pending, return_exceptions=True)
-
-    # Stop channel system
-    agent_adapter = getattr(app.state, "agent_adapter", None)
-    if agent_adapter:
-        await agent_adapter.stop()
-    channel_mgr = getattr(app.state, "channel_manager", None)
-    if channel_mgr:
-        await channel_mgr.stop_all()
-
-    # Stop remote tunnel
-    tunnel_mgr = getattr(app.state, "tunnel_manager", None)
-    if tunnel_mgr:
-        await tunnel_mgr.stop()
-
-    if hasattr(app.state, "connector_registry"):
-        await app.state.connector_registry.shutdown()
-
-    if hasattr(app.state, "task_scheduler"):
-        await app.state.task_scheduler.stop()
-
-    im = get_index_manager()
-    if im is not None:
-        await im.shutdown()
-
-    # Stop managed Ollama process
-    ollama_mgr = getattr(app.state, "ollama_manager", None)
-    if ollama_mgr and ollama_mgr.is_running:
-        await ollama_mgr.stop()
-
-    rapid_mlx_mgr = getattr(app.state, "rapid_mlx_manager", None)
-    if rapid_mlx_mgr and rapid_mlx_mgr.is_managed_process_alive:
-        await rapid_mlx_mgr.stop()
-
-    await engine.dispose()
+        # Stop producers and active work before closing the services they use.
+        # Keeping the entire sequence inside ``finally`` also guarantees it runs
+        # when the ASGI server injects an exception at the lifespan yield.
+        await _shutdown_runtime(
+            background_tasks=background_tasks,
+            task_scheduler=getattr(app.state, "task_scheduler", None),
+            stream_manager=get_stream_manager(),
+            shutdown_timeout=settings.shutdown_timeout,
+            agent_adapter=getattr(app.state, "agent_adapter", None),
+            channel_manager=getattr(app.state, "channel_manager", None),
+            workspace_memory_queue=getattr(app.state, "ws_memory_queue", None),
+            tunnel_manager=getattr(app.state, "tunnel_manager", None),
+            connector_registry=getattr(app.state, "connector_registry", None),
+            index_manager=get_index_manager(),
+            ollama_manager=getattr(app.state, "ollama_manager", None),
+            rapid_mlx_manager=getattr(app.state, "rapid_mlx_manager", None),
+            provider_registry=registry,
+            engine=engine,
+        )
 
 
 def _register_builtin_tools(
@@ -754,44 +867,6 @@ def _register_builtin_tools(
     if settings is not None and settings.fts_enabled:
         from app.tool.builtin.search import SearchTool
         registry.register(SearchTool())
-
-
-def _add_missing_columns(connection) -> None:
-    """Auto-migration: add columns that exist in models but not in the DB.
-
-    SQLAlchemy's create_all only creates new tables — it won't alter existing
-    ones. This function inspects each table and issues ALTER TABLE ADD COLUMN
-    for any missing columns, using SQLite-compatible defaults.
-    """
-    from sqlalchemy import inspect as sa_inspect, text
-
-    inspector = sa_inspect(connection)
-    for table in Base.metadata.sorted_tables:
-        if not inspector.has_table(table.name):
-            continue  # Table doesn't exist yet — create_all will handle it
-        existing = {col["name"] for col in inspector.get_columns(table.name)}
-        for col in table.columns:
-            if col.name in existing:
-                continue
-            # Build ALTER TABLE statement with a sensible default
-            col_type = col.type.compile(dialect=connection.dialect)
-            default = ""
-            if col.default is not None and col.default.is_scalar:
-                val = col.default.arg
-                if isinstance(val, str):
-                    default = f" DEFAULT '{val}'"
-                elif isinstance(val, bool):
-                    default = f" DEFAULT {1 if val else 0}"
-                elif isinstance(val, (int, float)):
-                    default = f" DEFAULT {val}"
-            elif col.nullable:
-                default = " DEFAULT NULL"
-            else:
-                # NOT NULL column with no default — use a type-appropriate zero
-                default = " DEFAULT ''" if "CHAR" in str(col_type).upper() or "TEXT" in str(col_type).upper() else " DEFAULT 0"
-            sql = f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type}{default}'
-            logger.info("Auto-migration: %s", sql)
-            connection.execute(text(sql))
 
 
 def _find_frontend_dir() -> Path | None:

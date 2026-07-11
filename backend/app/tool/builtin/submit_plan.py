@@ -17,6 +17,7 @@ from typing import Any
 
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
+from app.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def _write_plan_file(title: str, plan: str) -> str:
         filename = f"{_random_plan_name()}.md"
         plan_path = plan_dir / filename
 
-    plan_path.write_text(f"# {title}\n\n{plan}", encoding="utf-8")
+    atomic_write_text(plan_path, f"# {title}\n\n{plan}")
     return str(plan_path)
 
 
@@ -120,6 +121,16 @@ class SubmitPlanTool(ToolDefinition):
 
         # Access the GenerationJob for wait_for_response
         job = getattr(ctx, "_job", None)
+        should_wait = job is not None and job.interactive
+
+        if should_wait:
+            job.register_response_request(
+                ctx.call_id,
+                prompt_type="plan",
+                timeout=600.0,
+                tool_call_id=ctx.call_id,
+                tool=self.id,
+            )
 
         # Publish plan-review event to SSE stream
         if ctx._publish_fn:
@@ -133,7 +144,7 @@ class SubmitPlanTool(ToolDefinition):
             })
 
         # If no job context or not interactive — degrade gracefully
-        if job is None or not job.interactive:
+        if not should_wait:
             return ToolResult(
                 output=f"[没有用户连接] 已提交计划：{title}",
                 title=f"计划：{title}",

@@ -17,6 +17,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request, UploadFile
 from pydantic import BaseModel
 
+from app.dependencies import IndexManagerDep
 from app.utils.id import generate_ulid
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,16 @@ def _log_browse_telemetry(
 
 # Upload destination — relative to backend working directory
 UPLOAD_DIR = Path("data/uploads")
+
+# Browser uploads are streamed to disk.  The limit is deliberately above the
+# size of long recordings while still bounding disk exhaustion from a single
+# request.  Managed-workspace snapshots enforce the same ceiling.
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024
+MAX_BINARY_PREVIEW_BYTES = 50 * 1024 * 1024
+MAX_DIALOG_TITLE_CHARS = 200
+MAX_UPLOAD_FILENAME_BYTES = 180
 
 # In-memory hash → path index for deduplication of uploaded files
 _hash_index: dict[str, Path] = {}
@@ -118,6 +129,11 @@ def rebuild_hash_index(*, cancel_event: threading.Event | None = None) -> None:
     for f in UPLOAD_DIR.iterdir():
         if cancel_event is not None and cancel_event.is_set():
             return
+        if f.name.startswith(".") and f.name.endswith(".uploading"):
+            # Crash/cancellation staging files are explicitly incomplete. They
+            # remain eligible for age-based GC but must never become a dedup
+            # target returned to a later upload.
+            continue
         if f.is_file():
             try:
                 digest_builder = hashlib.sha256()
@@ -147,9 +163,49 @@ def remove_from_hash_index(content_hash: str | None) -> None:
             _hash_index.pop(content_hash, None)
 
 
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Truncate text on a UTF-8 code-point boundary."""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _bounded_upload_filename(name: str) -> str:
+    """Leave byte-safe room for the stored ULID prefix on common filesystems."""
+
+    if len(name.encode("utf-8")) <= MAX_UPLOAD_FILENAME_BYTES:
+        return name
+    path = Path(name)
+    suffix = _truncate_utf8(path.suffix, 24)
+    stem_budget = max(1, MAX_UPLOAD_FILENAME_BYTES - len(suffix.encode("utf-8")))
+    stem = _truncate_utf8(path.stem, stem_budget)
+    return f"{stem or 'f'}{suffix}"
+
+
 # ---------------------------------------------------------------------------
 # Native file dialog (platform-specific)
 # ---------------------------------------------------------------------------
+
+def _normalize_dialog_title(title: str) -> str:
+    """Bound native-dialog labels and remove control characters."""
+
+    normalized = " ".join(str(title).split()).strip()
+    return (normalized or "Select files")[:MAX_DIALOG_TITLE_CHARS]
+
+
+def _powershell_single_quoted(value: str) -> str:
+    """Encode a literal for a PowerShell single-quoted string."""
+
+    return value.replace("'", "''")
+
+
+def _applescript_double_quoted(value: str) -> str:
+    """Encode a literal for an AppleScript double-quoted string."""
+
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
 
 async def _open_native_file_dialog(
     multiple: bool = True,
@@ -165,6 +221,7 @@ async def _open_native_file_dialog(
     - Linux: zenity
     """
     system = platform.system()
+    title = _normalize_dialog_title(title)
 
     try:
         if system == "Windows":
@@ -188,6 +245,7 @@ async def _dialog_windows(multiple: bool, title: str) -> list[str]:
     does not support asyncio.create_subprocess_exec.
     """
     multiselect = "$true" if multiple else "$false"
+    title_literal = _powershell_single_quoted(_normalize_dialog_title(title))
     script = (
         # Force UTF-8 output so non-ASCII paths survive decoding
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
@@ -204,7 +262,7 @@ async def _dialog_windows(multiple: bool, title: str) -> list[str]:
         "$f = New-Object System.Windows.Forms.Form;"
         "$f.TopMost = $true;"
         "$d = New-Object System.Windows.Forms.OpenFileDialog;"
-        f"$d.Title = '{title}';"
+        f"$d.Title = '{title_literal}';"
         f"$d.Multiselect = {multiselect};"
         "$d.Filter = 'All files (*.*)|*.*';"
         "if ($d.ShowDialog($f) -eq 'OK') {"
@@ -242,7 +300,8 @@ async def _dialog_windows(multiple: bool, title: str) -> list[str]:
 
 async def _dialog_macos(multiple: bool, title: str) -> list[str]:
     multi_clause = " with multiple selections allowed" if multiple else ""
-    script = f'choose file with prompt "{title}"{multi_clause}'
+    title_literal = _applescript_double_quoted(_normalize_dialog_title(title))
+    script = f'choose file with prompt "{title_literal}"{multi_clause}'
 
     def _run() -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -304,6 +363,7 @@ async def _open_native_directory_dialog(
 ) -> str | None:
     """Open an OS-native folder picker and return the selected path."""
     system = platform.system()
+    title = _normalize_dialog_title(title)
     try:
         if system == "Windows":
             return await _dir_dialog_windows(title)
@@ -383,6 +443,7 @@ async def _dir_dialog_windows(title: str) -> str | None:
         "  } "
         "} "
     )
+    title_literal = _powershell_single_quoted(_normalize_dialog_title(title))
     script = (
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
         "Add-Type -TypeDefinition '"
@@ -397,7 +458,7 @@ async def _dir_dialog_windows(title: str) -> str | None:
         f"Add-Type -TypeDefinition '{csharp}';"
         "$f = New-Object System.Windows.Forms.Form;"
         "$f.TopMost = $true;"
-        f"$result = [FolderPicker]::Show('{title}', $f.Handle);"
+        f"$result = [FolderPicker]::Show('{title_literal}', $f.Handle);"
         "if ($result) { $result }"
         "$f.Dispose()"
     )
@@ -417,7 +478,8 @@ async def _dir_dialog_windows(title: str) -> str | None:
 
 
 async def _dir_dialog_macos(title: str) -> str | None:
-    script = f'choose folder with prompt "{title}"'
+    title_literal = _applescript_double_quoted(_normalize_dialog_title(title))
+    script = f'choose folder with prompt "{title_literal}"'
 
     def _run() -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -524,8 +586,18 @@ async def get_file_content(body: FileContentRequest) -> dict[str, Any]:
     if not file_path.is_file():
         raise HTTPException(status_code=400, detail=f"Not a file: {body.path}")
 
+    size = file_path.stat().st_size
+    if size > MAX_TEXT_PREVIEW_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large to preview ({size} bytes, "
+                f"max {MAX_TEXT_PREVIEW_BYTES})"
+            ),
+        )
+
     try:
-        content = file_path.read_text(encoding="utf-8")
+        content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail=f"Binary file cannot be previewed: {body.path}")
 
@@ -535,7 +607,7 @@ async def get_file_content(body: FileContentRequest) -> dict[str, Any]:
         "path": str(file_path.resolve()),
         "name": file_path.name,
         "mime_type": mime_type,
-        "size": file_path.stat().st_size,
+        "size": size,
     }
 
 
@@ -554,12 +626,18 @@ async def get_file_content_binary(body: FileContentRequest) -> dict[str, Any]:
     if not file_path.is_file():
         raise HTTPException(status_code=400, detail=f"Not a file: {body.path}")
 
-    MAX_SIZE = 50 * 1024 * 1024  # 50 MB
     size = file_path.stat().st_size
-    if size > MAX_SIZE:
-        raise HTTPException(status_code=400, detail=f"File too large ({size} bytes, max {MAX_SIZE})")
+    if size > MAX_BINARY_PREVIEW_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large to preview ({size} bytes, "
+                f"max {MAX_BINARY_PREVIEW_BYTES})"
+            ),
+        )
 
-    content_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+    raw = await asyncio.to_thread(file_path.read_bytes)
+    content_b64 = (await asyncio.to_thread(base64.b64encode, raw)).decode("ascii")
     mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     return {
         "content_base64": content_b64,
@@ -600,12 +678,55 @@ async def open_with_system(request: Request, body: FileContentRequest) -> dict[s
     return {"status": "ok"}
 
 
+@router.post("/files/reveal-system")
+async def reveal_with_system(request: Request, body: FileContentRequest) -> dict[str, str]:
+    """Reveal a local path in Finder, Explorer, or the Linux file manager.
+
+    Like ``open-system``, this is a host-side action rather than a file API.
+    Remote clients are rejected before path resolution/existence checks so the
+    endpoint cannot also be used as a local-path existence oracle.
+    """
+    from fastapi import HTTPException
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(status_code=403, detail="System reveal is only available locally")
+
+    file_path = _resolve_requested_file_path(body.path, body.workspace)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {body.path}")
+    file_path = file_path.resolve()
+
+    system = platform.system()
+    try:
+        if system == "Windows":
+            if file_path.is_dir():
+                subprocess.Popen(["explorer.exe", str(file_path)])
+            else:
+                subprocess.Popen(["explorer.exe", "/select,", str(file_path)])
+        elif system == "Darwin":
+            subprocess.Popen(["open", "-R", str(file_path)])
+        else:
+            target = file_path if file_path.is_dir() else file_path.parent
+            subprocess.Popen(["xdg-open", str(target)])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reveal file: {e}")
+
+    return {"status": "ok"}
+
+
 @router.post("/files/browse-directory")
 async def browse_directory(
     request: Request,
     body: BrowseDirectoryRequest | None = None,
 ) -> dict[str, str | None]:
     """Open native directory picker dialog. Returns selected path or null."""
+    from fastapi import HTTPException
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(
+            status_code=403,
+            detail="Native directory browsing is only available locally",
+        )
     req = body or BrowseDirectoryRequest()
     path = await _open_native_directory_dialog(title=req.title, request=request)
     _log_browse_telemetry(
@@ -665,6 +786,13 @@ async def browse_files(
 
     No files are copied — paths reference the originals.
     """
+    from fastapi import HTTPException
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(
+            status_code=403,
+            detail="Native file browsing is only available locally",
+        )
     req = body or BrowseRequest()
     paths = await _open_native_file_dialog(
         multiple=req.multiple, title=req.title, request=request
@@ -709,14 +837,13 @@ class IngestRequest(BaseModel):
 
 
 @router.post("/files/ingest")
-async def ingest_files(request: Request, body: IngestRequest) -> dict[str, Any]:
+async def ingest_files(body: IngestRequest, manager: IndexManagerDep) -> dict[str, Any]:
     """Ingest attached files into the FTS index for an existing session.
 
     Called by the frontend immediately after attaching files to a session
     that already exists, so they are indexed without waiting for the next
     message to be sent.
     """
-    manager = getattr(request.app.state, "index_manager", None)
     if manager is None:
         return {"ingested": 0, "message": "FTS not enabled"}
 
@@ -749,40 +876,82 @@ async def upload_file(file: UploadFile) -> dict:
     Includes SHA-256 deduplication: if the same content was already
     uploaded, the existing file is reused.
     """
+    from fastapi import HTTPException
+
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    content = await file.read()
-    digest = hashlib.sha256(content).hexdigest()
+    original_name = (file.filename or "untitled").replace("\\", "/")
+    safe_name = Path(original_name).name.replace("\x00", "").strip() or "untitled"
+    # Keep enough *bytes* (not characters) free for the ULID prefix on
+    # filesystems with a 255-byte component limit.  CJK characters take three
+    # UTF-8 bytes, so character slicing alone is not a safe bound.
+    safe_name = _bounded_upload_filename(safe_name)
 
-    # Check dedup index
-    with _hash_index_lock:
-        existing = _hash_index.get(digest)
-    if existing and existing.exists():
-        meta = _file_metadata(existing, source="uploaded", content_hash=digest)
-        return meta.model_dump()
+    upload_id = generate_ulid()
+    temp_path = UPLOAD_DIR / f".{upload_id}.uploading"
+    digest_builder = hashlib.sha256()
+    size = 0
 
-    # Save new file
-    file_id = generate_ulid()
-    original_name = file.filename or "untitled"
-    safe_name = Path(original_name).name
-    dest = UPLOAD_DIR / f"{file_id}_{safe_name}"
-    dest.write_bytes(content)
+    try:
+        with temp_path.open("xb") as handle:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (max {MAX_UPLOAD_BYTES} bytes)",
+                    )
+                digest_builder.update(chunk)
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
 
-    # Update index
-    with _hash_index_lock:
-        _hash_index[digest] = dest
+        digest = digest_builder.hexdigest()
+        with _hash_index_lock:
+            existing = _hash_index.get(digest)
+            if existing is not None and not existing.is_file():
+                _hash_index.pop(digest, None)
+                existing = None
 
-    mime_type = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+            if existing is None:
+                dest = UPLOAD_DIR / f"{upload_id}_{safe_name}"
+                # Atomic installation means a cancelled request or backend
+                # crash can leave only a hidden staging file, never a
+                # partially-readable attachment at its final path.
+                os.replace(temp_path, dest)
+                _hash_index[digest] = dest
+                existing = dest
 
-    return FileMetadata(
-        file_id=file_id,
-        name=safe_name,
-        path=str(dest.resolve()),
-        size=len(content),
-        mime_type=mime_type,
-        source="uploaded",
-        content_hash=digest,
-    ).model_dump()
+        if temp_path.exists():
+            temp_path.unlink()
+
+        stored_prefix, separator, _stored_name = existing.name.partition("_")
+        stored_file_id = (
+            stored_prefix
+            if separator and len(stored_prefix) == 26 and stored_prefix.isalnum()
+            else upload_id
+        )
+        mime_type = (
+            file.content_type
+            or mimetypes.guess_type(safe_name)[0]
+            or "application/octet-stream"
+        )
+        return FileMetadata(
+            file_id=stored_file_id,
+            name=safe_name,
+            path=str(existing.resolve()),
+            size=size,
+            mime_type=mime_type,
+            source="uploaded",
+            content_hash=digest,
+        ).model_dump()
+    finally:
+        # This covers validation errors, disconnect cancellation and disk-full
+        # failures.  Orphan GC handles committed final files separately.
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove incomplete upload: %s", temp_path)
 
 
 # ---------------------------------------------------------------------------

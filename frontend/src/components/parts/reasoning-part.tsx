@@ -10,6 +10,7 @@ import { SuxiaoyouLogo } from "@/components/ui/suxiaoyou-logo";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { getToolDisplayTitle, localizeVisibleProcessText } from "@/lib/activity-labels";
+import { formatElapsedDuration, formatElapsedMilliseconds } from "@/lib/duration";
 import type { ToolPart } from "@/types/message";
 
 interface ReasoningPartProps {
@@ -18,11 +19,22 @@ interface ReasoningPartProps {
   /** Tool parts to display inside the thinking section. */
   toolParts?: ToolPart[];
   isStreaming?: boolean;
+  /** True only while the stream store has an unresolved user prompt. */
+  isAwaitingConfirmation?: boolean;
   /** Callback when thinking duration changes (for ActivitySummary). */
   onDurationChange?: (seconds: number) => void;
+  /** Stable task origin supplied by the per-session stream store. */
+  startedAt?: number | null;
 }
 
-export function ReasoningPart({ texts, toolParts = [], isStreaming, onDurationChange }: ReasoningPartProps) {
+export function ReasoningPart({
+  texts,
+  toolParts = [],
+  isStreaming,
+  isAwaitingConfirmation = false,
+  onDurationChange,
+  startedAt,
+}: ReasoningPartProps) {
   const { t, i18n } = useTranslation("chat");
   const [isOpen, setIsOpen] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -33,7 +45,10 @@ export function ReasoningPart({ texts, toolParts = [], isStreaming, onDurationCh
   useEffect(() => {
     if (isStreaming) {
       if (!intervalRef.current) {
-        startRef.current = Date.now();
+        startRef.current = startedAt ?? startRef.current ?? Date.now();
+        setElapsed(
+          Math.max(0, Math.round((Date.now() - startRef.current) / 1000)),
+        );
         intervalRef.current = setInterval(() => {
           const secs = Math.round((Date.now() - (startRef.current ?? Date.now())) / 1000);
           setElapsed(secs);
@@ -58,7 +73,7 @@ export function ReasoningPart({ texts, toolParts = [], isStreaming, onDurationCh
         intervalRef.current = null;
       }
     };
-  }, [isStreaming, onDurationChange]);
+  }, [isStreaming, onDurationChange, startedAt]);
 
   // Determine label based on current activity
   const hasRunningTool = toolParts.some((t) => t.state.status === "running");
@@ -66,14 +81,22 @@ export function ReasoningPart({ texts, toolParts = [], isStreaming, onDurationCh
 
   let label: string;
   if (isStreaming) {
-    const timer = elapsed > 0 ? ` ${elapsed}s` : "";
-    if (hasRunningTool && lastRunningTool) {
+    const timer = elapsed > 0
+      ? ` ${formatElapsedDuration(elapsed, i18n.language)}`
+      : "";
+    if (isAwaitingConfirmation) {
+      label = `${t("stageWaitingForConfirmation")}${timer}`;
+    } else if (hasRunningTool && lastRunningTool) {
       label = `${t("stageWorkingWithTools")}${timer}`;
     } else {
       label = `${t("stageThinking")}${timer}`;
     }
   } else {
-    label = elapsed > 0 ? t("thoughtFor", { duration: `${elapsed}s` }) : t("reasoning");
+    label = elapsed > 0
+      ? t("thoughtFor", {
+          duration: formatElapsedDuration(elapsed, i18n.language),
+        })
+      : t("reasoning");
   }
 
   const combinedText = localizeVisibleProcessText(
@@ -156,7 +179,7 @@ export function ReasoningPart({ texts, toolParts = [], isStreaming, onDurationCh
 
 /** Compact tool line inside the thinking section */
 function ToolLine({ tool }: { tool: ToolPart }) {
-  const { t } = useTranslation("chat");
+  const { t, i18n } = useTranslation("chat");
   const isRunning = tool.state.status === "running" || tool.state.status === "pending";
   const isError = tool.state.status === "error";
   const label = getToolLabel(tool, t);
@@ -166,7 +189,7 @@ function ToolLine({ tool }: { tool: ToolPart }) {
     const ms =
       new Date(tool.state.time_end).getTime() -
       new Date(tool.state.time_start).getTime();
-    elapsed = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+    elapsed = formatElapsedMilliseconds(ms, i18n.language);
   }
 
   return (

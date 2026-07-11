@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class PromptRequest(BaseModel):
     """Start a new generation."""
 
+    client_request_id: str | None = Field(None, min_length=8, max_length=128)
     session_id: str | None = None
     text: str
     model: str | None = None  # e.g. "claude-sonnet-4-20250514"
@@ -85,3 +86,33 @@ class RespondRequest(BaseModel):
     stream_id: str
     call_id: str
     response: Any  # depends on context — string for question, bool for permission
+
+
+class SessionInputRequest(BaseModel):
+    """Queue a follow-up or steer input while a session is running."""
+
+    session_id: str
+    client_request_id: str = Field(..., min_length=8, max_length=128)
+    mode: Literal["queue", "steer"] = "queue"
+    text: str = ""
+    attachments: list[dict[str, Any]] = []
+    model: str | None = None
+    provider_id: str | None = None
+    agent: str = "build"
+    workspace: str | None = None
+    reasoning: bool | None = None
+    permission_presets: dict[str, bool] | None = None
+    permission_rules: list[dict[str, Any]] | None = None
+
+
+class SessionInputResponse(BaseModel):
+    id: str
+    session_id: str
+    client_request_id: str
+    mode: str
+    status: str
+    position: int
+    text: str
+    attachments: list[dict[str, Any]]
+    target_stream_id: str | None = None
+    error_message: str | None = None

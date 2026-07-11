@@ -1,4 +1,5 @@
 import type { ScheduleConfig } from "@/types/automation";
+import { formatElapsedMilliseconds } from "@/lib/duration";
 
 type TFunc = (key: string, opts?: Record<string, unknown>) => string;
 
@@ -48,15 +49,14 @@ export function formatTime(iso: string | null): string {
   });
 }
 
-export function formatDuration(startIso: string | null, endIso: string | null): string {
+export function formatDuration(
+  startIso: string | null,
+  endIso: string | null,
+  language = "en",
+): string {
   if (!startIso || !endIso) return "";
   const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
-  if (ms < 1000) return "<1s";
-  const secs = Math.floor(ms / 1000);
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.floor(secs / 60);
-  const remSecs = secs % 60;
-  return `${mins}m ${remSecs}s`;
+  return formatElapsedMilliseconds(ms, language);
 }
 
 /** Parse a cron string into { minute, hour, dow } for the visual editor. */

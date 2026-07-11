@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, ChevronDown, GitBranch, Play, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, GitBranch, ListPlus, Play, Plus, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ChatTextarea } from "./chat-textarea";
@@ -14,7 +14,9 @@ import { useAutoResize } from "@/hooks/use-auto-resize";
 import { uploadFile, browseFiles, attachByPath, ingestFiles } from "@/lib/upload";
 import type { FileSearchResult } from "@/lib/upload";
 import { cn } from "@/lib/utils";
-import type { FileAttachment } from "@/types/chat";
+import { formatElapsedDuration } from "@/lib/duration";
+import { resolveComposerWorkspace } from "@/lib/session-inputs";
+import type { FileAttachment, SessionInputMode, SessionInputResponse } from "@/types/chat";
 import { useArtifactStore } from "@/stores/artifact-store";
 import { useChatSession } from "@/stores/chat-store";
 import { useSettingsStore } from "@/stores/settings-store";
@@ -29,6 +31,12 @@ interface ChatFormProps {
   isGenerating: boolean;
   isCompacting?: boolean;
   onSend: (text: string, attachments?: FileAttachment[]) => Promise<boolean> | void;
+  onQueue?: (text: string, attachments?: FileAttachment[], mode?: SessionInputMode) => Promise<boolean> | void;
+  pendingInputs?: SessionInputResponse[];
+  onCancelInput?: (inputId: string) => Promise<boolean> | void;
+  isProgressStalled?: boolean;
+  lastBusinessProgressAt?: number | null;
+  onReconnect?: () => void;
   onSendTaskBatch?: (batch: { mode: TaskBatchMode; tasks: TaskBatchTask[] }) => Promise<boolean> | void;
   onStop: () => void;
   className?: string;
@@ -220,8 +228,23 @@ function detectMention(
   return { active: true, query, startIndex: atIndex };
 }
 
-export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTaskBatch, onStop, className, sessionId, directory }: ChatFormProps) {
-  const { t } = useTranslation('chat');
+export function ChatForm({
+  isGenerating,
+  isCompacting = false,
+  onSend,
+  onQueue,
+  pendingInputs = [],
+  onCancelInput,
+  isProgressStalled = false,
+  lastBusinessProgressAt = null,
+  onReconnect,
+  onSendTaskBatch,
+  onStop,
+  className,
+  sessionId,
+  directory,
+}: ChatFormProps) {
+  const { t, i18n } = useTranslation('chat');
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -229,6 +252,8 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchMode, setBatchMode] = useState<TaskBatchMode>("parallel");
   const [batchTasks, setBatchTasks] = useState<TaskDraft[]>([]);
+  const [inputMode, setInputMode] = useState<SessionInputMode>("queue");
+  const [inputModeOpen, setInputModeOpen] = useState(false);
   const { ref, resize } = useAutoResize();
   const dropTargetRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -250,6 +275,26 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   const sendingRef = useRef(false);
   const taskDraftIdRef = useRef(0);
   const tauriDropHandledAtRef = useRef(0);
+  const previousGeneratingRef = useRef(isGenerating);
+  const [statusNow, setStatusNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!isGenerating || !isProgressStalled) return;
+    setStatusNow(Date.now());
+    const timer = window.setInterval(() => setStatusNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [isGenerating, isProgressStalled]);
+
+  // Every newly started task defaults back to the safer, predictable queue
+  // behavior. A user's explicit steer choice remains active only for the
+  // current run.
+  useEffect(() => {
+    if (isGenerating && !previousGeneratingRef.current) {
+      setInputMode("queue");
+      setInputModeOpen(false);
+    }
+    previousGeneratingRef.current = isGenerating;
+  }, [isGenerating]);
 
   // Track latest values for draft save-on-unmount (avoids stale closures)
   const inputRef = useRef(input);
@@ -290,7 +335,11 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   const hasWorkspace = !!directory && directory !== ".";
 
   const globalWorkspace = useSettingsStore((s) => s.workspaceDirectory);
-  const effectiveWorkspace = hasWorkspace ? directory : globalWorkspace;
+  const effectiveWorkspace = resolveComposerWorkspace(
+    sessionId,
+    directory,
+    globalWorkspace,
+  );
   const { isIndexing } = useIndexStatus(effectiveWorkspace, sessionId);
   const formSession = useChatSession(sessionId ?? null);
   const compactingLabel = (() => {
@@ -308,7 +357,9 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
     }
     return null;
   })();
-  const isInputDisabled = isGenerating || isCompacting || noModelsAvailable;
+  const canQueueWhileGenerating = !!sessionId && !!onQueue;
+  const isInputDisabled = isCompacting || noModelsAvailable || (isGenerating && !canQueueWhileGenerating);
+  const isBatchDisabled = isInputDisabled || isGenerating;
   const visibleAgents = useMemo(
     () => (agents ?? []).filter((agent) => agent.mode !== "hidden"),
     [agents],
@@ -492,7 +543,12 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   }, [handleAttachPaths]);
 
   const handleSend = useCallback(async () => {
-    if (sendingRef.current || (!input.trim() && attachments.length === 0) || isGenerating || isCompacting) return;
+    if (
+      sendingRef.current ||
+      (!input.trim() && attachments.length === 0) ||
+      isCompacting ||
+      (isGenerating && !onQueue)
+    ) return;
     sendingRef.current = true;
     try {
       const text = input;
@@ -506,7 +562,9 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
       if (ref.current) {
         ref.current.style.height = "auto";
       }
-      const result = await onSend(text, files.length > 0 ? files : undefined);
+      const result = isGenerating && onQueue
+        ? await onQueue(text, files.length > 0 ? files : undefined, inputMode)
+        : await onSend(text, files.length > 0 ? files : undefined);
       // Restore input if send failed
       if (result === false) {
         setInput(text);
@@ -517,7 +575,7 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
     } finally {
       sendingRef.current = false;
     }
-  }, [input, attachments, isGenerating, isCompacting, onSend, ref, draftKey]);
+  }, [input, attachments, isGenerating, isCompacting, inputMode, onQueue, onSend, ref, draftKey]);
 
   const handleSendTaskBatch = useCallback(async () => {
     if (!onSendTaskBatch || isGenerating || isCompacting || sendingRef.current) return;
@@ -574,6 +632,36 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   const handleRemoveAttachment = useCallback((fileId: string) => {
     setAttachments((prev) => prev.filter((a) => a.file_id !== fileId));
   }, []);
+
+  const handleRestorePendingInput = useCallback(async (item: SessionInputResponse) => {
+    if (
+      sendingRef.current
+      || input.trim()
+      || attachments.length > 0
+      || !onCancelInput
+    ) return;
+
+    sendingRef.current = true;
+    try {
+      // Cancellation is the durable ownership transfer. Restore only after it
+      // succeeds so one user action can never leave both a queued record and
+      // an editable draft that might later run twice.
+      const cancelled = await onCancelInput(item.id);
+      if (cancelled === false) return;
+
+      setInput(item.text);
+      setAttachments(item.attachments);
+      inputRef.current = item.text;
+      attachmentsRef.current = item.attachments;
+      setMentionActive(false);
+      requestAnimationFrame(() => {
+        ref.current?.focus();
+        resize();
+      });
+    } finally {
+      sendingRef.current = false;
+    }
+  }, [attachments.length, input, onCancelInput, ref, resize]);
 
   // Handle @mention file selection
   const handleMentionSelect = useCallback(async (result: FileSearchResult) => {
@@ -677,12 +765,136 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
   const canStartTaskBatch = !!onSendTaskBatch &&
     batchTasks.length > 0 &&
     batchTasks.every((task) => task.title.trim() && task.prompt.trim()) &&
-    !isInputDisabled &&
+    !isBatchDisabled &&
     !isIndexing;
+  const stalledDuration = lastBusinessProgressAt === null
+    ? null
+    : formatElapsedDuration(
+        Math.max(0, (statusNow - lastBusinessProgressAt) / 1_000),
+        i18n.language,
+      );
 
   return (
     <div className={cn("px-4 pb-4", className)}>
       <div className="mx-auto max-w-3xl xl:max-w-4xl">
+        {isGenerating && isProgressStalled && (
+          <div
+            className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2 text-xs text-[var(--text-secondary)]"
+            data-testid="progress-stalled-notice"
+          >
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--color-warning)]" />
+            <span className="min-w-0 flex-1">
+              <span className="font-medium text-[var(--text-primary)]" role="status" aria-live="polite">
+                {t("taskMayBeStalled")}
+              </span>{" "}
+              {stalledDuration && (
+                <span aria-hidden="true">
+                  {t("taskNoProgressFor", { duration: stalledDuration })}{" "}
+                </span>
+              )}
+              {t("taskMayBeStalledHint")}
+            </span>
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+              {onReconnect && (
+                <button
+                  type="button"
+                  onClick={onReconnect}
+                  className="inline-flex min-h-8 items-center gap-1 rounded-lg border border-[var(--border-default)] bg-[var(--surface-primary)] px-2.5 font-medium text-[var(--text-primary)] hover:bg-[var(--surface-tertiary)]"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {t("taskReconnect")}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onStop}
+                className="inline-flex min-h-8 items-center rounded-lg border border-[var(--border-default)] bg-[var(--surface-primary)] px-2.5 font-medium text-[var(--text-primary)] hover:bg-[var(--surface-tertiary)]"
+              >
+                {t("stopAction")}
+              </button>
+            </div>
+          </div>
+        )}
+        {pendingInputs.length > 0 && (
+          <section
+            className="mb-2 overflow-hidden rounded-2xl border border-[var(--border-default)] bg-[var(--surface-secondary)]"
+            aria-label={t("pendingInputsTitle")}
+            data-testid="pending-inputs"
+          >
+            <div className="flex items-center gap-2 border-b border-[var(--border-default)] px-3 py-2">
+              <ListPlus className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
+              <span className="text-xs font-medium text-[var(--text-primary)]">
+                {t("pendingInputsTitle")}
+              </span>
+              <span className="rounded-full bg-[var(--surface-tertiary)] px-1.5 py-0.5 text-[10px] tabular-nums text-[var(--text-secondary)]">
+                {pendingInputs.length}
+              </span>
+            </div>
+            <ol className="max-h-36 overflow-y-auto py-1">
+              {pendingInputs.map((item, index) => {
+                const canCancel = item.status === "queued" || item.status === "blocked";
+                const canRestore = item.status === "blocked"
+                  || (!isGenerating && item.status === "queued");
+                const hasDraft = !!input.trim() || attachments.length > 0;
+                const summary = item.text.trim()
+                  || item.attachments.map((attachment) => attachment.name).join(", ")
+                  || t("pendingInputAttachmentOnly");
+                return (
+                  <li
+                    key={item.id}
+                    className="group flex min-w-0 items-center gap-2 px-3 py-1.5 text-xs"
+                    data-testid={`pending-input-${item.id}`}
+                  >
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--surface-tertiary)] text-[10px] tabular-nums text-[var(--text-secondary)]">
+                      {index + 1}
+                    </span>
+                    <span
+                      className="min-w-0 flex-1 truncate text-[var(--text-primary)]"
+                      title={item.error_message ? `${summary}\n${item.error_message}` : summary}
+                    >
+                      {summary}
+                    </span>
+                    {item.attachments.length > 0 && (
+                      <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
+                        {t("pendingInputFiles", { count: item.attachments.length })}
+                      </span>
+                    )}
+                    <span className="shrink-0 rounded-full bg-[var(--surface-tertiary)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                      {t(item.mode === "steer" ? "inputModeSteerShort" : "inputModeQueueShort")}
+                    </span>
+                    {item.status !== "queued" && (
+                      <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
+                        {t(`inputStatus_${item.status}`)}
+                      </span>
+                    )}
+                    {canRestore && (
+                      <button
+                        type="button"
+                        onClick={() => void handleRestorePendingInput(item)}
+                        disabled={hasDraft || !onCancelInput}
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--text-tertiary)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-30"
+                        aria-label={t("inputRestoreAria", { position: index + 1 })}
+                        title={hasDraft ? t("inputRestoreDraftBusy") : t("inputRestore")}
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onCancelInput?.(item.id)}
+                      disabled={!canCancel || !onCancelInput}
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--text-tertiary)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-30"
+                      aria-label={t("inputCancelAria", { position: index + 1 })}
+                      title={canCancel ? t("inputCancel") : t("inputAlreadyApplying")}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+          </section>
+        )}
         <div
           ref={dropTargetRef}
           className={cn(
@@ -751,7 +963,15 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
               onSelect={handleSelect}
               onSubmit={handleSend}
               mentionActive={mentionActive}
-              placeholder={noModelsAvailable ? t('noModelPlaceholder') : hasWorkspace ? t('placeholder') + t('placeholderMention') : t('placeholder')}
+              placeholder={
+                noModelsAvailable
+                  ? t("noModelPlaceholder")
+                  : isGenerating
+                    ? t("inputWhileRunningPlaceholder")
+                    : hasWorkspace
+                      ? t("placeholder") + t("placeholderMention")
+                      : t("placeholder")
+              }
               className="min-h-[28px] max-h-[200px] py-1"
               disabled={isInputDisabled}
             />
@@ -794,7 +1014,7 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    disabled={isInputDisabled}
+                    disabled={isBatchDisabled}
                     className="shrink-0 flex items-center justify-center h-8 w-8 rounded-full hover:bg-[var(--surface-tertiary)] transition-colors text-[var(--text-secondary)] disabled:opacity-50"
                     aria-label={t("taskBatchButton")}
                     title={t("taskBatchButton")}
@@ -937,6 +1157,58 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
               </Popover>
             )}
 
+            {isGenerating && onQueue && (
+              <Popover open={inputModeOpen} onOpenChange={setInputModeOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-[var(--surface-secondary)] px-3 text-[12px] font-medium text-[var(--text-primary)] hover:bg-[var(--surface-secondary)]/80"
+                    aria-label={t("inputDeliveryMode")}
+                    data-testid="input-delivery-mode"
+                  >
+                    <span>{t(inputMode === "steer" ? "inputModeSteerShort" : "inputModeQueueShort")}</span>
+                    <ChevronDown className="h-3 w-3 opacity-50" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="end"
+                  sideOffset={8}
+                  className="w-80 p-1.5"
+                  role="radiogroup"
+                  aria-label={t("inputDeliveryMode")}
+                >
+                  {(["queue", "steer"] as SessionInputMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      role="radio"
+                      aria-checked={inputMode === mode}
+                      onClick={() => {
+                        setInputMode(mode);
+                        setInputModeOpen(false);
+                      }}
+                      className={cn(
+                        "flex w-full items-start gap-2 rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--surface-secondary)]",
+                        inputMode === mode && "bg-[var(--surface-secondary)]",
+                      )}
+                    >
+                      <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                        {inputMode === mode && <Check className="h-3.5 w-3.5" />}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-[13px] font-medium text-[var(--text-primary)]">
+                          {t(mode === "steer" ? "inputModeSteer" : "inputModeQueue")}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                          {t(mode === "steer" ? "inputModeSteerDescription" : "inputModeQueueDescription")}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </PopoverContent>
+              </Popover>
+            )}
+
             <div className="flex-1" />
 
             {compactingStatusText && (
@@ -947,9 +1219,20 @@ export function ChatForm({ isGenerating, isCompacting = false, onSend, onSendTas
 
             <ChatActions
               isBusy={isGenerating || isCompacting}
-              canSend={(input.trim().length > 0 || attachments.length > 0) && !isIndexing && !isCompacting && !noModelsAvailable}
+              canSend={
+                (input.trim().length > 0 || attachments.length > 0) &&
+                !isIndexing &&
+                !isInputDisabled &&
+                !imageNeedsVisionModel
+              }
               onSend={handleSend}
               onStop={onStop}
+              sendLabel={isGenerating
+                ? t(inputMode === "steer" ? "inputSteerAction" : "inputQueueAction")
+                : t("sendAction")}
+              sendHint={isGenerating
+                ? t(inputMode === "steer" ? "inputSteerActionHint" : "inputQueueActionHint")
+                : t("sendActionHint")}
             />
           </div>
           </div>

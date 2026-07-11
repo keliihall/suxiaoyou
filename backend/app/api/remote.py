@@ -22,6 +22,7 @@ from app.auth.token import (
     rotate_token,
     save_token,
 )
+from app.dependencies import get_stream_manager
 
 logger = logging.getLogger(__name__)
 
@@ -198,8 +199,8 @@ async def remote_status(request: Request) -> RemoteStatusResponse:
     tunnel_mgr = getattr(request.app.state, "tunnel_manager", None)
 
     # Count active tasks
-    sm = getattr(request.app.state, "stream_manager", None)
-    active_tasks = len(sm.active_jobs()) if sm else 0
+    sm = get_stream_manager()
+    active_tasks = len(sm.active_jobs())
 
     tunnel_url = None
     if tunnel_mgr and tunnel_mgr.is_running:
@@ -331,18 +332,20 @@ async def update_remote_config(request: Request, body: RemoteConfigUpdate) -> di
 
 
 @router.get("/tasks", dependencies=[Depends(_localhost_only)])
-async def list_remote_tasks(request: Request) -> list[dict]:
+async def list_remote_tasks() -> list[dict]:
     """List recent tasks with status summary (for mobile task list)."""
-    sm = getattr(request.app.state, "stream_manager", None)
-    if not sm:
-        return []
+    sm = get_stream_manager()
+    active = {item["stream_id"]: item for item in sm.active_jobs()}
 
     tasks = []
     for stream_id, job in sm._jobs.items():
-        status = "completed" if job.completed else "running"
-        # Check if waiting for permission
-        if not job.completed and job._response_futures:
+        active_job = active.get(stream_id)
+        if active_job is None:
+            status = "completed"
+        elif active_job["needs_input"]:
             status = "waiting_permission"
+        else:
+            status = "running"
         tasks.append({
             "stream_id": stream_id,
             "session_id": job.session_id,

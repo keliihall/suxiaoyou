@@ -21,6 +21,10 @@ interface MessageContentProps {
   isStreaming?: boolean;
   /** Stable key identifying the message — used by ActivitySummary to toggle the activity panel. */
   activityKey?: string;
+  /** Backed by the live stream's pending permission/question/review state. */
+  isAwaitingConfirmation?: boolean;
+  /** Stable wall-clock origin for timers across route/component remounts. */
+  generationStartedAt?: number | null;
 }
 
 const VISIBLE_TOOL_PARTS = new Set(["artifact", "present_file", "submit_plan"]);
@@ -107,7 +111,13 @@ function fileCardsForTool(part: ToolPart, presentedFilePaths: Set<string>) {
  * When streaming: reasoning + tools are folded into a single "Thinking" line.
  * When complete: reasoning + tools are folded into a single "Activity" summary.
  */
-export function MessageContent({ parts, isStreaming, activityKey }: MessageContentProps) {
+export function MessageContent({
+  parts,
+  isStreaming,
+  activityKey,
+  isAwaitingConfirmation = false,
+  generationStartedAt,
+}: MessageContentProps) {
   // Thinking duration reported by ReasoningPart's live timer
   const [thinkingDuration, setThinkingDuration] = useState<number | undefined>();
   const handleDurationChange = useCallback((secs: number) => setThinkingDuration(secs), []);
@@ -196,6 +206,7 @@ export function MessageContent({ parts, isStreaming, activityKey }: MessageConte
             reasoningTexts,
             toolParts,
             thinkingDuration,
+            isAwaitingConfirmation,
             stepParts,
             hasVisibleOutput: parts.some((p) =>
               p.type === "text" ||
@@ -207,7 +218,7 @@ export function MessageContent({ parts, isStreaming, activityKey }: MessageConte
             chain,
           }
         : null,
-    [hasActivity, reasoningTexts, toolParts, thinkingDuration, stepParts, chain, parts, activityKey],
+    [hasActivity, reasoningTexts, toolParts, thinkingDuration, isAwaitingConfirmation, stepParts, chain, parts, activityKey],
   );
 
   // Content parts: text, subtask, and deliverable tool calls (shown as inline cards)
@@ -255,6 +266,8 @@ export function MessageContent({ parts, isStreaming, activityKey }: MessageConte
           texts={reasoningTexts}
           toolParts={toolParts}
           isStreaming={isStreaming}
+          isAwaitingConfirmation={isAwaitingConfirmation}
+          startedAt={generationStartedAt}
           onDurationChange={handleDurationChange}
         />
       )}

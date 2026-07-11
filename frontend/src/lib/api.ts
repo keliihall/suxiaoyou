@@ -7,6 +7,7 @@ import {
   resolveApiUrl,
 } from "./constants";
 import { getRemoteConfig } from "./remote-connection";
+import { networkRetryLimit } from "./api-retry-policy";
 import i18n from "@/i18n/config";
 
 class ApiError extends Error {
@@ -20,13 +21,20 @@ class ApiError extends Error {
   }
 }
 
-/** Max retries for network errors (connection refused/reset during backend restart). */
-const NETWORK_RETRY_MAX = 3;
 const DEFAULT_GET_TIMEOUT_MS = 30_000;
 const DEFAULT_MUTATION_TIMEOUT_MS = 120_000;
 
 export type ApiRequestInit = RequestInit & {
   timeoutMs?: number;
+  /**
+   * Explicitly opt a request into network-error retries.
+   *
+   * GET/HEAD requests retry by default. Mutating requests do not: a server may
+   * have committed the operation before the connection dropped, so replaying
+   * it can duplicate conversations, tool runs, charges, or file writes.
+   * Callers may enable this only when the endpoint has an idempotency key.
+   */
+  retryNetworkErrors?: boolean;
 };
 
 async function resolveRequestUrl(url: string): Promise<string> {
@@ -55,7 +63,7 @@ async function buildAuthHeaders(): Promise<Record<string, string>> {
 
 export async function apiFetch(
   url: string,
-  options?: ApiRequestInit,
+  options?: Omit<ApiRequestInit, "retryNetworkErrors">,
 ): Promise<Response> {
   const { timeoutMs, ...fetchOptions } = options ?? {};
   const method = fetchOptions.method?.toUpperCase() ?? "GET";
@@ -106,8 +114,9 @@ async function request<T>(
   url: string,
   options?: ApiRequestInit,
 ): Promise<T> {
-  const { timeoutMs, ...fetchOptions } = options ?? {};
+  const { timeoutMs, retryNetworkErrors, ...fetchOptions } = options ?? {};
   const method = fetchOptions.method?.toUpperCase() ?? "GET";
+  const retryLimit = networkRetryLimit(method, retryNetworkErrors);
   const requestTimeoutMs =
     timeoutMs ?? (method === "GET" ? DEFAULT_GET_TIMEOUT_MS : DEFAULT_MUTATION_TIMEOUT_MS);
 
@@ -132,15 +141,7 @@ async function request<T>(
   // read, preventing lateral-user escalation on shared hosts). In web
   // dev mode the Next.js proxy handles credential-less same-origin
   // calls, so no header is needed.
-  const authHeaders: Record<string, string> = {};
-  if (remoteConfig) {
-    authHeaders["Authorization"] = `Bearer ${remoteConfig.token}`;
-  } else if (IS_DESKTOP) {
-    const token = await getBackendToken();
-    authHeaders["Authorization"] = `Bearer ${token}`;
-  }
-
-  for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
+  for (let attempt = 0; attempt <= retryLimit; attempt++) {
     const controller = new AbortController();
     let didTimeout = false;
     const timeout = setTimeout(() => {
@@ -149,6 +150,10 @@ async function request<T>(
     }, requestTimeoutMs);
 
     try {
+      // Rebuild auth headers for each retry. A desktop backend restart rotates
+      // both its port and per-run bearer token; reusing either stale value
+      // makes an otherwise safe GET retry fail with an authentication error.
+      const authHeaders = await buildAuthHeaders();
       const res = await fetch(resolvedUrl, {
         headers: {
           "Content-Type": "application/json",
@@ -182,7 +187,7 @@ async function request<T>(
 
       // Only retry network errors (TypeError = connection refused/reset/failed).
       // Do NOT retry HTTP errors (ApiError) — those are business-level errors.
-      if (err instanceof TypeError && attempt < NETWORK_RETRY_MAX) {
+      if (err instanceof TypeError && attempt < retryLimit) {
         lastError = err;
         await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
         // Re-resolve URL in case backend restarted on a new port

@@ -16,6 +16,17 @@ const macArmConfig = JSON.parse(
 const macIntelConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/build.macos-x64.json"), "utf8"),
 );
+const linuxConfig = JSON.parse(
+  readFileSync(join(root, "desktop-tauri/src-tauri/build.linux-x64.json"), "utf8"),
+);
+const linuxDesktopTemplate = readFileSync(
+  join(root, "desktop-tauri/src-tauri/linux/suxiaoyou.desktop.hbs"),
+  "utf8",
+);
+const desktopCargo = readFileSync(
+  join(root, "desktop-tauri/src-tauri/Cargo.toml"),
+  "utf8",
+);
 const backendRequirements = readFileSync(
   join(root, "backend/requirements.txt"),
   "utf8",
@@ -43,6 +54,15 @@ function job(name) {
   return next === -1 ? rest : rest.slice(0, next);
 }
 
+function ciJob(name) {
+  const heading = `  ${name}:`;
+  const start = ciWorkflow.indexOf(`${heading}\n`);
+  assert.notEqual(start, -1, `missing CI ${name} job`);
+  const rest = ciWorkflow.slice(start + heading.length + 1);
+  const next = rest.search(/^  [a-zA-Z0-9_-]+:\s*$/m);
+  return next === -1 ? rest : rest.slice(0, next);
+}
+
 function step(jobText, name) {
   const heading = `      - name: ${name}`;
   const start = jobText.indexOf(`${heading}\n`);
@@ -64,6 +84,11 @@ test("supports tag releases and explicitly marked manual test builds", () => {
   const mac = job("build-macos");
   assert.match(mac, /--no-sign/);
   assert.match(mac, /ADHOC-TEST/);
+
+  const validate = job("validate-release");
+  assert.match(validate, /fetch-depth:\s*0/);
+  assert.match(validate, /Require official tag commit on main/);
+  assert.match(validate, /git merge-base --is-ancestor "\$GITHUB_SHA" refs\/remotes\/origin\/main/);
 });
 
 test("manual releases select one target while tags keep both native macOS builds", () => {
@@ -115,17 +140,69 @@ test("manual releases select one target while tags keep both native macOS builds
   );
 });
 
-test("test-build artifacts expire after one day", () => {
-  for (const name of ["build-windows", "build-macos", "build-linux"]) {
+test("installer artifacts expire after one day and lifecycle diagnostics after seven", () => {
+  const jobs = [
+    [
+      "build-windows",
+      "Upload Windows artifact",
+      "Upload Windows lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-windows",
+    ],
+    [
+      "build-macos",
+      "Upload macOS artifact",
+      "Upload macOS lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-macos-${{ env.DMG_ARCH }}",
+    ],
+    [
+      "build-linux",
+      "Upload Linux artifacts",
+      "Upload Linux lifecycle diagnostics",
+      "suxiaoyou-desktop-lifecycle-linux-*",
+    ],
+  ];
+  const diagnosticPaths = new Set();
+  for (const [name, installerStep, diagnosticsStep, diagnosticPath] of jobs) {
     const build = job(name);
-    assert.equal((build.match(/uses: actions\/upload-artifact@/g) ?? []).length, 1);
-    assert.match(build, /retention-days:\s*1/);
+    assert.equal((build.match(/uses: actions\/upload-artifact@/g) ?? []).length, 2);
+    assert.match(step(build, installerStep), /if:\s*always\(\)/);
+    assert.match(step(build, installerStep), /retention-days:\s*1/);
+    const diagnostics = step(build, diagnosticsStep);
+    assert.match(diagnostics, /if:\s*always\(\)/);
+    assert.match(diagnostics, /if-no-files-found:\s*ignore/);
+    assert.match(diagnostics, /retention-days:\s*7/);
+    assert.match(diagnostics, new RegExp(escapeRegExp(diagnosticPath)));
+    assert.equal(diagnosticPaths.has(diagnosticPath), false, diagnosticPath);
+    diagnosticPaths.add(diagnosticPath);
   }
 });
 
 test("sets the declared macOS minimum everywhere", () => {
   assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, "11.0");
   assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"11\.0"/);
+});
+
+test("keeps the Chinese UI name while Linux packages use a stable ASCII identity", () => {
+  assert.equal(tauriConfig.productName, "苏小有");
+  assert.ok(tauriConfig.app.windows.every((window) => window.title === "苏小有"));
+  assert.equal(linuxConfig.productName, "suxiaoyou");
+  assert.equal(linuxConfig.mainBinaryName, undefined);
+  assert.deepEqual(linuxConfig.bundle.resources, tauriConfig.bundle.resources);
+
+  const templatePath = "linux/suxiaoyou.desktop.hbs";
+  assert.equal(linuxConfig.bundle.linux.deb.desktopTemplate, templatePath);
+  assert.equal(linuxConfig.bundle.linux.rpm.desktopTemplate, templatePath);
+  assert.match(linuxDesktopTemplate, /^\[Desktop Entry\]$/m);
+  assert.match(linuxDesktopTemplate, /^Categories=\{\{categories\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Comment=\{\{comment\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Exec=\{\{exec\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^StartupWMClass=\{\{exec\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Icon=\{\{icon\}\}$/m);
+  assert.match(linuxDesktopTemplate, /^Name=苏小有$/m);
+  assert.match(linuxDesktopTemplate, /^Terminal=false$/m);
+  assert.match(linuxDesktopTemplate, /^Type=Application$/m);
+  assert.match(linuxDesktopTemplate, /^MimeType=\{\{mime_type\}\}$/m);
+  assert.doesNotMatch(linuxDesktopTemplate, /^Name=\{\{name\}\}$/m);
 });
 
 test("keeps Apple credentials step-scoped and fails official tags fast", () => {
@@ -155,11 +232,16 @@ test("keeps Apple credentials step-scoped and fails official tags fast", () => {
   assert.match(credentials, /exit 1/);
 });
 
-test("has no updater artifacts, updater keys, or latest manifest", () => {
+test("publishes a manual-download manifest without updater artifacts or keys", () => {
   assert.doesNotMatch(
     workflow,
     /TAURI_SIGNING_PRIVATE_KEY|\.app\.tar\.gz|\.exe\.sig|latest\.json/,
   );
+  assert.match(workflow, /release-manifest\.json/);
+  assert.match(workflow, /manual-download/);
+  assert.match(workflow, /generate-release-manifest\.mjs/);
+  assert.match(workflow, /verify-release-manifest\.mjs/);
+  assert.match(workflow, /git rev-parse "\$GITHUB_SHA\^\{commit\}"/);
 });
 
 test("uses locked desktop tooling and sanitized frontend output on every platform", () => {
@@ -169,6 +251,96 @@ test("uses locked desktop tooling and sanitized frontend output on every platfor
     assert.match(build, /npm run build:frontend/);
     assert.doesNotMatch(build, /npx (?:next|@tauri-apps\/cli)/);
     assert.match(build, /npm exec tauri build/);
+  }
+});
+
+test("prepares exactly the ignored Tauri resource roots only in validation jobs", () => {
+  const expectedResources = [
+    "../../backend/dist/suxiaoyou-backend",
+    "../../backend/resources/nodejs",
+  ];
+  const configuredBackendResources = Object.keys(
+    tauriConfig.bundle.resources,
+  )
+    .filter((path) => path.startsWith("../../backend/"))
+    .sort();
+  assert.deepEqual(configuredBackendResources, expectedResources);
+
+  const prepName = "Prepare placeholder Tauri resources for Rust validation";
+  const validations = [
+    [ciWorkflow, ciJob("rust"), "Run Rust tests"],
+    [workflow, job("validate-release"), "Validate Rust desktop graph"],
+  ];
+
+  for (const [source, validation, rustStepName] of validations) {
+    assert.equal(source.split(prepName).length - 1, 1);
+    const prep = step(validation, prepName);
+    const preparedResources = [
+      ...prep.matchAll(/\.\.\/\.\.\/backend\/[A-Za-z0-9_./-]+/g),
+    ]
+      .map((match) => match[0])
+      .sort();
+    assert.deepEqual(preparedResources, expectedResources);
+    assert.match(prep, /mkdir -p/);
+    assert.doesNotMatch(prep, /touch|printf|frontend\/out/);
+    assert.ok(validation.indexOf(prepName) < validation.indexOf(rustStepName));
+  }
+
+  assert.match(ciJob("rust"), /working-directory:\s*desktop-tauri\/src-tauri/);
+  assert.match(
+    step(job("validate-release"), prepName),
+    /working-directory:\s*desktop-tauri\/src-tauri/,
+  );
+  for (const name of ["build-windows", "build-macos", "build-linux", "publish"]) {
+    assert.doesNotMatch(job(name), new RegExp(escapeRegExp(prepName)));
+  }
+});
+
+test("formal platform builds replace validation placeholders with verified real resources", () => {
+  const expectations = [
+    [
+      "build-windows",
+      "Build backend with locked PyInstaller",
+      "Verify backend bundle",
+      "Download verified Node.js runtime",
+      "Build Tauri NSIS installer",
+    ],
+    [
+      "build-macos",
+      "Build native backend with locked PyInstaller",
+      "Verify backend bundle with full smoke",
+      "Download verified native Node.js runtime",
+      "Build Tauri app for post-copy repair",
+    ],
+    [
+      "build-linux",
+      "Build backend with locked PyInstaller",
+      "Verify backend bundle",
+      "Download verified Node.js runtime",
+      "Build Tauri Linux installers",
+    ],
+  ];
+
+  for (const [jobName, backendName, backendVerifyName, nodeName, tauriName] of
+    expectations) {
+    const build = job(jobName);
+    const orderedSteps = [
+      backendName,
+      backendVerifyName,
+      nodeName,
+      "Verify bundled Node.js toolchain",
+      tauriName,
+    ].map((name) => build.indexOf(`      - name: ${name}`));
+    assert.ok(orderedSteps.every((index) => index >= 0), `${jobName} is missing a resource step`);
+    assert.deepEqual(orderedSteps, [...orderedSteps].sort((a, b) => a - b));
+    assert.match(step(build, backendName), /PyInstaller/);
+    assert.match(step(build, backendVerifyName), /verify-bundle\.mjs/);
+    assert.match(step(build, nodeName), /download_node\.py/);
+    assert.match(
+      step(build, "Verify bundled Node.js toolchain"),
+      /verify-node-runtime\.mjs backend\/resources\/nodejs/,
+    );
+    assert.doesNotMatch(build, /placeholder Tauri resources|\.ci-resource-placeholder/);
   }
 });
 
@@ -202,10 +374,22 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   );
   assert.ok(uploadIndex >= 0, "Linux artifacts are not uploaded");
   assert.ok(
-    verifyIndex > uploadIndex,
-    "Linux artifacts must remain available when installed-content verification fails",
+    uploadIndex > verifyIndex,
+    "always-run artifact upload must follow installed-content verification",
   );
+  assert.match(step(linux, "Upload Linux artifacts"), /if:\s*always\(\)/);
   assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /DEB_PACKAGE=.*dpkg-deb -f .* Package/);
+  assert.match(linux, /dpkg-deb -f .* Version/);
+  assert.match(linux, /dpkg-deb -f .* Architecture/);
+  assert.match(linux, /RPM_PACKAGE=.*rpm -qp --queryformat '%\{NAME\}'/);
+  assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
+  assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
+  assert.match(linux, /EXPECTED_PACKAGE="suxiaoyou"/);
+  assert.match(linux, /DEB package is \$DEB_PACKAGE, expected \$EXPECTED_PACKAGE/);
+  assert.match(linux, /RPM package is \$RPM_PACKAGE, expected \$EXPECTED_PACKAGE/);
+  assert.match(linux, /expected amd64/);
+  assert.match(linux, /expected x86_64/);
   assert.match(linux, /rpm -K/);
   assert.match(linux, /rpm2cpio/);
   assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
@@ -233,12 +417,61 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   );
   assert.match(install, /Start-Process/);
   assert.match(install, /"\/S"/);
+  assert.match(install, /require\('\.\/package\.json'\)\.version/);
+  assert.match(desktopCargo, /^\[package\]\nname = "suxiaoyou-desktop"$/m);
+  assert.equal(tauriConfig.mainBinaryName, undefined);
+  assert.match(install, /id:\s*install-windows/);
+  assert.match(install, /expectedAppExecutable = "suxiaoyou-desktop\.exe"/);
+  assert.match(install, /appBinary = Join-Path \$installDirectory \$expectedAppExecutable/);
+  assert.match(install, /Test-Path -LiteralPath \$appBinary -PathType Leaf/);
+  assert.match(install, /VersionInfo\.ProductVersion/);
   assert.match(install, /Filter node\.exe/);
   assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
   assert.match(install, /npm\.cmd/);
   assert.match(install, /npx\.cmd/);
   assert.match(install, /suxiaoyou-backend\.exe/);
   assert.match(install, /node scripts\/verify-bundle\.mjs/);
+  assert.match(
+    install,
+    /"installed_app=\$appBinary" \| Out-File[\s\S]*-FilePath \$env:GITHUB_OUTPUT/,
+  );
+  assert.doesNotMatch(install, /苏小有\.exe/);
+});
+
+test("launches every installed desktop, waits for backend ready, and proves clean exit", () => {
+  const windows = step(
+    job("build-windows"),
+    "Launch installed Windows desktop and verify clean shutdown",
+  );
+  assert.match(
+    windows,
+    /WINDOWS_INSTALLED_APP:\s*\$\{\{ steps\.install-windows\.outputs\.installed_app \}\}/,
+  );
+  assert.match(windows, /Test-Path -LiteralPath \$installedApp -PathType Leaf/);
+  assert.match(windows, /--executable \$installedApp/);
+  assert.doesNotMatch(windows, /Get-ChildItem|苏小有\.exe/);
+  assert.match(windows, /verify-desktop-lifecycle\.mjs/);
+  assert.match(windows, /suxiaoyou-desktop-lifecycle-windows/);
+
+  const mac = step(job("build-macos"), "Verify final DMG contents");
+  const copiedApp = mac.indexOf("ditto \"$MOUNT_DIRECTORY/苏小有.app\"");
+  const lifecycle = mac.indexOf("verify-desktop-lifecycle.mjs");
+  assert.ok(copiedApp >= 0 && lifecycle > copiedApp);
+  assert.match(mac, /CFBundleExecutable/);
+  assert.match(mac, /suxiaoyou-desktop-lifecycle-macos-\$DMG_ARCH/);
+
+  const linux = step(job("build-linux"), "Install Linux packages and verify desktop lifecycle");
+  assert.match(linux, /sudo dpkg -i/);
+  assert.match(linux, /sudo rpm -i --nodeps/);
+  assert.match(linux, /xvfb-run -a dbus-run-session/);
+  assert.equal((linux.match(/verify-desktop-lifecycle\.mjs/g) ?? []).length, 2);
+  assert.match(linux, /sudo dpkg --purge/);
+  assert.match(linux, /sudo rpm -e/);
+
+  for (const name of ["build-windows", "build-macos", "build-linux"]) {
+    assert.match(job(name), /lifecycle-diagnostics/);
+    assert.match(job(name), /if-no-files-found:\s*ignore/);
+  }
 });
 
 test("Windows native build validates lifecycle primitives before packaging", () => {
@@ -297,10 +530,14 @@ test("validates release metadata, production audits, and tests before building",
   assert.match(validate, /node --test scripts\/\*\.test\.mjs/);
   assert.match(validate, /npm audit --omit=dev/);
   assert.match(validate, /node --test tests\/unit\/\*\.test\.ts/);
+  assert.match(validate, /playwright install --with-deps chromium/);
+  assert.match(validate, /npm run test:ui:core/);
   assert.match(backend, /python -m pip check/);
   assert.match(backend, /pip-audit -r requirements\.txt/);
   assert.match(backend, /pytest -q/);
   assert.match(validate, /cargo metadata --locked --format-version 1/);
+  assert.match(validate, /cargo test --locked/);
+  assert.match(validate, /cargo clippy --locked --all-targets -- -D warnings/);
 
   for (const name of ["build-windows", "build-macos", "build-linux"]) {
     assert.match(job(name), /needs:\s*validate-release/);
@@ -378,10 +615,34 @@ test("verifies all five installer types before publishing checksums", () => {
   }
   assert.match(publish, /macos-aarch64/);
   assert.match(publish, /macos-x64/);
+  assert.match(publish, /VERSION="\$\{GITHUB_REF_NAME#v\}"/);
+  assert.match(publish, /\*\$\{VERSION\}\*_aarch64\.dmg/);
+  assert.match(publish, /\*\$\{VERSION\}\*_x64\.dmg/);
+  for (const stableName of [
+    "windows-x64-setup.exe",
+    "macos-aarch64.dmg",
+    "macos-x64.dmg",
+    "linux-amd64.deb",
+    "linux-x86_64.rpm",
+  ]) {
+    assert.match(publish, new RegExp(escapeRegExp(stableName)));
+  }
+  assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
 
   const release = step(publish, "Create draft GitHub Release");
   assert.match(release, /draft:\s*true/);
+  assert.match(release, /body_path:\s*RELEASE-BODY\.md/);
   assert.match(release, /files:[\s\S]*CHECKSUMS\.md/);
+  assert.match(release, /files:[\s\S]*release-manifest\.json/);
+  assert.match(release, /files:[\s\S]*release-assets\/\*/);
+
+  const trust = step(publish, "Record installer trust status");
+  assert.match(trust, /Developer ID/);
+  assert.match(trust, /Apple 公证/);
+  assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
+  assert.match(trust, /Linux DEB\/RPM[^\n]*未配置仓库签名/);
+  assert.match(trust, /release-manifest\.json[^\n]*手动下载/);
+  assert.match(trust, /cat CHECKSUMS\.md/);
 });
 
 test("repairs then signs inside-out and notarizes the final DMG", () => {
@@ -497,11 +758,51 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.match(mac, /hdiutil verify/);
 });
 
+test("retries only transient hdiutil Resource busy failures when creating the DMG", () => {
+  const createDmg = step(job("build-macos"), "Create final DMG");
+  const createIndex = createDmg.indexOf("hdiutil create");
+  const verifyIndex = createDmg.indexOf('hdiutil verify "$DMG_PATH"');
+
+  assert.match(createDmg, /MAX_HDIUTIL_ATTEMPTS=3/);
+  assert.match(
+    createDmg,
+    /for \(\( attempt = 1; attempt <= MAX_HDIUTIL_ATTEMPTS; attempt\+\+ \)\); do/,
+  );
+  assert.equal((createDmg.match(/hdiutil create -volname/g) ?? []).length, 1);
+  assert.match(
+    createDmg,
+    /rm -f "\$DMG_PATH"[\s\S]*hdiutil_output="\$\([\s\S]*hdiutil create/,
+  );
+  assert.match(createDmg, /hdiutil_status=\$\?/);
+  assert.match(
+    createDmg,
+    /hdiutil_status != 1[\s\S]*grep -Fqx "hdiutil: create failed - Resource busy"/,
+  );
+  assert.match(
+    createDmg,
+    /non-transient error \(status \$hdiutil_status\)"\s+exit "\$hdiutil_status"/,
+  );
+  assert.match(
+    createDmg,
+    /attempt == MAX_HDIUTIL_ATTEMPTS[\s\S]*remained busy[\s\S]*exit "\$hdiutil_status"/,
+  );
+  assert.match(createDmg, /retry_delay=\$\(\( attempt \* 5 \)\)/);
+  assert.match(createDmg, /sleep "\$retry_delay"/);
+  assert.match(createDmg, /\[\[ -s "\$DMG_PATH" \]\]/);
+  assert.doesNotMatch(createDmg, /hdiutil create[^\n]*(?:\|\| true|; true)/);
+  assert.ok(createIndex >= 0 && verifyIndex > createIndex);
+});
+
 test("CI runs the frontend unit suite", () => {
   assert.match(ciWorkflow, /node --test tests\/unit\/\*\.test\.ts/);
   assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
   assert.match(ciWorkflow, /verify-macos-bundle\.test\.mjs/);
   assert.match(ciWorkflow, /verify-node-runtime\.test\.mjs/);
+  assert.match(ciWorkflow, /workflow-security\.test\.mjs/);
+  assert.match(ciWorkflow, /bump-version\.test\.mjs/);
+  assert.match(ciWorkflow, /release-manifest\.test\.mjs/);
+  assert.match(ciWorkflow, /release-metadata\.mjs/);
+  assert.match(ciWorkflow, /verify-desktop-lifecycle\.test\.mjs/);
   assert.match(ciWorkflow, /python -m pip install uv==0\.11\.28/);
   for (const target of [
     "x86_64-pc-windows-msvc",
@@ -515,4 +816,8 @@ test("CI runs the frontend unit suite", () => {
     ciWorkflow,
     /uv pip install[\s\S]*--system[\s\S]*--require-hashes[\s\S]*--only-binary=:all:/,
   );
+  assert.match(ciWorkflow, /cargo test --locked/);
+  assert.match(ciWorkflow, /cargo clippy --locked --all-targets -- -D warnings/);
+  assert.match(ciWorkflow, /playwright install --with-deps chromium/);
+  assert.match(ciWorkflow, /npm run test:ui:core/);
 });

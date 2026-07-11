@@ -78,7 +78,7 @@
   "minutesAgo": "{{count}} 分钟前",
   "hoursAgo": "{{count}} 小时前",
   "daysAgo": "{{count}} 天前",
-  "poweredBy": "苏小有 v0.7.3",
+  "poweredBy": "苏小有 v0.8.0",
   "sortBy": "排序",
   "name": "名称",
   "price": "价格",

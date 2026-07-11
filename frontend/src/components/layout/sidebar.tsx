@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarHeader } from "./sidebar-header";
 import { SessionList } from "./session-list";
 import { SidebarFooter } from "./sidebar-footer";
+import { ProjectsToolbar } from "./projects-toolbar";
 import { SearchCommandDialog } from "./search-command-dialog";
 import { SidebarResizeHandle } from "./sidebar-resize-handle";
 import { useSidebarStore } from "@/stores/sidebar-store";
@@ -34,6 +35,8 @@ export function Sidebar() {
     <TooltipProvider delayDuration={200}>
       <motion.aside
         aria-label="Chat sidebar"
+        aria-hidden={isCollapsed}
+        inert={isCollapsed ? true : undefined}
         className="sidebar-glass fixed inset-y-0 left-0 z-30 flex flex-col overflow-hidden bg-[var(--sidebar-translucent-bg)] backdrop-blur-xl"
         style={IS_DESKTOP ? { top: topOffset } : undefined}
         initial={false}
@@ -42,6 +45,7 @@ export function Sidebar() {
       >
         <SidebarHeader />
         <SidebarNav />
+        <ProjectsToolbar variant="primary" />
         <Suspense fallback={<div className="flex-1" />}>
           <SessionList />
         </Suspense>

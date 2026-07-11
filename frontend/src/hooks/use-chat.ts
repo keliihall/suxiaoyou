@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { API, queryKeys } from "@/lib/constants";
@@ -12,10 +12,37 @@ import { useChatStore, useChatSession } from "@/stores/chat-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useActivityStore } from "@/stores/activity-store";
-import { startStream, stopStream } from "@/lib/session-stream-registry";
+import {
+  reconnectStream,
+  recoverInteractionState,
+  startStream,
+  stopStream,
+} from "@/lib/session-stream-registry";
+import { canSubmitInteraction, type InteractionPromptType } from "@/lib/interaction-response";
+import {
+  clearSessionInputRequestId,
+  removeSessionInput,
+  reserveSessionInputRequestId,
+  sortSessionInputs,
+  upsertSessionInput,
+} from "@/lib/session-inputs";
+import {
+  clearPromptRequestId,
+  promptRequestFingerprint,
+  reservePromptRequestId,
+} from "@/lib/prompt-idempotency";
 import { useRemoteGenerationSync } from "./use-remote-generation-sync";
 import type { InfiniteData } from "@tanstack/react-query";
-import type { FileAttachment, PromptResponse, RespondRequest, TaskBatchRequest } from "@/types/chat";
+import type {
+  FileAttachment,
+  PromptRequest,
+  PromptResponse,
+  RespondRequest,
+  RespondResult,
+  SessionInputMode,
+  SessionInputResponse,
+  TaskBatchRequest,
+} from "@/types/chat";
 import type { PaginatedMessages } from "@/types/message";
 import type { SessionResponse } from "@/types/session";
 import type { ModelInfo } from "@/types/model";
@@ -23,6 +50,20 @@ import type { ModelInfo } from "@/types/model";
 const MODEL_DOES_NOT_SUPPORT_IMAGES = "MODEL_DOES_NOT_SUPPORT_IMAGES";
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
 const VISION_MODEL_REQUIRED_MESSAGE = "The selected model does not support images. Choose a vision model and try again.";
+
+function queuedInputFingerprint(
+  sessionId: string,
+  mode: SessionInputMode,
+  text: string,
+  attachments: FileAttachment[] | undefined,
+): string {
+  return JSON.stringify([
+    sessionId,
+    mode,
+    text.trim(),
+    (attachments ?? []).map((file) => [file.file_id, file.path, file.size]),
+  ]);
+}
 
 function isImageAttachment(attachment: FileAttachment): boolean {
   if (attachment.mime_type?.startsWith("image/")) return true;
@@ -58,6 +99,34 @@ function isUnsupportedImagesError(err: unknown): boolean {
   );
 }
 
+function respondErrorDetail(err: unknown): Record<string, unknown> | null {
+  if (!(err instanceof ApiError)) return null;
+  const detail = (err.body as { detail?: unknown } | undefined)?.detail;
+  return typeof detail === "object" && detail !== null
+    ? detail as Record<string, unknown>
+    : null;
+}
+
+function interactionWasAcknowledgedOrDismissed(
+  sessionId: string | null,
+  promptType: "permission" | "question" | "plan",
+  callId: string,
+): boolean {
+  const state = useChatStore.getState();
+  const bucket = sessionId === null ? state.draftSession : state.sessions[sessionId];
+  const request = promptType === "permission"
+    ? bucket?.pendingPermission
+    : promptType === "plan"
+      ? bucket?.pendingPlanReview
+      : bucket?.pendingQuestion;
+  return (
+    !request
+    || request.callId !== callId
+    || request.responseState === "resolved"
+    || request.responseState === "continuing"
+  );
+}
+
 function formatTaskBatchPrompt(batch: Pick<TaskBatchRequest, "mode" | "tasks">): string {
   const heading = i18n.t(batch.mode === "parallel" ? "taskBatchParallel" : "taskBatchSequential", {
     ns: "chat",
@@ -76,10 +145,25 @@ function formatTaskBatchPrompt(batch: Pick<TaskBatchRequest, "mode" | "tasks">):
 export function useChat(currentSessionId?: string) {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const stopInFlightRef = useRef(false);
 
   // One subscription, one selector — re-renders only when the bucket reference
   // changes (i.e. when this session's state mutates).
   const session = useChatSession(currentSessionId ?? null);
+
+  const { data: pendingInputs = [] } = useQuery({
+    queryKey: queryKeys.sessionInputs(currentSessionId ?? "__draft__"),
+    queryFn: async () => {
+      if (!currentSessionId) return [];
+      return sortSessionInputs(
+        await api.get<SessionInputResponse[]>(API.CHAT.SESSION_INPUTS(currentSessionId)),
+      );
+    },
+    enabled: !!currentSessionId,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchInterval: session.isGenerating ? 5_000 : false,
+  });
 
   // Polling sync for streams started by other clients (e.g. mobile)
   useRemoteGenerationSync(currentSessionId);
@@ -127,6 +211,8 @@ export function useChat(currentSessionId?: string) {
 
       chatState.beginSending(targetSessionId, text.trim(), attachments);
 
+      const promptRequestScope = currentSessionId ?? "__new__";
+      let promptRequestId: string | null = null;
       try {
         const presets = settingsState.permissionPresets;
         const permissionPresets = {
@@ -140,7 +226,7 @@ export function useChat(currentSessionId?: string) {
           pattern: "*",
         }));
 
-        const res = await api.post<PromptResponse>(API.CHAT.PROMPT, {
+        const promptPayload: PromptRequest = {
           text: text.trim(),
           session_id: currentSessionId ?? null,
           model: settingsState.selectedModel,
@@ -151,7 +237,19 @@ export function useChat(currentSessionId?: string) {
           permission_rules: permissionRules.length > 0 ? permissionRules : null,
           reasoning: settingsState.reasoningEnabled,
           workspace: settingsState.workspaceDirectory,
-        });
+        };
+        promptRequestId = reservePromptRequestId(
+          promptRequestScope,
+          promptRequestFingerprint(promptPayload),
+        );
+        const res = await api.post<PromptResponse>(
+          API.CHAT.PROMPT,
+          { ...promptPayload, client_request_id: promptRequestId },
+          // The backend durably binds this key to one session/stream before
+          // execution, so a lost HTTP response can be retried safely.
+          { retryNetworkErrors: true },
+        );
+        clearPromptRequestId(promptRequestScope, promptRequestId);
 
         // Seed the keyed bucket (carries over the draft contents if any) and
         // attach the SSE stream. Order matters: store update first so the
@@ -197,6 +295,18 @@ export function useChat(currentSessionId?: string) {
       } catch (err) {
         console.error("Failed to start generation:", err);
         chatState.resetSession(targetSessionId);
+
+        // A concrete client error proves the request was not ambiguously
+        // accepted. Keep the key across network/timeout/5xx failures so the
+        // user's next click converges on any already-committed execution.
+        if (
+          promptRequestId
+          && err instanceof ApiError
+          && err.status >= 400
+          && err.status < 500
+        ) {
+          clearPromptRequestId(promptRequestScope, promptRequestId);
+        }
 
         if (err instanceof ApiError) {
           if (isUnsupportedImagesError(err)) {
@@ -315,18 +425,191 @@ export function useChat(currentSessionId?: string) {
     [currentSessionId, router, queryClient],
   );
 
-  const stopGeneration = useCallback(async () => {
+  const queueMessage = useCallback(
+    async (
+      text: string,
+      attachments?: FileAttachment[],
+      mode: SessionInputMode = "queue",
+    ): Promise<boolean> => {
+      if (!currentSessionId || (!text.trim() && (!attachments || attachments.length === 0))) {
+        return false;
+      }
+
+      const settingsState = useSettingsStore.getState();
+      if (
+        hasImageAttachments(attachments) &&
+        !selectedModelSupportsVision(
+          queryClient.getQueryData<ModelInfo[]>(queryKeys.models),
+          settingsState.selectedModel,
+          settingsState.selectedProviderId,
+        )
+      ) {
+        toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+        return false;
+      }
+
+      const presets = settingsState.permissionPresets;
+      const permissionPresets = {
+        file_changes: presets.fileChanges,
+        run_commands: presets.runCommands,
+      };
+      const hasActivePresets = Object.values(permissionPresets).some(Boolean);
+      const permissionRules = settingsState.savedPermissions.map((rule) => ({
+        action: rule.allow ? "allow" as const : "deny" as const,
+        permission: rule.tool,
+        pattern: "*",
+      }));
+      const fingerprint = queuedInputFingerprint(currentSessionId, mode, text, attachments);
+      const clientRequestId = reserveSessionInputRequestId(fingerprint);
+
+      try {
+        const queued = await api.post<SessionInputResponse>(
+          API.CHAT.INPUTS,
+          {
+            session_id: currentSessionId,
+            client_request_id: clientRequestId,
+            mode,
+            text: text.trim(),
+            attachments: attachments ?? [],
+            model: settingsState.selectedModel,
+            provider_id: settingsState.selectedProviderId,
+            agent: settingsState.selectedAgent,
+            permission_presets: hasActivePresets ? permissionPresets : null,
+            permission_rules: permissionRules.length > 0 ? permissionRules : null,
+            reasoning: settingsState.reasoningEnabled,
+            workspace: settingsState.workspaceDirectory,
+          },
+          // Safe because client_request_id is a backend-enforced idempotency key.
+          { retryNetworkErrors: true },
+        );
+        clearSessionInputRequestId(fingerprint, clientRequestId);
+        queryClient.setQueryData<SessionInputResponse[]>(
+          queryKeys.sessionInputs(currentSessionId),
+          (old) => upsertSessionInput(old, queued),
+        );
+        if (queued.status === "failed" || queued.status === "cancelled") {
+          toast.error(
+            queued.error_message
+              ? i18n.t("inputExecutionFailedWithReason", {
+                  ns: "chat",
+                  reason: queued.error_message,
+                })
+              : i18n.t("inputExecutionFailed", { ns: "chat" }),
+          );
+          // The idempotent replay found a terminal failure. Restore the
+          // composer so an explicit next click can submit a fresh request id.
+          return false;
+        }
+        if (queued.status === "consumed") {
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.messages.list(currentSessionId),
+          });
+          toast.info(i18n.t("inputAlreadyCompleted", { ns: "chat" }));
+          return true;
+        }
+        toast.success(i18n.t(mode === "steer" ? "inputSteerSubmitted" : "inputQueued", { ns: "chat" }));
+        return true;
+      } catch (err) {
+        const detail = respondErrorDetail(err);
+        if (
+          err instanceof ApiError
+          && err.status >= 400
+          && err.status < 500
+        ) {
+          // A concrete client error is definitive. Keep the key for 5xx,
+          // timeout and transport failures because the server may already
+          // have committed the queued input before the response was lost.
+          clearSessionInputRequestId(fingerprint, clientRequestId);
+        }
+
+        if (err instanceof ApiError && err.status === 409 && detail?.code === "session_idle") {
+          // The task finished between the user's click and the enqueue request.
+          // Detach the stale stream before starting the ordinary follow-up so a
+          // late DONE from the previous stream cannot clear the new generation.
+          stopStream(currentSessionId);
+          useChatStore.getState().finishGeneration(currentSessionId);
+          const sent = await sendMessage(text, attachments);
+          if (sent) {
+            toast.info(i18n.t("inputSentAfterTaskFinished", { ns: "chat" }));
+          }
+          return sent;
+        }
+
+        console.error("Failed to queue follow-up:", err);
+        toast.error(i18n.t("inputQueueFailed", { ns: "chat" }));
+        return false;
+      }
+    },
+    [currentSessionId, queryClient, sendMessage],
+  );
+
+  const cancelQueuedInput = useCallback(
+    async (inputId: string): Promise<boolean> => {
+      if (!currentSessionId) return false;
+      const key = queryKeys.sessionInputs(currentSessionId);
+      const previous = queryClient.getQueryData<SessionInputResponse[]>(key);
+      queryClient.setQueryData<SessionInputResponse[]>(key, (old) =>
+        removeSessionInput(old, inputId),
+      );
+      try {
+        await api.delete(API.CHAT.SESSION_INPUT(currentSessionId, inputId));
+        return true;
+      } catch (err) {
+        // DELETE may have committed before its response was lost. Reconcile
+        // with the durable list before restoring the optimistic row; absence
+        // proves cancellation and makes move-back-to-composer lossless.
+        try {
+          const latest = sortSessionInputs(
+            await api.get<SessionInputResponse[]>(
+              API.CHAT.SESSION_INPUTS(currentSessionId),
+            ),
+          );
+          queryClient.setQueryData(key, latest);
+          if (!latest.some((item) => item.id === inputId)) return true;
+        } catch {
+          // Fall through to the original row when reconciliation is unavailable.
+        }
+        queryClient.setQueryData(key, previous);
+        console.error("Failed to cancel queued input:", err);
+        toast.error(i18n.t("inputCancelFailed", { ns: "chat" }));
+        return false;
+      } finally {
+        queryClient.invalidateQueries({ queryKey: key });
+      }
+    },
+    [currentSessionId, queryClient],
+  );
+
+  const stopGeneration = useCallback(async (): Promise<boolean> => {
+    if (stopInFlightRef.current) return false;
     const chatState = useChatStore.getState();
     const targetSessionId = currentSessionId ?? null;
     const bucket = targetSessionId === null
       ? chatState.draftSession
       : chatState.sessions[targetSessionId];
     const streamId = bucket?.streamId;
-    if (!streamId) return;
+    if (!streamId) return false;
+    stopInFlightRef.current = true;
     try {
-      await api.post(API.CHAT.ABORT, { stream_id: streamId });
+      const result = await api.post<{ status: "aborted" | "not_found" }>(
+        API.CHAT.ABORT,
+        { stream_id: streamId },
+        // Aborting the same stream more than once has the same outcome, so a
+        // response lost at the network boundary is safe to retry.
+        { retryNetworkErrors: true },
+      );
+      if (result.status !== "aborted" && result.status !== "not_found") {
+        throw new Error(`Unexpected abort status: ${String(result.status)}`);
+      }
     } catch (err) {
+      // Truthful stop semantics: if the backend did not acknowledge the abort,
+      // keep the stream attached and the UI in its running state. The task may
+      // still be writing files and the user must be able to retry Stop.
       console.error("Failed to abort — backend may still be generating:", err);
+      toast.error(i18n.t("stopFailed", { ns: "chat" }));
+      return false;
+    } finally {
+      stopInFlightRef.current = false;
     }
     // Stop the SSE stream and clear local state immediately — don't wait for
     // backend DONE (backend may delay DONE while doing post-generation work
@@ -345,9 +628,36 @@ export function useChat(currentSessionId?: string) {
     if (targetSessionId) {
       queryClient.invalidateQueries({ queryKey: queryKeys.messages.list(targetSessionId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.sessions.detail(targetSessionId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.sessionInputs(targetSessionId) });
     }
     queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
+    return true;
   }, [currentSessionId, queryClient]);
+
+  const reconnectGeneration = useCallback(() => {
+    if (!currentSessionId || !reconnectStream(currentSessionId)) return false;
+    toast.info(i18n.t("taskReconnectStarted", { ns: "chat" }));
+    return true;
+  }, [currentSessionId]);
+
+  const recoverInteraction = useCallback((
+    promptType: InteractionPromptType,
+    callId: string,
+  ) => {
+    if (!currentSessionId) return false;
+    const streamId = useChatStore.getState().sessions[currentSessionId]?.streamId;
+    if (!streamId) return false;
+    const started = recoverInteractionState(
+      currentSessionId,
+      streamId,
+      promptType,
+      callId,
+    );
+    if (started) {
+      toast.info(i18n.t("taskReconnectStarted", { ns: "chat" }));
+    }
+    return started;
+  }, [currentSessionId]);
 
   const respondToPermission = useCallback(
     async (allow: boolean, remember = false) => {
@@ -358,7 +668,7 @@ export function useChat(currentSessionId?: string) {
         : chatState.sessions[targetSessionId];
       const perm = bucket?.pendingPermission;
       const streamId = bucket?.streamId;
-      if (!perm || !streamId) return;
+      if (!perm || !streamId || !canSubmitInteraction(perm.responseState)) return;
 
       const req: RespondRequest = {
         stream_id: streamId,
@@ -372,12 +682,57 @@ export function useChat(currentSessionId?: string) {
       };
 
       try {
-        chatState.clearPermissionRequest(targetSessionId);
-        await api.post(API.CHAT.RESPOND, req);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "permission",
+          perm.callId,
+          "submitting",
+        );
+        const result = await api.post<RespondResult>(API.CHAT.RESPOND, req);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "permission",
+          perm.callId,
+          "resolved",
+          { decision: result.decision, source: result.source },
+        );
+        if (remember) {
+          useSettingsStore.getState().savePermissionRule(
+            perm.tool || perm.permission,
+            allow,
+          );
+        }
       } catch (err) {
-        chatState.setPermissionRequest(targetSessionId, perm);
+        const detail = respondErrorDetail(err);
+        if (detail?.code === "response_conflict") {
+          chatState.setInteractionResponseState(
+            targetSessionId,
+            "permission",
+            perm.callId,
+            "resolved",
+            {
+              decision: typeof detail.existing_decision === "string"
+                ? detail.existing_decision
+                : null,
+              source: typeof detail.source === "string" ? detail.source : null,
+            },
+          );
+        } else {
+          chatState.resetInteractionResponseState(
+            targetSessionId,
+            "permission",
+            perm.callId,
+          );
+          if (interactionWasAcknowledgedOrDismissed(
+            targetSessionId,
+            "permission",
+            perm.callId,
+          )) return;
+        }
         console.error("Failed to respond to permission:", err);
-        toast.error("Failed to respond");
+        toast.error(
+          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+        );
       }
     },
     [currentSessionId],
@@ -523,7 +878,7 @@ export function useChat(currentSessionId?: string) {
         : chatState.sessions[targetSessionId];
       const question = bucket?.pendingQuestion;
       const streamId = bucket?.streamId;
-      if (!question || !streamId) return;
+      if (!question || !streamId || !canSubmitInteraction(question.responseState)) return;
 
       const response =
         typeof answer === "string" ? answer.trim() : JSON.stringify(answer);
@@ -536,11 +891,51 @@ export function useChat(currentSessionId?: string) {
       };
 
       try {
-        await api.post(API.CHAT.RESPOND, req);
-        chatState.clearQuestion(targetSessionId);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "question",
+          question.callId,
+          "submitting",
+        );
+        const result = await api.post<RespondResult>(API.CHAT.RESPOND, req);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "question",
+          question.callId,
+          "resolved",
+          { decision: result.decision, source: result.source },
+        );
       } catch (err) {
+        const detail = respondErrorDetail(err);
+        if (detail?.code === "response_conflict") {
+          chatState.setInteractionResponseState(
+            targetSessionId,
+            "question",
+            question.callId,
+            "resolved",
+            {
+              decision: typeof detail.existing_decision === "string"
+                ? detail.existing_decision
+                : null,
+              source: typeof detail.source === "string" ? detail.source : null,
+            },
+          );
+        } else {
+          chatState.resetInteractionResponseState(
+            targetSessionId,
+            "question",
+            question.callId,
+          );
+          if (interactionWasAcknowledgedOrDismissed(
+            targetSessionId,
+            "question",
+            question.callId,
+          )) return;
+        }
         console.error("Failed to respond to question:", err);
-        toast.error("Failed to respond");
+        toast.error(
+          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+        );
       }
     },
     [currentSessionId],
@@ -555,7 +950,7 @@ export function useChat(currentSessionId?: string) {
         : chatState.sessions[targetSessionId];
       const review = bucket?.pendingPlanReview;
       const streamId = bucket?.streamId;
-      if (!review || !streamId) return;
+      if (!review || !streamId || !canSubmitInteraction(review.responseState)) return;
 
       let response: Record<string, string>;
       if (action === "accept") {
@@ -573,8 +968,20 @@ export function useChat(currentSessionId?: string) {
       };
 
       try {
-        await api.post(API.CHAT.RESPOND, req);
-        chatState.clearPlanReview(targetSessionId);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "plan",
+          review.callId,
+          "submitting",
+        );
+        const result = await api.post<RespondResult>(API.CHAT.RESPOND, req);
+        chatState.setInteractionResponseState(
+          targetSessionId,
+          "plan",
+          review.callId,
+          "resolved",
+          { decision: result.decision, source: result.source },
+        );
 
         if (action === "accept") {
           try {
@@ -584,8 +991,36 @@ export function useChat(currentSessionId?: string) {
           useSettingsStore.getState().setWorkMode(options?.mode ?? "auto");
         }
       } catch (err) {
+        const detail = respondErrorDetail(err);
+        if (detail?.code === "response_conflict") {
+          chatState.setInteractionResponseState(
+            targetSessionId,
+            "plan",
+            review.callId,
+            "resolved",
+            {
+              decision: typeof detail.existing_decision === "string"
+                ? detail.existing_decision
+                : null,
+              source: typeof detail.source === "string" ? detail.source : null,
+            },
+          );
+        } else {
+          chatState.resetInteractionResponseState(
+            targetSessionId,
+            "plan",
+            review.callId,
+          );
+          if (interactionWasAcknowledgedOrDismissed(
+            targetSessionId,
+            "plan",
+            review.callId,
+          )) return;
+        }
         console.error("Failed to respond to plan review:", err);
-        toast.error("Failed to respond");
+        toast.error(
+          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+        );
       }
     },
     [currentSessionId],
@@ -593,9 +1028,14 @@ export function useChat(currentSessionId?: string) {
 
   return {
     sendMessage,
+    queueMessage,
+    cancelQueuedInput,
+    pendingInputs,
     sendTaskBatch,
     editAndResend,
     stopGeneration,
+    reconnectGeneration,
+    recoverInteraction,
     respondToPermission,
     respondToQuestion,
     respondToPlanReview,
@@ -610,5 +1050,7 @@ export function useChat(currentSessionId?: string) {
     pendingPermission: session.pendingPermission,
     pendingQuestion: session.pendingQuestion,
     pendingPlanReview: session.pendingPlanReview,
+    isProgressStalled: session.isProgressStalled,
+    lastBusinessProgressAt: session.lastBusinessProgressAt,
   };
 }

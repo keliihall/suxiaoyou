@@ -129,13 +129,25 @@ interface StreamingMessageProps {
   parts: PartData[];
   streamingText: string;
   streamingReasoning: string;
+  /** Backed by pendingPermission/pendingQuestion/pendingPlanReview. */
+  isAwaitingConfirmation?: boolean;
 }
 
-export const StreamingMessage = memo(function StreamingMessage({ sessionId, parts, streamingText, streamingReasoning }: StreamingMessageProps) {
+export const StreamingMessage = memo(function StreamingMessage({
+  sessionId,
+  parts,
+  streamingText,
+  streamingReasoning,
+  isAwaitingConfirmation = false,
+}: StreamingMessageProps) {
   const { t } = useTranslation("chat");
   const isModelLoading = useChatStore((s) => {
     const bucket = sessionId === null ? s.draftSession : s.sessions[sessionId];
     return bucket?.isModelLoading ?? false;
+  });
+  const generationStartedAt = useChatStore((s) => {
+    const bucket = sessionId === null ? s.draftSession : s.sessions[sessionId];
+    return bucket?.generationStartedAt ?? null;
   });
 
   // Track whether this component mounted with no existing stream content.
@@ -166,7 +178,11 @@ export const StreamingMessage = memo(function StreamingMessage({ sessionId, part
   // (This phase also used to stack a separate StreamingIndicator dot-row on
   // top of the stage, so two different thinking animations showed at once.)
   if (liveParts.length === 0) {
-    return <StreamingStage label={t("stageThinking")} />;
+    return (
+      <StreamingStage
+        label={t(isAwaitingConfirmation ? "stageWaitingForConfirmation" : "stageThinking")}
+      />
+    );
   }
 
   // Check if there's active text/reasoning streaming.
@@ -192,13 +208,19 @@ export const StreamingMessage = memo(function StreamingMessage({ sessionId, part
   const showTail = hasAnyActivity && !isActivelyStreaming && !hasRunningTool && !isGenerationDone;
 
   let stageLabel = t("stageThinking");
-  if (hasRunningTool) stageLabel = t("stageWorkingWithTools");
+  if (isAwaitingConfirmation) stageLabel = t("stageWaitingForConfirmation");
+  else if (hasRunningTool) stageLabel = t("stageWorkingWithTools");
   else if (!isActivelyStreaming && hasAnyTool) stageLabel = t("stageFinalizing");
 
   return (
     <div className={freshMountRef.current ? "animate-fade-in" : undefined}>
       {!hasAnyActivity && <StreamingStage label={isModelLoading ? t("stageThinking") : stageLabel} />}
-      <MessageContent parts={liveParts} isStreaming />
+      <MessageContent
+        parts={liveParts}
+        isStreaming
+        isAwaitingConfirmation={isAwaitingConfirmation}
+        generationStartedAt={generationStartedAt}
+      />
       {showTail && (
         <div className="mt-2">
           <StreamingIndicator label={stageLabel} />

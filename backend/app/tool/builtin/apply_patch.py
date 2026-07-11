@@ -9,6 +9,7 @@ from app.tool.base import ToolDefinition, ToolResult
 from app.tool.builtin.patch_parser import HunkType, apply_chunks, parse_patch
 from app.tool.context import ToolContext
 from app.tool.workspace import WorkspaceViolation, resolve_and_validate, resolve_for_write
+from app.utils.atomic_write import atomic_write_text
 from app.utils.diff import generate_unified_diff
 
 
@@ -87,8 +88,7 @@ class ApplyPatchTool(ToolDefinition):
                     return ToolResult(
                         error=f"Cannot add file '{hunk.path}': already exists"
                     )
-                with open(resolved, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(hunk.contents)
+                atomic_write_text(resolved, hunk.contents)
                 summaries.append(f"+ 已新增 {hunk.path}")
 
             elif hunk.type == HunkType.DELETE:
@@ -123,14 +123,12 @@ class ApplyPatchTool(ToolDefinition):
                     if parent:
                         os.makedirs(parent, exist_ok=True)
                     # Delete original after writing new
-                    with open(target, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(modified)
+                    atomic_write_text(target, modified)
                     if resolved != target:
                         os.remove(resolved)
                     label = f"~ 已更新 {hunk.path} → {hunk.move_to}"
                 else:
-                    with open(target, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(modified)
+                    atomic_write_text(target, modified)
                     label = f"~ 已更新 {hunk.path}"
 
                 summaries.append(label)

@@ -83,6 +83,8 @@ interface MessageListProps {
   streamingParts: PartData[];
   streamingText: string;
   streamingReasoning: string;
+  /** Whether the active stream is waiting for a user decision. */
+  isAwaitingConfirmation?: boolean;
   /** Callback to edit a user message and re-generate from that point. */
   onEditAndResend?: (messageId: string, newText: string, attachments?: FileAttachment[]) => Promise<boolean>;
   /** Workspace directory for @mention in edit mode. */
@@ -107,6 +109,7 @@ export function MessageList({
   streamingParts,
   streamingText,
   streamingReasoning,
+  isAwaitingConfirmation = false,
   onEditAndResend,
   directory,
   sessionId,
@@ -322,6 +325,7 @@ export function MessageList({
                 parts={streamingParts}
                 streamingText={streamingText}
                 streamingReasoning={streamingReasoning}
+                isAwaitingConfirmation={isAwaitingConfirmation}
               />
             </div>
           </div>
@@ -524,6 +528,7 @@ export function MessageList({
                     parts={streamingParts}
                     streamingText={streamingText}
                     streamingReasoning={streamingReasoning}
+                    isAwaitingConfirmation={isAwaitingConfirmation}
                   />
                 </div>
               </div>

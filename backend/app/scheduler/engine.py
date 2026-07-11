@@ -13,10 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from croniter import croniter
-from sqlalchemy import select, and_
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.scheduled_task import ScheduledTask
+from app.models.task_run import TaskRun
 from app.scheduler.executor import execute_scheduled_task
 from app.utils.id import generate_ulid
 
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 # Maximum age of a missed task trigger that will still be executed on startup.
 # Beyond this window, missed triggers are skipped and rescheduled.
 _MISSED_GRACE_HOURS = 24
+_STARTUP_INTERRUPTED_MESSAGE = "Application exited before automation completed"
+_SHUTDOWN_INTERRUPTED_MESSAGE = "Application stopped before automation completed"
 
 
 class TaskScheduler:
@@ -45,6 +48,10 @@ class TaskScheduler:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._running_tasks: set[str] = set()  # task IDs currently executing
+        self._execution_tasks: set[asyncio.Task[Any]] = set()
+        # Catch-up can enqueue multiple missed triggers at startup. Keep them
+        # tracked, but never execute more than the configured process limit.
+        self._execution_slots = asyncio.Semaphore(self._max_concurrent)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,8 +59,15 @@ class TaskScheduler:
 
     async def start(self) -> None:
         """Start the scheduler. Call during FastAPI lifespan startup."""
-        await self._recompute_all_next_run()
+        if self._task is not None and not self._task.done():
+            return
+
+        self._stop_event.clear()
+        await self._recover_interrupted_runs(_STARTUP_INTERRUPTED_MESSAGE)
+        # Catch up before recomputing. Recomputing first moves every missed
+        # next_run_at into the future, making the catch-up query a no-op.
         await self._catchup_missed()
+        await self._recompute_all_next_run()
         self._task = asyncio.create_task(self._poll_loop(), name="task-scheduler")
         logger.info("Task scheduler started (poll interval %ds)", self._poll_interval)
 
@@ -66,6 +80,22 @@ class TaskScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
+
+        current = asyncio.current_task()
+        executions = [
+            task
+            for task in self._execution_tasks
+            if task is not current and not task.done()
+        ]
+        for task in executions:
+            task.cancel()
+        if executions:
+            await asyncio.gather(*executions, return_exceptions=True)
+
+        self._execution_tasks.clear()
+        self._running_tasks.clear()
+        await self._recover_interrupted_runs(_SHUTDOWN_INTERRUPTED_MESSAGE)
         logger.info("Task scheduler stopped")
 
     # ------------------------------------------------------------------
@@ -94,15 +124,21 @@ class TaskScheduler:
             logger.warning("Task %s is already running, skipping manual trigger", task_id)
             return None
         self._running_tasks.add(task_id)
+        current = asyncio.current_task()
+        if current is not None:
+            self._execution_tasks.add(current)
         try:
-            return await execute_scheduled_task(
-                task_id,
-                session_factory=self._session_factory,
-                app_state=self._app_state,
-                triggered_by="manual",
-            )
+            async with self._execution_slots:
+                return await execute_scheduled_task(
+                    task_id,
+                    session_factory=self._session_factory,
+                    app_state=self._app_state,
+                    triggered_by="manual",
+                )
         finally:
             self._running_tasks.discard(task_id)
+            if current is not None:
+                self._execution_tasks.discard(current)
 
     # ------------------------------------------------------------------
     # Internal: poll loop
@@ -148,36 +184,102 @@ class TaskScheduler:
                     self._max_concurrent, task.name,
                 )
                 break
-            asyncio.create_task(
-                self._execute_and_reschedule(task.id, task.name),
-                name=f"sched-exec-{task.id[:12]}",
-            )
+            self._launch_execution(task.id, task.name, triggered_by="schedule")
 
-    async def _execute_and_reschedule(self, task_id: str, task_name: str) -> None:
-        """Execute a task and compute the next run time."""
+    def _launch_execution(
+        self,
+        task_id: str,
+        task_name: str,
+        *,
+        triggered_by: str,
+    ) -> None:
+        """Reserve and track one background execution before yielding control."""
         self._running_tasks.add(task_id)
-        try:
-            await execute_scheduled_task(
+        execution = asyncio.create_task(
+            self._execute_and_reschedule(
                 task_id,
-                session_factory=self._session_factory,
-                app_state=self._app_state,
-                triggered_by="schedule",
-            )
-        except Exception as e:
-            logger.error("Failed to execute scheduled task %s: %s", task_name, e)
+                task_name,
+                triggered_by=triggered_by,
+            ),
+            name=f"sched-exec-{task_id[:12]}",
+        )
+        self._execution_tasks.add(execution)
+        execution.add_done_callback(self._execution_tasks.discard)
+
+    async def _execute_and_reschedule(
+        self,
+        task_id: str,
+        task_name: str,
+        *,
+        triggered_by: str = "schedule",
+    ) -> None:
+        """Execute a task and compute the next run time."""
+        try:
+            async with self._execution_slots:
+                try:
+                    await execute_scheduled_task(
+                        task_id,
+                        session_factory=self._session_factory,
+                        app_state=self._app_state,
+                        triggered_by=triggered_by,
+                    )
+                except Exception as e:
+                    logger.error("Failed to execute scheduled task %s: %s", task_name, e)
+
+                # Reschedule after completed attempts, including execution
+                # errors. Cancellation skips this block so shutdown does not
+                # manufacture a future schedule before recovery.
+                async with self._session_factory() as db:
+                    async with db.begin():
+                        task = (
+                            await db.execute(
+                                select(ScheduledTask).where(ScheduledTask.id == task_id)
+                            )
+                        ).scalar_one_or_none()
+                        if task and task.enabled:
+                            task.next_run_at = self._compute_next_run(task.schedule_config)
         finally:
             self._running_tasks.discard(task_id)
 
-        # Reschedule
+    async def _recover_interrupted_runs(self, reason: str) -> int:
+        """Close process-local ``running`` records left by a prior execution.
+
+        A running automation cannot survive an application process restart. On
+        graceful stop we also call this after cancelling tracked executions so
+        the UI never remains stuck in a permanent running state.
+        """
+        now = datetime.now(timezone.utc)
+        recovered = 0
         async with self._session_factory() as db:
             async with db.begin():
-                task = (
+                runs = (
                     await db.execute(
-                        select(ScheduledTask).where(ScheduledTask.id == task_id)
+                        select(TaskRun).where(TaskRun.status == "running")
                     )
-                ).scalar_one_or_none()
-                if task and task.enabled:
-                    task.next_run_at = self._compute_next_run(task.schedule_config)
+                ).scalars().all()
+                for run in runs:
+                    run.status = "error"
+                    run.error_message = run.error_message or reason
+                    run.finished_at = now
+                    recovered += 1
+
+                tasks = (
+                    await db.execute(
+                        select(ScheduledTask).where(
+                            or_(
+                                ScheduledTask.last_run_status == "running",
+                                ScheduledTask.last_run_status.like("running:%"),
+                            )
+                        )
+                    )
+                ).scalars().all()
+                for task in tasks:
+                    task.last_run_status = "error"
+                    task.last_run_at = now
+
+        if recovered:
+            logger.warning("Recovered %d interrupted automation run(s)", recovered)
+        return recovered
 
     # ------------------------------------------------------------------
     # Internal: startup helpers
@@ -193,6 +295,14 @@ class TaskScheduler:
                 tasks = result.scalars().all()
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 for task in tasks:
+                    # Startup catch-up reserves IDs synchronously before its
+                    # background coroutine gets CPU.  Advancing that missed
+                    # timestamp here would create a crash window: if the process
+                    # exits before execute_scheduled_task creates a TaskRun, the
+                    # missed occurrence disappears forever.  The tracked runner
+                    # reschedules only after an actual attempt completes.
+                    if task.id in self._running_tasks:
+                        continue
                     next_run = self._compute_next_run(task.schedule_config)
                     # Only update if next_run_at is stale or missing
                     existing = task.next_run_at
@@ -227,9 +337,10 @@ class TaskScheduler:
             len(missed), _MISSED_GRACE_HOURS,
         )
         for task in missed:
-            asyncio.create_task(
-                self._execute_and_reschedule(task.id, task.name),
-                name=f"sched-catchup-{task.id[:12]}",
+            self._launch_execution(
+                task.id,
+                task.name,
+                triggered_by="startup_catchup",
             )
 
     # ------------------------------------------------------------------

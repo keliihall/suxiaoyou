@@ -1,9 +1,18 @@
 {
+  "productName": "suxiaoyou",
   "build": {
     "beforeBuildCommand": ""
   },
   "bundle": {
     "targets": ["deb", "rpm"],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
+      }
+    },
     "resources": {
       "../../backend/dist/suxiaoyou-backend": "backend",
       "../../backend/resources/nodejs": "nodejs",

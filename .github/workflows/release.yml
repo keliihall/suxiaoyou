@@ -27,6 +27,16 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require official tag commit on main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::official release tag $GITHUB_REF_NAME is not reachable from origin/main"
+            exit 1
+          fi
 
       - name: Require Apple credentials for an official tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -60,17 +70,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-06-30
         with:
           toolchain: "1.96.1"
+          components: clippy
 
       - name: Install validation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev pkg-config
+          sudo apt-get install -y libcairo2-dev pkg-config libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
           npm ci
           npm --prefix frontend ci --legacy-peer-deps
           npm --prefix desktop-tauri ci
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
           python -m pip install -e ./backend --no-deps
           python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pip-audit==2.10.1
+
+      - name: Install Chromium validation runtime
+        run: |
+          cd frontend
+          npx playwright install --with-deps chromium
 
       - name: Validate metadata and workflow contracts
         run: |
@@ -90,6 +106,7 @@ jobs:
           npx tsc --noEmit
           npm run lint
           node --test tests/unit/*.test.ts
+          npm run test:ui:core
 
       - name: Audit and test backend production graph
         run: |
@@ -98,8 +115,18 @@ jobs:
           pip-audit -r requirements.txt
           pytest -q
 
-      - name: Validate locked Rust metadata
-        run: cargo metadata --locked --format-version 1 >/dev/null
+      - name: Prepare placeholder Tauri resources for Rust validation
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          mkdir -p \
+            ../../backend/dist/suxiaoyou-backend \
+            ../../backend/resources/nodejs
+
+      - name: Validate Rust desktop graph
+        run: |
+          cargo metadata --locked --format-version 1 >/dev/null
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
         working-directory: desktop-tauri/src-tauri
 
   build-windows:
@@ -168,12 +195,17 @@ jobs:
           [[ ${#installers[@]} -eq 1 ]]
 
       - name: Install NSIS package and verify packaged Node.js toolchain
+        id: install-windows
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $installer = @(Get-ChildItem "desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe")
           if ($installer.Count -ne 1) {
             throw "Expected exactly one NSIS installer, found $($installer.Count)"
+          }
+          $expectedVersion = (& node -p "require('./package.json').version").Trim()
+          if ($installer[0].Name -notmatch [regex]::Escape($expectedVersion)) {
+            throw "NSIS installer name does not contain version ${expectedVersion}: $($installer[0].Name)"
           }
 
           $installDirectory = Join-Path $env:RUNNER_TEMP "suxiaoyou-nsis-install"
@@ -185,6 +217,17 @@ jobs:
             -PassThru
           if ($process.ExitCode -ne 0) {
             throw "NSIS installer exited with code $($process.ExitCode)"
+          }
+
+          $expectedAppExecutable = "suxiaoyou-desktop.exe"
+          $appBinary = Join-Path $installDirectory $expectedAppExecutable
+          if (-not (Test-Path -LiteralPath $appBinary -PathType Leaf)) {
+            throw "Installed app executable is missing from the install root: $appBinary"
+          }
+          $productVersion = (Get-Item -LiteralPath $appBinary).VersionInfo.ProductVersion
+          $expectedVersionPattern = "^$([regex]::Escape($expectedVersion))(?:\.0+)?$"
+          if ($productVersion -notmatch $expectedVersionPattern) {
+            throw "Installed app version is $productVersion, expected $expectedVersion"
           }
 
           $nodeBinaries = @(
@@ -211,8 +254,39 @@ jobs:
             throw "Expected one packaged suxiaoyou-backend.exe, found $($backendBinaries.Count)"
           }
           node scripts/verify-bundle.mjs $backendBinaries[0].Directory.FullName
+          "installed_app=$appBinary" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 `
+            -Append
+
+      - name: Launch installed Windows desktop and verify clean shutdown
+        shell: pwsh
+        env:
+          WINDOWS_INSTALLED_APP: ${{ steps.install-windows.outputs.installed_app }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installedApp = $env:WINDOWS_INSTALLED_APP
+          if (-not (Test-Path -LiteralPath $installedApp -PathType Leaf)) {
+            throw "Installed Windows desktop is missing: $installedApp"
+          }
+          node scripts/verify-desktop-lifecycle.mjs `
+            --executable $installedApp `
+            --work-dir (Join-Path $env:RUNNER_TEMP "suxiaoyou-desktop-lifecycle-windows")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed Windows desktop lifecycle smoke failed with code $LASTEXITCODE"
+          }
+
+      - name: Upload Windows lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-lifecycle-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-windows
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload Windows artifact
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
@@ -472,7 +546,41 @@ jobs:
           rm -f "$DMG_DIRECTORY"/*.dmg
           ditto "$APP_PATH" "$STAGING_DIRECTORY/苏小有.app"
           ln -s /Applications "$STAGING_DIRECTORY/Applications"
-          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH"
+
+          MAX_HDIUTIL_ATTEMPTS=3
+          for (( attempt = 1; attempt <= MAX_HDIUTIL_ATTEMPTS; attempt++ )); do
+            rm -f "$DMG_PATH"
+            set +e
+            hdiutil_output="$(
+              hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH" 2>&1
+            )"
+            hdiutil_status=$?
+            set -e
+            printf '%s\n' "$hdiutil_output"
+
+            if (( hdiutil_status == 0 )); then
+              break
+            fi
+
+            rm -f "$DMG_PATH"
+            if (( hdiutil_status != 1 )) || ! grep -Fqx "hdiutil: create failed - Resource busy" <<< "$hdiutil_output"; then
+              echo "::error::hdiutil create failed with a non-transient error (status $hdiutil_status)"
+              exit "$hdiutil_status"
+            fi
+            if (( attempt == MAX_HDIUTIL_ATTEMPTS )); then
+              echo "::error::hdiutil create remained busy after $MAX_HDIUTIL_ATTEMPTS attempts"
+              exit "$hdiutil_status"
+            fi
+
+            retry_delay=$(( attempt * 5 ))
+            echo "::warning::hdiutil create was busy on attempt $attempt/$MAX_HDIUTIL_ATTEMPTS; retrying in ${retry_delay}s"
+            sleep "$retry_delay"
+          done
+
+          [[ -s "$DMG_PATH" ]] || {
+            echo "::error::hdiutil create reported success without a non-empty DMG"
+            exit 1
+          }
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG
@@ -528,6 +636,10 @@ jobs:
           node scripts/verify-macos-bundle.mjs "$MOUNT_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 11.0 --verify-signature
           ditto "$MOUNT_DIRECTORY/苏小有.app" "$INSTALL_TEST_DIRECTORY/苏小有.app"
           node scripts/verify-macos-bundle.mjs "$INSTALL_TEST_DIRECTORY/苏小有.app" "$BUNDLE_ARCH" 11.0 --verify-signature
+          APP_EXECUTABLE="$(plutil -extract CFBundleExecutable raw "$INSTALL_TEST_DIRECTORY/苏小有.app/Contents/Info.plist")"
+          node scripts/verify-desktop-lifecycle.mjs \
+            --executable "$INSTALL_TEST_DIRECTORY/苏小有.app/Contents/MacOS/$APP_EXECUTABLE" \
+            --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-macos-$DMG_ARCH"
           hdiutil detach "$MOUNT_DIRECTORY"
           trap - EXIT
           rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
@@ -538,7 +650,17 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/apple-certificate.p12"
 
+      - name: Upload macOS lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-${{ env.DMG_ARCH }}-lifecycle-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-macos-${{ env.DMG_ARCH }}
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload macOS artifact
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-${{ env.DMG_ARCH }}-${{ github.event_name == 'workflow_dispatch' && 'ADHOC-TEST' || 'release' }}
@@ -559,7 +681,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm cpio file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm cpio file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev xvfb dbus-x11
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -605,16 +727,6 @@ jobs:
           cd desktop-tauri
           npm exec tauri build -- --config src-tauri/build.linux-x64.json --no-sign
 
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: linux-x64-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
-          path: |
-            desktop-tauri/src-tauri/target/release/bundle/deb/*.deb
-            desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
-          if-no-files-found: error
-          retention-days: 1
-
       - name: Verify Linux installers and packaged Node.js toolchain
         run: |
           set -euo pipefail
@@ -630,6 +742,39 @@ jobs:
             exit 1
           fi
           printf 'Verifying DEB %s and RPM %s\n' "${debs[0]}" "${rpms[0]}"
+
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_PACKAGE="suxiaoyou"
+          DEB_PACKAGE="$(dpkg-deb -f "${debs[0]}" Package)"
+          DEB_VERSION="$(dpkg-deb -f "${debs[0]}" Version)"
+          DEB_ARCH="$(dpkg-deb -f "${debs[0]}" Architecture)"
+          RPM_PACKAGE="$(rpm -qp --queryformat '%{NAME}' "${rpms[0]}")"
+          RPM_VERSION="$(rpm -qp --queryformat '%{VERSION}' "${rpms[0]}")"
+          RPM_ARCH="$(rpm -qp --queryformat '%{ARCH}' "${rpms[0]}")"
+          [[ "$DEB_PACKAGE" == "$EXPECTED_PACKAGE" ]] || {
+            echo "::error::DEB package is $DEB_PACKAGE, expected $EXPECTED_PACKAGE"
+            exit 1
+          }
+          [[ "$RPM_PACKAGE" == "$EXPECTED_PACKAGE" ]] || {
+            echo "::error::RPM package is $RPM_PACKAGE, expected $EXPECTED_PACKAGE"
+            exit 1
+          }
+          [[ "$DEB_VERSION" == "$VERSION" ]] || {
+            echo "::error::DEB version is $DEB_VERSION, expected $VERSION"
+            exit 1
+          }
+          [[ "$DEB_ARCH" == "amd64" ]] || {
+            echo "::error::DEB architecture is $DEB_ARCH, expected amd64"
+            exit 1
+          }
+          [[ "$RPM_VERSION" == "$VERSION" ]] || {
+            echo "::error::RPM version is $RPM_VERSION, expected $VERSION"
+            exit 1
+          }
+          [[ "$RPM_ARCH" == "x86_64" ]] || {
+            echo "::error::RPM architecture is $RPM_ARCH, expected x86_64"
+            exit 1
+          }
 
           DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
           RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
@@ -699,6 +844,94 @@ jobs:
           done
           rm -f "$RPM_PAYLOAD" "$RPM_CPIO_LIST" "$RPM_QUERY_LIST"
 
+      - name: Install Linux packages and verify desktop lifecycle
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
+          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
+          [[ ${#debs[@]} -eq 1 && ${#rpms[@]} -eq 1 ]]
+
+          DEB_INSPECT_ROOT="$RUNNER_TEMP/suxiaoyou-deb-launcher"
+          RPM_INSPECT_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-launcher"
+          rm -rf "$DEB_INSPECT_ROOT" "$RPM_INSPECT_ROOT"
+          mkdir -p "$DEB_INSPECT_ROOT" "$RPM_INSPECT_ROOT"
+          dpkg-deb -x "${debs[0]}" "$DEB_INSPECT_ROOT"
+          set +e
+          rpm2cpio "${rpms[0]}" > "$RUNNER_TEMP/suxiaoyou-lifecycle-rpm.cpio"
+          rpm2cpio_status=$?
+          set -e
+          if (( rpm2cpio_status != 0 && rpm2cpio_status != 1 )); then
+            echo "::error::rpm2cpio exited with unexpected status $rpm2cpio_status during lifecycle install"
+            exit 1
+          fi
+          (cd "$RPM_INSPECT_ROOT" && cpio -idm --quiet < "$RUNNER_TEMP/suxiaoyou-lifecycle-rpm.cpio")
+
+          mapfile -d '' -t deb_launchers < <(
+            find "$DEB_INSPECT_ROOT/usr/bin" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0
+          )
+          mapfile -d '' -t rpm_launchers < <(
+            find "$RPM_INSPECT_ROOT/usr/bin" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0
+          )
+          if (( ${#deb_launchers[@]} != 1 || ${#rpm_launchers[@]} != 1 )); then
+            echo "::error::Expected one desktop launcher in each Linux package (deb=${#deb_launchers[@]}, rpm=${#rpm_launchers[@]})"
+            exit 1
+          fi
+          DEB_LAUNCHER="${deb_launchers[0]#"$DEB_INSPECT_ROOT"}"
+          RPM_LAUNCHER="${rpm_launchers[0]#"$RPM_INSPECT_ROOT"}"
+          DEB_PACKAGE="$(dpkg-deb -f "${debs[0]}" Package)"
+          RPM_PACKAGE="$(rpm -qp --queryformat '%{NAME}' "${rpms[0]}")"
+          deb_installed=0
+          rpm_installed=0
+          cleanup_packages() {
+            if (( rpm_installed )); then sudo rpm -e "$RPM_PACKAGE" >/dev/null 2>&1 || true; fi
+            if (( deb_installed )); then sudo dpkg --purge "$DEB_PACKAGE" >/dev/null 2>&1 || true; fi
+            rm -f "$RUNNER_TEMP/suxiaoyou-lifecycle-rpm.cpio"
+          }
+          trap cleanup_packages EXIT
+
+          sudo dpkg -i "${debs[0]}"
+          deb_installed=1
+          [[ -x "$DEB_LAUNCHER" ]]
+          xvfb-run -a dbus-run-session -- \
+            node scripts/verify-desktop-lifecycle.mjs \
+              --executable "$DEB_LAUNCHER" \
+              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-deb"
+          sudo dpkg --purge "$DEB_PACKAGE"
+          deb_installed=0
+
+          sudo rpm -i --nodeps "${rpms[0]}"
+          rpm_installed=1
+          [[ -x "$RPM_LAUNCHER" ]]
+          xvfb-run -a dbus-run-session -- \
+            node scripts/verify-desktop-lifecycle.mjs \
+              --executable "$RPM_LAUNCHER" \
+              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-rpm"
+          sudo rpm -e "$RPM_PACKAGE"
+          rpm_installed=0
+          trap - EXIT
+          cleanup_packages
+
+      - name: Upload Linux lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-lifecycle-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-linux-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Linux artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-x64-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
+          path: |
+            desktop-tauri/src-tauri/target/release/bundle/deb/*.deb
+            desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Create draft GitHub Release
     needs: [validate-release, build-windows, build-macos, build-linux]
@@ -725,6 +958,7 @@ jobs:
       - name: Verify artifact completeness
         run: |
           set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
           require_one() {
             local label="$1"
             local directory="$2"
@@ -744,21 +978,79 @@ jobs:
           require_one "macOS Intel installer (*.dmg)" artifacts/macos-x64-release "*.dmg"
           require_one "Linux Debian installer (*.deb)" artifacts/linux-x64-release "*.deb"
           require_one "Linux RPM installer (*.rpm)" artifacts/linux-x64-release "*.rpm"
+          require_one "Windows NSIS installer for $VERSION" artifacts/windows-release "*${VERSION}*.exe"
+          require_one "macOS Apple Silicon installer for $VERSION" artifacts/macos-aarch64-release "*${VERSION}*_aarch64.dmg"
+          require_one "macOS Intel installer for $VERSION" artifacts/macos-x64-release "*${VERSION}*_x64.dmg"
+          require_one "Linux Debian installer for $VERSION" artifacts/linux-x64-release "*${VERSION}*.deb"
+          require_one "Linux RPM installer for $VERSION" artifacts/linux-x64-release "*${VERSION}*.rpm"
+
+      - name: Stage stable release asset names
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          rm -rf release-assets
+          mkdir release-assets
+          copy_one() {
+            local directory="$1"
+            local pattern="$2"
+            local destination="$3"
+            local source
+            source="$(find "$directory" -type f -name "$pattern" -print -quit)"
+            [[ -n "$source" ]]
+            cp -- "$source" "release-assets/$destination"
+          }
+          copy_one artifacts/windows-release "*.exe" "suxiaoyou-${VERSION}-windows-x64-setup.exe"
+          copy_one artifacts/macos-aarch64-release "*.dmg" "suxiaoyou-${VERSION}-macos-aarch64.dmg"
+          copy_one artifacts/macos-x64-release "*.dmg" "suxiaoyou-${VERSION}-macos-x64.dmg"
+          copy_one artifacts/linux-x64-release "*.deb" "suxiaoyou-${VERSION}-linux-amd64.deb"
+          copy_one artifacts/linux-x64-release "*.rpm" "suxiaoyou-${VERSION}-linux-x86_64.rpm"
+          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "5" ]]
 
       - name: Generate SHA-256 checksums
-        run: node scripts/generate-checksums.mjs artifacts CHECKSUMS.md
+        run: node scripts/generate-checksums.mjs release-assets CHECKSUMS.md
+
+      - name: Generate and verify manual-download release manifest
+        run: |
+          RELEASE_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          node scripts/generate-release-manifest.mjs \
+            release-assets \
+            "$GITHUB_REF_NAME" \
+            "$RELEASE_COMMIT" \
+            "$GITHUB_REPOSITORY" \
+            CHECKSUMS.md \
+            release-manifest.json
+          node scripts/verify-release-manifest.mjs \
+            release-manifest.json \
+            release-assets \
+            CHECKSUMS.md \
+            "$GITHUB_REF_NAME" \
+            "$RELEASE_COMMIT" \
+            "$GITHUB_REPOSITORY"
+
+      - name: Record installer trust status
+        run: |
+          {
+            cat <<'EOF'
+          ## 安装包信任与验证状态
+
+          - macOS Apple Silicon 与 Intel：Developer ID 签名，已通过 Apple 公证并 stapled。
+          - Windows NSIS：当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
+          - Linux DEB/RPM：当前未配置仓库签名；已验证包元数据、完整解包和内置运行时。
+          - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
+          - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
+
+          EOF
+            cat CHECKSUMS.md
+          } > RELEASE-BODY.md
 
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           draft: true
           generate_release_notes: true
-          body_path: CHECKSUMS.md
+          body_path: RELEASE-BODY.md
           append_body: true
           files: |
-            artifacts/windows-release/**/*.exe
-            artifacts/macos-aarch64-release/**/*.dmg
-            artifacts/macos-x64-release/**/*.dmg
-            artifacts/linux-x64-release/**/*.deb
-            artifacts/linux-x64-release/**/*.rpm
+            release-assets/*
             CHECKSUMS.md
+            release-manifest.json

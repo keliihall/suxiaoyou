@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+
+from app.dependencies import IndexManagerDep
 
 router = APIRouter(prefix="/fts")
 
@@ -28,19 +30,16 @@ class IndexTriggerResponse(BaseModel):
     message: str
 
 
-def _get_manager(request: Request):
-    """Return the IndexManager from app state, or raise 404 if disabled."""
-    manager = getattr(request.app.state, "index_manager", None)
+def _require_manager(manager: IndexManagerDep):
+    """Return the registered IndexManager, or raise 404 if FTS is disabled."""
     if manager is None:
         raise HTTPException(status_code=404, detail="FTS is not enabled")
     return manager
 
 
 @router.get("/status", response_model=FTSStatus)
-async def get_fts_status(request: Request) -> FTSStatus:
+async def get_fts_status(manager: IndexManagerDep) -> FTSStatus:
     """Global FTS status."""
-    manager = getattr(request.app.state, "index_manager", None)
-
     if manager is None:
         return FTSStatus(enabled=False, active_workspaces=0, active_sessions=0)
 
@@ -53,12 +52,12 @@ async def get_fts_status(request: Request) -> FTSStatus:
 
 @router.get("/index/{workspace:path}", response_model=IndexStatus)
 async def get_index_status(
-    request: Request,
     workspace: str,
+    manager: IndexManagerDep,
     session_id: str | None = Query(None),
 ) -> IndexStatus:
     """Index status for a session's workspace index."""
-    manager = _get_manager(request)
+    manager = _require_manager(manager)
 
     if not session_id:
         return IndexStatus(workspace=workspace, status="not_indexed")
@@ -75,12 +74,12 @@ async def get_index_status(
 
 @router.post("/index/{workspace:path}", response_model=IndexTriggerResponse)
 async def trigger_index(
-    request: Request,
     workspace: str,
+    manager: IndexManagerDep,
     session_id: str | None = Query(None),
 ) -> IndexTriggerResponse:
     """Initialize and index a workspace for a session."""
-    manager = _get_manager(request)
+    manager = _require_manager(manager)
 
     if not session_id:
         return IndexTriggerResponse(
