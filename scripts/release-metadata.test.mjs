@@ -131,6 +131,14 @@ test("accepts a completely consistent release fixture", (t) => {
   assert.doesNotThrow(() => verifyReleaseMetadata(rootDir, VERSION));
 });
 
+test("keeps application metadata on stable X.Y.Z versions", () => {
+  assert.doesNotThrow(() => releaseMetadata.assertReleaseVersion("0.8.0"));
+  assert.throws(
+    () => releaseMetadata.assertReleaseVersion("0.8.0-rc.1"),
+    /Expected format: X\.Y\.Z/,
+  );
+});
+
 test("reports every mismatched release consumer in one error", (t) => {
   const rootDir = createFixture({
     root: "1.0.0",

@@ -8,11 +8,31 @@ import { basename, join, resolve } from "node:path";
 
 import { assertReleaseVersion, isMainModule } from "./release-metadata.mjs";
 
-export const RELEASE_MANIFEST_SCHEMA_VERSION = 1;
+export const RELEASE_MANIFEST_SCHEMA_VERSION = 2;
 export const RELEASE_MANIFEST_KIND = "suxiaoyou-release-manifest";
 
+const RELEASE_ARTIFACT_VERSION_PATTERN =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.([1-9]\d*))?$/;
+
+export function releaseIdentityFromVersion(version) {
+  const match = RELEASE_ARTIFACT_VERSION_PATTERN.exec(version ?? "");
+  if (!match) {
+    throw new Error(
+      `Invalid release version "${version ?? ""}". Expected format: X.Y.Z or X.Y.Z-rc.N`,
+    );
+  }
+  const appVersion = `${match[1]}.${match[2]}.${match[3]}`;
+  assertReleaseVersion(appVersion);
+  return {
+    version,
+    appVersion,
+    channel: match[4] ? "prerelease" : "stable",
+  };
+}
+
 export function expectedReleaseAssets(version) {
-  assertReleaseVersion(version);
+  const { channel } = releaseIdentityFromVersion(version);
+  const macosTrustSuffix = channel === "prerelease" ? "-ADHOC-NOT-NOTARIZED" : "";
   return [
     {
       platform: "windows",
@@ -24,13 +44,13 @@ export function expectedReleaseAssets(version) {
       platform: "macos",
       architecture: "arm64",
       format: "dmg",
-      name: `suxiaoyou-${version}-macos-aarch64.dmg`,
+      name: `suxiaoyou-${version}-macos-aarch64${macosTrustSuffix}.dmg`,
     },
     {
       platform: "macos",
       architecture: "x86_64",
       format: "dmg",
-      name: `suxiaoyou-${version}-macos-x64.dmg`,
+      name: `suxiaoyou-${version}-macos-x64${macosTrustSuffix}.dmg`,
     },
     {
       platform: "linux",
@@ -66,6 +86,7 @@ export function generateReleaseManifest({
   checksumFile,
 }) {
   const version = releaseVersionFromTag(tag);
+  const { appVersion, channel } = releaseIdentityFromVersion(version);
   assertCommit(commit);
   assertRepository(repository);
   const assetsRoot = resolve(assetsDirectory);
@@ -94,9 +115,11 @@ export function generateReleaseManifest({
     schemaVersion: RELEASE_MANIFEST_SCHEMA_VERSION,
     kind: RELEASE_MANIFEST_KIND,
     updateMode: "manual-download",
+    channel,
     repository,
     tag,
     version,
+    appVersion,
     commit,
     releaseUrl: `${releaseBase}/tag/${tag}`,
     checksumUrl: `${releaseBase}/download/${tag}/CHECKSUMS.md`,
@@ -105,11 +128,13 @@ export function generateReleaseManifest({
 }
 
 export function releaseVersionFromTag(tag) {
-  if (typeof tag !== "string" || !/^v\d+\.\d+\.\d+$/.test(tag)) {
-    throw new Error(`invalid release tag ${JSON.stringify(tag)}; expected vX.Y.Z`);
+  if (typeof tag !== "string" || !tag.startsWith("v")) {
+    throw new Error(
+      `invalid release tag ${JSON.stringify(tag)}; expected vX.Y.Z or vX.Y.Z-rc.N`,
+    );
   }
   const version = tag.slice(1);
-  assertReleaseVersion(version);
+  releaseIdentityFromVersion(version);
   return version;
 }
 

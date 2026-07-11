@@ -12,16 +12,18 @@ import {
 import { verifyReleaseManifest } from "./verify-release-manifest.mjs";
 
 const TAG = "v0.8.0";
+const RC_TAG = "v0.8.0-rc.1";
 const COMMIT = "a".repeat(40);
 const REPOSITORY = "keliihall/suxiaoyou";
 
-function fixture(t) {
+function fixture(t, tag = TAG) {
   const root = mkdtempSync(join(tmpdir(), "suxiaoyou-release-manifest-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const assetsDirectory = join(root, "assets");
   mkdirSync(assetsDirectory);
   const checksumRows = [];
-  for (const asset of expectedReleaseAssets("0.8.0")) {
+  const version = tag.slice(1);
+  for (const asset of expectedReleaseAssets(version)) {
     const content = `fixture:${asset.name}`;
     writeFileSync(join(assetsDirectory, asset.name), content);
     const sha256 = createHash("sha256").update(content).digest("hex");
@@ -37,7 +39,7 @@ function fixture(t) {
   const manifestFile = join(root, "release-manifest.json");
   const manifest = generateReleaseManifest({
     assetsDirectory,
-    tag: TAG,
+    tag,
     commit: COMMIT,
     repository: REPOSITORY,
     checksumFile,
@@ -55,6 +57,8 @@ test("generates and verifies a five-installer manual-download manifest", (t) => 
     expectedRepository: REPOSITORY,
   });
   assert.equal(verified.updateMode, "manual-download");
+  assert.equal(verified.channel, "stable");
+  assert.equal(verified.appVersion, "0.8.0");
   assert.equal(verified.assets.length, 5);
   assert.equal(
     verified.checksumUrl,
@@ -63,6 +67,27 @@ test("generates and verifies a five-installer manual-download manifest", (t) => 
   assert.ok(verified.assets.every((asset) => asset.downloadUrl.startsWith("https://github.com/")));
   assert.equal("signature" in verified, false);
   assert.equal("updater" in verified, false);
+});
+
+test("generates a prerelease manifest with explicit ad-hoc macOS asset names", (t) => {
+  const data = fixture(t, RC_TAG);
+  const verified = verifyReleaseManifest({
+    ...data,
+    expectedTag: RC_TAG,
+    expectedCommit: COMMIT,
+    expectedRepository: REPOSITORY,
+  });
+  assert.equal(verified.version, "0.8.0-rc.1");
+  assert.equal(verified.appVersion, "0.8.0");
+  assert.equal(verified.channel, "prerelease");
+  const macosAssets = verified.assets.filter((asset) => asset.platform === "macos");
+  assert.equal(macosAssets.length, 2);
+  assert.ok(macosAssets.every((asset) => asset.name.includes("ADHOC-NOT-NOTARIZED")));
+  assert.ok(
+    verified.assets
+      .filter((asset) => asset.platform !== "macos")
+      .every((asset) => !asset.name.includes("ADHOC")),
+  );
 });
 
 test("rejects a manifest after an installer is tampered", (t) => {
@@ -106,6 +131,22 @@ test("rejects automatic-update claims and mismatched release identity", (t) => {
       }),
     /fields mismatch/,
   );
+  for (const [patch, message] of [
+    [{ channel: "prerelease" }, /channel mismatch/],
+    [{ appVersion: "9.9.9" }, /app version mismatch/],
+  ]) {
+    writeFileSync(data.manifestFile, `${JSON.stringify({ ...data.manifest, ...patch })}\n`);
+    assert.throws(
+      () =>
+        verifyReleaseManifest({
+          ...data,
+          expectedTag: TAG,
+          expectedCommit: COMMIT,
+          expectedRepository: REPOSITORY,
+        }),
+      message,
+    );
+  }
   assert.throws(
     () =>
       generateReleaseManifest({
@@ -114,6 +155,18 @@ test("rejects automatic-update claims and mismatched release identity", (t) => {
         commit: COMMIT,
         repository: REPOSITORY,
       }),
-    /expected vX\.Y\.Z/,
+    /expected vX\.Y\.Z or vX\.Y\.Z-rc\.N/,
   );
+});
+
+test("rejects unsupported prerelease tag shapes", () => {
+  for (const tag of [
+    "v0.8.0-rc.0",
+    "v0.8.0-rc.01",
+    "v0.8.0-beta.1",
+    "v00.8.0-rc.1",
+    "v0.8.0-rc",
+  ]) {
+    assert.throws(() => expectedReleaseAssets(tag.slice(1)), /Expected format/);
+  }
 });

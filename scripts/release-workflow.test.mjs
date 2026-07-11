@@ -83,12 +83,15 @@ test("supports tag releases and explicitly marked manual test builds", () => {
 
   const mac = job("build-macos");
   assert.match(mac, /--no-sign/);
-  assert.match(mac, /ADHOC-TEST/);
+  assert.match(mac, /MACOS_ARTIFACT_PROFILE/);
 
   const validate = job("validate-release");
   assert.match(validate, /fetch-depth:\s*0/);
   assert.match(validate, /Require official tag commit on main/);
   assert.match(validate, /git merge-base --is-ancestor "\$GITHUB_SHA" refs\/remotes\/origin\/main/);
+  assert.match(validate, /Resolve and validate release context/);
+  assert.match(validate, /RELEASE_CHANNEL="manual-test"/);
+  assert.match(validate, /MACOS_ARTIFACT_PROFILE="ADHOC-TEST"/);
 });
 
 test("manual releases select one target while tags keep both native macOS builds", () => {
@@ -205,7 +208,7 @@ test("keeps the Chinese UI name while Linux packages use a stable ASCII identity
   assert.doesNotMatch(linuxDesktopTemplate, /^Name=\{\{name\}\}$/m);
 });
 
-test("keeps Apple credentials step-scoped and fails official tags fast", () => {
+test("keeps Apple credentials step-scoped and fails stable tags fast", () => {
   const beforeJobs = workflow.slice(0, workflow.indexOf("\njobs:\n"));
   assert.doesNotMatch(beforeJobs, /APPLE_(?:CERTIFICATE|CERTIFICATE_PASSWORD|ID|PASSWORD|TEAM_ID)/);
 
@@ -216,8 +219,9 @@ test("keeps Apple credentials step-scoped and fails official tags fast", () => {
   }
 
   const validate = job("validate-release");
-  const credentials = step(validate, "Require Apple credentials for an official tag");
+  const credentials = step(validate, "Require Apple credentials for a stable tag");
   assert.match(credentials, /if:\s*github\.event_name == 'push'/);
+  assert.match(credentials, /steps\.release-context\.outputs\.is_stable == 'true'/);
   for (const name of [
     "APPLE_CERTIFICATE",
     "APPLE_CERTIFICATE_PASSWORD",
@@ -230,6 +234,26 @@ test("keeps Apple credentials step-scoped and fails official tags fast", () => {
   }
   assert.match(credentials, /missing/);
   assert.match(credentials, /exit 1/);
+});
+
+test("separates app version from stable and RC release identities", () => {
+  const validate = job("validate-release");
+  const context = step(validate, "Resolve and validate release context");
+  assert.match(context, /APP_VERSION=.*package\.json/);
+  assert.match(context, /GITHUB_REF_NAME.*v\$APP_VERSION/);
+  assert.match(context, /-rc\\\.\(\[1-9\]\[0-9\]\*\)/);
+  assert.match(context, /RELEASE_VERSION="\$\{GITHUB_REF_NAME#v\}"/);
+  assert.match(context, /RELEASE_CHANNEL="stable"/);
+  assert.match(context, /RELEASE_CHANNEL="prerelease"/);
+  assert.match(context, /IS_STABLE="true"/);
+  assert.match(context, /IS_STABLE="false"/);
+  assert.match(context, /RC-ADHOC-NOT-NOTARIZED/);
+  assert.match(context, /tag must be v\$APP_VERSION or v\$APP_VERSION-rc\.N/);
+
+  const metadata = step(validate, "Validate metadata and workflow contracts");
+  assert.match(metadata, /APP_VERSION:\s*\$\{\{ steps\.release-context\.outputs\.app_version \}\}/);
+  assert.match(metadata, /release-metadata\.mjs "\$APP_VERSION"/);
+  assert.doesNotMatch(metadata, /GITHUB_REF_NAME#v/);
 });
 
 test("publishes a manual-download manifest without updater artifacts or keys", () => {
@@ -615,13 +639,16 @@ test("verifies all five installer types before publishing checksums", () => {
   }
   assert.match(publish, /macos-aarch64/);
   assert.match(publish, /macos-x64/);
-  assert.match(publish, /VERSION="\$\{GITHUB_REF_NAME#v\}"/);
-  assert.match(publish, /\*\$\{VERSION\}\*_aarch64\.dmg/);
-  assert.match(publish, /\*\$\{VERSION\}\*_x64\.dmg/);
+  assert.match(publish, /APP_VERSION:\s*\$\{\{ needs\.validate-release\.outputs\.app_version \}\}/);
+  assert.match(publish, /RELEASE_VERSION:\s*\$\{\{ needs\.validate-release\.outputs\.release_version \}\}/);
+  assert.match(publish, /\*\$\{APP_VERSION\}\*_aarch64\.dmg/);
+  assert.match(publish, /\*\$\{APP_VERSION\}\*_x64\.dmg/);
+  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-windows-x64-setup\.exe/);
+  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-macos-aarch64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
+  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-macos-x64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
+  assert.match(publish, /MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED"/);
   for (const stableName of [
     "windows-x64-setup.exe",
-    "macos-aarch64.dmg",
-    "macos-x64.dmg",
     "linux-amd64.deb",
     "linux-x86_64.rpm",
   ]) {
@@ -629,8 +656,10 @@ test("verifies all five installer types before publishing checksums", () => {
   }
   assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
 
-  const release = step(publish, "Create draft GitHub Release");
+  const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /draft:\s*true/);
+  assert.match(release, /prerelease:\s*\$\{\{ needs\.validate-release\.outputs\.release_channel == 'prerelease' \}\}/);
+  assert.match(release, /make_latest:\s*false/);
   assert.match(release, /body_path:\s*RELEASE-BODY\.md/);
   assert.match(release, /files:[\s\S]*CHECKSUMS\.md/);
   assert.match(release, /files:[\s\S]*release-manifest\.json/);
@@ -639,10 +668,38 @@ test("verifies all five installer types before publishing checksums", () => {
   const trust = step(publish, "Record installer trust status");
   assert.match(trust, /Developer ID/);
   assert.match(trust, /Apple 公证/);
+  assert.match(trust, /ad-hoc 临时签名/);
+  assert.match(trust, /未使用 Developer ID 签名/);
+  assert.match(trust, /未经过 Apple 公证/);
+  assert.match(trust, /Gatekeeper 可能拦截/);
+  assert.match(trust, /先卸载候选版，或显式执行覆盖安装/);
   assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
   assert.match(trust, /Linux DEB\/RPM[^\n]*未配置仓库签名/);
   assert.match(trust, /release-manifest\.json[^\n]*手动下载/);
   assert.match(trust, /cat CHECKSUMS\.md/);
+});
+
+test("keeps stable Apple trust fail-closed while RC stays explicitly ad-hoc", () => {
+  const mac = job("build-macos");
+  const importCertificate = step(mac, "Import Apple certificate and discover signing identity");
+  const signApp = step(mac, "Sign nested Mach-O files and app");
+  const signDmg = step(mac, "Sign final DMG");
+  const notarize = step(mac, "Notarize and staple final DMG");
+  const gatekeeper = step(mac, "Verify official signatures and Gatekeeper");
+  const rcBoundary = step(mac, "Verify RC ad-hoc trust boundary");
+  const cleanup = step(mac, "Remove temporary Apple keychain");
+
+  for (const stableOnly of [importCertificate, signDmg, notarize, gatekeeper, cleanup]) {
+    assert.match(stableOnly, /needs\.validate-release\.outputs\.is_stable == 'true'/);
+  }
+  assert.match(signApp, /if \[\[ "\$IS_STABLE_RELEASE" == "true" \]\]/);
+  assert.match(signApp, /SIGNING_IDENTITY="\$DEVELOPER_IDENTITY"/);
+  assert.match(signApp, /SIGNING_IDENTITY="-"/);
+  assert.match(signApp, /grep -Fxq "Signature=adhoc"/);
+  assert.match(signApp, /grep -Fxq "Authority=\$SIGNING_IDENTITY"/);
+  assert.match(rcBoundary, /is_stable == 'false'/);
+  assert.match(rcBoundary, /unexpectedly has a code signature/);
+  assert.match(rcBoundary, /unexpectedly has a stapled notarization ticket/);
 });
 
 test("repairs then signs inside-out and notarizes the final DMG", () => {
