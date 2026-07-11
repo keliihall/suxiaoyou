@@ -539,7 +539,41 @@ jobs:
           rm -f "$DMG_DIRECTORY"/*.dmg
           ditto "$APP_PATH" "$STAGING_DIRECTORY/苏小有.app"
           ln -s /Applications "$STAGING_DIRECTORY/Applications"
-          hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH"
+
+          MAX_HDIUTIL_ATTEMPTS=3
+          for (( attempt = 1; attempt <= MAX_HDIUTIL_ATTEMPTS; attempt++ )); do
+            rm -f "$DMG_PATH"
+            set +e
+            hdiutil_output="$(
+              hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH" 2>&1
+            )"
+            hdiutil_status=$?
+            set -e
+            printf '%s\n' "$hdiutil_output"
+
+            if (( hdiutil_status == 0 )); then
+              break
+            fi
+
+            rm -f "$DMG_PATH"
+            if (( hdiutil_status != 1 )) || ! grep -Fqx "hdiutil: create failed - Resource busy" <<< "$hdiutil_output"; then
+              echo "::error::hdiutil create failed with a non-transient error (status $hdiutil_status)"
+              exit "$hdiutil_status"
+            fi
+            if (( attempt == MAX_HDIUTIL_ATTEMPTS )); then
+              echo "::error::hdiutil create remained busy after $MAX_HDIUTIL_ATTEMPTS attempts"
+              exit "$hdiutil_status"
+            fi
+
+            retry_delay=$(( attempt * 5 ))
+            echo "::warning::hdiutil create was busy on attempt $attempt/$MAX_HDIUTIL_ATTEMPTS; retrying in ${retry_delay}s"
+            sleep "$retry_delay"
+          done
+
+          [[ -s "$DMG_PATH" ]] || {
+            echo "::error::hdiutil create reported success without a non-empty DMG"
+            exit 1
+          }
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG

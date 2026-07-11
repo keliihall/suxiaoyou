@@ -703,6 +703,41 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.match(mac, /hdiutil verify/);
 });
 
+test("retries only transient hdiutil Resource busy failures when creating the DMG", () => {
+  const createDmg = step(job("build-macos"), "Create final DMG");
+  const createIndex = createDmg.indexOf("hdiutil create");
+  const verifyIndex = createDmg.indexOf('hdiutil verify "$DMG_PATH"');
+
+  assert.match(createDmg, /MAX_HDIUTIL_ATTEMPTS=3/);
+  assert.match(
+    createDmg,
+    /for \(\( attempt = 1; attempt <= MAX_HDIUTIL_ATTEMPTS; attempt\+\+ \)\); do/,
+  );
+  assert.equal((createDmg.match(/hdiutil create -volname/g) ?? []).length, 1);
+  assert.match(
+    createDmg,
+    /rm -f "\$DMG_PATH"[\s\S]*hdiutil_output="\$\([\s\S]*hdiutil create/,
+  );
+  assert.match(createDmg, /hdiutil_status=\$\?/);
+  assert.match(
+    createDmg,
+    /hdiutil_status != 1[\s\S]*grep -Fqx "hdiutil: create failed - Resource busy"/,
+  );
+  assert.match(
+    createDmg,
+    /non-transient error \(status \$hdiutil_status\)"\s+exit "\$hdiutil_status"/,
+  );
+  assert.match(
+    createDmg,
+    /attempt == MAX_HDIUTIL_ATTEMPTS[\s\S]*remained busy[\s\S]*exit "\$hdiutil_status"/,
+  );
+  assert.match(createDmg, /retry_delay=\$\(\( attempt \* 5 \)\)/);
+  assert.match(createDmg, /sleep "\$retry_delay"/);
+  assert.match(createDmg, /\[\[ -s "\$DMG_PATH" \]\]/);
+  assert.doesNotMatch(createDmg, /hdiutil create[^\n]*(?:\|\| true|; true)/);
+  assert.ok(createIndex >= 0 && verifyIndex > createIndex);
+});
+
 test("CI runs the frontend unit suite", () => {
   assert.match(ciWorkflow, /node --test tests\/unit\/\*\.test\.ts/);
   assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
