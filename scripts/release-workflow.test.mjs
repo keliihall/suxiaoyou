@@ -206,8 +206,12 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
     "Linux artifacts must remain available when installed-content verification fails",
   );
   assert.match(linux, /dpkg-deb -x/);
+  assert.match(linux, /rpm -K/);
   assert.match(linux, /rpm2cpio/);
   assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
+  assert.match(linux, /rpm2cpio_status/);
+  assert.match(linux, /cpio -it --quiet/);
+  assert.match(linux, /RPM\/CPIO entry-count mismatch/);
   assert.match(linux, /cpio -idm --quiet < "\$RPM_PAYLOAD"/);
   assert.doesNotMatch(linux, /rpm2cpio[^\n]*\|/);
   assert.match(linux, /nodejs\/bin\/node/);

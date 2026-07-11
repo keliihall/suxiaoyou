@@ -634,18 +634,44 @@ jobs:
           DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
           RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
           RPM_PAYLOAD="$RUNNER_TEMP/suxiaoyou-rpm-payload.cpio"
-          rm -rf "$DEB_ROOT" "$RPM_ROOT" "$RPM_PAYLOAD"
+          RPM_CPIO_LIST="$RUNNER_TEMP/suxiaoyou-rpm-cpio.list"
+          RPM_QUERY_LIST="$RUNNER_TEMP/suxiaoyou-rpm-query.list"
+          rm -rf "$DEB_ROOT" "$RPM_ROOT"
+          rm -f "$RPM_PAYLOAD" "$RPM_CPIO_LIST" "$RPM_QUERY_LIST"
           mkdir -p "$DEB_ROOT" "$RPM_ROOT"
           dpkg-deb -x "${debs[0]}" "$DEB_ROOT"
-          # Piping rpm2cpio directly into cpio can make rpm2cpio report a
-          # non-zero status after cpio has consumed a complete payload.  With
-          # pipefail that aborts before any installed-content checks.  Persist
-          # the CPIO stream first, then require cpio itself to extract it.
+          rpm -K "${rpms[0]}"
+
+          # Tauri RPMs do not currently carry ARCHIVESIZE/LONGARCHIVESIZE.
+          # Ubuntu 22.04's rpm2cpio 4.17 therefore copies the complete payload
+          # but returns 1 after comparing its byte count with a missing header
+          # value.  Capture that documented status, then independently require
+          # valid RPM digests, a complete CPIO index, matching package entry
+          # counts, successful extraction, and executable installed runtimes.
+          set +e
           rpm2cpio "${rpms[0]}" > "$RPM_PAYLOAD"
+          rpm2cpio_status=$?
+          set -e
+          if (( rpm2cpio_status != 0 && rpm2cpio_status != 1 )); then
+            printf '::error::rpm2cpio exited with unexpected status %d\n' "$rpm2cpio_status"
+            exit 1
+          fi
+          if (( rpm2cpio_status == 1 )); then
+            echo '::warning::rpm2cpio returned 1 for a Tauri RPM without an archive-size header; validating the emitted payload independently'
+          fi
           if [[ ! -s "$RPM_PAYLOAD" ]]; then
             echo '::error::rpm2cpio produced an empty payload'
             exit 1
           fi
+          cpio -it --quiet < "$RPM_PAYLOAD" > "$RPM_CPIO_LIST"
+          rpm -qpl "${rpms[0]}" > "$RPM_QUERY_LIST"
+          cpio_entries="$(wc -l < "$RPM_CPIO_LIST")"
+          rpm_entries="$(wc -l < "$RPM_QUERY_LIST")"
+          if (( cpio_entries == 0 || cpio_entries != rpm_entries )); then
+            printf '::error::RPM/CPIO entry-count mismatch: rpm=%d cpio=%d\n' "$rpm_entries" "$cpio_entries"
+            exit 1
+          fi
+          printf 'Validated RPM payload: %d package entries, %s bytes\n' "$cpio_entries" "$(stat -c %s "$RPM_PAYLOAD")"
           (cd "$RPM_ROOT" && cpio -idm --quiet < "$RPM_PAYLOAD")
 
           for root in "$DEB_ROOT" "$RPM_ROOT"; do
@@ -671,7 +697,7 @@ jobs:
             printf 'Packaged backend binary: %s\n' "${backend_binaries[0]}"
             node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
           done
-          rm -f "$RPM_PAYLOAD"
+          rm -f "$RPM_PAYLOAD" "$RPM_CPIO_LIST" "$RPM_QUERY_LIST"
 
   publish:
     name: Create draft GitHub Release
