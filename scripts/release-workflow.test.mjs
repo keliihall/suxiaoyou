@@ -23,6 +23,10 @@ const linuxDesktopTemplate = readFileSync(
   join(root, "desktop-tauri/src-tauri/linux/suxiaoyou.desktop.hbs"),
   "utf8",
 );
+const desktopCargo = readFileSync(
+  join(root, "desktop-tauri/src-tauri/Cargo.toml"),
+  "utf8",
+);
 const backendRequirements = readFileSync(
   join(root, "backend/requirements.txt"),
   "utf8",
@@ -414,7 +418,12 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /Start-Process/);
   assert.match(install, /"\/S"/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
-  assert.match(install, /Filter "苏小有\.exe"/);
+  assert.match(desktopCargo, /^\[package\]\nname = "suxiaoyou-desktop"$/m);
+  assert.equal(tauriConfig.mainBinaryName, undefined);
+  assert.match(install, /id:\s*install-windows/);
+  assert.match(install, /expectedAppExecutable = "suxiaoyou-desktop\.exe"/);
+  assert.match(install, /appBinary = Join-Path \$installDirectory \$expectedAppExecutable/);
+  assert.match(install, /Test-Path -LiteralPath \$appBinary -PathType Leaf/);
   assert.match(install, /VersionInfo\.ProductVersion/);
   assert.match(install, /Filter node\.exe/);
   assert.match(install, /node scripts\/verify-node-runtime\.mjs/);
@@ -422,6 +431,11 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /npx\.cmd/);
   assert.match(install, /suxiaoyou-backend\.exe/);
   assert.match(install, /node scripts\/verify-bundle\.mjs/);
+  assert.match(
+    install,
+    /"installed_app=\$appBinary" \| Out-File[\s\S]*-FilePath \$env:GITHUB_OUTPUT/,
+  );
+  assert.doesNotMatch(install, /苏小有\.exe/);
 });
 
 test("launches every installed desktop, waits for backend ready, and proves clean exit", () => {
@@ -429,7 +443,13 @@ test("launches every installed desktop, waits for backend ready, and proves clea
     job("build-windows"),
     "Launch installed Windows desktop and verify clean shutdown",
   );
-  assert.match(windows, /苏小有\.exe/);
+  assert.match(
+    windows,
+    /WINDOWS_INSTALLED_APP:\s*\$\{\{ steps\.install-windows\.outputs\.installed_app \}\}/,
+  );
+  assert.match(windows, /Test-Path -LiteralPath \$installedApp -PathType Leaf/);
+  assert.match(windows, /--executable \$installedApp/);
+  assert.doesNotMatch(windows, /Get-ChildItem|苏小有\.exe/);
   assert.match(windows, /verify-desktop-lifecycle\.mjs/);
   assert.match(windows, /suxiaoyou-desktop-lifecycle-windows/);
 

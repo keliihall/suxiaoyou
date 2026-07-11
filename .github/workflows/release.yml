@@ -195,6 +195,7 @@ jobs:
           [[ ${#installers[@]} -eq 1 ]]
 
       - name: Install NSIS package and verify packaged Node.js toolchain
+        id: install-windows
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -218,11 +219,12 @@ jobs:
             throw "NSIS installer exited with code $($process.ExitCode)"
           }
 
-          $appBinaries = @(Get-ChildItem $installDirectory -Recurse -File -Filter "苏小有.exe")
-          if ($appBinaries.Count -ne 1) {
-            throw "Expected one installed 苏小有.exe, found $($appBinaries.Count)"
+          $expectedAppExecutable = "suxiaoyou-desktop.exe"
+          $appBinary = Join-Path $installDirectory $expectedAppExecutable
+          if (-not (Test-Path -LiteralPath $appBinary -PathType Leaf)) {
+            throw "Installed app executable is missing from the install root: $appBinary"
           }
-          $productVersion = $appBinaries[0].VersionInfo.ProductVersion
+          $productVersion = (Get-Item -LiteralPath $appBinary).VersionInfo.ProductVersion
           $expectedVersionPattern = "^$([regex]::Escape($expectedVersion))(?:\.0+)?$"
           if ($productVersion -notmatch $expectedVersionPattern) {
             throw "Installed app version is $productVersion, expected $expectedVersion"
@@ -252,18 +254,23 @@ jobs:
             throw "Expected one packaged suxiaoyou-backend.exe, found $($backendBinaries.Count)"
           }
           node scripts/verify-bundle.mjs $backendBinaries[0].Directory.FullName
+          "installed_app=$appBinary" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 `
+            -Append
 
       - name: Launch installed Windows desktop and verify clean shutdown
         shell: pwsh
+        env:
+          WINDOWS_INSTALLED_APP: ${{ steps.install-windows.outputs.installed_app }}
         run: |
           $ErrorActionPreference = "Stop"
-          $installDirectory = Join-Path $env:RUNNER_TEMP "suxiaoyou-nsis-install"
-          $appBinaries = @(Get-ChildItem $installDirectory -Recurse -File -Filter "苏小有.exe")
-          if ($appBinaries.Count -ne 1) {
-            throw "Expected one installed 苏小有.exe, found $($appBinaries.Count)"
+          $installedApp = $env:WINDOWS_INSTALLED_APP
+          if (-not (Test-Path -LiteralPath $installedApp -PathType Leaf)) {
+            throw "Installed Windows desktop is missing: $installedApp"
           }
           node scripts/verify-desktop-lifecycle.mjs `
-            --executable $($appBinaries[0].FullName) `
+            --executable $installedApp `
             --work-dir (Join-Path $env:RUNNER_TEMP "suxiaoyou-desktop-lifecycle-windows")
           if ($LASTEXITCODE -ne 0) {
             throw "Installed Windows desktop lifecycle smoke failed with code $LASTEXITCODE"
