@@ -196,14 +196,25 @@ test("verifies the complete bundled Node toolchain before every Tauri build", ()
 
 test("re-extracts Linux installers and executes their packaged Node toolchain", () => {
   const linux = job("build-linux");
+  const uploadIndex = linux.indexOf("Upload Linux artifacts");
+  const verifyIndex = linux.indexOf(
+    "Verify Linux installers and packaged Node.js toolchain",
+  );
+  assert.ok(uploadIndex >= 0, "Linux artifacts are not uploaded");
+  assert.ok(
+    verifyIndex > uploadIndex,
+    "Linux artifacts must remain available when installed-content verification fails",
+  );
   assert.match(linux, /dpkg-deb -x/);
   assert.match(linux, /rpm2cpio/);
   assert.match(linux, /nodejs\/bin\/node/);
+  assert.match(linux, /Expected exactly one packaged Node binary/);
   assert.match(
     linux,
     /node scripts\/verify-node-runtime\.mjs "\$runtime"/,
   );
   assert.match(linux, /backend\/suxiaoyou-backend/);
+  assert.match(linux, /Expected exactly one packaged backend/);
   assert.match(linux, /node scripts\/verify-bundle\.mjs/);
 });
 
@@ -227,6 +238,7 @@ test("Windows native build validates lifecycle primitives before packaging", () 
 
   assert.match(buildBackend, /pytest==9\.1\.1/);
   assert.match(buildBackend, /python -m pytest -q backend\/tests\/test_run\.py/);
+  assert.match(buildBackend, /backend\/tests\/test_scripts\/test_download_node\.py/);
 });
 
 test("uses Python 3.12 and full backend smoke on every build host", () => {

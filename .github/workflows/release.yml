@@ -139,7 +139,7 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
           python -m pip install pyinstaller==6.21.0 pytest==9.1.1
-          python -m pytest -q backend/tests/test_run.py
+          python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py
           cd backend
           python -m PyInstaller suxiaoyou.spec --noconfirm
 
@@ -598,33 +598,6 @@ jobs:
           cd desktop-tauri
           npm exec tauri build -- --config src-tauri/build.linux-x64.json --no-sign
 
-      - name: Verify Linux installers and packaged Node.js toolchain
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
-          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
-          [[ ${#debs[@]} -eq 1 ]]
-          [[ ${#rpms[@]} -eq 1 ]]
-
-          DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
-          RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
-          rm -rf "$DEB_ROOT" "$RPM_ROOT"
-          mkdir -p "$DEB_ROOT" "$RPM_ROOT"
-          dpkg-deb -x "${debs[0]}" "$DEB_ROOT"
-          rpm2cpio "${rpms[0]}" | (cd "$RPM_ROOT" && cpio -idm --quiet)
-
-          for root in "$DEB_ROOT" "$RPM_ROOT"; do
-            mapfile -t node_binaries < <(find "$root" -type f -path '*/nodejs/bin/node')
-            [[ ${#node_binaries[@]} -eq 1 ]]
-            runtime="$(dirname "$(dirname "${node_binaries[0]}")")"
-            node scripts/verify-node-runtime.mjs "$runtime"
-
-            mapfile -t backend_binaries < <(find "$root" -type f -path '*/backend/suxiaoyou-backend')
-            [[ ${#backend_binaries[@]} -eq 1 ]]
-            node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
-          done
-
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -634,6 +607,53 @@ jobs:
             desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
           retention-days: 1
+
+      - name: Verify Linux installers and packaged Node.js toolchain
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
+          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
+          if (( ${#debs[@]} != 1 )); then
+            printf '::error::Expected exactly one DEB installer, found %d: %s\n' "${#debs[@]}" "${debs[*]-}"
+            exit 1
+          fi
+          if (( ${#rpms[@]} != 1 )); then
+            printf '::error::Expected exactly one RPM installer, found %d: %s\n' "${#rpms[@]}" "${rpms[*]-}"
+            exit 1
+          fi
+          printf 'Verifying DEB %s and RPM %s\n' "${debs[0]}" "${rpms[0]}"
+
+          DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
+          RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
+          rm -rf "$DEB_ROOT" "$RPM_ROOT"
+          mkdir -p "$DEB_ROOT" "$RPM_ROOT"
+          dpkg-deb -x "${debs[0]}" "$DEB_ROOT"
+          rpm2cpio "${rpms[0]}" | (cd "$RPM_ROOT" && cpio -idm --quiet)
+
+          for root in "$DEB_ROOT" "$RPM_ROOT"; do
+            printf 'Inspecting extracted installer root: %s\n' "$root"
+            mapfile -t node_binaries < <(find -L "$root" -type f -path '*/nodejs/bin/node')
+            if (( ${#node_binaries[@]} != 1 )); then
+              printf '::error::Expected exactly one packaged Node binary under %s, found %d\n' "$root" "${#node_binaries[@]}"
+              printf '%s\n' "${node_binaries[@]-}"
+              find "$root" -path '*nodejs*' \( -type f -o -type l \) -print | sort
+              exit 1
+            fi
+            printf 'Packaged Node binary: %s\n' "${node_binaries[0]}"
+            runtime="$(dirname "$(dirname "${node_binaries[0]}")")"
+            node scripts/verify-node-runtime.mjs "$runtime"
+
+            mapfile -t backend_binaries < <(find -L "$root" -type f -path '*/backend/suxiaoyou-backend')
+            if (( ${#backend_binaries[@]} != 1 )); then
+              printf '::error::Expected exactly one packaged backend under %s, found %d\n' "$root" "${#backend_binaries[@]}"
+              printf '%s\n' "${backend_binaries[@]-}"
+              find "$root" -path '*backend*' \( -type f -o -type l \) -print | sort
+              exit 1
+            fi
+            printf 'Packaged backend binary: %s\n' "${backend_binaries[0]}"
+            node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
+          done
 
   publish:
     name: Create draft GitHub Release

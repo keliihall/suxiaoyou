@@ -426,17 +426,20 @@ def test_windows_cmd_launcher_quotes_path_separately_from_arguments(
 
 @pytest.mark.skipif(os.name != "nt", reason="requires the Windows command processor")
 def test_windows_cmd_launcher_executes_real_batch_file(tmp_path: Path) -> None:
-    executable = tmp_path / "npm.cmd"
-    executable.write_text("@echo off\necho 10.9.4\n", encoding="utf-8")
+    for directory_name in ("runtime", "runtime with spaces"):
+        runtime = tmp_path / directory_name
+        runtime.mkdir()
+        executable = runtime / "npm.cmd"
+        executable.write_text("@echo off\necho 10.9.4\n", encoding="utf-8")
 
-    result = subprocess.run(
-        download_node._version_command(executable, True),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+        result = subprocess.run(
+            download_node._version_command(executable, True),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
-    assert result.stdout.strip() == "10.9.4"
+        assert result.stdout.strip() == "10.9.4"
 
 
 def test_runtime_acceptance_rejects_missing_npx(tmp_path: Path) -> None:
