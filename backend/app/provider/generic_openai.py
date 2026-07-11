@@ -68,18 +68,7 @@ class GenericOpenAIProvider(OpenAICompatProvider):
 
         # Manual override wins over every discovery path.
         if self._models_override:
-            models = [
-                ModelInfo(
-                    id=m["id"],
-                    name=m["name"],
-                    provider_id=self._provider_id,
-                    capabilities=ModelCapabilities(
-                        function_calling=True,
-                        max_context=_infer_context_from_name(m["id"]),
-                    ),
-                )
-                for m in self._models_override
-            ]
+            models = self._models_from_declarations(self._models_override)
             self._models_cache = models
             return models
 
@@ -101,6 +90,33 @@ class GenericOpenAIProvider(OpenAICompatProvider):
         self._models_cache = models
         return models
 
+    def local_models(self) -> list[ModelInfo]:
+        """Build the cold-start seed from memory and bundled declarations."""
+        if self._models_override:
+            return self._models_from_declarations(self._models_override)
+
+        models: list[ModelInfo] = []
+        if self._kind != "openai_compat_custom":
+            try:
+                from app.provider.models_dev import models_dev
+
+                models = self._convert_metadata_models(
+                    models_dev.get_models_cached(self._provider_id)
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Cached models.dev seed unavailable for %s: %s",
+                    self._provider_id,
+                    exc,
+                )
+
+            seen_ids = {m.id for m in models}
+            for model in self._load_builtin_models():
+                if model.id not in seen_ids:
+                    models.append(model)
+                    seen_ids.add(model.id)
+        return models
+
     def clear_cache(self) -> None:
         self._models_cache = None
 
@@ -110,32 +126,7 @@ class GenericOpenAIProvider(OpenAICompatProvider):
             from app.provider.models_dev import models_dev
 
             raw_models = await models_dev.get_models(self._provider_id)
-            if not raw_models:
-                return []
-
-            models = []
-            for m in raw_models:
-                caps = m.get("capabilities", {})
-                pricing = m.get("pricing", {})
-                models.append(ModelInfo(
-                    id=m["id"],
-                    name=m.get("name", m["id"]),
-                    provider_id=self._provider_id,
-                    capabilities=ModelCapabilities(
-                        function_calling=caps.get("function_calling", True),
-                        vision=caps.get("vision", False),
-                        reasoning=caps.get("reasoning", False),
-                        json_output=caps.get("json_output", False),
-                        max_context=caps.get("max_context", 128_000),
-                        max_output=caps.get("max_output"),
-                        prompt_caching=caps.get("prompt_caching", False),
-                    ),
-                    pricing=ModelPricing(
-                        prompt=pricing.get("prompt", 0),
-                        completion=pricing.get("completion", 0),
-                    ),
-                    metadata=m.get("metadata", {}),
-                ))
+            models = self._convert_metadata_models(raw_models)
             logger.debug("models.dev: loaded %d models for %s", len(models), self._provider_id)
             return models
         except Exception as e:
@@ -172,6 +163,65 @@ class GenericOpenAIProvider(OpenAICompatProvider):
             return models
         except ImportError:
             return []
+
+    def _load_builtin_models(self) -> list[ModelInfo]:
+        from app.provider.catalog import PROVIDER_CATALOG
+
+        pdef = PROVIDER_CATALOG.get(self._provider_id)
+        if pdef is None:
+            return []
+        declarations = [
+            {"id": model_id, "name": name}
+            for model_id, name in pdef.seed_models
+        ]
+        models = self._models_from_declarations(declarations)
+        for model in models:
+            model.metadata["source"] = "builtin-seed"
+        return models
+
+    def _models_from_declarations(self, declarations: list[dict]) -> list[ModelInfo]:
+        return [
+            ModelInfo(
+                id=m["id"],
+                name=m.get("name") or m["id"],
+                provider_id=self._provider_id,
+                capabilities=ModelCapabilities(
+                    function_calling=True,
+                    reasoning=(
+                        "reasoner" in m["id"].lower()
+                        or "thinking" in m["id"].lower()
+                    ),
+                    max_context=_infer_context_from_name(m["id"]),
+                ),
+            )
+            for m in declarations
+        ]
+
+    def _convert_metadata_models(self, raw_models: list[dict]) -> list[ModelInfo]:
+        models: list[ModelInfo] = []
+        for m in raw_models:
+            caps = m.get("capabilities", {})
+            pricing = m.get("pricing", {})
+            models.append(ModelInfo(
+                id=m["id"],
+                name=m.get("name", m["id"]),
+                provider_id=self._provider_id,
+                capabilities=ModelCapabilities(
+                    function_calling=caps.get("function_calling", True),
+                    vision=caps.get("vision", False),
+                    reasoning=caps.get("reasoning", False),
+                    json_output=caps.get("json_output", False),
+                    max_context=caps.get("max_context", 128_000),
+                    max_output=caps.get("max_output"),
+                    prompt_caching=caps.get("prompt_caching", False),
+                ),
+                pricing=ModelPricing(
+                    prompt=pricing.get("prompt", 0),
+                    completion=pricing.get("completion", 0),
+                ),
+                metadata=m.get("metadata", {}),
+            ))
+        return models
 
     async def _fetch_api_models(self) -> list[ModelInfo]:
         """Last resort: fetch models from the provider's /v1/models endpoint.

@@ -57,8 +57,14 @@ def _rapid_capabilities(model: str = DEFAULT_MODEL) -> ModelCapabilities:
 class RapidMLXProvider(OpenAICompatProvider):
     """OpenAI-compatible provider backed by ``rapid-mlx serve``."""
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL):
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        *,
+        seed_model: str = DEFAULT_MODEL,
+    ):
         self._base_url = base_url.rstrip("/")
+        self._seed_model = normalize_rapid_mlx_model(seed_model)
         super().__init__(
             api_key="not-needed",
             base_url=self._base_url,
@@ -102,6 +108,19 @@ class RapidMLXProvider(OpenAICompatProvider):
 
         self._models_cache = models
         return models
+
+    def local_models(self) -> list[ModelInfo]:
+        """Return the configured model alias without probing Rapid-MLX."""
+        return [
+            ModelInfo(
+                id=_model_id(self._seed_model),
+                name=_model_name(self._seed_model),
+                provider_id=self.id,
+                capabilities=_rapid_capabilities(self._seed_model),
+                pricing=ModelPricing(prompt=0.0, completion=0.0),
+                metadata={"local": True, "source": "configured-seed"},
+            )
+        ]
 
     async def stream_chat(
         self,

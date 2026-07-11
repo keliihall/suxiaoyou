@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from app.api.remote import router
+from app.api.remote import get_or_create_tunnel_manager, router
 from app.auth.tunnel import TunnelManager
 
 pytestmark = pytest.mark.asyncio
@@ -67,3 +67,35 @@ class TestEnableRemote:
         tunnel_mgr = app.state.tunnel_manager
         await tunnel_mgr.stop()
         assert tunnel_mgr._monitor_task is None
+
+
+async def test_tunnel_manager_uses_runtime_port_and_syncs_allowlist(monkeypatch):
+    app = FastAPI()
+    app.state.settings = SimpleNamespace(port=17321)
+    app.state.runtime_allowed_origins = set()
+
+    created = {}
+
+    class FakeTunnelManager:
+        def __init__(self, *, backend_port, on_url_change):
+            created["port"] = backend_port
+            created["callback"] = on_url_change
+
+    monkeypatch.setattr("app.auth.tunnel.TunnelManager", FakeTunnelManager)
+
+    manager = get_or_create_tunnel_manager(app)
+    assert manager is app.state.tunnel_manager
+    assert created["port"] == 17321
+
+    callback = created["callback"]
+    callback(None, "https://first.trycloudflare.com")
+    assert app.state.runtime_allowed_origins == {
+        "https://first.trycloudflare.com"
+    }
+    callback(
+        "https://first.trycloudflare.com",
+        "https://second.trycloudflare.com",
+    )
+    assert app.state.runtime_allowed_origins == {
+        "https://second.trycloudflare.com"
+    }

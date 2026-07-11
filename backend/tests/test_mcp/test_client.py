@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("mcp")
@@ -113,3 +115,54 @@ class TestConnectStdio:
         c._exit_stack.__aenter__ = AsyncMock()
         with pytest.raises(ValueError, match="command"):
             await c._connect_stdio()
+
+
+class TestConnectTimeout:
+    @pytest.mark.asyncio
+    async def test_configured_timeout_bounds_connection(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def never_connects():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        c = McpClient(
+            "slow",
+            {"type": "local", "command": ["slow-server"], "timeout": 0.01},
+        )
+        c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
+
+        await c.connect()
+
+        assert started.is_set()
+        assert cancelled.is_set()
+        assert c.status == "failed"
+        assert c.error == "Connection timed out after 0.1s"
+        assert c._exit_stack is None
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_cleans_up_and_propagates(self):
+        started = asyncio.Event()
+
+        async def never_connects():
+            started.set()
+            await asyncio.Event().wait()
+
+        c = McpClient(
+            "slow",
+            {"type": "local", "command": ["slow-server"], "timeout": 60},
+        )
+        c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
+
+        task = asyncio.create_task(c.connect())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert c._exit_stack is None

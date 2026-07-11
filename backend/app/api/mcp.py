@@ -10,6 +10,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
+from app.api.oauth_redirect import loopback_redirect_uri
+
 router = APIRouter(prefix="/mcp")
 
 
@@ -66,8 +68,7 @@ async def mcp_auth_start(name: str, request: Request) -> dict[str, Any]:
     """Start an OAuth flow for an MCP server."""
     registry = _get_registry(request)
     settings = request.app.state.settings
-    host = settings.host if settings.host != "0.0.0.0" else "localhost"
-    redirect_uri = f"http://{host}:{settings.port}/api/connectors/oauth/callback"
+    redirect_uri = loopback_redirect_uri(settings, "/api/connectors/oauth/callback")
 
     if registry:
         result = await registry.connect(name, redirect_uri)

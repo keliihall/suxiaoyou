@@ -73,6 +73,28 @@ def _disallow_origin(app, url: str | None) -> None:
     origins.discard(url.rstrip("/"))
 
 
+def get_or_create_tunnel_manager(app):
+    """Return the app's tunnel manager with port and CSRF sync configured."""
+    tunnel_mgr = getattr(app.state, "tunnel_manager", None)
+    if tunnel_mgr is not None:
+        return tunnel_mgr
+
+    from app.auth.tunnel import TunnelManager
+
+    def _sync_allowlist(old_url: str | None, new_url: str | None) -> None:
+        if old_url is not None:
+            _disallow_origin(app, old_url)
+        if new_url is not None:
+            _allow_origin(app, new_url)
+
+    tunnel_mgr = TunnelManager(
+        backend_port=app.state.settings.port,
+        on_url_change=_sync_allowlist,
+    )
+    app.state.tunnel_manager = tunnel_mgr
+    return tunnel_mgr
+
+
 # --- Schemas ---
 
 class RemoteEnableResponse(BaseModel):
@@ -116,26 +138,7 @@ async def enable_remote(request: Request) -> RemoteEnableResponse:
     # Start tunnel if not already running
     tunnel_url = None
     if settings.remote_tunnel_mode == "cloudflare":
-        tunnel_mgr = getattr(request.app.state, "tunnel_manager", None)
-        if tunnel_mgr is None:
-            from app.auth.tunnel import TunnelManager
-
-            app_ref = request.app
-
-            def _sync_allowlist(old_url: str | None, new_url: str | None) -> None:
-                # Swap the CSRF allowlist entry atomically so a
-                # monitor-triggered restart on a fresh random quick-tunnel
-                # URL doesn't leave the previous URL whitelisted.
-                if old_url is not None:
-                    _disallow_origin(app_ref, old_url)
-                if new_url is not None:
-                    _allow_origin(app_ref, new_url)
-
-            tunnel_mgr = TunnelManager(
-                backend_port=settings.port,
-                on_url_change=_sync_allowlist,
-            )
-            request.app.state.tunnel_manager = tunnel_mgr
+        tunnel_mgr = get_or_create_tunnel_manager(request.app)
 
         if not tunnel_mgr.is_running:
             try:

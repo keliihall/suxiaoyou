@@ -56,6 +56,7 @@ class TunnelManager:
         self._tunnel_url: str | None = None
         self._monitor_task: asyncio.Task | None = None
         self._on_url_change = on_url_change
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def tunnel_url(self) -> str | None:
@@ -67,30 +68,58 @@ class TunnelManager:
 
     async def start(self) -> str:
         """Start cloudflared tunnel. Returns the tunnel URL."""
-        # Cancel any existing monitor task to prevent duplicates on restart
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            self._monitor_task = None
+        async with self._lifecycle_lock:
+            current_task = asyncio.current_task()
+            monitor_task = self._monitor_task
 
-        binary = await self._ensure_binary()
+            # A manual start supersedes the old monitor.  A monitor-triggered
+            # restart must not cancel itself before it reaches Popen.
+            if (
+                monitor_task is not None
+                and monitor_task is not current_task
+                and not monitor_task.done()
+            ):
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+                if self._monitor_task is monitor_task:
+                    self._monitor_task = None
 
-        try:
-            return await self._start_with_binary(binary)
-        except OSError as exc:
-            if not self._should_redownload_binary(exc, binary):
+            if self.is_running and self._tunnel_url is not None:
+                return self._tunnel_url
+
+            stale_process = self._process
+            self._process = None
+            if stale_process is not None:
+                await self._terminate_process(stale_process)
+
+            try:
+                binary = await self._ensure_binary()
+                try:
+                    return await self._start_with_binary(binary)
+                except OSError as exc:
+                    if not self._should_redownload_binary(exc, binary):
+                        raise
+
+                    logger.warning(
+                        "Bundled cloudflared binary at %s is invalid, re-downloading",
+                        binary,
+                    )
+                    self._remove_binary(binary)
+                    binary = await self._download(binary)
+                    return await self._start_with_binary(binary)
+            except BaseException:
+                # The old quick-tunnel URL is no longer valid once its process
+                # has exited.  Remove it from the runtime CSRF allowlist even
+                # when replacement startup is cancelled or fails.
+                self._set_tunnel_url(None)
                 raise
-
-            logger.warning("Bundled cloudflared binary at %s is invalid, re-downloading", binary)
-            self._remove_binary(binary)
-            binary = await self._download(binary)
-            return await self._start_with_binary(binary)
 
     async def _start_with_binary(self, binary: Path) -> str:
         """Start cloudflared using a specific binary path."""
 
         logger.info("Starting cloudflared tunnel on port %d...", self._port)
 
-        self._process = subprocess.Popen(
+        process = subprocess.Popen(
             [str(binary), "tunnel", "--url", f"http://localhost:{self._port}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -98,25 +127,30 @@ class TunnelManager:
             bufsize=1,
             **get_subprocess_kwargs(),
         )
+        self._process = process
 
-        # Read output to find the tunnel URL (with timeout)
-        url = await asyncio.wait_for(
-            self._read_tunnel_url(),
-            timeout=30.0,
-        )
-        old_url = self._tunnel_url
-        self._tunnel_url = url
+        try:
+            # Read output to find the tunnel URL (with timeout).  Bind the
+            # reader to this process so a late executor callback cannot read a
+            # replacement process created by a concurrent restart.
+            url = await asyncio.wait_for(
+                self._read_tunnel_url(process),
+                timeout=30.0,
+            )
+        except BaseException:
+            if self._process is process:
+                self._process = None
+            await self._terminate_process(process)
+            raise
+
         logger.info("Cloudflare tunnel active: %s", url)
-        # Notify the allowlist owner. Invoked after self._tunnel_url is
-        # set so a callback that reads back state sees the new value.
-        if self._on_url_change is not None and old_url != url:
-            try:
-                self._on_url_change(old_url, url)
-            except Exception:
-                logger.exception("on_url_change callback raised")
+        self._set_tunnel_url(url)
 
         # Start background monitor
-        self._monitor_task = asyncio.create_task(self._monitor(), name="tunnel-monitor")
+        self._monitor_task = asyncio.create_task(
+            self._monitor(process),
+            name="tunnel-monitor",
+        )
 
         return url
 
@@ -150,39 +184,70 @@ class TunnelManager:
     def _remove_binary(self, binary: Path) -> None:
         """Remove a broken managed binary before re-downloading."""
         binary.unlink(missing_ok=True)
-        self._process = None
-        self._tunnel_url = None
 
     async def stop(self) -> None:
         """Stop the tunnel subprocess."""
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            self._monitor_task = None
+        async with self._lifecycle_lock:
+            current_task = asyncio.current_task()
+            monitor_task = self._monitor_task
+            if monitor_task is not None and monitor_task is not current_task:
+                if not monitor_task.done():
+                    monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+            if self._monitor_task is monitor_task:
+                self._monitor_task = None
 
-        if self._process:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+            process = self._process
             self._process = None
-            logger.info("Cloudflare tunnel stopped")
+            if process is not None:
+                await self._terminate_process(process)
+                logger.info("Cloudflare tunnel stopped")
 
+            self._set_tunnel_url(None)
+
+    def _set_tunnel_url(self, new_url: str | None) -> None:
+        """Update the URL and keep the owner's allowlist synchronized."""
         old_url = self._tunnel_url
-        self._tunnel_url = None
-        if self._on_url_change is not None and old_url is not None:
+        self._tunnel_url = new_url
+        if self._on_url_change is not None and old_url != new_url:
             try:
-                self._on_url_change(old_url, None)
+                self._on_url_change(old_url, new_url)
             except Exception:
                 logger.exception("on_url_change callback raised")
 
-    async def _read_tunnel_url(self) -> str:
+    @staticmethod
+    async def _terminate_process(process: subprocess.Popen) -> None:
+        """Terminate and reap cloudflared without blocking the event loop."""
+        try:
+            if process.poll() is None:
+                process.terminate()
+            await asyncio.to_thread(process.wait, 5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning("cloudflared did not exit after being killed")
+        except OSError:
+            # The process may already have been reaped by the platform.
+            pass
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+
+    async def _read_tunnel_url(self, process: subprocess.Popen) -> str:
         """Read cloudflared output until we find the tunnel URL."""
         loop = asyncio.get_running_loop()
 
         def _read_lines():
-            assert self._process and self._process.stdout
-            for line in self._process.stdout:
+            assert process.stdout
+            for line in process.stdout:
                 logger.debug("cloudflared: %s", line.rstrip())
                 match = _URL_PATTERN.search(line)
                 if match:
@@ -191,21 +256,27 @@ class TunnelManager:
 
         return await loop.run_in_executor(None, _read_lines)
 
-    async def _monitor(self) -> None:
+    async def _monitor(self, process: subprocess.Popen) -> None:
         """Monitor tunnel process health, restart if it dies."""
         try:
-            while True:
+            while self._process is process:
                 await asyncio.sleep(10)
-                if self._process and self._process.poll() is not None:
-                    logger.warning("cloudflared process died (exit code %d), restarting...",
-                                   self._process.returncode)
+                if process.poll() is not None:
+                    logger.warning(
+                        "cloudflared process died (exit code %d), restarting...",
+                        process.returncode,
+                    )
                     try:
                         await self.start()
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         logger.error("Failed to restart tunnel: %s", e)
-                        break
-        except asyncio.CancelledError:
-            pass
+                    return
+        finally:
+            current_task = asyncio.current_task()
+            if self._monitor_task is current_task:
+                self._monitor_task = None
 
     async def _ensure_binary(self) -> Path:
         """Ensure cloudflared binary is available."""

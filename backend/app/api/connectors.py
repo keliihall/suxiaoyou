@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from app.api.oauth_redirect import loopback_redirect_uri
+
 router = APIRouter(prefix="/connectors")
 
 
@@ -205,8 +207,7 @@ async def connect_connector(connector_id: str, request: Request) -> dict[str, An
         return {"success": False, "error": "Connector system not available"}
 
     settings = request.app.state.settings
-    host = settings.host if settings.host != "0.0.0.0" else "localhost"
-    redirect_uri = f"http://{host}:{settings.port}/api/connectors/oauth/callback"
+    redirect_uri = loopback_redirect_uri(settings, "/api/connectors/oauth/callback")
 
     result = await registry.connect(connector_id, redirect_uri)
     if result is None:

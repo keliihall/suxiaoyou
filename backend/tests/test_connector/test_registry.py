@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("mcp")
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.connector.registry import ConnectorRegistry
 
@@ -131,3 +131,35 @@ class TestListAndGet:
     def test_get_nonexistent(self, tmp_path: Path):
         reg = self._make_registry(tmp_path)
         assert reg.get("nope") is None
+
+
+class TestLifecycle:
+    def _make_registry(self, tmp_path: Path) -> ConnectorRegistry:
+        with patch.object(ConnectorRegistry, "_load_catalog", return_value={}):
+            return ConnectorRegistry(project_dir=str(tmp_path))
+
+    def test_prepare_builds_manager_without_connecting(self, tmp_path: Path):
+        reg = self._make_registry(tmp_path)
+        with patch("app.connector.registry.McpManager") as manager_type:
+            manager = MagicMock()
+            manager.startup = AsyncMock()
+            manager_type.return_value = manager
+
+            reg.prepare()
+
+        assert reg.mcp_manager is manager
+        manager.startup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connect_enabled_syncs_tools_after_connection(self, tmp_path: Path):
+        reg = self._make_registry(tmp_path)
+        reg.prepare()
+        manager = reg.mcp_manager
+        assert manager is not None
+        manager.startup = AsyncMock()  # type: ignore[method-assign]
+        reg.sync_tools = MagicMock()  # type: ignore[method-assign]
+
+        await reg.connect_enabled()
+
+        manager.startup.assert_awaited_once()
+        reg.sync_tools.assert_called_once()

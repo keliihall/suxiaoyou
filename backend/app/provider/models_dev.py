@@ -90,6 +90,33 @@ class ModelsDevService:
     async def get_models(self, provider_id: str) -> list[dict[str, Any]]:
         """Get model list for a provider, converted to our ModelInfo-compatible format."""
         provider_data = await self.get_provider(provider_id)
+        return self._convert_models(provider_id, provider_data)
+
+    def get_models_cached(self, provider_id: str) -> list[dict[str, Any]]:
+        """Return the already-loaded snapshot without disk or network I/O."""
+        data = self._data or {}
+        provider_data = self._find_provider(data, provider_id)
+        return self._convert_models(provider_id, provider_data)
+
+    @staticmethod
+    def _find_provider(
+        data: dict[str, Any],
+        provider_id: str,
+    ) -> dict[str, Any] | None:
+        if provider_id in data:
+            value = data[provider_id]
+            return value if isinstance(value, dict) else None
+        for mdev_id, our_id in _PROVIDER_ID_MAP.items():
+            if our_id == provider_id and mdev_id in data:
+                value = data[mdev_id]
+                return value if isinstance(value, dict) else None
+        return None
+
+    @staticmethod
+    def _convert_models(
+        provider_id: str,
+        provider_data: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
         if not provider_data:
             return []
 

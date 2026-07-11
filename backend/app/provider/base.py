@@ -39,6 +39,16 @@ class BaseProvider(ABC):
     async def health_check(self) -> ProviderStatus:
         """Check provider connectivity and return status."""
 
+    def local_models(self) -> list[ModelInfo]:
+        """Return a network-free model seed for cold startup.
+
+        Providers that have a built-in catalog, a user-declared model list, or
+        other purely local metadata can override this method.  The application
+        calls it before scheduling any background discovery so ``/livez`` and
+        the initial model picker never depend on a remote service.
+        """
+        return []
+
     def clear_cache(self) -> None:
         """Clear cached models to force refresh on next list_models() call.
 

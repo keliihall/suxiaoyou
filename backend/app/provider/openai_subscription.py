@@ -148,6 +148,10 @@ class OpenAISubscriptionProvider(BaseProvider):
 
     async def list_models(self) -> list[ModelInfo]:
         """Return curated list of subscription models."""
+        return self.local_models()
+
+    def local_models(self) -> list[ModelInfo]:
+        """Return the bundled subscription catalog without refreshing OAuth."""
         return [
             ModelInfo(
                 id=f"{PROVIDER_ID}/{m['id']}",

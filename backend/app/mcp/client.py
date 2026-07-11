@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from contextlib import AsyncExitStack
@@ -42,33 +43,49 @@ class McpClient:
         return self.config.get("type", "local")
 
     @property
-    def timeout(self) -> int:
+    def timeout(self) -> int | float:
         return self.config.get("timeout", 30)
 
     async def connect(self) -> None:
         """Connect to the MCP server and discover tools."""
         try:
-            if self.server_type == "local":
-                self._exit_stack = AsyncExitStack()
-                await self._exit_stack.__aenter__()
-                await self._connect_stdio()
-            else:
-                await self._connect_remote()
+            timeout_seconds = max(0.1, float(self.timeout))
+        except (TypeError, ValueError):
+            timeout_seconds = 30.0
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                if self.server_type == "local":
+                    self._exit_stack = AsyncExitStack()
+                    await self._exit_stack.__aenter__()
+                    await self._connect_stdio()
+                else:
+                    await self._connect_remote()
 
-            # Discover tools
-            result = await self._session.list_tools()  # type: ignore[union-attr]
-            self._tools = result.tools
-            self.status = "connected"
-            self.error = None
-            logger.info(
-                "MCP server '%s' connected — %d tools available",
-                self.name,
-                len(self._tools),
-            )
+                # Discover tools
+                result = await self._session.list_tools()  # type: ignore[union-attr]
+                self._tools = result.tools
+                self.status = "connected"
+                self.error = None
+                logger.info(
+                    "MCP server '%s' connected — %d tools available",
+                    self.name,
+                    len(self._tools),
+                )
+        except asyncio.CancelledError:
+            await self._cleanup()
+            raise
         except Exception as e:
             self.status = "failed"
-            self.error = str(e)
-            logger.warning("Failed to connect to MCP server '%s': %s", self.name, e)
+            self.error = (
+                f"Connection timed out after {timeout_seconds:g}s"
+                if isinstance(e, TimeoutError)
+                else str(e)
+            )
+            logger.warning(
+                "Failed to connect to MCP server '%s': %s",
+                self.name,
+                self.error,
+            )
             await self._cleanup()
 
     async def _connect_stdio(self) -> None:
@@ -142,6 +159,9 @@ class McpClient:
         await stack.__aenter__()
         try:
             await enter_fn(stack)
+        except asyncio.CancelledError:
+            await self._close_stack(stack)
+            raise
         except BaseException as e:
             await self._close_stack(stack)
             if isinstance(e, Exception):
