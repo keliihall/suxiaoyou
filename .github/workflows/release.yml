@@ -626,10 +626,20 @@ jobs:
 
           DEB_ROOT="$RUNNER_TEMP/suxiaoyou-deb-root"
           RPM_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-root"
-          rm -rf "$DEB_ROOT" "$RPM_ROOT"
+          RPM_PAYLOAD="$RUNNER_TEMP/suxiaoyou-rpm-payload.cpio"
+          rm -rf "$DEB_ROOT" "$RPM_ROOT" "$RPM_PAYLOAD"
           mkdir -p "$DEB_ROOT" "$RPM_ROOT"
           dpkg-deb -x "${debs[0]}" "$DEB_ROOT"
-          rpm2cpio "${rpms[0]}" | (cd "$RPM_ROOT" && cpio -idm --quiet)
+          # Piping rpm2cpio directly into cpio can make rpm2cpio report a
+          # non-zero status after cpio has consumed a complete payload.  With
+          # pipefail that aborts before any installed-content checks.  Persist
+          # the CPIO stream first, then require cpio itself to extract it.
+          rpm2cpio "${rpms[0]}" > "$RPM_PAYLOAD"
+          if [[ ! -s "$RPM_PAYLOAD" ]]; then
+            echo '::error::rpm2cpio produced an empty payload'
+            exit 1
+          fi
+          (cd "$RPM_ROOT" && cpio -idm --quiet < "$RPM_PAYLOAD")
 
           for root in "$DEB_ROOT" "$RPM_ROOT"; do
             printf 'Inspecting extracted installer root: %s\n' "$root"
@@ -654,6 +664,7 @@ jobs:
             printf 'Packaged backend binary: %s\n' "${backend_binaries[0]}"
             node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
           done
+          rm -f "$RPM_PAYLOAD"
 
   publish:
     name: Create draft GitHub Release

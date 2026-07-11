@@ -207,6 +207,9 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   );
   assert.match(linux, /dpkg-deb -x/);
   assert.match(linux, /rpm2cpio/);
+  assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
+  assert.match(linux, /cpio -idm --quiet < "\$RPM_PAYLOAD"/);
+  assert.doesNotMatch(linux, /rpm2cpio[^\n]*\|/);
   assert.match(linux, /nodejs\/bin\/node/);
   assert.match(linux, /Expected exactly one packaged Node binary/);
   assert.match(
