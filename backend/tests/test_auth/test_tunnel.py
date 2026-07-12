@@ -49,6 +49,7 @@ async def test_monitor_restart_does_not_cancel_itself(monkeypatch) -> None:
     ]
     created: list[_FakeProcess] = []
     changes: list[tuple[str | None, str | None]] = []
+    replacement_ready = asyncio.Event()
     original_sleep = asyncio.sleep
 
     def fake_popen(*args, **kwargs):
@@ -60,20 +61,22 @@ async def test_monitor_restart_does_not_cancel_itself(monkeypatch) -> None:
     async def fast_sleep(_delay: float) -> None:
         await original_sleep(0)
 
+    def record_change(old: str | None, new: str | None) -> None:
+        changes.append((old, new))
+        if new == "https://second.trycloudflare.com":
+            replacement_ready.set()
+
     monkeypatch.setattr("app.auth.tunnel.subprocess.Popen", fake_popen)
     monkeypatch.setattr("app.auth.tunnel.shutil.which", lambda _name: "/fake/cloudflared")
     monkeypatch.setattr("app.auth.tunnel.asyncio.sleep", fast_sleep)
 
-    manager = TunnelManager(on_url_change=lambda old, new: changes.append((old, new)))
+    manager = TunnelManager(on_url_change=record_change)
     assert await manager.start() == "https://first.trycloudflare.com"
     first_monitor = manager._monitor_task
     assert first_monitor is not None
 
     processes[0].returncode = 1
-    for _ in range(100):
-        if len(created) == 2 and manager.tunnel_url == "https://second.trycloudflare.com":
-            break
-        await original_sleep(0)
+    await asyncio.wait_for(replacement_ready.wait(), timeout=5)
 
     assert len(created) == 2
     assert manager.tunnel_url == "https://second.trycloudflare.com"
