@@ -1,6 +1,6 @@
 [package]
 name = "suxiaoyou-desktop"
-version = "0.8.2"
+version = "0.8.3"
 description = "苏小有 — local-first AI agent for desktop work"
 license = "Apache-2.0"
 edition = "2021"
@@ -20,7 +20,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 portpicker = "0.1"
 log = "0.4"
@@ -34,7 +34,12 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Native window vibrancy: NSVisualEffectView on macOS so the sidebar's
 # semi-transparent bg reveals a blurred wallpaper instead of the app's

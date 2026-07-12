@@ -4,6 +4,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
+  AppWindow,
   ChevronDown,
   Code,
   Copy,
@@ -37,7 +38,7 @@ import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { API, IS_DESKTOP } from "@/lib/constants";
 import { artifactTypeFromExtension, languageFromExtension } from "@/lib/artifacts";
-import { base64ToBlob, base64ToUint8Array, downloadBlob } from "@/lib/browser-files";
+import { base64ToBlob, downloadBlob } from "@/lib/browser-files";
 import {
   getFileArtifactActionIds,
   type FileArtifactActionId,
@@ -55,6 +56,7 @@ interface FileArtifactCardProps {
   title?: string;
   cardId?: string;
   compact?: boolean;
+  sessionId?: string | null;
 }
 
 interface BinaryContentResponse {
@@ -92,6 +94,9 @@ function titleWithoutExtension(name: string): string {
 }
 
 function labelForFile(filePath: string, artifactType: ArtifactType | null): string {
+  if (filePath.toLowerCase().endsWith(".ppt")) {
+    return "Presentation · PPT";
+  }
   if (artifactType === "code") {
     const language = languageFromExtension(filePath);
     return language ? `Code · ${language.charAt(0).toUpperCase() + language.slice(1)}` : "Code";
@@ -103,12 +108,38 @@ function artifactPanelType(filePath: string): ArtifactType {
   return artifactTypeFromExtension(filePath) ?? "file-preview";
 }
 
+function nativeFileActionErrorKey(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("source_missing:")) return "fileSourceMissing";
+  if (message.includes("source_not_authorized:")) return "fileSourceNotAuthorized";
+  if (message.includes("source_read_failed:")) return "fileSourceReadFailed";
+  if (message.includes("disk_full:")) return "fileDiskFull";
+  if (message.includes("permission_denied:")) return "filePermissionDenied";
+  if (message.includes("target_missing:") || message.includes("invalid_target:")) {
+    return "fileSaveTargetInvalid";
+  }
+  if (
+    message.includes("application_missing:") ||
+    message.includes("application_invalid:")
+  ) {
+    return "fileApplicationInvalid";
+  }
+  if (
+    message.includes("application_launch_failed:") ||
+    message.includes("dialog_failed:")
+  ) {
+    return "fileApplicationLaunchFailed";
+  }
+  return fallback;
+}
+
 export function FileArtifactCard({
   data,
   filePath: directFilePath,
   title: directTitle,
   cardId,
   compact = false,
+  sessionId,
 }: FileArtifactCardProps) {
   const { t } = useTranslation("chat");
   const platform = usePlatform();
@@ -125,7 +156,8 @@ export function FileArtifactCard({
   const isError = data?.state.status === "error";
   const isInteractive = Boolean(filePath) && !isRunning && !isError;
   const localDesktop = IS_DESKTOP && !isRemoteMode();
-  const actionIds = getFileArtifactActionIds(localDesktop);
+  const nativeFileActionsAvailable = localDesktop && Boolean(sessionId);
+  const actionIds = getFileArtifactActionIds(nativeFileActionsAvailable);
 
   const artifactType = useMemo(() => (filePath ? artifactTypeFromExtension(filePath) : null), [filePath]);
   const typeLabel = filePath ? labelForFile(filePath, artifactType) : "File";
@@ -145,30 +177,54 @@ export function FileArtifactCard({
   }, [cardId, data?.call_id, fileName, filePath, isError, isRunning, openArtifact, title]);
 
   const handleOpenDefault = useCallback(async () => {
-    if (!filePath || !localDesktop || busyAction) return;
+    if (!filePath || !localDesktop || !sessionId || busyAction) return;
     setBusyAction("openDefault");
     try {
-      await api.post(API.FILES.OPEN_SYSTEM, { path: filePath, workspace });
+      await api.post(API.FILES.OPEN_FILE_DEFAULT, {
+        path: filePath,
+        session_id: sessionId,
+      });
     } catch (error) {
       console.error("Failed to open file with the default application:", error);
       toast.error(t("fileOpenFailed"));
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, filePath, localDesktop, t, workspace]);
+  }, [busyAction, filePath, localDesktop, sessionId, t]);
+
+  const handleOpenOther = useCallback(async () => {
+    if (!filePath || !localDesktop || !sessionId || busyAction) return;
+    setBusyAction("openOther");
+    try {
+      const { desktopAPI } = await import("@/lib/tauri-api");
+      await desktopAPI.openAuthorizedFileWith({
+        path: filePath,
+        sessionId,
+        dialogTitle: t("chooseApplicationTitle"),
+      });
+    } catch (error) {
+      console.error("Failed to open file with another application:", error);
+      toast.error(t(nativeFileActionErrorKey(error, "fileOpenOtherFailed")));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, filePath, localDesktop, sessionId, t]);
 
   const handleReveal = useCallback(async () => {
-    if (!filePath || !localDesktop || busyAction) return;
+    if (!filePath || !localDesktop || !sessionId || busyAction) return;
     setBusyAction("reveal");
     try {
-      await api.post(API.FILES.REVEAL_SYSTEM, { path: filePath, workspace });
+      await api.post(API.FILES.REVEAL_FILE_SYSTEM, {
+        path: filePath,
+        session_id: sessionId,
+      });
     } catch (error) {
       console.error("Failed to reveal file in the system file manager:", error);
       toast.error(t("fileRevealFailed"));
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, filePath, localDesktop, t, workspace]);
+  }, [busyAction, filePath, localDesktop, sessionId, t]);
 
   const handleCopyPath = useCallback(async () => {
     if (!filePath || !localDesktop || busyAction) return;
@@ -189,32 +245,36 @@ export function FileArtifactCard({
 
     setBusyAction("saveCopy");
     try {
+      if (localDesktop) {
+        if (!sessionId) throw new Error("source_not_authorized:missing conversation");
+        const { desktopAPI } = await import("@/lib/tauri-api");
+        const saved = await desktopAPI.saveAuthorizedFileAs({
+          path: filePath,
+          sessionId,
+          defaultName: fileName,
+          dialogTitle: t("saveAs"),
+        });
+        if (saved) toast.success(t("fileSaved"));
+        return;
+      }
+
       const res = await api.post<BinaryContentResponse>(
         API.FILES.CONTENT_BINARY,
         { path: filePath, workspace },
         { timeoutMs: 120_000 },
       );
 
-      if (localDesktop) {
-        const { desktopAPI } = await import("@/lib/tauri-api");
-        const saved = await desktopAPI.downloadAndSave({
-          data: Array.from(base64ToUint8Array(res.content_base64)),
-          defaultName: res.name || fileName,
-        });
-        if (saved) toast.success(t("fileSaved"));
-      } else {
-        downloadBlob(
-          base64ToBlob(res.content_base64, res.mime_type),
-          res.name || fileName,
-        );
-      }
+      downloadBlob(
+        base64ToBlob(res.content_base64, res.mime_type),
+        res.name || fileName,
+      );
     } catch (error) {
       console.error("Failed to save file:", error);
-      toast.error(t("fileSaveFailed"));
+      toast.error(t(nativeFileActionErrorKey(error, "fileSaveFailed")));
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, fileName, filePath, localDesktop, t, workspace]);
+  }, [busyAction, fileName, filePath, localDesktop, sessionId, t, workspace]);
 
   const revealLabel = t(
     platform === "macos"
@@ -247,6 +307,12 @@ export function FileArtifactCard({
             {t("openWithDefaultApp")}
           </Item>
         )}
+        {actionIds.includes("openOther") && (
+          <Item onSelect={() => void handleOpenOther()} disabled={!isInteractive || busyAction !== null}>
+            <AppWindow />
+            {t("openWithOtherApp")}
+          </Item>
+        )}
         {actionIds.includes("reveal") && (
           <Item onSelect={() => void handleReveal()} disabled={!isInteractive || busyAction !== null}>
             <FolderOpen />
@@ -260,7 +326,12 @@ export function FileArtifactCard({
           </Item>
         )}
         <Separator />
-        <Item onSelect={() => void handleSaveCopy()} disabled={!isInteractive || busyAction !== null}>
+        <Item
+          onSelect={() => void handleSaveCopy()}
+          disabled={
+            !isInteractive || busyAction !== null || (localDesktop && !sessionId)
+          }
+        >
           {busyAction === "saveCopy" ? <Loader2 className="animate-spin" /> : <Download />}
           {localDesktop ? t("saveAs") : t("download")}
         </Item>
@@ -272,11 +343,13 @@ export function FileArtifactCard({
       handleCopyPath,
       handleOpen,
       handleOpenDefault,
+      handleOpenOther,
       handleReveal,
       handleSaveCopy,
       isInteractive,
       localDesktop,
       revealLabel,
+      sessionId,
       t,
     ],
   );
@@ -339,7 +412,7 @@ export function FileArtifactCard({
                   type="button"
                   disabled={busyAction !== null}
                   aria-busy={busyAction !== null}
-                  aria-label={localDesktop ? t("openWith") : t("fileActions")}
+                  aria-label={nativeFileActionsAvailable ? t("openWith") : t("fileActions")}
                   className={cn(
                     "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium",
                     "bg-[var(--surface-tertiary)] text-[var(--text-secondary)] transition-colors",
@@ -350,12 +423,14 @@ export function FileArtifactCard({
                 >
                   {busyAction ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : localDesktop ? (
+                  ) : nativeFileActionsAvailable ? (
                     <ExternalLink className="h-3.5 w-3.5" />
                   ) : (
                     <Download className="h-3.5 w-3.5" />
                   )}
-                  <span>{localDesktop ? t("openWith") : t("fileActions")}</span>
+                  <span>
+                    {nativeFileActionsAvailable ? t("openWith") : t("fileActions")}
+                  </span>
                   <ChevronDown className="h-3.5 w-3.5" />
                 </button>
               </DropdownMenuTrigger>

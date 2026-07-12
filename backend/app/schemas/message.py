@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # --- Part types (discriminated union via 'type' field) ---
@@ -162,3 +162,22 @@ class PaginatedMessages(BaseModel):
     total: int
     offset: int
     messages: list[MessageResponse]
+
+
+class ConversationTurn(BaseModel):
+    """Lightweight navigation metadata for one visible user turn."""
+
+    message_id: str
+    ordinal: int
+    message_offset: int
+    time_created: datetime
+    summary: str
+    attachment_names: list[str] = Field(default_factory=list)
+
+
+class ConversationTurnIndex(BaseModel):
+    """Complete user-turn outline without assistant/tool message bodies."""
+
+    total_messages: int
+    total_turns: int
+    turns: list[ConversationTurn]

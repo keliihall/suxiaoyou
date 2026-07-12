@@ -158,3 +158,20 @@ export interface PaginatedMessages {
   offset: number;
   messages: MessageResponse[];
 }
+
+export interface ConversationTurn {
+  message_id: string;
+  /** One-based visible user-turn number. */
+  ordinal: number;
+  /** Zero-based offset within the complete chronological message list. */
+  message_offset: number;
+  time_created: string;
+  summary: string;
+  attachment_names: string[];
+}
+
+export interface ConversationTurnIndex {
+  total_messages: number;
+  total_turns: number;
+  turns: ConversationTurn[];
+}

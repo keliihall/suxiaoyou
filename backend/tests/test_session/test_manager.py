@@ -1,5 +1,7 @@
 """Session manager tests (DB operations)."""
 
+from datetime import datetime, timezone
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +10,7 @@ from app.session.manager import (
     create_message,
     create_part,
     create_session,
+    delete_messages_after,
     get_message_history_for_llm,
     get_messages,
     get_session,
@@ -51,6 +54,30 @@ class TestSessionManager:
 
 
 class TestMessageManager:
+    @pytest.mark.asyncio
+    async def test_message_order_and_history_deletion_are_stable_for_tied_timestamps(
+        self, db: AsyncSession
+    ):
+        session = await create_session(db, title="Stable message order")
+        messages = [
+            await create_message(db, session_id=session.id, data={"role": "user"})
+            for _ in range(3)
+        ]
+        tied_time = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        for message in messages:
+            message.time_created = tied_time
+        await db.flush()
+
+        ordered = await get_messages(db, session.id)
+        assert [message.id for message in ordered] == sorted(
+            message.id for message in messages
+        )
+
+        deleted = await delete_messages_after(db, session.id, ordered[0].id)
+        assert deleted == 2
+        remaining = await get_messages(db, session.id)
+        assert [message.id for message in remaining] == [ordered[0].id]
+
     @pytest.mark.asyncio
     async def test_create_message_and_part(self, db: AsyncSession):
         session = await create_session(db, title="Msg Test")

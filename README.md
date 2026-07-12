@@ -37,7 +37,7 @@
 
 ## 安装与使用
 
-> 发布状态：最新候选测试版为 `v0.8.2-rc.1`，提供七个安装包，覆盖 Windows x64、macOS arm64/x64 与 Linux x64/ARM64。在取得 Apple Developer ID
+> 发布状态：最新候选测试版为 `v0.8.3-rc.1`，提供七个安装包，覆盖 Windows x64、macOS arm64/x64 与 Linux x64/ARM64。在取得 Apple Developer ID
 > 和公证凭据前，macOS 只提供明确标注的 ad-hoc 签名测试包（非 Developer ID
 > 签名、未公证），不作为面向普通用户的正式发布。
 

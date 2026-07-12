@@ -23,6 +23,17 @@ export interface DesktopAPI {
   relaunch: () => Promise<void>;
   openExternal: (url: string) => Promise<void>;
   downloadAndSave: (opts: { url?: string; data?: number[]; defaultName: string }) => Promise<boolean>;
+  saveAuthorizedFileAs: (opts: {
+    path: string;
+    sessionId: string;
+    defaultName: string;
+    dialogTitle: string;
+  }) => Promise<boolean>;
+  openAuthorizedFileWith: (opts: {
+    path: string;
+    sessionId: string;
+    dialogTitle: string;
+  }) => Promise<boolean>;
   minimize: () => Promise<void>;
   maximize: () => Promise<void>;
   close: () => Promise<void>;
@@ -72,6 +83,15 @@ export const desktopAPI: DesktopAPI = {
   relaunch: () => invoke<void>("relaunch_app"),
   openExternal: (url) => invoke("open_external", { url }),
   downloadAndSave: ({ url, data, defaultName }) => invoke<boolean>("download_and_save", { url, data, defaultName }),
+  saveAuthorizedFileAs: ({ path, sessionId, defaultName, dialogTitle }) =>
+    invoke<boolean>("save_authorized_file_as", {
+      path,
+      sessionId,
+      defaultName,
+      dialogTitle,
+    }),
+  openAuthorizedFileWith: ({ path, sessionId, dialogTitle }) =>
+    invoke<boolean>("open_authorized_file_with", { path, sessionId, dialogTitle }),
   minimize: () => invoke("window_minimize"),
   maximize: () => invoke("window_maximize"),
   close: () => invoke("window_close"),

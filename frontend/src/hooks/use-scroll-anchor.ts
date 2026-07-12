@@ -211,5 +211,22 @@ export function useScrollAnchor() {
     }
   }, []);
 
-  return { scrollRef, scrollElementRef: currentElRef, bottomRef, isAtBottom, scrollToBottom: handleScrollToBottom };
+  /**
+   * Treat a programmatic history jump like an intentional upward scroll.
+   * Streaming mutations may continue after the jump, but must not pull the
+   * viewport back to the newest response until the user returns to bottom.
+   */
+  const suspendAutoScroll = useCallback(() => {
+    userScrolledRef.current = true;
+    updateIsAtBottom(false);
+  }, [updateIsAtBottom]);
+
+  return {
+    scrollRef,
+    scrollElementRef: currentElRef,
+    bottomRef,
+    isAtBottom,
+    scrollToBottom: handleScrollToBottom,
+    suspendAutoScroll,
+  };
 }

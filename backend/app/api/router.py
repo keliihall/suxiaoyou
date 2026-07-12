@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from app.api import agents as agents_api
 from app.api import artifacts as artifacts_api
+from app.api import pptx as pptx_api
 from app.api import automations as automations_api
 from app.api import workspace_memory as workspace_memory_api
 from app.api import channels as channels_api
@@ -41,6 +42,7 @@ api_router.include_router(sessions_api.router, tags=["sessions"])
 api_router.include_router(messages_api.router, tags=["messages"])
 api_router.include_router(files_api.router, tags=["files"])
 api_router.include_router(artifacts_api.router, tags=["artifacts"])
+api_router.include_router(pptx_api.router, tags=["files"])
 api_router.include_router(usage_api.router, tags=["usage"])
 api_router.include_router(config_api.router, tags=["config"])
 api_router.include_router(openai_auth_api.router, tags=["openai-auth"])

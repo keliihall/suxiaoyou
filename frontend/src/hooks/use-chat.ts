@@ -35,6 +35,7 @@ import { useRemoteGenerationSync } from "./use-remote-generation-sync";
 import type { InfiniteData } from "@tanstack/react-query";
 import type {
   FileAttachment,
+  EditAndResendResult,
   PromptRequest,
   PromptResponse,
   RespondRequest,
@@ -44,7 +45,7 @@ import type {
   SessionInputUpdateRequest,
   TaskBatchRequest,
 } from "@/types/chat";
-import type { PaginatedMessages } from "@/types/message";
+import type { ConversationTurnIndex, PaginatedMessages } from "@/types/message";
 import type { SessionResponse } from "@/types/session";
 import type { ModelInfo } from "@/types/model";
 
@@ -790,12 +791,12 @@ export function useChat(currentSessionId?: string) {
   );
 
   const editAndResend = useCallback(
-    async (messageId: string, newText: string, attachments?: FileAttachment[]): Promise<boolean> => {
+    async (messageId: string, newText: string, attachments?: FileAttachment[]): Promise<EditAndResendResult> => {
       const chatState = useChatStore.getState();
       const settingsState = useSettingsStore.getState();
       const bucket = currentSessionId ? chatState.sessions[currentSessionId] : null;
 
-      if (bucket?.isGenerating || bucket?.isCompacting || (!newText.trim() && (!attachments || attachments.length === 0)) || !currentSessionId) return false;
+      if (bucket?.isGenerating || bucket?.isCompacting || (!newText.trim() && (!attachments || attachments.length === 0)) || !currentSessionId) return { status: "failed" };
       if (
         hasImageAttachments(attachments) &&
         !selectedModelSupportsVision(
@@ -805,7 +806,7 @@ export function useChat(currentSessionId?: string) {
         )
       ) {
         toast.error(VISION_MODEL_REQUIRED_MESSAGE);
-        return false;
+        return { status: "failed" };
       }
 
       useActivityStore.getState().close();
@@ -820,6 +821,7 @@ export function useChat(currentSessionId?: string) {
 
       chatState.beginSending(currentSessionId, newText.trim(), attachments);
 
+      let editCommitted = false;
       try {
         const presets = settingsState.permissionPresets;
         const permissionPresets = {
@@ -846,6 +848,7 @@ export function useChat(currentSessionId?: string) {
           reasoning: settingsState.reasoningEnabled,
           workspace: settingsState.workspaceDirectory,
         });
+        editCommitted = true;
 
         chatState.startGeneration(res.session_id, res.stream_id);
         void startStream(res.session_id, res.stream_id);
@@ -854,6 +857,12 @@ export function useChat(currentSessionId?: string) {
         useWorkspaceStore.getState().setWorkspaceFiles([]);
 
         const trimmed = newText.trim();
+        const liveCacheBeforeEdit = queryClient.getQueryData<
+          InfiniteData<PaginatedMessages>
+        >(queryKeys.messages.list(currentSessionId));
+        const targetWasInLiveCache = !!liveCacheBeforeEdit?.pages.some((page) =>
+          page.messages.some((message) => message.id === messageId),
+        );
         queryClient.setQueryData<InfiniteData<PaginatedMessages>>(
           queryKeys.messages.list(currentSessionId),
           (old) => {
@@ -886,6 +895,38 @@ export function useChat(currentSessionId?: string) {
             };
           },
         );
+        const normalizedSummary = trimmed.replace(/\s+/g, " ");
+        const summary = normalizedSummary.length <= 160
+          ? normalizedSummary
+          : `${normalizedSummary.slice(0, 159).trimEnd()}…`;
+        queryClient.setQueryData<ConversationTurnIndex>(
+          queryKeys.messages.turnIndex(currentSessionId),
+          (old) => {
+            if (!old) return old;
+            const turnIndex = old.turns.findIndex(
+              (turn) => turn.message_id === messageId,
+            );
+            if (turnIndex < 0) return old;
+            const turns = old.turns.slice(0, turnIndex + 1).map((turn, index) =>
+              index === turnIndex
+                ? {
+                    ...turn,
+                    summary,
+                    attachment_names: (attachments ?? []).map((file) => file.name),
+                  }
+                : turn,
+            );
+            return {
+              total_messages: turns.at(-1)!.message_offset + 1,
+              total_turns: turns.length,
+              turns,
+            };
+          },
+        );
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.messages.turnIndex(currentSessionId),
+          exact: true,
+        });
         // No pending bubble needed — the edited message is already in cache.
         // Clear it explicitly on this session's bucket.
         useChatStore.setState((s) => {
@@ -899,22 +940,76 @@ export function useChat(currentSessionId?: string) {
           };
         });
 
-        return true;
+        try {
+          // Editing an early message can happen entirely inside the isolated
+          // history window, so the live cache may not contain the target and
+          // cannot be safely truncated client-side. Wait for the committed
+          // latest page, then replace pages/pageParams together in one write.
+          const authoritativeLatest = await api.get<PaginatedMessages>(
+            API.MESSAGES.LIST(currentSessionId, 50, -1),
+            { timeoutMs: 10_000, retryNetworkErrors: false },
+          );
+          queryClient.setQueryData<InfiniteData<PaginatedMessages>>(
+            queryKeys.messages.list(currentSessionId),
+            {
+              pages: [authoritativeLatest],
+              pageParams: [-1],
+            },
+          );
+          return { status: "reconciled" };
+        } catch (reconcileError) {
+          // Never expose an untouched pre-edit latest page. If the target was
+          // absent from live cache, replace that unsafe cache with an empty
+          // latest shell; active polling/stream completion can reconcile it
+          // later, while the user remains on the truthful history window.
+          const currentLiveCache = queryClient.getQueryData<
+            InfiniteData<PaginatedMessages>
+          >(queryKeys.messages.list(currentSessionId));
+          const currentContainsTarget = !!currentLiveCache?.pages.some((page) =>
+            page.messages.some((message) => message.id === messageId),
+          );
+          if (!targetWasInLiveCache && !currentContainsTarget) {
+            queryClient.setQueryData<InfiniteData<PaginatedMessages>>(
+              queryKeys.messages.list(currentSessionId),
+              {
+                pages: [{ total: 0, offset: 0, messages: [] }],
+                pageParams: [-1],
+              },
+            );
+          }
+          console.error(
+            "Edit committed but latest-page reconciliation failed:",
+            reconcileError,
+          );
+          toast.error(i18n.t("conversationEditReconcileFailed", { ns: "chat" }));
+          return { status: "committed_unreconciled" };
+        }
       } catch (err) {
         console.error("Failed to edit and resend:", err);
+        if (editCommitted) {
+          queryClient.setQueryData<InfiniteData<PaginatedMessages>>(
+            queryKeys.messages.list(currentSessionId),
+            {
+              pages: [{ total: 0, offset: 0, messages: [] }],
+              pageParams: [-1],
+            },
+          );
+          toast.error(i18n.t("conversationEditReconcileFailed", { ns: "chat" }));
+          return { status: "committed_unreconciled" };
+        }
         chatState.resetSession(currentSessionId);
 
         if (err instanceof ApiError) {
           if (isUnsupportedImagesError(err)) {
             toast.error(VISION_MODEL_REQUIRED_MESSAGE);
-            return false;
+            return { status: "failed" };
           }
           toast.error(err.message);
-          return false;
+          return { status: "failed" };
         }
 
         toast.error("Failed to edit message");
-        return false;
+        return { status: "failed" };
       }
     },
     [currentSessionId, queryClient],

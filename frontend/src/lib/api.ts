@@ -134,6 +134,11 @@ async function request<T>(
   }
 
   let lastError: unknown;
+  const callerSignal = fetchOptions.signal;
+
+  if (callerSignal?.aborted) {
+    throw callerSignal.reason ?? new DOMException("The operation was aborted", "AbortError");
+  }
 
   // Build auth headers. In remote mode we use the tunnel-issued token;
   // in desktop mode we use the per-run session token fetched through
@@ -144,6 +149,11 @@ async function request<T>(
   for (let attempt = 0; attempt <= retryLimit; attempt++) {
     const controller = new AbortController();
     let didTimeout = false;
+    const abortFromCaller = () => controller.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort();
+      else callerSignal.addEventListener("abort", abortFromCaller, { once: true });
+    }
     const timeout = setTimeout(() => {
       didTimeout = true;
       controller.abort();
@@ -154,6 +164,9 @@ async function request<T>(
       // both its port and per-run bearer token; reusing either stale value
       // makes an otherwise safe GET retry fail with an authentication error.
       const authHeaders = await buildAuthHeaders();
+      if (callerSignal?.aborted) {
+        throw callerSignal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      }
       const res = await fetch(resolvedUrl, {
         headers: {
           "Content-Type": "application/json",
@@ -185,6 +198,10 @@ async function request<T>(
         throw new Error(`Request timed out while contacting ${url}`);
       }
 
+      // A caller cancellation is terminal even on runtimes that surface an
+      // aborted fetch as TypeError rather than DOMException AbortError.
+      if (callerSignal?.aborted) throw err;
+
       // Only retry network errors (TypeError = connection refused/reset/failed).
       // Do NOT retry HTTP errors (ApiError) — those are business-level errors.
       if (err instanceof TypeError && attempt < retryLimit) {
@@ -201,6 +218,7 @@ async function request<T>(
       throw err;
     } finally {
       clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", abortFromCaller);
     }
   }
 

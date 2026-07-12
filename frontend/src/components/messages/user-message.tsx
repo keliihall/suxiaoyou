@@ -9,7 +9,7 @@ import { FileChip } from "@/components/chat/file-chip";
 import { FileMentionPopup } from "@/components/chat/file-mention-popup";
 import { uploadFile, browseFiles, attachByPath, ingestFiles } from "@/lib/upload";
 import type { FileSearchResult } from "@/lib/upload";
-import type { FileAttachment } from "@/types/chat";
+import type { EditAndResendResult, FileAttachment } from "@/types/chat";
 import { extractTextFromPartResponses } from "@/lib/utils";
 import type { MessageResponse, FilePart as FilePartType } from "@/types/message";
 
@@ -34,7 +34,7 @@ interface UserMessageProps {
   /** Whether this message just arrived (animate) or was loaded from history (skip animation). */
   isNew?: boolean;
   /** Callback to edit this message and re-generate from this point. */
-  onEditAndResend?: (messageId: string, newText: string, attachments?: FileAttachment[]) => Promise<boolean>;
+  onEditAndResend?: (messageId: string, newText: string, attachments?: FileAttachment[]) => Promise<EditAndResendResult>;
   /** Whether a generation is currently active (disables edit). */
   isGenerating?: boolean;
   /** Workspace directory for @mention file search. */
@@ -86,8 +86,8 @@ export function UserMessage({ message, isNew = true, onEditAndResend, isGenerati
 
   const handleSave = useCallback(async () => {
     if ((!editText.trim() && editAttachments.length === 0) || !onEditAndResend) return;
-    const success = await onEditAndResend(message.id, editText, editAttachments);
-    if (success) {
+    const result = await onEditAndResend(message.id, editText, editAttachments);
+    if (result.status !== "failed") {
       setEditing(false);
       setEditText("");
       setEditAttachments([]);

@@ -82,7 +82,7 @@
   "sessionRunning": "Running",
   "sessionCreatedAt": "Created {{time}}",
   "sessionUpdatedAt": "Updated {{time}}",
-  "poweredBy": "苏小有 v0.8.2",
+  "poweredBy": "苏小有 v0.8.3",
   "sortBy": "Sort",
   "name": "Name",
   "price": "Price",

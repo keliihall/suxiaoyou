@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
@@ -260,7 +260,13 @@ async def delete_messages_after(
         select(Message)
         .where(
             Message.session_id == session_id,
-            Message.time_created > target.time_created,
+            or_(
+                Message.time_created > target.time_created,
+                and_(
+                    Message.time_created == target.time_created,
+                    Message.id > target.id,
+                ),
+            ),
         )
         .options(selectinload(Message.parts))
     )
@@ -360,7 +366,7 @@ async def get_messages(
         select(Message)
         .where(Message.session_id == session_id)
         .options(selectinload(Message.parts))
-        .order_by(Message.time_created.asc())
+        .order_by(Message.time_created.asc(), Message.id.asc())
     )
     if limit is not None:
         if offset < 0:

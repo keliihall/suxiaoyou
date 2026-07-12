@@ -93,6 +93,8 @@ pub fn run() {
             commands::open_backend_logs,
             commands::relaunch_app,
             commands::download_and_save,
+            commands::save_authorized_file_as,
+            commands::open_authorized_file_with,
             commands::update_tray_recents,
         ])
         // -- Setup --

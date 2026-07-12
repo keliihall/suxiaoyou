@@ -22,6 +22,7 @@ import { QuestionPrompt } from "@/components/interactive/question-prompt";
 import { PlanAcceptPrompt } from "@/components/interactive/plan-accept-prompt";
 import { OfflineOverlay } from "@/components/layout/offline-overlay";
 import type { SessionResponse } from "@/types/session";
+import type { FileAttachment } from "@/types/chat";
 
 interface ChatViewProps {
   sessionId: string;
@@ -56,7 +57,35 @@ export function ChatView({ sessionId }: ChatViewProps) {
     lastBusinessProgressAt,
   } = useChat(sessionId);
 
-  const { messages, isLoading, hasPreviousPage, isFetchingPreviousPage, fetchPreviousPage } = useMessages(sessionId);
+  const {
+    messages,
+    total,
+    isLoading,
+    hasPreviousPage,
+    isFetchingPreviousPage,
+    fetchPreviousPage,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+    turnIndex,
+    loadTurnWindow,
+    cancelHistoryNavigation,
+    isHistoryWindow,
+    exitHistoryWindow,
+  } = useMessages(sessionId);
+
+  const handleEditAndResend = useCallback(
+    async (
+      messageId: string,
+      newText: string,
+      attachments?: FileAttachment[],
+    ) => {
+      const result = await editAndResend(messageId, newText, attachments);
+      if (result.status === "reconciled") exitHistoryWindow();
+      return result;
+    },
+    [editAndResend, exitHistoryWindow],
+  );
 
   // Per-session model memory — restore this session's last-used model on entry.
   useSessionModelRestore(sessionId);
@@ -195,12 +224,21 @@ export function ChatView({ sessionId }: ChatViewProps) {
           (!!pendingQuestion && isInteractionAwaitingResolution(pendingQuestion.responseState)) ||
           (!!pendingPlanReview && isInteractionAwaitingResolution(pendingPlanReview.responseState))
         }
-        onEditAndResend={editAndResend}
+        onEditAndResend={handleEditAndResend}
         directory={session?.directory}
         sessionId={sessionId}
         hasPreviousPage={hasPreviousPage}
         isFetchingPreviousPage={isFetchingPreviousPage}
         fetchPreviousPage={fetchPreviousPage}
+        hasNextPage={hasNextPage}
+        isFetchingNextPage={isFetchingNextPage}
+        fetchNextPage={fetchNextPage}
+        turns={turnIndex?.turns}
+        onLocateTurn={loadTurnWindow}
+        onCancelLocate={cancelHistoryNavigation}
+        totalMessageCount={total}
+        isHistoryWindow={isHistoryWindow}
+        onExitHistoryWindow={exitHistoryWindow}
       />
 
       {/* Interactive prompts */}

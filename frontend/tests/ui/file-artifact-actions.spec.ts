@@ -86,8 +86,12 @@ async function mockOutputFileMessage(
   });
 }
 
-async function installLocalTauriMock(page: Page, platform: "macos" | "windows" | "linux") {
-  await page.addInitScript((mockedPlatform) => {
+async function installLocalTauriMock(
+  page: Page,
+  platform: "macos" | "windows" | "linux",
+  nativeFailure?: { command: string; message: string },
+) {
+  await page.addInitScript(({ mockedPlatform, mockedNativeFailure }) => {
     type ListenerEvent = { id: number; event: string; payload: unknown };
     type ListenerCallback = (event: ListenerEvent) => void;
     type TauriTestWindow = Window & {
@@ -108,6 +112,7 @@ async function installLocalTauriMock(page: Page, platform: "macos" | "windows" |
         unregisterListener: (event: string, eventId: number) => void;
       };
       __FILE_ACTION_SAVE_CALLS__: Array<Record<string, unknown>>;
+      __FILE_ACTION_OPEN_WITH_CALLS__: Array<Record<string, unknown>>;
     };
 
     const w = window as unknown as TauriTestWindow;
@@ -116,6 +121,7 @@ async function installLocalTauriMock(page: Page, platform: "macos" | "windows" |
     const callbacks = new Map<number, ListenerCallback>();
     const listenerEntries = new Map<number, { event: string; handler: number }>();
     w.__FILE_ACTION_SAVE_CALLS__ = [];
+    w.__FILE_ACTION_OPEN_WITH_CALLS__ = [];
 
     w.__TAURI_INTERNALS__ = {
       metadata: {
@@ -123,6 +129,9 @@ async function installLocalTauriMock(page: Page, platform: "macos" | "windows" |
         currentWebview: { label: "main" },
       },
       invoke: async (cmd, args = {}) => {
+        if (mockedNativeFailure?.command === cmd) {
+          throw new Error(mockedNativeFailure.message);
+        }
         if (cmd === "get_backend_url") return "http://localhost:8000";
         if (cmd === "get_backend_token") return "test-session-token";
         if (cmd === "get_backend_status") {
@@ -135,8 +144,12 @@ async function installLocalTauriMock(page: Page, platform: "macos" | "windows" |
         if (cmd === "get_pending_navigation") return null;
         if (cmd === "get_platform") return mockedPlatform;
         if (cmd === "is_maximized") return false;
-        if (cmd === "download_and_save") {
+        if (cmd === "download_and_save" || cmd === "save_authorized_file_as") {
           w.__FILE_ACTION_SAVE_CALLS__.push(args);
+          return true;
+        }
+        if (cmd === "open_authorized_file_with") {
+          w.__FILE_ACTION_OPEN_WITH_CALLS__.push(args);
           return true;
         }
         if (cmd === "plugin:event|listen") {
@@ -168,7 +181,7 @@ async function installLocalTauriMock(page: Page, platform: "macos" | "windows" |
         listenerEntries.delete(eventId);
       },
     };
-  }, platform);
+  }, { mockedPlatform: platform, mockedNativeFailure: nativeFailure });
 }
 
 let mockState: 苏小有MockState;
@@ -196,6 +209,7 @@ test("output file dropdown and right-click menu share remote-safe actions", asyn
   await expect(page.getByRole("menuitem", { name: "Open preview" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Download" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Open with default app" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Choose another app…" })).toHaveCount(0);
   await expect(page.getByRole("menuitem", { name: "Copy file path" })).toHaveCount(0);
   await page.keyboard.press("Escape");
 
@@ -222,19 +236,39 @@ test("local desktop menu opens, reveals, copies, and saves the output file", asy
 
   await actions.click();
   await expect(page.getByRole("menuitem", { name: "Open with default app" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Choose another app…" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Show in File Explorer" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Copy file path" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Save as…" })).toBeVisible();
 
   await page.getByRole("menuitem", { name: "Open with default app" }).click();
   await expect.poll(() => mockState.systemOpenRequests).toEqual([
-    { path: outputPath, workspace: "/Users/alex/suxiaoyou-demo" },
+    { path: outputPath, session_id: "session-artifacts" },
   ]);
+
+  await actions.click();
+  await page.getByRole("menuitem", { name: "Choose another app…" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const w = window as unknown as {
+          __FILE_ACTION_OPEN_WITH_CALLS__: Array<Record<string, unknown>>;
+        };
+        return w.__FILE_ACTION_OPEN_WITH_CALLS__;
+      }),
+    )
+    .toEqual([
+      {
+        path: outputPath,
+        sessionId: "session-artifacts",
+        dialogTitle: "Choose an application to open this file",
+      },
+    ]);
 
   await actions.click();
   await page.getByRole("menuitem", { name: "Show in File Explorer" }).click();
   await expect.poll(() => mockState.systemRevealRequests).toEqual([
-    { path: outputPath, workspace: "/Users/alex/suxiaoyou-demo" },
+    { path: outputPath, session_id: "session-artifacts" },
   ]);
 
   await actions.click();
@@ -251,10 +285,35 @@ test("local desktop menu opens, reveals, copies, and saves the output file", asy
         const w = window as unknown as {
           __FILE_ACTION_SAVE_CALLS__: Array<Record<string, unknown>>;
         };
-        return w.__FILE_ACTION_SAVE_CALLS__.map((call) => call.defaultName);
+        return w.__FILE_ACTION_SAVE_CALLS__;
       }),
     )
-    .toEqual(["office-deck.pptx"]);
+    .toEqual([
+      {
+        path: outputPath,
+        sessionId: "session-artifacts",
+        defaultName: "office-deck.pptx",
+        dialogTitle: "Save as…",
+      },
+    ]);
+  expect(mockState.binaryReads).not.toContain(outputPath);
+});
+
+test("local native save failures have a specific recoverable message", async ({ page }) => {
+  await installLocalTauriMock(page, "macos", {
+    command: "save_authorized_file_as",
+    message: "disk_full:no space left on device",
+  });
+  await page.goto("/c/session-artifacts");
+
+  const card = page.getByTestId("file-artifact-card").filter({ hasText: "Office deck" });
+  await card.getByRole("button", { name: "Open with" }).click();
+  await page.getByRole("menuitem", { name: "Save as…" }).click();
+
+  await expect(
+    page.getByText("There is not enough disk space to save this file"),
+  ).toBeVisible();
+  expect(mockState.binaryReads).not.toContain(outputPath);
 });
 
 for (const {
@@ -291,6 +350,7 @@ for (const {
     for (const label of [
       "Open preview",
       "Open with default app",
+      "Choose another app…",
       revealLabel,
       "Copy file path",
       "Save as…",
@@ -303,6 +363,7 @@ for (const {
     for (const label of [
       "Open preview",
       "Open with default app",
+      "Choose another app…",
       revealLabel,
       "Copy file path",
       "Save as…",

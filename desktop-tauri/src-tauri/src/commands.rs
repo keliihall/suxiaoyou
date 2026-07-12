@@ -8,8 +8,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tauri_plugin_opener::OpenerExt;
+use tokio::io::AsyncWriteExt;
+
+#[cfg(not(target_os = "windows"))]
+use std::process::Stdio;
 
 use crate::{
     backend::{BackendState, BackendStatus},
@@ -120,6 +125,30 @@ pub async fn relaunch_app(
 }
 
 static SAVE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+const NATIVE_SOURCE_INFO_ENDPOINT: &str = "/api/files/native-source-info";
+const NATIVE_SOURCE_CONTENT_ENDPOINT: &str = "/api/files/native-source-content";
+
+#[derive(Serialize)]
+struct NativeSourceRequest<'a> {
+    path: &'a str,
+    session_id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct NativeSourceInfo {
+    path: String,
+    identity: String,
+}
+
+#[derive(Deserialize)]
+struct BackendErrorBody {
+    detail: Option<String>,
+}
+
+fn native_action_error(code: &str, detail: impl std::fmt::Display) -> String {
+    format!("{code}:{detail}")
+}
 
 struct TemporaryFileGuard {
     path: Option<PathBuf>,
@@ -321,6 +350,514 @@ async fn atomic_save_file(target: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
     .map_err(|error| io::Error::other(format!("save task failed: {error}")))?
 }
 
+fn sanitized_default_file_name(value: &str) -> String {
+    let basename = value.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    let mut sanitized = String::with_capacity(basename.len().min(180));
+    for character in basename.chars() {
+        if sanitized.len() >= 180 {
+            break;
+        }
+        if character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        {
+            sanitized.push('_');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    let sanitized = sanitized.trim_matches([' ', '.']);
+    if sanitized.is_empty() {
+        "download".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn save_dialog_extension(file_name: &str) -> Option<String> {
+    let extension = Path::new(file_name).extension()?.to_str()?;
+    (extension.len() <= 20
+        && !extension.is_empty()
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()))
+    .then(|| extension.to_string())
+}
+
+fn sanitized_dialog_title(value: &str, fallback: &str) -> String {
+    let title: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect();
+    let title = title.trim();
+    if title.is_empty() {
+        fallback.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+async fn choose_save_target(
+    app: &AppHandle,
+    default_name: &str,
+    dialog_title: &str,
+) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title(dialog_title)
+        .set_file_name(default_name);
+    if let Some(extension) = save_dialog_extension(default_name) {
+        dialog = dialog.add_filter(extension.to_uppercase(), &[&extension]);
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |path| {
+        let _ = tx.send(path);
+    });
+    let selected = rx
+        .await
+        .map_err(|error| native_action_error("dialog_failed", error))?;
+    selected
+        .map(|path| {
+            path.as_path().map(Path::to_path_buf).ok_or_else(|| {
+                native_action_error("invalid_target", "save target is not a local path")
+            })
+        })
+        .transpose()
+}
+
+fn backend_error_code(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "source_invalid",
+        403 => "source_not_authorized",
+        404 => "source_missing",
+        _ => "backend_unavailable",
+    }
+}
+
+async fn authorized_backend_response(
+    state: &BackendState,
+    endpoint: &str,
+    source_path: &str,
+    session_id: &str,
+) -> Result<reqwest::Response, String> {
+    let token = state
+        .token()
+        .await
+        .map_err(|error| native_action_error("backend_unavailable", error))?;
+    let base_url = state.url().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}{}", base_url.trim_end_matches('/'), endpoint))
+        .bearer_auth(token)
+        .json(&NativeSourceRequest {
+            path: source_path,
+            session_id,
+        })
+        .send()
+        .await
+        .map_err(|error| native_action_error("backend_unavailable", error))?;
+
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let detail = response
+        .json::<BackendErrorBody>()
+        .await
+        .ok()
+        .and_then(|body| body.detail)
+        .unwrap_or_else(|| format!("backend returned HTTP {}", status.as_u16()));
+    Err(native_action_error(backend_error_code(status), detail))
+}
+
+async fn authorized_source_info(
+    state: &BackendState,
+    source_path: &str,
+    session_id: &str,
+) -> Result<NativeSourceInfo, String> {
+    authorized_backend_response(state, NATIVE_SOURCE_INFO_ENDPOINT, source_path, session_id)
+        .await?
+        .json::<NativeSourceInfo>()
+        .await
+        .map_err(|error| native_action_error("backend_unavailable", error))
+}
+
+fn ensure_same_authorized_source(
+    expected: &NativeSourceInfo,
+    current: &NativeSourceInfo,
+) -> Result<(), String> {
+    if expected.path == current.path && expected.identity == current.identity {
+        Ok(())
+    } else {
+        Err(native_action_error(
+            "source_changed",
+            "source file changed before the native action",
+        ))
+    }
+}
+
+fn target_io_error(error: io::Error) -> String {
+    let code = match error.kind() {
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => "disk_full",
+        io::ErrorKind::NotFound => "target_missing",
+        io::ErrorKind::InvalidInput => "invalid_target",
+        _ => "save_failed",
+    };
+    native_action_error(code, error)
+}
+
+async fn stream_authorized_source_to_target(
+    state: &BackendState,
+    source_path: &str,
+    session_id: &str,
+    target: PathBuf,
+) -> Result<(), String> {
+    validate_save_target(&target).map_err(target_io_error)?;
+    let mut response = authorized_backend_response(
+        state,
+        NATIVE_SOURCE_CONTENT_ENDPOINT,
+        source_path,
+        session_id,
+    )
+    .await?;
+    let expected_length = response.content_length();
+
+    let parent = target.parent().expect("validated save target has a parent");
+    let (temporary, std_file) = create_save_temporary_file(parent).map_err(target_io_error)?;
+    let mut guard = TemporaryFileGuard::new(temporary.clone());
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut copied = 0_u64;
+
+    let streamed = async {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| native_action_error("source_read_failed", error))?
+        {
+            file.write_all(&chunk).await.map_err(target_io_error)?;
+            copied = copied.saturating_add(chunk.len() as u64);
+        }
+        if expected_length.is_some_and(|expected| expected != copied) {
+            return Err(native_action_error(
+                "source_read_failed",
+                format!(
+                    "source ended after {copied} of {} bytes",
+                    expected_length.unwrap()
+                ),
+            ));
+        }
+        file.flush().await.map_err(target_io_error)?;
+        file.sync_all().await.map_err(target_io_error)?;
+        Ok(())
+    }
+    .await;
+    drop(file);
+
+    if let Err(error) = streamed {
+        let _ = guard.cleanup();
+        return Err(error);
+    }
+
+    let install_temporary = temporary.clone();
+    let install_target = target.clone();
+    let installed = tokio::task::spawn_blocking(move || {
+        validate_save_target(&install_target)?;
+        install_save_temporary_file(&install_temporary, &install_target)
+    })
+    .await
+    .map_err(|error| native_action_error("save_failed", format!("save task failed: {error}")))?
+    .map_err(target_io_error);
+
+    match installed {
+        Ok(()) => {
+            guard.disarm();
+            Ok(())
+        }
+        Err(error) => {
+            let _ = guard.cleanup();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn choose_alternate_application(
+    app: &AppHandle,
+    dialog_title: &str,
+) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let mut dialog = app.dialog().file().set_title(dialog_title);
+    #[cfg(target_os = "macos")]
+    {
+        dialog = dialog
+            .set_directory("/Applications")
+            .add_filter("Applications", &["app"]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let user_applications = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local/share/applications"));
+        let starting_directory = user_applications
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/usr/share/applications"));
+        dialog = dialog.set_directory(starting_directory);
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.pick_file(move |path| {
+        let _ = tx.send(path);
+    });
+    let selected = rx
+        .await
+        .map_err(|error| native_action_error("dialog_failed", error))?;
+    selected
+        .map(|path| {
+            path.as_path().map(Path::to_path_buf).ok_or_else(|| {
+                native_action_error("application_invalid", "application is not a local path")
+            })
+        })
+        .transpose()
+}
+
+#[cfg(target_os = "macos")]
+async fn launch_with_selected_application(
+    application: &Path,
+    state: &BackendState,
+    source_path: &str,
+    session_id: &str,
+    expected_source: &NativeSourceInfo,
+) -> Result<(), String> {
+    let application = application
+        .canonicalize()
+        .map_err(|error| native_action_error("application_missing", error))?;
+    let is_app_bundle = application.is_dir()
+        && application
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+    if !is_app_bundle {
+        return Err(native_action_error(
+            "application_invalid",
+            "select a macOS .app application",
+        ));
+    }
+
+    // Validate the selected application first, then re-authorize the source
+    // immediately before entering the path-based LaunchServices API.
+    let current_source = authorized_source_info(state, source_path, session_id).await?;
+    ensure_same_authorized_source(expected_source, &current_source)?;
+
+    let status = tokio::process::Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(application)
+        .arg(&current_source.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| native_action_error("application_launch_failed", error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(native_action_error(
+            "application_launch_failed",
+            format!("macOS open exited with {status}"),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn launch_with_selected_application(
+    application: &Path,
+    state: &BackendState,
+    source_path: &str,
+    session_id: &str,
+    expected_source: &NativeSourceInfo,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let application = application
+        .canonicalize()
+        .map_err(|error| native_action_error("application_missing", error))?;
+    let metadata = application
+        .metadata()
+        .map_err(|error| native_action_error("application_missing", error))?;
+    if !metadata.is_file() {
+        return Err(native_action_error(
+            "application_invalid",
+            "selected application is not a regular file",
+        ));
+    }
+
+    let is_desktop_entry = application
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"));
+    if !is_desktop_entry && metadata.permissions().mode() & 0o111 != 0 {
+        let current_source = authorized_source_info(state, source_path, session_id).await?;
+        ensure_same_authorized_source(expected_source, &current_source)?;
+        tokio::process::Command::new(&application)
+            .arg(&current_source.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| native_action_error("application_launch_failed", error))?;
+        return Ok(());
+    }
+    if !is_desktop_entry {
+        return Err(native_action_error(
+            "application_invalid",
+            "select a .desktop entry or executable application",
+        ));
+    }
+
+    let current_source = authorized_source_info(state, source_path, session_id).await?;
+    ensure_same_authorized_source(expected_source, &current_source)?;
+
+    let status = tokio::process::Command::new("gio")
+        .arg("launch")
+        .arg(&application)
+        .arg(&current_source.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| native_action_error("application_launch_failed", error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(native_action_error(
+            "application_launch_failed",
+            format!("application launcher exited with {status}"),
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn launch_windows_open_with(source: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    fn wide(value: &std::ffi::OsStr) -> Result<Vec<u16>, String> {
+        let mut encoded: Vec<u16> = value.encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(native_action_error(
+                "source_invalid",
+                "source path contains a NUL character",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    let verb = wide(std::ffi::OsStr::new("openas"))?;
+    let source = wide(source.as_os_str())?;
+    let launched = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            source.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if launched as isize > 32 {
+        Ok(())
+    } else {
+        Err(native_action_error(
+            "application_launch_failed",
+            format!("Windows open-with returned code {}", launched as isize),
+        ))
+    }
+}
+
+/// Copy a session-authorized source through the backend's bounded byte stream.
+/// The WebView never receives the file contents or a writable destination path.
+#[tauri::command]
+pub async fn save_authorized_file_as(
+    app: AppHandle,
+    state: tauri::State<'_, BackendState>,
+    path: String,
+    session_id: String,
+    default_name: String,
+    dialog_title: String,
+) -> Result<bool, String> {
+    let default_name = sanitized_default_file_name(&default_name);
+    let dialog_title = sanitized_dialog_title(&dialog_title, "Save a copy");
+    let Some(target) = choose_save_target(&app, &default_name, &dialog_title).await? else {
+        return Ok(false);
+    };
+    stream_authorized_source_to_target(&state, &path, &session_id, target).await?;
+    Ok(true)
+}
+
+/// Open a session-authorized source with a user-selected installed application.
+///
+/// Platform launchers accept a text path rather than the backend's authorized
+/// handle.  We therefore compare the backend's opaque identity again after the
+/// picker/application validation and immediately before launch.  This protects
+/// the WebView trust boundary and detects replacements up to launcher entry; it
+/// does not claim to defeat a hostile same-user process racing the final
+/// path-based OS call.  Snapshot/fd paths are intentionally avoided because
+/// they break edit-in-place and reveal-original-file semantics.
+#[tauri::command]
+pub async fn open_authorized_file_with(
+    app: AppHandle,
+    state: tauri::State<'_, BackendState>,
+    path: String,
+    session_id: String,
+    dialog_title: String,
+) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (&app, &dialog_title);
+        let first_authorization = authorized_source_info(&state, &path, &session_id).await?;
+        let current_authorization = authorized_source_info(&state, &path, &session_id).await?;
+        ensure_same_authorized_source(&first_authorization, &current_authorization)?;
+        // ShellExecuteW(openas) accepts only a path.  This second backend
+        // authorization is intentionally adjacent to the launcher call.
+        launch_windows_open_with(Path::new(&current_authorization.path))?;
+        return Ok(true);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Reject an unauthorized/missing source before presenting a native
+        // application picker that could otherwise imply the action is valid.
+        let first_authorization = authorized_source_info(&state, &path, &session_id).await?;
+        let dialog_title = sanitized_dialog_title(&dialog_title, "Choose an application");
+        let Some(application) = choose_alternate_application(&app, &dialog_title).await? else {
+            return Ok(false);
+        };
+        // Application validation happens inside the launcher helper before its
+        // final source authorization, keeping that authorization adjacent to
+        // the OS path launcher instead of before a potentially slow check.
+        launch_with_selected_application(
+            &application,
+            &state,
+            &path,
+            &session_id,
+            &first_authorization,
+        )
+        .await?;
+        Ok(true)
+    }
+}
+
 /// Save a file via a native save dialog.
 ///
 /// Accepts either a `url` (fetched via GET) or raw `data` bytes.
@@ -447,6 +984,66 @@ mod tests {
         drop(second_file);
         fs::remove_file(first_path).expect("remove first temporary file");
         fs::remove_file(second_path).expect("remove second temporary file");
+    }
+
+    #[test]
+    fn native_dialog_values_cannot_smuggle_paths_or_control_characters() {
+        assert_eq!(
+            sanitized_default_file_name("../../reports/quarter:final?.pptx"),
+            "quarter_final_.pptx"
+        );
+        assert_eq!(
+            sanitized_default_file_name(r"C:\\Users\\Alex\\report.xlsx"),
+            "report.xlsx"
+        );
+        assert_eq!(sanitized_default_file_name(".."), "download");
+        assert_eq!(
+            sanitized_dialog_title("  Save\nthis\tfile  ", "fallback"),
+            "Savethisfile"
+        );
+        assert_eq!(sanitized_dialog_title("\n\t", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn native_open_with_rejects_a_changed_backend_identity() {
+        let initial = NativeSourceInfo {
+            path: "/workspace/report.txt".to_string(),
+            identity: "v1:1:2:3:4:5".to_string(),
+        };
+        let unchanged = NativeSourceInfo {
+            path: initial.path.clone(),
+            identity: initial.identity.clone(),
+        };
+        let replaced = NativeSourceInfo {
+            path: initial.path.clone(),
+            identity: "v1:1:9:3:4:5".to_string(),
+        };
+        let redirected = NativeSourceInfo {
+            path: "/workspace/other.txt".to_string(),
+            identity: initial.identity.clone(),
+        };
+
+        assert!(ensure_same_authorized_source(&initial, &unchanged).is_ok());
+        assert!(ensure_same_authorized_source(&initial, &replaced)
+            .expect_err("changed identity must be rejected")
+            .starts_with("source_changed:"));
+        assert!(ensure_same_authorized_source(&initial, &redirected)
+            .expect_err("changed canonical path must be rejected")
+            .starts_with("source_changed:"));
+    }
+
+    #[test]
+    fn native_save_filter_only_accepts_short_ascii_extensions() {
+        assert_eq!(
+            save_dialog_extension("report.PPTX").as_deref(),
+            Some("PPTX")
+        );
+        assert_eq!(save_dialog_extension("README"), None);
+        assert_eq!(save_dialog_extension("report.bad-ext"), None);
+        assert_eq!(
+            save_dialog_extension("report.thisextensioniswaytoolong"),
+            None
+        );
     }
 
     #[test]

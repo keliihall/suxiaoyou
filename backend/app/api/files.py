@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import logging
 import mimetypes
 import os
 import platform
+import stat
 import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
-from fastapi import APIRouter, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 
-from app.dependencies import IndexManagerDep
+from app.dependencies import IndexManagerDep, SessionFactoryDep
+from app.models.session import Session
+from app.session.managed_workspace import managed_workspace_for_session
 from app.utils.id import generate_ulid
 
 logger = logging.getLogger(__name__)
@@ -68,6 +75,7 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 MAX_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024
 MAX_BINARY_PREVIEW_BYTES = 50 * 1024 * 1024
+NATIVE_FILE_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_DIALOG_TITLE_CHARS = 200
 MAX_UPLOAD_FILENAME_BYTES = 180
 
@@ -558,6 +566,18 @@ class FileContentRequest(BaseModel):
     workspace: str | None = None  # Resolve relative paths against this directory
 
 
+class NativeFileActionRequest(BaseModel):
+    """A source file claimed by one persisted conversation.
+
+    Native file actions deliberately do not trust a workspace path supplied by
+    the WebView.  ``session_id`` is resolved through the database and its
+    persisted workspace becomes the authorization boundary.
+    """
+
+    path: str
+    session_id: str
+
+
 def _resolve_requested_file_path(path: str, workspace: str | None = None) -> Path:
     """Resolve a requested file path for preview/open operations.
 
@@ -573,6 +593,374 @@ def _resolve_requested_file_path(path: str, workspace: str | None = None) -> Pat
         return (Path(workspace) / file_path).resolve()
 
     return (Path.cwd() / file_path).resolve()
+
+
+@dataclass(frozen=True)
+class _NativeSourceIdentity:
+    device: int
+    inode: int
+    file_type: int
+    size: int
+    modified_ns: int
+
+
+@dataclass
+class _OpenedNativeSource:
+    """An authorized source whose identity is pinned by an open handle."""
+
+    path: Path
+    workspace: Path
+    relative_path: Path
+    handle: BinaryIO
+    opened_stat: os.stat_result
+
+    @property
+    def identity(self) -> _NativeSourceIdentity:
+        return _native_source_identity(self.opened_stat)
+
+    @property
+    def identity_token(self) -> str:
+        """Opaque equality token for a trusted desktop re-authorization."""
+
+        identity = self.identity
+        return (
+            f"v1:{identity.device:x}:{identity.inode:x}:{identity.file_type:x}:"
+            f"{identity.size:x}:{identity.modified_ns:x}"
+        )
+
+
+def _native_source_identity(result: os.stat_result) -> _NativeSourceIdentity:
+    return _NativeSourceIdentity(
+        device=result.st_dev,
+        inode=result.st_ino,
+        file_type=stat.S_IFMT(result.st_mode),
+        size=result.st_size,
+        modified_ns=result.st_mtime_ns,
+    )
+
+
+def _is_link_or_reparse_point(result: os.stat_result) -> bool:
+    """Treat Windows junctions and other reparse points like symlinks."""
+
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(result.st_mode) or bool(
+        getattr(result, "st_file_attributes", 0) & reparse_attribute
+    )
+
+
+def _native_source_error(error: OSError) -> HTTPException:
+    if isinstance(error, FileNotFoundError) or error.errno == errno.ENOENT:
+        return HTTPException(status_code=404, detail="Source file no longer exists")
+    if error.errno in {errno.EISDIR}:
+        return HTTPException(status_code=400, detail="Source path is not a regular file")
+    return HTTPException(status_code=403, detail="File source could not be authorized")
+
+
+def _open_native_source_with_dir_fd(
+    workspace: Path,
+    relative_path: Path,
+) -> _OpenedNativeSource:
+    """Open every path component relative to a trusted directory handle.
+
+    ``O_NOFOLLOW`` on every hop closes the resolution/open race: replacing
+    either a parent directory or the final file with a symlink cannot redirect
+    the handle outside the conversation workspace.
+    """
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    file_flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    directory_fd = -1
+    file_fd = -1
+    try:
+        directory_fd = os.open(workspace, directory_flags)
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise PermissionError(errno.EACCES, "Workspace is not a directory")
+
+        for component in relative_path.parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                os.close(next_fd)
+                raise PermissionError(errno.EACCES, "Path component is not a directory")
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        file_fd = os.open(relative_path.name, file_flags, dir_fd=directory_fd)
+        opened_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise IsADirectoryError(errno.EISDIR, "Source path is not a regular file")
+        handle = open(file_fd, "rb", closefd=True)
+        file_fd = -1
+        return _OpenedNativeSource(
+            path=workspace / relative_path,
+            workspace=workspace,
+            relative_path=relative_path,
+            handle=handle,
+            opened_stat=opened_stat,
+        )
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def _assert_no_link_components(workspace: Path, relative_path: Path) -> os.stat_result:
+    """Windows fallback: lstat every workspace-relative path component."""
+
+    current = workspace
+    workspace_stat = os.lstat(current)
+    if _is_link_or_reparse_point(workspace_stat):
+        raise PermissionError(errno.ELOOP, "Workspace is a link or reparse point")
+    if not stat.S_ISDIR(workspace_stat.st_mode):
+        raise PermissionError(errno.ENOTDIR, "Workspace is not a directory")
+
+    result = workspace_stat
+    for component in relative_path.parts:
+        current = current / component
+        result = os.lstat(current)
+        if _is_link_or_reparse_point(result):
+            raise PermissionError(errno.ELOOP, "Source path contains a link or reparse point")
+    return result
+
+
+def _windows_path_from_handle(file_descriptor: int) -> Path | None:
+    """Return the kernel-resolved DOS path for a Windows file handle."""
+
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    get_final_path.restype = ctypes.c_uint32
+    native_handle = msvcrt.get_osfhandle(file_descriptor)
+    required = get_final_path(native_handle, None, 0, 0)
+    if required == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(required + 1)
+    written = get_final_path(native_handle, buffer, len(buffer), 0)
+    if written == 0 or written >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _path_is_within(child: Path, parent: Path) -> bool:
+    try:
+        child_key = os.path.normcase(os.path.abspath(child))
+        parent_key = os.path.normcase(os.path.abspath(parent))
+        return os.path.commonpath([child_key, parent_key]) == parent_key
+    except ValueError:
+        return False
+
+
+def _open_native_source_fallback(
+    workspace: Path,
+    relative_path: Path,
+) -> _OpenedNativeSource:
+    """Open safely where component-relative ``open`` is unavailable.
+
+    Windows is additionally validated against the kernel-resolved path for the
+    opened handle.  That check prevents a raced junction from supplying bytes
+    outside the authorized workspace even if the path is restored immediately.
+    """
+
+    target = workspace / relative_path
+    before = _assert_no_link_components(workspace, relative_path)
+    if not stat.S_ISREG(before.st_mode):
+        raise IsADirectoryError(errno.EISDIR, "Source path is not a regular file")
+
+    file_descriptor = os.open(
+        target,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+    )
+    try:
+        opened_stat = os.fstat(file_descriptor)
+        after = _assert_no_link_components(workspace, relative_path)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise IsADirectoryError(errno.EISDIR, "Source path is not a regular file")
+        if _native_source_identity(after) != _native_source_identity(opened_stat):
+            raise PermissionError(errno.EACCES, "Source identity changed while opening")
+
+        resolved_handle_path = _windows_path_from_handle(file_descriptor)
+        if resolved_handle_path is not None and not _path_is_within(
+            resolved_handle_path,
+            workspace,
+        ):
+            raise PermissionError(errno.EACCES, "Opened source escaped its workspace")
+
+        handle = open(file_descriptor, "rb", closefd=True)
+        file_descriptor = -1
+        return _OpenedNativeSource(
+            path=target,
+            workspace=workspace,
+            relative_path=relative_path,
+            handle=handle,
+            opened_stat=opened_stat,
+        )
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+
+
+def _securely_open_native_source(
+    workspace: Path,
+    relative_path: Path,
+) -> _OpenedNativeSource:
+    try:
+        supports_dir_fd = os.open in os.supports_dir_fd
+        if supports_dir_fd and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"):
+            return _open_native_source_with_dir_fd(workspace, relative_path)
+        return _open_native_source_fallback(workspace, relative_path)
+    except HTTPException:
+        raise
+    except OSError as error:
+        raise _native_source_error(error)
+
+
+async def _authorize_native_file_source(
+    body: NativeFileActionRequest,
+    session_factory: SessionFactoryDep,
+) -> _OpenedNativeSource:
+    """Authorize and pin a regular source without holding a DB session open."""
+
+    # Do only the database lookup in this short context.  In particular, the
+    # StreamingResponse iterator never captures a yield-based get_db session.
+    async with session_factory() as db:
+        session = (
+            await db.execute(select(Session).where(Session.id == body.session_id))
+        ).scalar_one_or_none()
+        if session is None:
+            raise HTTPException(
+                status_code=403,
+                detail="File is not authorized for this conversation",
+            )
+        directory = session.directory
+
+    try:
+        workspace_claim = (
+            managed_workspace_for_session(body.session_id, create=False)
+            if directory == "."
+            else Path(directory).expanduser()
+        )
+        workspace_claim_stat = os.lstat(workspace_claim)
+        if _is_link_or_reparse_point(workspace_claim_stat):
+            raise HTTPException(
+                status_code=403,
+                detail="Conversation workspace cannot be a symbolic link",
+            )
+        workspace = workspace_claim.resolve(strict=True)
+        if not workspace.is_dir():
+            raise HTTPException(
+                status_code=403,
+                detail="Conversation workspace is unavailable",
+            )
+
+        requested = Path(body.path).expanduser()
+        lexical = requested if requested.is_absolute() else workspace / requested
+        normalized = Path(os.path.abspath(lexical))
+        try:
+            relative_path = normalized.relative_to(workspace)
+        except ValueError:
+            raise HTTPException(
+                status_code=403,
+                detail="File is outside the conversation workspace",
+            )
+        if not relative_path.parts:
+            raise HTTPException(status_code=400, detail="Source path is not a regular file")
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=403, detail="Conversation workspace is unavailable")
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=403, detail="File source could not be authorized")
+
+    return await asyncio.to_thread(
+        _securely_open_native_source,
+        workspace,
+        relative_path,
+    )
+
+
+def _invoke_native_path_action(
+    path: Path,
+    action: Literal["open", "reveal"],
+    system: str,
+) -> None:
+    """Invoke one platform path launcher without performing authorization."""
+
+    if action == "open":
+        if system == "Windows":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return
+
+    if system == "Windows":
+        subprocess.Popen(["explorer.exe", "/select,", str(path)])
+    elif system == "Darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent)])
+
+
+def _launch_authorized_native_path(
+    source: _OpenedNativeSource,
+    action: Literal["open", "reveal"],
+) -> None:
+    """Perform the final identity check at the synchronous launcher entry.
+
+    The supported OS launch APIs accept a text path, not an already-authorized
+    file handle.  Keeping this re-open, identity comparison, and launcher call
+    in one synchronous function removes event-loop and ``await`` gaps and keeps
+    both identity-pinned handles alive until the launcher returns.
+
+    Threat boundary: this rejects untrusted WebView/remote path escapes,
+    symlinks/reparse points, and replacements observed before launcher entry.
+    No portable path launcher can prevent a process with the same user's
+    filesystem permissions from renaming the path in the final instructions
+    between this check and the OS consuming it.  A snapshot or fd path would
+    break edit-in-place and reveal-original semantics, so we do not claim that
+    stronger guarantee for open/reveal.  Byte streaming does retain it because
+    it reads only from the pinned handle.
+    """
+
+    system = platform.system()
+    revalidated = _securely_open_native_source(
+        source.workspace,
+        source.relative_path,
+    )
+    try:
+        if revalidated.identity != source.identity:
+            raise HTTPException(
+                status_code=403,
+                detail="Source file changed before the native action",
+            )
+        try:
+            _invoke_native_path_action(source.path, action, system)
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to {action} file: {error}",
+            )
+    finally:
+        revalidated.handle.close()
 
 
 @router.post("/files/content")
@@ -648,15 +1036,88 @@ async def get_file_content_binary(body: FileContentRequest) -> dict[str, Any]:
     }
 
 
+@router.post("/files/native-source-info")
+async def get_native_source_info(
+    request: Request,
+    body: NativeFileActionRequest,
+    session_factory: SessionFactoryDep,
+) -> dict[str, str | int]:
+    """Return a canonical source path to the trusted desktop process only."""
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(
+            status_code=403,
+            detail="Native file actions are only available locally",
+        )
+
+    source = await _authorize_native_file_source(body, session_factory)
+    try:
+        return {
+            "path": str(source.path),
+            "name": source.path.name,
+            "size": source.opened_stat.st_size,
+            "identity": source.identity_token,
+        }
+    finally:
+        source.handle.close()
+
+
+@router.post("/files/native-source-content")
+async def stream_native_source_content(
+    request: Request,
+    body: NativeFileActionRequest,
+    session_factory: SessionFactoryDep,
+) -> StreamingResponse:
+    """Stream an authorized source without a base64 or WebView memory hop.
+
+    The file handle is opened before the response is returned and kept alive
+    for the duration of the stream.  Tauri writes each bounded chunk to a
+    destination-side temporary file and atomically installs it only after a
+    successful flush/fsync.
+    """
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(
+            status_code=403,
+            detail="Native file actions are only available locally",
+        )
+
+    source = await _authorize_native_file_source(body, session_factory)
+
+    async def chunks():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(
+                    source.handle.read,
+                    NATIVE_FILE_STREAM_CHUNK_BYTES,
+                )
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            source.handle.close()
+
+    mime_type = mimetypes.guess_type(source.path.name)[0] or "application/octet-stream"
+    return StreamingResponse(
+        chunks(),
+        media_type=mime_type,
+        headers={
+            "Content-Length": str(source.opened_stat.st_size),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.post("/files/open-system")
-async def open_with_system(request: Request, body: FileContentRequest) -> dict[str, str]:
+async def open_with_system(
+    request: Request,
+    body: FileContentRequest,
+) -> dict[str, str]:
     """Open a local path with the OS default application.
 
     This endpoint launches a process on the machine running 苏小有. Remote
     clients must never be able to invoke it, even if they know a valid path.
     """
-    from fastapi import HTTPException
-
     if getattr(request.state, "source", "remote") != "local":
         raise HTTPException(status_code=403, detail="System open is only available locally")
 
@@ -678,16 +1139,36 @@ async def open_with_system(request: Request, body: FileContentRequest) -> dict[s
     return {"status": "ok"}
 
 
+@router.post("/files/open-file-default")
+async def open_authorized_file_default(
+    request: Request,
+    body: NativeFileActionRequest,
+    session_factory: SessionFactoryDep,
+) -> dict[str, str]:
+    """Open a session-authorized regular file with its default application."""
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(status_code=403, detail="System open is only available locally")
+
+    source = await _authorize_native_file_source(body, session_factory)
+    try:
+        await asyncio.to_thread(_launch_authorized_native_path, source, "open")
+    finally:
+        source.handle.close()
+    return {"status": "ok"}
+
+
 @router.post("/files/reveal-system")
-async def reveal_with_system(request: Request, body: FileContentRequest) -> dict[str, str]:
+async def reveal_with_system(
+    request: Request,
+    body: FileContentRequest,
+) -> dict[str, str]:
     """Reveal a local path in Finder, Explorer, or the Linux file manager.
 
     Like ``open-system``, this is a host-side action rather than a file API.
     Remote clients are rejected before path resolution/existence checks so the
     endpoint cannot also be used as a local-path existence oracle.
     """
-    from fastapi import HTTPException
-
     if getattr(request.state, "source", "remote") != "local":
         raise HTTPException(status_code=403, detail="System reveal is only available locally")
 
@@ -711,6 +1192,25 @@ async def reveal_with_system(request: Request, body: FileContentRequest) -> dict
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reveal file: {e}")
 
+    return {"status": "ok"}
+
+
+@router.post("/files/reveal-file-system")
+async def reveal_authorized_file(
+    request: Request,
+    body: NativeFileActionRequest,
+    session_factory: SessionFactoryDep,
+) -> dict[str, str]:
+    """Reveal a session-authorized regular file in the platform file manager."""
+
+    if getattr(request.state, "source", "remote") != "local":
+        raise HTTPException(status_code=403, detail="System reveal is only available locally")
+
+    source = await _authorize_native_file_source(body, session_factory)
+    try:
+        await asyncio.to_thread(_launch_authorized_native_path, source, "reveal")
+    finally:
+        source.handle.close()
     return {"status": "ok"}
 
 

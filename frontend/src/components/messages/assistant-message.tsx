@@ -93,7 +93,11 @@ export function AssistantMessage({ message, combinedParts, onRegenerate, isNew =
             opacity: { duration: 0.2 },
           }}
         >
-          <MessageContent parts={mainParts} activityKey={activityKey} />
+          <MessageContent
+            parts={mainParts}
+            activityKey={activityKey}
+            sessionId={message.session_id}
+          />
         </motion.div>
 
         {/* Action bar — always in DOM to avoid layout shift, opacity-only toggle */}
@@ -217,6 +221,7 @@ export const StreamingMessage = memo(function StreamingMessage({
       {!hasAnyActivity && <StreamingStage label={isModelLoading ? t("stageThinking") : stageLabel} />}
       <MessageContent
         parts={liveParts}
+        sessionId={sessionId}
         isStreaming
         isAwaitingConfirmation={isAwaitingConfirmation}
         generationStartedAt={generationStartedAt}

@@ -1,6 +1,7 @@
 export type FileArtifactActionId =
   | "preview"
   | "openDefault"
+  | "openOther"
   | "reveal"
   | "copyPath"
   | "saveCopy";
@@ -17,5 +18,5 @@ export function getFileArtifactActionIds(
   localDesktop: boolean,
 ): FileArtifactActionId[] {
   if (!localDesktop) return ["preview", "saveCopy"];
-  return ["preview", "openDefault", "reveal", "copyPath", "saveCopy"];
+  return ["preview", "openDefault", "openOther", "reveal", "copyPath", "saveCopy"];
 }

@@ -68,6 +68,7 @@ export interface 苏小有MockState {
   channelAdds: unknown[];
   channelRemoves: unknown[];
   remoteEnabled: boolean;
+  extraLongConversationMessages: MockMessage[];
 }
 
 type AutomationMock = ReturnType<typeof createdAutomation>;
@@ -771,6 +772,19 @@ function textMessage(
   };
 }
 
+export function appendLongConversationTurn(
+  state: 苏小有MockState,
+  prompt: string,
+  reply: string,
+) {
+  const turnNumber = 61 + Math.floor(state.extraLongConversationMessages.length / 2);
+  const turn = String(turnNumber).padStart(3, "0");
+  state.extraLongConversationMessages.push(
+    textMessage("session-long", `user-${turn}`, "user", `Long user turn ${turn}: ${prompt}`),
+    textMessage("session-long", `assistant-${turn}`, "assistant", `Long assistant turn ${turn}: ${reply}`),
+  );
+}
+
 const longConversationPrompts = [
   "Can you turn the launch notes into a short operating brief for tomorrow's review?",
   "Add a section that separates product readiness from commercial risk.",
@@ -885,6 +899,88 @@ function compactMessagePage(compacted: boolean) {
       ),
       assistant,
     ],
+  };
+}
+
+function messagesForSession(
+  sessionId: string,
+  state: 苏小有MockState,
+): MockMessage[] {
+  if (sessionId === "session-new") {
+    return createdMessagePageForState(state).messages as MockMessage[];
+  }
+  if (sessionId === "session-artifacts") {
+    return artifactMessagePage.messages as MockMessage[];
+  }
+  if (sessionId === "session-long") {
+    const messages = cloneJson([
+      ...longConversationMessages,
+      ...state.extraLongConversationMessages,
+    ]);
+    const edit = [...state.editBodies].reverse().find((body) => {
+      const value = body as Record<string, unknown> | null;
+      return value?.session_id === sessionId;
+    }) as Record<string, unknown> | undefined;
+    if (!edit) return messages;
+    const targetIndex = messages.findIndex(
+      (message) => message.id === String(edit.message_id ?? ""),
+    );
+    if (targetIndex < 0) return messages;
+    const truncated = messages.slice(0, targetIndex + 1);
+    const target = truncated[targetIndex];
+    const textPart = target.parts.find((part) => part.data.type === "text");
+    if (textPart) {
+      textPart.data = { type: "text", text: String(edit.text ?? "") };
+    }
+    truncated.push(
+      textMessage(
+        sessionId,
+        "assistant-edited",
+        "assistant",
+        "Edited response streamed from the mock backend.",
+      ),
+    );
+    return truncated;
+  }
+  if (sessionId === "session-compact") {
+    return compactMessagePage(state.compactRequests.length > 0).messages;
+  }
+  return sessionMessagePageForState(sessionId, state).messages as MockMessage[];
+}
+
+function conversationTurnIndex(messages: MockMessage[]) {
+  const turns = messages.flatMap((message, messageOffset) => {
+    if (message.data.role !== "user" || message.data.system) return [];
+    const text = message.parts
+      .filter((part) => part.data.type === "text")
+      .map((part) => String(part.data.text ?? ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const attachmentNames = message.parts
+      .filter((part) => part.data.type === "file")
+      .map((part) => String(part.data.name ?? ""))
+      .filter(Boolean);
+    const rawSummary = text || attachmentNames[0] || "";
+    const summary = rawSummary.length <= 160
+      ? rawSummary
+      : `${rawSummary.slice(0, 159).trimEnd()}…`;
+    return [{
+      message_id: message.id,
+      ordinal: 0,
+      message_offset: messageOffset,
+      time_created: message.time_created,
+      summary,
+      attachment_names: attachmentNames,
+    }];
+  });
+  turns.forEach((turn, index) => {
+    turn.ordinal = index + 1;
+  });
+  return {
+    total_messages: messages.length,
+    total_turns: turns.length,
+    turns,
   };
 }
 
@@ -1640,6 +1736,7 @@ export async function mock苏小有Api(
     channelAdds: [],
     channelRemoves: [],
     remoteEnabled: false,
+    extraLongConversationMessages: [],
   };
   const sessionRecords = new Map<string, SessionRecord>([
     [sessionAlpha.id, cloneJson(sessionAlpha)],
@@ -2048,6 +2145,14 @@ export async function mock苏小有Api(
         ],
       });
     }
+    const turnIndexMatch = path.match(/^\/api\/messages\/([^/]+)\/turn-index$/);
+    if (turnIndexMatch) {
+      const sessionId = decodeURIComponent(turnIndexMatch[1]);
+      return fulfillJson(
+        route,
+        conversationTurnIndex(messagesForSession(sessionId, state)),
+      );
+    }
     if (path.startsWith("/api/messages/")) {
       const sessionId = decodeURIComponent(
         path.split("/").pop() ?? "session-alpha",
@@ -2061,7 +2166,7 @@ export async function mock苏小有Api(
       if (sessionId === "session-long")
         return fulfillJson(
           route,
-          paginatedMessages(longConversationMessages, limit, offset),
+          paginatedMessages(messagesForSession(sessionId, state), limit, offset),
         );
       if (sessionId === "session-compact")
         return fulfillJson(
@@ -2129,12 +2234,20 @@ export async function mock苏小有Api(
       return fulfillJson(route, { status: "aborted" });
     }
 
-    if (path === "/api/files/open-system" && method === "POST") {
+    if (
+      (path === "/api/files/open-system" ||
+        path === "/api/files/open-file-default") &&
+      method === "POST"
+    ) {
       const body = (requestJson(request) ?? {}) as Record<string, unknown>;
       state.systemOpenRequests.push(body);
       return fulfillJson(route, { status: "ok" });
     }
-    if (path === "/api/files/reveal-system" && method === "POST") {
+    if (
+      (path === "/api/files/reveal-system" ||
+        path === "/api/files/reveal-file-system") &&
+      method === "POST"
+    ) {
       const body = (requestJson(request) ?? {}) as Record<string, unknown>;
       state.systemRevealRequests.push(body);
       return fulfillJson(route, { status: "ok" });

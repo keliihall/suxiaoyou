@@ -17,6 +17,8 @@ import type { ActivityData, ChainItem } from "@/stores/activity-store";
 
 interface MessageContentProps {
   parts: PartData[];
+  /** Conversation owning generated file paths; native actions are bound to it. */
+  sessionId?: string | null;
   /** Whether this is the currently streaming message. */
   isStreaming?: boolean;
   /** Stable key identifying the message — used by ActivitySummary to toggle the activity panel. */
@@ -119,6 +121,7 @@ function fileCardsForTool(part: ToolPart, presentedFilePaths: Set<string>) {
  */
 export function MessageContent({
   parts,
+  sessionId,
   isStreaming,
   activityKey,
   isAwaitingConfirmation = false,
@@ -322,6 +325,7 @@ export function MessageContent({
                   title={item.title}
                   cardId={`file-card-${item.source.call_id}-${item.filePath}`}
                   compact={group.length > 1}
+                  sessionId={sessionId}
                 />
               ))}
             </div>

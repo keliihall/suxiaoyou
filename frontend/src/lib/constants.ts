@@ -260,6 +260,8 @@ export const API = {
   MESSAGES: {
     LIST: (sessionId: string, limit = 50, offset = -1) =>
       `/api/messages/${sessionId}?limit=${limit}&offset=${offset}`,
+    TURN_INDEX: (sessionId: string) =>
+      `/api/messages/${sessionId}/turn-index`,
   },
   FILES: {
     UPLOAD: "/api/files/upload",
@@ -269,8 +271,11 @@ export const API = {
     ATTACH: "/api/files/attach",
     CONTENT: "/api/files/content",
     CONTENT_BINARY: "/api/files/content-binary",
+    PPTX_PREVIEW: "/api/files/pptx-preview",
     OPEN_SYSTEM: "/api/files/open-system",
+    OPEN_FILE_DEFAULT: "/api/files/open-file-default",
     REVEAL_SYSTEM: "/api/files/reveal-system",
+    REVEAL_FILE_SYSTEM: "/api/files/reveal-file-system",
     SEARCH: "/api/files/search",
     INGEST: "/api/files/ingest",
   },
@@ -409,6 +414,8 @@ export const queryKeys = {
   },
   messages: {
     list: (sessionId: string) => ["messages", sessionId] as const,
+    turnIndex: (sessionId: string) =>
+      ["messages", sessionId, "turn-index"] as const,
   },
   sessionInputs: (sessionId: string) => ["session-inputs", sessionId] as const,
   models: ["models"] as const,

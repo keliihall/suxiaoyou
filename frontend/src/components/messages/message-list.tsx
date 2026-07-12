@@ -1,18 +1,23 @@
 "use client";
 
-import { useMemo, useRef, useEffect, useState } from "react";
+import { useCallback, useMemo, useRef, useEffect, useState } from "react";
 import { ArrowDown, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useScrollAnchor } from "@/hooks/use-scroll-anchor";
 import { MessageItem } from "./message-item";
+import { ConversationOutline } from "./conversation-outline";
 import { AssistantMessageGroup } from "./assistant-message-group";
 import { StreamingMessage } from "./assistant-message";
 import { FileChip } from "@/components/chat/file-chip";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { FileAttachment } from "@/types/chat";
+import type { EditAndResendResult, FileAttachment } from "@/types/chat";
 import { extractTextFromPartResponses } from "@/lib/utils";
-import type { MessageResponse, PartData } from "@/types/message";
+import type {
+  ConversationTurn,
+  MessageResponse,
+  PartData,
+} from "@/types/message";
 
 /** A user message or a group of consecutive assistant messages. */
 type MessageGroup =
@@ -86,7 +91,7 @@ interface MessageListProps {
   /** Whether the active stream is waiting for a user decision. */
   isAwaitingConfirmation?: boolean;
   /** Callback to edit a user message and re-generate from that point. */
-  onEditAndResend?: (messageId: string, newText: string, attachments?: FileAttachment[]) => Promise<boolean>;
+  onEditAndResend?: (messageId: string, newText: string, attachments?: FileAttachment[]) => Promise<EditAndResendResult>;
   /** Workspace directory for @mention in edit mode. */
   directory?: string | null;
   /** Session ID for @mention file ingestion. */
@@ -96,7 +101,25 @@ interface MessageListProps {
   /** Whether older messages are currently being fetched. */
   isFetchingPreviousPage?: boolean;
   /** Fetch the next batch of older messages. */
-  fetchPreviousPage?: () => void;
+  fetchPreviousPage?: () => Promise<void>;
+  /** Whether a directed history window has newer pages below it. */
+  hasNextPage?: boolean;
+  /** Whether newer history pages are currently being fetched. */
+  isFetchingNextPage?: boolean;
+  /** Fetch the next batch of newer history messages. */
+  fetchNextPage?: () => Promise<void>;
+  /** Complete lightweight outline for all visible user turns. */
+  turns?: ConversationTurn[];
+  /** Fetch a contiguous history window containing an unloaded turn. */
+  onLocateTurn?: (messageOffset: number) => Promise<void>;
+  /** Invalidate and abort any in-flight directed history request. */
+  onCancelLocate?: () => void;
+  /** Total authoritative message count, independent of loaded page count. */
+  totalMessageCount?: number;
+  /** True while displaying isolated directed-history pages. */
+  isHistoryWindow?: boolean;
+  /** Restore the live latest-page view. */
+  onExitHistoryWindow?: () => void;
 }
 
 export function MessageList({
@@ -116,12 +139,44 @@ export function MessageList({
   hasPreviousPage,
   isFetchingPreviousPage,
   fetchPreviousPage,
+  hasNextPage,
+  isFetchingNextPage,
+  fetchNextPage,
+  turns = [],
+  onLocateTurn,
+  onCancelLocate,
+  totalMessageCount = messages.length,
+  isHistoryWindow = false,
+  onExitHistoryWindow,
 }: MessageListProps) {
   const { t } = useTranslation("chat");
-  const { scrollRef, scrollElementRef, bottomRef, isAtBottom, scrollToBottom } = useScrollAnchor();
+  const {
+    scrollRef,
+    scrollElementRef,
+    bottomRef,
+    isAtBottom,
+    scrollToBottom,
+    suspendAutoScroll,
+  } = useScrollAnchor();
   const topSentinelRef = useRef<HTMLDivElement>(null);
+  const bottomSentinelRef = useRef<HTMLDivElement>(null);
+  const paginationInFlightRef = useRef(false);
+  const [listShellElement, setListShellElement] = useState<HTMLDivElement | null>(null);
+  const [contentIsTallEnough, setContentIsTallEnough] = useState(false);
+  const messageElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [activeTurnMessageId, setActiveTurnMessageId] = useState<string | null>(null);
+  const [pendingLocateMessageId, setPendingLocateMessageId] = useState<string | null>(null);
+  const pendingLocateRef = useRef<string | null>(null);
+  const [locateErrorMessageId, setLocateErrorMessageId] = useState<string | null>(null);
+  const locateSequenceRef = useRef(0);
+  const locateRestoreActiveRef = useRef<string | null>(null);
+  const locateRestoreForwardPagingRef = useRef<boolean | null>(null);
+  const locateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const enableForwardPagingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const returnToLatestRef = useRef(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const [canFetchOlderMessages, setCanFetchOlderMessages] = useState(false);
+  const [canFetchNewerMessages, setCanFetchNewerMessages] = useState(false);
   const anchoredSessionRef = useRef<string | undefined>(undefined);
 
   // Keep StreamingMessage visible briefly after generation finishes so the
@@ -131,6 +186,37 @@ export function MessageList({
   const wasGeneratingRef = useRef(false);
   const prevMessageCountRef = useRef(messages?.length ?? 0);
   const [showStreamingFallback, setShowStreamingFallback] = useState(false);
+
+  const listShellRef = useCallback((element: HTMLDivElement | null) => {
+    setListShellElement(element);
+  }, []);
+
+  const registerMessageElement = useCallback(
+    (messageId: string, element: HTMLDivElement | null) => {
+      if (element) messageElementsRef.current.set(messageId, element);
+      else messageElementsRef.current.delete(messageId);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!listShellElement) return;
+    const update = () => setContentIsTallEnough(listShellElement.clientHeight >= 280);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(listShellElement);
+    return () => observer.disconnect();
+  }, [listShellElement]);
+
+  useEffect(() => {
+    return () => {
+      onCancelLocate?.();
+      if (locateTimeoutRef.current) clearTimeout(locateTimeoutRef.current);
+      if (enableForwardPagingTimeoutRef.current) {
+        clearTimeout(enableForwardPagingTimeoutRef.current);
+      }
+    };
+  }, [onCancelLocate]);
 
   useEffect(() => {
     if (isGenerating) {
@@ -155,7 +241,18 @@ export function MessageList({
     if (anchoredSessionRef.current === sessionId) return;
     anchoredSessionRef.current = sessionId;
     setCanFetchOlderMessages(false);
+    setCanFetchNewerMessages(false);
     streamedHandoffIdsRef.current = new Set();
+    messageElementsRef.current.clear();
+    locateSequenceRef.current += 1;
+    pendingLocateRef.current = null;
+    locateRestoreActiveRef.current = null;
+    locateRestoreForwardPagingRef.current = null;
+    setPendingLocateMessageId(null);
+    setLocateErrorMessageId(null);
+    setActiveTurnMessageId(null);
+    setUnreadCount(0);
+    returnToLatestRef.current = false;
   }, [sessionId]);
 
   useEffect(() => {
@@ -180,15 +277,27 @@ export function MessageList({
 
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting && hasPreviousPage && !isFetchingPreviousPage) {
+        if (
+          entry.isIntersecting
+          && hasPreviousPage
+          && !isFetchingPreviousPage
+          && !paginationInFlightRef.current
+        ) {
           // Save scroll height before prepending for scroll position restoration
           const prevHeight = container.scrollHeight;
-          fetchPreviousPage?.();
-          // After DOM updates, restore scroll position
-          requestAnimationFrame(() => {
-            const newHeight = container.scrollHeight;
-            container.scrollTop += newHeight - prevHeight;
-          });
+          paginationInFlightRef.current = true;
+          void fetchPreviousPage?.()
+            .then(() => {
+              // Restore the same visible content after the prepend commits.
+              requestAnimationFrame(() => {
+                const newHeight = container.scrollHeight;
+                container.scrollTop += newHeight - prevHeight;
+              });
+            })
+            .catch(() => {})
+            .finally(() => {
+              paginationInFlightRef.current = false;
+            });
         }
       },
       { root: container, rootMargin: "200px 0px 0px 0px" },
@@ -196,6 +305,46 @@ export function MessageList({
     observer.observe(sentinel);
     return () => observer.disconnect();
   }, [canFetchOlderMessages, hasPreviousPage, isFetchingPreviousPage, fetchPreviousPage, scrollElementRef]);
+
+  // Directed history windows can be traversed in both directions. The live
+  // infinite query never enters this path and remains latest-page anchored.
+  useEffect(() => {
+    const sentinel = bottomSentinelRef.current;
+    const container = scrollElementRef.current;
+    if (
+      !sentinel
+      || !container
+      || !canFetchNewerMessages
+      || !hasNextPage
+      || isFetchingNextPage
+    ) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (
+          entry.isIntersecting
+          && hasNextPage
+          && !isFetchingNextPage
+          && !paginationInFlightRef.current
+        ) {
+          paginationInFlightRef.current = true;
+          void fetchNextPage?.()
+            .catch(() => {})
+            .finally(() => {
+              paginationInFlightRef.current = false;
+            });
+        }
+      },
+      { root: container, rootMargin: "0px 0px 200px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [
+    canFetchNewerMessages,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    scrollElementRef,
+  ]);
 
   // Track known message IDs to distinguish historical vs new messages.
   // Messages present on first render (or first data load) are "old" — skip animation.
@@ -234,18 +383,28 @@ export function MessageList({
 
   // Reset unread count when user scrolls to bottom
   useEffect(() => {
-    if (isAtBottom) setUnreadCount(0);
-  }, [isAtBottom]);
+    if (isAtBottom && !isHistoryWindow) setUnreadCount(0);
+  }, [isAtBottom, isHistoryWindow]);
 
   // Increment unread count when new messages arrive while scrolled up
-  const prevMsgLenRef = useRef(messages.length);
+  const prevTotalCountRef = useRef(totalMessageCount);
+  const totalCountSessionRef = useRef(sessionId);
+
   useEffect(() => {
-    const prevLen = prevMsgLenRef.current;
-    prevMsgLenRef.current = messages.length;
-    if (messages.length > prevLen && !isAtBottom) {
-      setUnreadCount((c) => c + (messages.length - prevLen));
+    if (totalCountSessionRef.current !== sessionId) {
+      totalCountSessionRef.current = sessionId;
+      prevTotalCountRef.current = totalMessageCount;
+      return;
     }
-  }, [messages.length, isAtBottom]);
+    const previousTotal = prevTotalCountRef.current;
+    prevTotalCountRef.current = totalMessageCount;
+    if (
+      totalMessageCount > previousTotal
+      && (isHistoryWindow || !isAtBottom)
+    ) {
+      setUnreadCount((count) => count + (totalMessageCount - previousTotal));
+    }
+  }, [isAtBottom, isHistoryWindow, sessionId, totalMessageCount]);
 
   // Group consecutive assistant messages so multi-step responses render as one block
   // Regroup whenever message content changes. Parts can be appended to existing
@@ -256,9 +415,266 @@ export function MessageList({
     [messages]
   );
 
+  useEffect(() => {
+    if (turns.length === 0) {
+      setActiveTurnMessageId(null);
+      return;
+    }
+    setActiveTurnMessageId((current) => {
+      if (current && turns.some((turn) => turn.message_id === current)) {
+        return current;
+      }
+      return turns.at(-1)?.message_id ?? null;
+    });
+  }, [sessionId, turns]);
+
+  useEffect(() => {
+    const turnIds = new Set(turns.map((turn) => turn.message_id));
+    const pending = pendingLocateRef.current;
+    if (pending && !turnIds.has(pending)) {
+      locateSequenceRef.current += 1;
+      onCancelLocate?.();
+      pendingLocateRef.current = null;
+      locateRestoreActiveRef.current = null;
+      locateRestoreForwardPagingRef.current = null;
+      setPendingLocateMessageId(null);
+      if (locateTimeoutRef.current) {
+        clearTimeout(locateTimeoutRef.current);
+        locateTimeoutRef.current = null;
+      }
+      if (enableForwardPagingTimeoutRef.current) {
+        clearTimeout(enableForwardPagingTimeoutRef.current);
+        enableForwardPagingTimeoutRef.current = null;
+      }
+    }
+    setLocateErrorMessageId((current) =>
+      current && !turnIds.has(current) ? null : current,
+    );
+  }, [onCancelLocate, turns]);
+
+  // User-message anchors are point markers. Observe the top portion of the
+  // scroller so a long assistant response keeps the preceding turn active
+  // until the next user prompt crosses into that reading region.
+  useEffect(() => {
+    const container = scrollElementRef.current;
+    if (!container || turns.length === 0) return;
+    const turnIds = new Set(turns.map((turn) => turn.message_id));
+    let frame = 0;
+    const updateActiveTurn = () => {
+      frame = 0;
+      const rootRect = container.getBoundingClientRect();
+      const readingLine = rootRect.top + Math.min(96, container.clientHeight * 0.25);
+      let candidate: string | null = null;
+      let firstAfterLine: string | null = null;
+      for (const turn of turns) {
+        const element = messageElementsRef.current.get(turn.message_id);
+        if (!element) continue;
+        if (element.getBoundingClientRect().top <= readingLine) {
+          candidate = turn.message_id;
+        } else {
+          firstAfterLine = turn.message_id;
+          break;
+        }
+      }
+      const next = candidate ?? firstAfterLine;
+      if (next) setActiveTurnMessageId(next);
+    };
+    const scheduleUpdate = () => {
+      if (!frame) frame = requestAnimationFrame(updateActiveTurn);
+    };
+    const observer = new IntersectionObserver(
+      scheduleUpdate,
+      { root: container, threshold: 0 },
+    );
+    for (const [messageId, element] of messageElementsRef.current) {
+      if (turnIds.has(messageId)) observer.observe(element);
+    }
+    container.addEventListener("scroll", scheduleUpdate, { passive: true });
+    scheduleUpdate();
+    return () => {
+      observer.disconnect();
+      container.removeEventListener("scroll", scheduleUpdate);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [messages, scrollElementRef, turns]);
+
+  const finishPendingLocate = useCallback((messageId: string) => {
+    const element = messageElementsRef.current.get(messageId);
+    if (!element) return false;
+    if (locateTimeoutRef.current) {
+      clearTimeout(locateTimeoutRef.current);
+      locateTimeoutRef.current = null;
+    }
+    pendingLocateRef.current = null;
+    locateRestoreActiveRef.current = null;
+    locateRestoreForwardPagingRef.current = null;
+    setPendingLocateMessageId(null);
+    setLocateErrorMessageId(null);
+    setActiveTurnMessageId(messageId);
+    requestAnimationFrame(() => {
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      element.scrollIntoView({
+        block: "start",
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
+    });
+    if (enableForwardPagingTimeoutRef.current) {
+      clearTimeout(enableForwardPagingTimeoutRef.current);
+    }
+    // Do not let the bottom sentinel append newer pages while the replacement
+    // window is still at its inherited scrollTop. Wait for the smooth target
+    // jump to settle, then allow deliberate downward traversal.
+    enableForwardPagingTimeoutRef.current = setTimeout(() => {
+      setCanFetchNewerMessages(true);
+    }, 650);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    const messageId = pendingLocateRef.current;
+    if (messageId) finishPendingLocate(messageId);
+  }, [finishPendingLocate, messages]);
+
+  const beginPendingLocate = useCallback((messageId: string) => {
+    pendingLocateRef.current = messageId;
+    setPendingLocateMessageId(messageId);
+    setLocateErrorMessageId(null);
+    if (locateTimeoutRef.current) clearTimeout(locateTimeoutRef.current);
+    locateTimeoutRef.current = setTimeout(() => {
+      if (pendingLocateRef.current !== messageId) return;
+      locateTimeoutRef.current = null;
+      locateSequenceRef.current += 1;
+      onCancelLocate?.();
+      if (enableForwardPagingTimeoutRef.current) {
+        clearTimeout(enableForwardPagingTimeoutRef.current);
+        enableForwardPagingTimeoutRef.current = null;
+      }
+      pendingLocateRef.current = null;
+      setPendingLocateMessageId(null);
+      setLocateErrorMessageId(messageId);
+      setActiveTurnMessageId(locateRestoreActiveRef.current);
+      setCanFetchNewerMessages(
+        locateRestoreForwardPagingRef.current ?? false,
+      );
+      locateRestoreActiveRef.current = null;
+      locateRestoreForwardPagingRef.current = null;
+    }, 4_000);
+  }, [onCancelLocate]);
+
+  const handleSelectTurn = useCallback(async (turn: ConversationTurn) => {
+    const hadPendingLocate = pendingLocateRef.current !== null;
+    const restoreForwardPaging = hadPendingLocate
+      ? (locateRestoreForwardPagingRef.current ?? canFetchNewerMessages)
+      : canFetchNewerMessages;
+    const restoreActive = hadPendingLocate
+      ? locateRestoreActiveRef.current
+      : activeTurnMessageId;
+    locateSequenceRef.current += 1;
+    onCancelLocate?.();
+    if (locateTimeoutRef.current) {
+      clearTimeout(locateTimeoutRef.current);
+      locateTimeoutRef.current = null;
+    }
+    if (enableForwardPagingTimeoutRef.current) {
+      clearTimeout(enableForwardPagingTimeoutRef.current);
+      enableForwardPagingTimeoutRef.current = null;
+    }
+    pendingLocateRef.current = null;
+    setPendingLocateMessageId(null);
+    const sequence = ++locateSequenceRef.current;
+    locateRestoreActiveRef.current = restoreActive;
+    locateRestoreForwardPagingRef.current = restoreForwardPaging;
+    suspendAutoScroll();
+    setActiveTurnMessageId(turn.message_id);
+    setLocateErrorMessageId(null);
+
+    if (finishPendingLocate(turn.message_id)) return;
+    setCanFetchNewerMessages(false);
+    beginPendingLocate(turn.message_id);
+
+    // The main query already owns the true latest page. Leaving an older
+    // isolated window is enough to mount a recent target without another API
+    // request, and preserves live-stream cache invariants.
+    if (
+      isHistoryWindow
+      && turn.message_offset >= Math.max(0, totalMessageCount - 50)
+    ) {
+      onExitHistoryWindow?.();
+      return;
+    }
+
+    try {
+      if (!onLocateTurn) throw new Error("History navigation is unavailable");
+      await onLocateTurn(turn.message_offset);
+      if (sequence !== locateSequenceRef.current) return;
+      // React commits the isolated window on the next render; the messages
+      // effect above completes the scroll once its stable anchor is mounted.
+    } catch {
+      if (sequence !== locateSequenceRef.current) return;
+      if (locateTimeoutRef.current) clearTimeout(locateTimeoutRef.current);
+      locateTimeoutRef.current = null;
+      pendingLocateRef.current = null;
+      setPendingLocateMessageId(null);
+      setLocateErrorMessageId(turn.message_id);
+      setActiveTurnMessageId(restoreActive);
+      locateRestoreActiveRef.current = null;
+      locateRestoreForwardPagingRef.current = null;
+      setCanFetchNewerMessages(restoreForwardPaging);
+    }
+  }, [
+    activeTurnMessageId,
+    beginPendingLocate,
+    canFetchNewerMessages,
+    finishPendingLocate,
+    isHistoryWindow,
+    onExitHistoryWindow,
+    onLocateTurn,
+    onCancelLocate,
+    suspendAutoScroll,
+    totalMessageCount,
+  ]);
+
+  const handleRetryLocate = useCallback(() => {
+    const turn = turns.find((item) => item.message_id === locateErrorMessageId);
+    if (turn) void handleSelectTurn(turn);
+  }, [handleSelectTurn, locateErrorMessageId, turns]);
+
+  const handleReturnToLatest = useCallback(() => {
+    setUnreadCount(0);
+    locateSequenceRef.current += 1;
+    onCancelLocate?.();
+    pendingLocateRef.current = null;
+    locateRestoreActiveRef.current = null;
+    locateRestoreForwardPagingRef.current = null;
+    setPendingLocateMessageId(null);
+    setLocateErrorMessageId(null);
+    if (locateTimeoutRef.current) {
+      clearTimeout(locateTimeoutRef.current);
+      locateTimeoutRef.current = null;
+    }
+    if (enableForwardPagingTimeoutRef.current) {
+      clearTimeout(enableForwardPagingTimeoutRef.current);
+      enableForwardPagingTimeoutRef.current = null;
+    }
+    setCanFetchNewerMessages(false);
+    if (isHistoryWindow) {
+      returnToLatestRef.current = true;
+      onExitHistoryWindow?.();
+      return;
+    }
+    scrollToBottom();
+  }, [isHistoryWindow, onCancelLocate, onExitHistoryWindow, scrollToBottom]);
+
+  useEffect(() => {
+    if (!returnToLatestRef.current || isHistoryWindow) return;
+    returnToLatestRef.current = false;
+    const frame = requestAnimationFrame(() => scrollToBottom());
+    return () => cancelAnimationFrame(frame);
+  }, [isHistoryWindow, messages, scrollToBottom]);
+
   // The shell message only exists after the backend created it (streamId is set).
   // During beginSending (streamId is null), we must NOT hide the previous response.
-  const hasActiveStream = !!streamId;
+  const hasActiveStream = !!streamId && !isHistoryWindow;
   const hasVisibleStreamingReplacement = useMemo(() => {
     if (streamingText.trim() || streamingReasoning.trim()) return true;
     return streamingParts.some(
@@ -271,6 +687,7 @@ export function MessageList({
   // from /c/new to /c/{sessionId} (where useMessages fetches the persisted
   // user message while pendingUserText is still set in the global store).
   const showPendingBubble = useMemo(() => {
+    if (isHistoryWindow) return false;
     if (!pendingUserText) return false;
     if (messages.length === 0) return true;
     const hasPendingInDb = messages.some((m) => {
@@ -279,7 +696,7 @@ export function MessageList({
       return fullText.includes(pendingUserText);
     });
     return !hasPendingInDb;
-  }, [pendingUserText, messages]);
+  }, [pendingUserText, messages, isHistoryWindow]);
 
   // Only show the loading state on the very first load (no cached/placeholder data).
   // When switching sessions with keepPreviousData, messages.length > 0 so we
@@ -375,7 +792,7 @@ export function MessageList({
   // turn that should stay untouched.
   const lastGroupForCover = groups[groups.length - 1];
   if (
-    (hasActiveStream || showStreamingFallback) &&
+    (hasActiveStream || (showStreamingFallback && !isHistoryWindow)) &&
     !showPendingBubble &&
     lastGroupForCover?.kind === "assistant"
   ) {
@@ -398,7 +815,7 @@ export function MessageList({
   }
 
   return (
-    <div className="relative flex-1 overflow-hidden">
+    <div ref={listShellRef} className="relative flex-1 overflow-hidden">
       <div
         ref={scrollRef}
         data-testid="message-list-scroller"
@@ -429,6 +846,7 @@ export function MessageList({
                     isGenerating={isGenerating}
                     directory={directory}
                     sessionId={sessionId}
+                    onElementChange={registerMessageElement}
                   />
                 );
               }
@@ -467,7 +885,7 @@ export function MessageList({
                 !group.messages.some((m) => streamedHandoffIdsRef.current.has(m.id));
 
               if (
-                (hasActiveStream || showStreamingFallback) &&
+                (hasActiveStream || (showStreamingFallback && !isHistoryWindow)) &&
                 hasVisibleStreamingReplacement &&
                 isLastOverall &&
                 !showPendingBubble
@@ -520,7 +938,7 @@ export function MessageList({
 
             {/* Currently streaming message — kept visible briefly after
                 generation finishes so DB messages can mount first. */}
-            {(isGenerating || !!streamId || showStreamingFallback) && (
+            {!isHistoryWindow && (isGenerating || !!streamId || showStreamingFallback) && (
               <div className="px-4 py-5">
                 <div className="mx-auto max-w-3xl xl:max-w-4xl">
                   <StreamingMessage
@@ -536,20 +954,41 @@ export function MessageList({
           </>
         )}
 
+        <div ref={bottomSentinelRef} className="h-px" />
+        {isFetchingNextPage && (
+          <div className="flex justify-center py-4">
+            <Loader2 className="h-4 w-4 animate-spin text-[var(--text-tertiary)]" />
+          </div>
+        )}
+
         {/* Scroll anchor */}
         <div ref={bottomRef} className="h-px" />
       </div>
 
+      <ConversationOutline
+        turns={turns}
+        activeMessageId={activeTurnMessageId}
+        locatingMessageId={pendingLocateMessageId}
+        locateErrorMessageId={locateErrorMessageId}
+        contentIsTallEnough={contentIsTallEnough}
+        onSelect={(turn) => { void handleSelectTurn(turn); }}
+        onRetry={handleRetryLocate}
+      />
+
+      <span className="sr-only" aria-live="polite">
+        {pendingLocateMessageId ? t("conversationLocating") : ""}
+      </span>
+
       {/* Scroll to bottom button — outside scroll container so it never affects scrollHeight */}
       <AnimatePresence>
-        {!isAtBottom && (
+        {(!isAtBottom || isHistoryWindow) && (
           <motion.button
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.8 }}
             transition={{ type: "spring", stiffness: 400, damping: 25 }}
-            onClick={() => { scrollToBottom(); setUnreadCount(0); }}
-            aria-label={t("scrollToBottom")}
+            onClick={handleReturnToLatest}
+            aria-label={t(isHistoryWindow ? "conversationReturnToLatest" : "scrollToBottom")}
             className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center justify-center h-9 w-9 rounded-full border border-[var(--border-default)] bg-[var(--surface-primary)] shadow-[var(--shadow-lg)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-secondary)] transition-colors hover:[&_svg]:translate-y-0.5 [&_svg]:transition-transform [&_svg]:duration-150"
           >
             <ArrowDown className="h-4 w-4" />

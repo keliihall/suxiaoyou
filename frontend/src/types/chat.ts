@@ -99,6 +99,11 @@ export interface EditAndResendRequest {
   workspace?: string | null;
 }
 
+export type EditAndResendResult =
+  | { status: "reconciled" }
+  | { status: "committed_unreconciled" }
+  | { status: "failed" };
+
 export interface AbortRequest {
   stream_id: string;
 }
