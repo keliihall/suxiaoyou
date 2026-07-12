@@ -462,6 +462,21 @@ export function MessageList({
     let frame = 0;
     const updateActiveTurn = () => {
       frame = 0;
+      // At the physical bottom the final user anchor cannot always be scrolled
+      // up to the reading line (there may be only a short assistant reply
+      // beneath it). Treat the last mounted turn as active so a jump to the
+      // latest turn stays highlighted consistently across viewport speeds.
+      const bottomGap =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (bottomGap <= 2) {
+        for (let index = turns.length - 1; index >= 0; index -= 1) {
+          const turn = turns[index];
+          if (messageElementsRef.current.has(turn.message_id)) {
+            setActiveTurnMessageId(turn.message_id);
+            return;
+          }
+        }
+      }
       const rootRect = container.getBoundingClientRect();
       const readingLine = rootRect.top + Math.min(96, container.clientHeight * 0.25);
       let candidate: string | null = null;
