@@ -45,7 +45,7 @@ test("an explicit interaction wait is not reported as a stalled task", () => {
   );
 });
 
-test("the stalled state is surfaced beside controls that remain usable", () => {
+test("the stalled state is neutral, localized, and keeps queue input usable", () => {
   const registry = readFileSync("src/lib/session-stream-registry.ts", "utf8");
   const form = readFileSync("src/components/chat/chat-form.tsx", "utf8");
   const en = JSON.parse(readFileSync("src/i18n/locales/en/chat.json", "utf8"));
@@ -59,7 +59,9 @@ test("the stalled state is surfaced beside controls that remain usable", () => {
   assert.match(registry, /an old DONE[\s\S]*newer stream/);
   assert.match(form, /data-testid="progress-stalled-notice"/);
   assert.match(form, /taskNoProgressFor/);
-  assert.match(form, /taskReconnect/);
-  assert.match(en.taskMayBeStalledHint, /queuing follow-ups or stop/);
-  assert.match(zh.taskMayBeStalledHint, /继续排队输入，或停止当前任务/);
+  assert.doesNotMatch(form, /color-warning[\s\S]*progress-stalled-notice/);
+  assert.doesNotMatch(form, /taskReconnect/);
+  assert.match(en.taskMayBeStalledHint, /queued in order/);
+  assert.match(zh.taskMayBeStalled, /任务仍在进行/);
+  assert.match(zh.taskMayBeStalledHint, /按顺序排队/);
 });

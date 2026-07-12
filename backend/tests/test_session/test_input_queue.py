@@ -12,6 +12,7 @@ from app.session.input_queue import (
     enqueue_session_input,
     finish_session_input,
     list_session_inputs,
+    update_queued_session_input,
 )
 
 
@@ -86,3 +87,33 @@ async def test_cancel_and_restart_block_are_safe(queue_db) -> None:
     async with queue_db() as db:
         items = await list_session_inputs(db, "session")
         assert [(item.id, item.status) for item in items] == [(queued.id, "blocked")]
+
+
+@pytest.mark.asyncio
+async def test_queued_inputs_can_be_reordered_and_promoted_to_steer(queue_db) -> None:
+    async with queue_db() as db:
+        async with db.begin():
+            first, _ = await _enqueue(db, "request-first")
+            second, _ = await _enqueue(db, "request-second")
+            third, _ = await _enqueue(db, "request-third")
+            moved = await update_queued_session_input(
+                db,
+                "session",
+                first.id,
+                position=3,
+            )
+            assert moved is not None
+            steered = await update_queued_session_input(
+                db,
+                "session",
+                first.id,
+                mode="steer",
+                target_stream_id="stream-current",
+            )
+            assert steered is not None
+
+    async with queue_db() as db:
+        items = await list_session_inputs(db, "session")
+        assert [item.id for item in items] == [second.id, third.id, first.id]
+        assert items[2].mode == "steer"
+        assert items[2].target_stream_id == "stream-current"

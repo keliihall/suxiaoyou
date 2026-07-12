@@ -79,7 +79,7 @@
   "minutesAgo": "{{count}}m ago",
   "hoursAgo": "{{count}}h ago",
   "daysAgo": "{{count}}d ago",
-  "poweredBy": "苏小有 v0.8.0",
+  "poweredBy": "苏小有 v0.8.1",
   "sortBy": "Sort",
   "name": "Name",
   "price": "Price",

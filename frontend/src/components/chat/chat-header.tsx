@@ -3,10 +3,14 @@
 import { useState, useCallback } from "react";
 import { useTranslation } from 'react-i18next';
 import { useRouter } from "next/navigation";
-import { Share2, Loader2, List, PanelRightClose, PanelRightOpen } from "lucide-react";
-import { HeaderModelDropdown } from "@/components/selectors/header-model-dropdown";
-import { ContextIndicator } from "@/components/chat/context-indicator";
+import { Share2, Loader2, List, MoreHorizontal, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { useSidebarStore } from "@/stores/sidebar-store";
 import { useChatSession } from "@/stores/chat-store";
@@ -27,10 +31,11 @@ import { downloadBlob } from "@/lib/browser-files";
 
 interface ChatHeaderProps {
   sessionId?: string;
+  title?: string | null;
 }
 
-export function ChatHeader({ sessionId }: ChatHeaderProps) {
-  const { t } = useTranslation('chat');
+export function ChatHeader({ sessionId, title }: ChatHeaderProps) {
+  const { t } = useTranslation(['chat', 'common']);
   const router = useRouter();
   const isCollapsed = useSidebarStore((s) => s.isCollapsed);
   const { messages } = useMessages(sessionId);
@@ -155,8 +160,40 @@ export function ChatHeader({ sessionId }: ChatHeaderProps) {
             (desktop non-remote) so they stay at the window's left edge across
             sidebar states. */}
 
-        <div className="flex items-center gap-2 min-w-0 shrink-0">
-          <HeaderModelDropdown />
+        <div className="flex min-w-0 max-w-[min(360px,42vw)] items-center gap-1">
+          <span
+            className="truncate px-2 text-[13px] font-semibold text-[var(--text-primary)]"
+            title={title || t("common:newChat")}
+          >
+            {title || t("common:newChat")}
+          </span>
+          {!remote && sessionId && messages && messages.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 shrink-0 rounded-lg"
+                  aria-label={t("chat:conversationMenu")}
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-44">
+                <DropdownMenuItem
+                  onSelect={() => void handleExportPdf()}
+                  disabled={pdfLoading}
+                >
+                  {pdfLoading ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Share2 className="h-4 w-4" />
+                  )}
+                  {t("chat:export")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
 
         <div
@@ -164,29 +201,6 @@ export function ChatHeader({ sessionId }: ChatHeaderProps) {
           className="min-w-6 flex-1 self-stretch"
           aria-hidden="true"
         />
-
-        {/* Export PDF — desktop only */}
-        {!remote && sessionId && messages && messages.length > 0 && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-9 w-9"
-                aria-label={t('export')}
-                onClick={handleExportPdf}
-                disabled={pdfLoading}
-              >
-                {pdfLoading ? (
-                  <Loader2 className="h-[18px] w-[18px] animate-spin" />
-                ) : (
-                  <Share2 className="h-[18px] w-[18px]" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">{t('export')}</TooltipContent>
-          </Tooltip>
-        )}
 
         {/* Remote mode: stream status, or task list button */}
         {remote && streamStatus && (
@@ -217,9 +231,6 @@ export function ChatHeader({ sessionId }: ChatHeaderProps) {
             </TooltipContent>
           </Tooltip>
         )}
-
-        {/* Context usage indicator — desktop only */}
-        {!remote && sessionId && <ContextIndicator sessionId={sessionId} />}
       </header>
     </TooltipProvider>
   );

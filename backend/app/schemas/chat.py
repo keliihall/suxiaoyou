@@ -105,6 +105,14 @@ class SessionInputRequest(BaseModel):
     permission_rules: list[dict[str, Any]] | None = None
 
 
+class SessionInputUpdateRequest(BaseModel):
+    """Adjust a queued follow-up before execution begins."""
+
+    mode: Literal["queue", "steer"] | None = None
+    move: Literal["up", "down"] | None = None
+    position: int | None = Field(None, ge=1)
+
+
 class SessionInputResponse(BaseModel):
     id: str
     session_id: str

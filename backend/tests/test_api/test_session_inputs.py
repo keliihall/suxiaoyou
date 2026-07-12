@@ -166,6 +166,40 @@ async def test_steer_is_bound_to_the_current_active_stream(
 
 
 @pytest.mark.asyncio
+async def test_queued_inputs_can_be_reordered_and_steered_before_execution(
+    app_client,
+    session_factory,
+    stream_manager: StreamManager,
+) -> None:
+    await _create_session(session_factory)
+    active = stream_manager.create_job("stream-current", "session-1")
+    first = await app_client.post(
+        "/api/chat/inputs",
+        json=_payload(client_request_id="client-queue-first", text="First"),
+    )
+    second = await app_client.post(
+        "/api/chat/inputs",
+        json=_payload(client_request_id="client-queue-second", text="Second"),
+    )
+
+    moved = await app_client.patch(
+        f"/api/chat/inputs/session-1/{second.json()['id']}",
+        json={"position": 1},
+    )
+    assert moved.status_code == 200
+    listed = await app_client.get("/api/chat/inputs/session-1")
+    assert [item["text"] for item in listed.json()] == ["Second", "First"]
+
+    steered = await app_client.patch(
+        f"/api/chat/inputs/session-1/{first.json()['id']}",
+        json={"mode": "steer"},
+    )
+    assert steered.status_code == 200
+    assert steered.json()["mode"] == "steer"
+    assert steered.json()["target_stream_id"] == active.stream_id
+
+
+@pytest.mark.asyncio
 async def test_folderless_queue_snapshots_attachment_despite_stale_workspace(
     app_client,
     session_factory,

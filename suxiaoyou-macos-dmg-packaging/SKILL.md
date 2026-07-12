@@ -111,7 +111,7 @@ Expected local arm64 results:
 
 - version matches the requested version
 - name is `苏小有`
-- bundle identifier is `com.chaoyuanxinzhi.suxiaoyou`
+- bundle identifier is `com.suxiaoyou.desktop`
 - executable is `Mach-O 64-bit executable arm64`
 - `hdiutil verify` reports the checksum is valid
 - signing is Developer ID for official packages or ad-hoc/unsigned when `--no-sign` was used

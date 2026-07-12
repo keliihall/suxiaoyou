@@ -41,6 +41,7 @@ import type {
   RespondResult,
   SessionInputMode,
   SessionInputResponse,
+  SessionInputUpdateRequest,
   TaskBatchRequest,
 } from "@/types/chat";
 import type { PaginatedMessages } from "@/types/message";
@@ -580,6 +581,56 @@ export function useChat(currentSessionId?: string) {
     [currentSessionId, queryClient],
   );
 
+  const updateQueuedInput = useCallback(
+    async (
+      inputId: string,
+      update: SessionInputUpdateRequest,
+    ): Promise<boolean> => {
+      if (!currentSessionId) return false;
+      const key = queryKeys.sessionInputs(currentSessionId);
+      const previous = queryClient.getQueryData<SessionInputResponse[]>(key);
+
+      queryClient.setQueryData<SessionInputResponse[]>(key, (old) => {
+        const items = sortSessionInputs(old ?? []);
+        const index = items.findIndex((item) => item.id === inputId);
+        if (index < 0) return items;
+        if (update.mode) {
+          items[index] = { ...items[index], mode: update.mode };
+        }
+        if (update.move) {
+          const neighborIndex = update.move === "up" ? index - 1 : index + 1;
+          if (neighborIndex >= 0 && neighborIndex < items.length) {
+            [items[index], items[neighborIndex]] = [items[neighborIndex], items[index]];
+          }
+        }
+        if (update.position) {
+          const [moving] = items.splice(index, 1);
+          const targetIndex = Math.min(Math.max(update.position - 1, 0), items.length);
+          items.splice(targetIndex, 0, moving);
+        }
+        return items;
+      });
+
+      try {
+        await api.patch<SessionInputResponse>(
+          API.CHAT.SESSION_INPUT(currentSessionId, inputId),
+          update,
+        );
+        if (update.mode === "steer") {
+          toast.success(i18n.t("inputSteerSubmitted", { ns: "chat" }));
+        }
+        await queryClient.invalidateQueries({ queryKey: key });
+        return true;
+      } catch (err) {
+        queryClient.setQueryData(key, previous);
+        console.error("Failed to update queued input:", err);
+        toast.error(i18n.t("inputUpdateFailed", { ns: "chat" }));
+        return false;
+      }
+    },
+    [currentSessionId, queryClient],
+  );
+
   const stopGeneration = useCallback(async (): Promise<boolean> => {
     if (stopInFlightRef.current) return false;
     const chatState = useChatStore.getState();
@@ -1030,6 +1081,7 @@ export function useChat(currentSessionId?: string) {
     sendMessage,
     queueMessage,
     cancelQueuedInput,
+    updateQueuedInput,
     pendingInputs,
     sendTaskBatch,
     editAndResend,

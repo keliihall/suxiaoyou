@@ -1,8 +1,11 @@
 "use client";
 
 import Link from "next/link";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
-import { PanelLeft, Search, SquarePen } from "lucide-react";
+import { FolderPlus, Loader2, PanelLeft, Search, SquarePen } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -13,6 +16,7 @@ import {
 import { useSidebarStore } from "@/stores/sidebar-store";
 import { useIsMacOS } from "@/hooks/use-platform";
 import { IS_DESKTOP, TITLE_BAR_HEIGHT } from "@/lib/constants";
+import { browseDirectory } from "@/lib/upload";
 
 /**
  * Floating icon strip anchored to the top-left of the window.
@@ -23,18 +27,34 @@ import { IS_DESKTOP, TITLE_BAR_HEIGHT } from "@/lib/constants";
  * left of the chat area. Either way their x coordinate doesn't move.
  *
  * Approximate footprint (used by ChatHeader to reserve left padding):
- *   macOS:         ≈ 187px  (91 left inset + 3 × 28 buttons + gaps)
- *   Windows/Linux: ≈ 132px  (12 left pad + 3 × 36 buttons + gaps)
+ *   macOS:         ≈ 221px  (91 left inset + 4 × 28 buttons + gaps)
+ *   Windows/Linux: ≈ 166px  (12 left pad + 4 × 36 buttons + gaps)
  */
-export const WINDOW_TOP_ICONS_WIDTH_MAC = 187;
-export const WINDOW_TOP_ICONS_WIDTH_OTHER = 132;
+export const WINDOW_TOP_ICONS_WIDTH_MAC = 221;
+export const WINDOW_TOP_ICONS_WIDTH_OTHER = 166;
 
 export function WindowTopIcons() {
   const { t } = useTranslation("common");
+  const router = useRouter();
+  const [isPickingDirectory, setIsPickingDirectory] = useState(false);
   const isMac = useIsMacOS();
   const isCollapsed = useSidebarStore((s) => s.isCollapsed);
   const toggle = useSidebarStore((s) => s.toggle);
   const setSearchModalOpen = useSidebarStore((s) => s.setSearchModalOpen);
+
+  const handleAddProject = async () => {
+    if (isPickingDirectory) return;
+    setIsPickingDirectory(true);
+    try {
+      const path = await browseDirectory(t("addProject"));
+      if (path) router.push(`/c/new?directory=${encodeURIComponent(path)}`);
+    } catch (error) {
+      console.error("Failed to pick project directory:", error);
+      toast.error(t("addProjectFailed"));
+    } finally {
+      setIsPickingDirectory(false);
+    }
+  };
 
   if (!IS_DESKTOP) return null;
 
@@ -65,6 +85,26 @@ export function WindowTopIcons() {
           <TooltipContent side="bottom">
             {t(isCollapsed ? "openSidebar" : "toggleSidebar")}
           </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--sidebar-hover)]"
+              onClick={() => void handleAddProject()}
+              disabled={isPickingDirectory}
+              aria-label={t("addProject")}
+              data-testid="window-add-project"
+            >
+              {isPickingDirectory ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FolderPlus className="h-4 w-4" />
+              )}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{t("addProject")}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>

@@ -15,9 +15,11 @@ import { useModels } from "@/hooks/use-models";
 import { useChatStore, useChatSession } from "@/stores/chat-store";
 import { startStream } from "@/lib/session-stream-registry";
 import { useSettingsStore } from "@/stores/settings-store";
+import { cn } from "@/lib/utils";
 
 interface ContextIndicatorProps {
   sessionId: string;
+  compact?: boolean;
 }
 
 const DEFAULT_OUTPUT_BUDGET = 8192;
@@ -69,7 +71,7 @@ function ProgressRing({ percentage, color }: { percentage: number; color: string
   );
 }
 
-export function ContextIndicator({ sessionId }: ContextIndicatorProps) {
+export function ContextIndicator({ sessionId, compact = false }: ContextIndicatorProps) {
   const { t } = useTranslation('chat');
   const queryClient = useQueryClient();
   const { data: models } = useModels();
@@ -144,7 +146,10 @@ export function ContextIndicator({ sessionId }: ContextIndicatorProps) {
         <Button
           variant="ghost"
           size="icon"
-          className="relative h-9 w-9 rounded-[var(--radius)] disabled:pointer-events-auto disabled:opacity-100"
+          className={cn(
+            "relative rounded-[var(--radius)] disabled:pointer-events-auto disabled:opacity-100",
+            compact ? "h-8 w-8" : "h-9 w-9",
+          )}
           aria-label={meetsManualCompactionThreshold ? t('contextCompactNow') : t('contextCompactThreshold')}
           aria-disabled={isDisabled}
           onClick={handleManualCompact}
@@ -156,7 +161,7 @@ export function ContextIndicator({ sessionId }: ContextIndicatorProps) {
           )}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" align="end" sideOffset={8} className="pointer-events-none w-[220px] rounded-lg border border-[var(--border-default)] bg-[var(--surface-tertiary)] px-3 py-2.5 shadow-[var(--shadow-md)]">
+      <TooltipContent side={compact ? "top" : "bottom"} align="end" sideOffset={8} className="pointer-events-none w-[220px] rounded-lg border border-[var(--border-default)] bg-[var(--surface-tertiary)] px-3 py-2.5 shadow-[var(--shadow-md)]">
         <div className="flex flex-col items-center text-center space-y-2">
           <div className="w-full space-y-0.5">
             <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--text-tertiary)]">{t('contextWindow')}</div>

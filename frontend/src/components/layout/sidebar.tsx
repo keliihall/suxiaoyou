@@ -45,7 +45,7 @@ export function Sidebar() {
       >
         <SidebarHeader />
         <SidebarNav />
-        <ProjectsToolbar variant="primary" />
+        {!IS_DESKTOP && <ProjectsToolbar variant="primary" />}
         <Suspense fallback={<div className="flex-1" />}>
           <SessionList />
         </Suspense>

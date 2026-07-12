@@ -22,6 +22,7 @@ async function installSessionInputApi(
 ) {
   let items = [...initial];
   const posts: Array<Record<string, unknown>> = [];
+  const patches: Array<Record<string, unknown>> = [];
   let getCount = 0;
 
   await page.route("**/api/chat/inputs**", async (route: Route) => {
@@ -90,11 +91,53 @@ async function installSessionInputApi(
       });
       return;
     }
+    if (match && match[2] && method === "PATCH") {
+      const inputId = decodeURIComponent(match[2]);
+      const body = request.postDataJSON() as { mode?: "queue" | "steer"; move?: "up" | "down"; position?: number };
+      patches.push({ inputId, ...body });
+      const index = items.findIndex((item) => item.id === inputId);
+      if (index < 0) {
+        await route.fulfill({ status: 409, body: "{}" });
+        return;
+      }
+      if (body.mode) {
+        items[index] = {
+          ...items[index],
+          mode: body.mode,
+          target_stream_id: body.mode === "steer" ? "stream-slow" : null,
+        };
+      }
+      if (body.move) {
+        const neighbor = body.move === "up" ? index - 1 : index + 1;
+        if (neighbor >= 0 && neighbor < items.length) {
+          const currentPosition = items[index].position;
+          items[index].position = items[neighbor].position;
+          items[neighbor].position = currentPosition;
+          items.sort((a, b) => a.position - b.position);
+        }
+      }
+      if (body.position) {
+        const [moving] = items.splice(index, 1);
+        const targetIndex = Math.min(Math.max(body.position - 1, 0), items.length);
+        items.splice(targetIndex, 0, moving);
+        items.forEach((item, itemIndex) => {
+          item.position = itemIndex + 1;
+        });
+      }
+      const updated = items.find((item) => item.id === inputId)!;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(updated),
+      });
+      return;
+    }
     await route.fallback();
   });
 
   return {
     posts,
+    patches,
     get getCount() {
       return getCount;
     },
@@ -116,7 +159,7 @@ test.describe("long-task follow-up queue", () => {
     await seed苏小有Storage(page, { force: true });
   });
 
-  test("keeps the composer active, separates stop/send, supports steer, order, and cancel", async ({ page }) => {
+  test("defaults to queue, then supports edit, steer, order, and cancel from the queue", async ({ page }) => {
     await mock苏小有Api(page);
     const inputs = await installSessionInputApi(page);
     await startSlowTask(page);
@@ -132,23 +175,35 @@ test.describe("long-task follow-up queue", () => {
     await expect(page.getByTestId("pending-inputs")).toContainText(
       "Run the validation suite after the current task",
     );
-    await expect(
-      page.getByRole("button", { name: "Move pending input 1 back to composer" }),
-    ).toHaveCount(0);
-
-    await page.getByTestId("input-delivery-mode").click();
-    await expect(page.getByText(/next safe boundary/i)).toBeVisible();
-    await page.getByText("Steer current task", { exact: true }).click();
+    await page.getByRole("button", { name: "More actions for queued message 1" }).click();
+    await expect(page.getByRole("menuitem", { name: "Edit" })).toBeVisible();
+    await page.mouse.click(500, 500);
+    await expect(page.getByRole("menuitem", { name: "Edit" })).toHaveCount(0);
+    await expect(page.getByTestId("input-delivery-mode")).toHaveCount(0);
 
     await composer.fill("Prioritize the data-loss check first");
-    await page.getByRole("button", { name: "Steer current task", exact: true }).click();
+    await page.getByRole("button", { name: "Queue follow-up" }).click();
     await expect.poll(() => inputs.posts.length).toBe(2);
-    expect(inputs.posts[1]?.mode).toBe("steer");
+    expect(inputs.posts[1]?.mode).toBe("queue");
     await expect(page.getByTestId("pending-inputs")).toContainText(
       "Prioritize the data-loss check first",
     );
 
-    await page.getByRole("button", { name: "Cancel pending input 1" }).click();
+    await page.getByRole("button", { name: "More actions for queued message 2" }).click();
+    await page.getByRole("menuitem", { name: "Steer" }).click();
+    await expect.poll(() => inputs.patches.length).toBe(1);
+    expect(inputs.patches[0]).toMatchObject({ mode: "steer" });
+
+    const queueRows = page.getByTestId("pending-inputs").locator("li");
+    await queueRows.nth(1).dragTo(queueRows.nth(0));
+    await expect.poll(() => inputs.patches.length).toBe(2);
+    expect(inputs.patches[1]).toMatchObject({ position: 1 });
+    await expect(page.getByTestId("pending-inputs").locator("li").first()).toContainText(
+      "Prioritize the data-loss check first",
+    );
+
+    await page.getByRole("button", { name: "More actions for queued message 2" }).click();
+    await page.getByRole("menuitem", { name: "Cancel" }).click();
     await expect(page.getByTestId("pending-inputs")).not.toContainText(
       "Run the validation suite after the current task",
     );
@@ -266,7 +321,8 @@ test.describe("long-task follow-up queue", () => {
     ], { loseDeleteResponse: true });
 
     await page.goto("/c/session-alpha");
-    await page.getByRole("button", { name: "Move pending input 1 back to composer" }).click();
+    await page.getByRole("button", { name: "More actions for queued message 1" }).click();
+    await page.getByRole("menuitem", { name: "Edit" }).click();
 
     await expect(page.getByPlaceholder(/Describe the result you want/i)).toHaveValue(
       "Review this interrupted follow-up before retrying",
@@ -294,7 +350,8 @@ test.describe("long-task follow-up queue", () => {
     ]);
 
     await page.goto("/c/session-alpha");
-    await page.getByRole("button", { name: "Move pending input 1 back to composer" }).click();
+    await page.getByRole("button", { name: "More actions for queued message 1" }).click();
+    await page.getByRole("menuitem", { name: "Edit" }).click();
 
     await expect(page.getByPlaceholder(/Describe the result you want/i)).toHaveValue(
       "Edit me before explicitly sending again",

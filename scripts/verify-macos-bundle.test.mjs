@@ -82,7 +82,7 @@ function commandRunner(fixture, overrides = {}) {
       return {
         stdout:
           {
-            CFBundleIdentifier: "com.chaoyuanxinzhi.suxiaoyou",
+            CFBundleIdentifier: "com.suxiaoyou.desktop",
             CFBundleExecutable: "suxiaoyou-desktop",
             CFBundleName: "苏小有",
             CFBundleShortVersionString: PRODUCT_VERSION,
@@ -165,7 +165,7 @@ test("checks every Mach-O, Node, Info.plist, and the embedded backend", async ()
   assert.equal(result.nodeVersion, "v22.22.0");
   assert.equal(result.npmVersion, "10.9.4");
   assert.equal(result.npxVersion, "10.9.4");
-  assert.equal(result.bundleIdentifier, "com.chaoyuanxinzhi.suxiaoyou");
+  assert.equal(result.bundleIdentifier, "com.suxiaoyou.desktop");
   assert.equal(result.backendPreflightPassed, true);
   assert.equal(result.releaseLicenseCount, REQUIRED_RELEASE_LICENSE_FILES.length);
   assert.equal(

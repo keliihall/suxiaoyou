@@ -171,6 +171,31 @@ fn epoch_ms() -> u64 {
 
 fn predecessor_data_dir(app_data_dir: &Path) -> Option<PathBuf> {
     let data_root = app_data_dir.parent()?;
+    let current_identifier = app_data_dir.file_name()?;
+
+    // Before the product-owned bundle identifier was introduced, releases
+    // still ended their application-support directory in `.suxiaoyou`.
+    // Discover that sibling generically so the retired publisher name does
+    // not remain embedded in the application while existing users keep their
+    // data after upgrading.
+    let mut suxiaoyou_predecessors = std::fs::read_dir(data_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let identifier = file_name.to_string_lossy();
+            (file_name != current_identifier && identifier.ends_with(".suxiaoyou"))
+                .then(|| entry.path().join("data"))
+        })
+        .filter(|candidate| candidate.is_dir())
+        .collect::<Vec<_>>();
+    suxiaoyou_predecessors.sort();
+    if let Some(candidate) = suxiaoyou_predecessors.into_iter().next() {
+        return Some(candidate);
+    }
+
     let predecessor_identifier = format!("com.{}.desktop", concat!("open", "yak"));
     Some(data_root.join(predecessor_identifier).join("data"))
 }
@@ -1567,7 +1592,7 @@ mod startup_contract_tests {
     use serde_json::json;
     use std::path::Path;
     use std::process::Stdio;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
@@ -1582,7 +1607,7 @@ mod startup_contract_tests {
 
     #[test]
     fn predecessor_data_directory_is_a_sibling_of_current_app_data() {
-        let current = Path::new("/application-support/com.chaoyuanxinzhi.suxiaoyou");
+        let current = Path::new("/application-support/com.suxiaoyou.desktop");
         let expected_identifier = format!("com.{}.desktop", concat!("open", "yak"));
         assert_eq!(
             predecessor_data_dir(current).unwrap(),
@@ -1590,6 +1615,26 @@ mod startup_contract_tests {
                 .join(expected_identifier)
                 .join("data")
         );
+    }
+
+    #[test]
+    fn predecessor_data_directory_discovers_a_prior_suxiaoyou_identifier() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "suxiaoyou-predecessor-{}-{unique}",
+            std::process::id()
+        ));
+        let current = root.join("com.suxiaoyou.desktop");
+        let predecessor = root.join("desktop.suxiaoyou").join("data");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&predecessor).unwrap();
+
+        assert_eq!(predecessor_data_dir(&current), Some(predecessor));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

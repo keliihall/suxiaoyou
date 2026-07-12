@@ -220,6 +220,58 @@ async def cancel_session_input(
     return result.rowcount == 1
 
 
+async def update_queued_session_input(
+    db: AsyncSession,
+    session_id: str,
+    item_id: str,
+    *,
+    mode: InputMode | None = None,
+    target_stream_id: str | None = None,
+    move: Literal["up", "down"] | None = None,
+    position: int | None = None,
+) -> SessionInput | None:
+    """Change delivery mode or ordering while an input is still unclaimed."""
+
+    items = list(
+        (
+            await db.execute(
+                select(SessionInput)
+                .where(
+                    SessionInput.session_id == session_id,
+                    SessionInput.status == "queued",
+                )
+                .order_by(SessionInput.position.asc(), SessionInput.time_created.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    index = next((i for i, item in enumerate(items) if item.id == item_id), None)
+    if index is None:
+        return None
+
+    item = items[index]
+    if mode is not None:
+        item.mode = mode
+        item.target_stream_id = target_stream_id if mode == "steer" else None
+
+    if move is not None:
+        neighbor_index = index - 1 if move == "up" else index + 1
+        if 0 <= neighbor_index < len(items):
+            neighbor = items[neighbor_index]
+            item.position, neighbor.position = neighbor.position, item.position
+
+    if position is not None:
+        items.pop(index)
+        target_index = min(max(position - 1, 0), len(items))
+        items.insert(target_index, item)
+        for new_position, queued_item in enumerate(items, start=1):
+            queued_item.position = new_position
+
+    await db.flush()
+    return item
+
+
 async def block_interrupted_inputs(db: AsyncSession) -> int:
     """Prevent an interrupted, possibly side-effecting input from auto-replay."""
     result = await db.execute(

@@ -2,11 +2,21 @@
 
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, ChevronDown, GitBranch, ListPlus, Play, Plus, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, CircleEllipsis, CornerUpLeft, GitBranch, GripVertical, ListPlus, MoreHorizontal, Play, Plus, RotateCcw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { ChatTextarea } from "./chat-textarea";
 import { ChatActions } from "./chat-actions";
+import { ContextIndicator } from "./context-indicator";
+import { HeaderModelDropdown } from "@/components/selectors/header-model-dropdown";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkspaceToggle } from "./workspace-toggle";
 import { FileChip } from "./file-chip";
 import { FileMentionPopup } from "./file-mention-popup";
@@ -16,7 +26,7 @@ import type { FileSearchResult } from "@/lib/upload";
 import { cn } from "@/lib/utils";
 import { formatElapsedDuration } from "@/lib/duration";
 import { resolveComposerWorkspace } from "@/lib/session-inputs";
-import type { FileAttachment, SessionInputMode, SessionInputResponse } from "@/types/chat";
+import type { FileAttachment, SessionInputMode, SessionInputResponse, SessionInputUpdateRequest } from "@/types/chat";
 import { useArtifactStore } from "@/stores/artifact-store";
 import { useChatSession } from "@/stores/chat-store";
 import { useSettingsStore } from "@/stores/settings-store";
@@ -34,9 +44,9 @@ interface ChatFormProps {
   onQueue?: (text: string, attachments?: FileAttachment[], mode?: SessionInputMode) => Promise<boolean> | void;
   pendingInputs?: SessionInputResponse[];
   onCancelInput?: (inputId: string) => Promise<boolean> | void;
+  onUpdateInput?: (inputId: string, update: SessionInputUpdateRequest) => Promise<boolean> | void;
   isProgressStalled?: boolean;
   lastBusinessProgressAt?: number | null;
-  onReconnect?: () => void;
   onSendTaskBatch?: (batch: { mode: TaskBatchMode; tasks: TaskBatchTask[] }) => Promise<boolean> | void;
   onStop: () => void;
   className?: string;
@@ -235,9 +245,9 @@ export function ChatForm({
   onQueue,
   pendingInputs = [],
   onCancelInput,
+  onUpdateInput,
   isProgressStalled = false,
   lastBusinessProgressAt = null,
-  onReconnect,
   onSendTaskBatch,
   onStop,
   className,
@@ -252,8 +262,8 @@ export function ChatForm({
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchMode, setBatchMode] = useState<TaskBatchMode>("parallel");
   const [batchTasks, setBatchTasks] = useState<TaskDraft[]>([]);
-  const [inputMode, setInputMode] = useState<SessionInputMode>("queue");
-  const [inputModeOpen, setInputModeOpen] = useState(false);
+  const [draggedInputId, setDraggedInputId] = useState<string | null>(null);
+  const [dragOverInputId, setDragOverInputId] = useState<string | null>(null);
   const { ref, resize } = useAutoResize();
   const dropTargetRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -275,7 +285,6 @@ export function ChatForm({
   const sendingRef = useRef(false);
   const taskDraftIdRef = useRef(0);
   const tauriDropHandledAtRef = useRef(0);
-  const previousGeneratingRef = useRef(isGenerating);
   const [statusNow, setStatusNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -284,17 +293,6 @@ export function ChatForm({
     const timer = window.setInterval(() => setStatusNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [isGenerating, isProgressStalled]);
-
-  // Every newly started task defaults back to the safer, predictable queue
-  // behavior. A user's explicit steer choice remains active only for the
-  // current run.
-  useEffect(() => {
-    if (isGenerating && !previousGeneratingRef.current) {
-      setInputMode("queue");
-      setInputModeOpen(false);
-    }
-    previousGeneratingRef.current = isGenerating;
-  }, [isGenerating]);
 
   // Track latest values for draft save-on-unmount (avoids stale closures)
   const inputRef = useRef(input);
@@ -563,7 +561,7 @@ export function ChatForm({
         ref.current.style.height = "auto";
       }
       const result = isGenerating && onQueue
-        ? await onQueue(text, files.length > 0 ? files : undefined, inputMode)
+        ? await onQueue(text, files.length > 0 ? files : undefined, "queue")
         : await onSend(text, files.length > 0 ? files : undefined);
       // Restore input if send failed
       if (result === false) {
@@ -575,7 +573,7 @@ export function ChatForm({
     } finally {
       sendingRef.current = false;
     }
-  }, [input, attachments, isGenerating, isCompacting, inputMode, onQueue, onSend, ref, draftKey]);
+  }, [input, attachments, isGenerating, isCompacting, onQueue, onSend, ref, draftKey]);
 
   const handleSendTaskBatch = useCallback(async () => {
     if (!onSendTaskBatch || isGenerating || isCompacting || sendingRef.current) return;
@@ -779,10 +777,10 @@ export function ChatForm({
       <div className="mx-auto max-w-3xl xl:max-w-4xl">
         {isGenerating && isProgressStalled && (
           <div
-            className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2 text-xs text-[var(--text-secondary)]"
+            className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--text-secondary)]"
             data-testid="progress-stalled-notice"
           >
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--color-warning)]" />
+            <CircleEllipsis className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]" />
             <span className="min-w-0 flex-1">
               <span className="font-medium text-[var(--text-primary)]" role="status" aria-live="polite">
                 {t("taskMayBeStalled")}
@@ -795,16 +793,6 @@ export function ChatForm({
               {t("taskMayBeStalledHint")}
             </span>
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {onReconnect && (
-                <button
-                  type="button"
-                  onClick={onReconnect}
-                  className="inline-flex min-h-8 items-center gap-1 rounded-lg border border-[var(--border-default)] bg-[var(--surface-primary)] px-2.5 font-medium text-[var(--text-primary)] hover:bg-[var(--surface-tertiary)]"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  {t("taskReconnect")}
-                </button>
-              )}
               <button
                 type="button"
                 onClick={onStop}
@@ -833,8 +821,12 @@ export function ChatForm({
             <ol className="max-h-36 overflow-y-auto py-1">
               {pendingInputs.map((item, index) => {
                 const canCancel = item.status === "queued" || item.status === "blocked";
-                const canRestore = item.status === "blocked"
-                  || (!isGenerating && item.status === "queued");
+                const canRestore = canCancel;
+                const canMove = item.status === "queued";
+                const canSteer = item.status === "queued" && item.mode === "queue";
+                const queuedPosition = pendingInputs
+                  .filter((candidate) => candidate.status === "queued")
+                  .findIndex((candidate) => candidate.id === item.id) + 1;
                 const hasDraft = !!input.trim() || attachments.length > 0;
                 const summary = item.text.trim()
                   || item.attachments.map((attachment) => attachment.name).join(", ")
@@ -842,9 +834,46 @@ export function ChatForm({
                 return (
                   <li
                     key={item.id}
-                    className="group flex min-w-0 items-center gap-2 px-3 py-1.5 text-xs"
+                    draggable={canMove}
+                    onDragStart={(event) => {
+                      if (!canMove) return;
+                      setDraggedInputId(item.id);
+                      setDragOverInputId(item.id);
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", item.id);
+                    }}
+                    onDragOver={(event) => {
+                      if (!canMove || !draggedInputId || draggedInputId === item.id) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      setDragOverInputId(item.id);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      if (canMove && draggedInputId && draggedInputId !== item.id) {
+                        void onUpdateInput?.(draggedInputId, { position: queuedPosition });
+                      }
+                      setDraggedInputId(null);
+                      setDragOverInputId(null);
+                    }}
+                    onDragEnd={() => {
+                      setDraggedInputId(null);
+                      setDragOverInputId(null);
+                    }}
+                    className={cn(
+                      "group flex min-w-0 items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-xs transition-colors",
+                      canMove && "cursor-grab active:cursor-grabbing",
+                      draggedInputId === item.id && "opacity-50",
+                      dragOverInputId === item.id && draggedInputId !== item.id && "border-l-[var(--brand-primary)] bg-[var(--surface-tertiary)]",
+                    )}
                     data-testid={`pending-input-${item.id}`}
                   >
+                    {canMove && (
+                      <GripVertical
+                        className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)] opacity-45 group-hover:opacity-100"
+                        aria-hidden="true"
+                      />
+                    )}
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--surface-tertiary)] text-[10px] tabular-nums text-[var(--text-secondary)]">
                       {index + 1}
                     </span>
@@ -859,36 +888,59 @@ export function ChatForm({
                         {t("pendingInputFiles", { count: item.attachments.length })}
                       </span>
                     )}
-                    <span className="shrink-0 rounded-full bg-[var(--surface-tertiary)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]">
-                      {t(item.mode === "steer" ? "inputModeSteerShort" : "inputModeQueueShort")}
-                    </span>
+                    {item.mode === "steer" && (
+                      <span className="shrink-0 rounded-full bg-[var(--surface-tertiary)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                        {t("inputModeSteerShort")}
+                      </span>
+                    )}
                     {item.status !== "queued" && (
                       <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
                         {t(`inputStatus_${item.status}`)}
                       </span>
                     )}
-                    {canRestore && (
-                      <button
-                        type="button"
-                        onClick={() => void handleRestorePendingInput(item)}
-                        disabled={hasDraft || !onCancelInput}
-                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--text-tertiary)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-30"
-                        aria-label={t("inputRestoreAria", { position: index + 1 })}
-                        title={hasDraft ? t("inputRestoreDraftBusy") : t("inputRestore")}
-                      >
-                        <RotateCcw className="h-3.5 w-3.5" />
-                      </button>
+                    {canCancel && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--text-tertiary)] opacity-70 transition-colors hover:bg-[var(--surface-tertiary)] hover:text-[var(--text-primary)] group-hover:opacity-100 data-[state=open]:bg-[var(--surface-tertiary)] data-[state=open]:opacity-100"
+                            aria-label={t("inputMoreActionsAria", { position: index + 1 })}
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-48">
+                          {canSteer && (
+                            <DropdownMenuItem
+                              onSelect={() => void onUpdateInput?.(item.id, { mode: "steer" })}
+                              disabled={!onUpdateInput}
+                            >
+                              <CornerUpLeft className="h-4 w-4" />
+                              {t("inputSteer")}
+                            </DropdownMenuItem>
+                          )}
+                          {canRestore && (
+                            <DropdownMenuItem
+                              onSelect={() => void handleRestorePendingInput(item)}
+                              disabled={hasDraft || !onCancelInput}
+                              title={hasDraft ? t("inputRestoreDraftBusy") : undefined}
+                            >
+                              <RotateCcw className="h-4 w-4" />
+                              {t("inputRestore")}
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onSelect={() => void onCancelInput?.(item.id)}
+                            disabled={!onCancelInput}
+                            className="text-[var(--color-destructive)] focus:text-[var(--color-destructive)]"
+                          >
+                            <X className="h-4 w-4" />
+                            {t("inputCancel")}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => onCancelInput?.(item.id)}
-                      disabled={!canCancel || !onCancelInput}
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--text-tertiary)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-30"
-                      aria-label={t("inputCancelAria", { position: index + 1 })}
-                      title={canCancel ? t("inputCancel") : t("inputAlreadyApplying")}
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
                   </li>
                 );
               })}
@@ -1157,58 +1209,6 @@ export function ChatForm({
               </Popover>
             )}
 
-            {isGenerating && onQueue && (
-              <Popover open={inputModeOpen} onOpenChange={setInputModeOpen}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-[var(--surface-secondary)] px-3 text-[12px] font-medium text-[var(--text-primary)] hover:bg-[var(--surface-secondary)]/80"
-                    aria-label={t("inputDeliveryMode")}
-                    data-testid="input-delivery-mode"
-                  >
-                    <span>{t(inputMode === "steer" ? "inputModeSteerShort" : "inputModeQueueShort")}</span>
-                    <ChevronDown className="h-3 w-3 opacity-50" />
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent
-                  align="end"
-                  sideOffset={8}
-                  className="w-80 p-1.5"
-                  role="radiogroup"
-                  aria-label={t("inputDeliveryMode")}
-                >
-                  {(["queue", "steer"] as SessionInputMode[]).map((mode) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      role="radio"
-                      aria-checked={inputMode === mode}
-                      onClick={() => {
-                        setInputMode(mode);
-                        setInputModeOpen(false);
-                      }}
-                      className={cn(
-                        "flex w-full items-start gap-2 rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--surface-secondary)]",
-                        inputMode === mode && "bg-[var(--surface-secondary)]",
-                      )}
-                    >
-                      <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
-                        {inputMode === mode && <Check className="h-3.5 w-3.5" />}
-                      </span>
-                      <span className="min-w-0">
-                        <span className="block text-[13px] font-medium text-[var(--text-primary)]">
-                          {t(mode === "steer" ? "inputModeSteer" : "inputModeQueue")}
-                        </span>
-                        <span className="mt-0.5 block text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                          {t(mode === "steer" ? "inputModeSteerDescription" : "inputModeQueueDescription")}
-                        </span>
-                      </span>
-                    </button>
-                  ))}
-                </PopoverContent>
-              </Popover>
-            )}
-
             <div className="flex-1" />
 
             {compactingStatusText && (
@@ -1216,6 +1216,15 @@ export function ChatForm({
                 {compactingStatusText}
               </div>
             )}
+
+            <div className="flex min-w-0 shrink items-center gap-0.5">
+              <HeaderModelDropdown compact />
+              {sessionId && (
+                <TooltipProvider delayDuration={200}>
+                  <ContextIndicator sessionId={sessionId} compact />
+                </TooltipProvider>
+              )}
+            </div>
 
             <ChatActions
               isBusy={isGenerating || isCompacting}
@@ -1228,10 +1237,10 @@ export function ChatForm({
               onSend={handleSend}
               onStop={onStop}
               sendLabel={isGenerating
-                ? t(inputMode === "steer" ? "inputSteerAction" : "inputQueueAction")
+                ? t("inputQueueAction")
                 : t("sendAction")}
               sendHint={isGenerating
-                ? t(inputMode === "steer" ? "inputSteerActionHint" : "inputQueueActionHint")
+                ? t("inputQueueActionHint")
                 : t("sendActionHint")}
             />
           </div>

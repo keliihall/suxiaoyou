@@ -1,7 +1,7 @@
 # Source availability and provenance
 
 This document tells recipients where to obtain the Source Code Form for
-MPL-2.0 components included in 苏小有 v0.8.0. The exact-version links below
+MPL-2.0 components included in 苏小有 v0.8.1. The exact-version links below
 provide the source without charge. 苏小有 does not intentionally modify the
 listed upstream MPL-covered source files.
 
@@ -56,7 +56,6 @@ The complete data-license agreement is in `CDLA-PERMISSIVE-2.0.txt`.
   Version name, and final SHA-256 are recorded in
   `backend/app/data/fonts/PROVENANCE.md` and
   `SUXIAOYOU-CJK-FONT-OFL-1.1.txt`.
-- OpenYak: <https://github.com/openyak/openyak>
 - Anthropic Agent Skills source-equivalent snapshot for the eight permitted
   bundled skill directories:
   <https://github.com/anthropics/skills/tree/7029232b9212482c0476da354b83364bd28fab2f>
