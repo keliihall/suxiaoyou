@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { AlertCircle, Check, ChevronDown, Loader2 } from "lucide-react";
 import { useProviderModels } from "@/hooks/use-provider-models";
-import { useModelArenaMap, type ArenaScore } from "@/hooks/use-arena-scores";
 import { useSettingsStore } from "@/stores/settings-store";
 import {
   Popover,
@@ -27,60 +26,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { usdToCentsPerM, formatUsdPerM } from "@/lib/pricing";
 import type { ModelInfo } from "@/types/model";
-
-const PROVIDER_LABELS: Record<string, string> = {
-  openai: "OpenAI",
-  anthropic: "Anthropic",
-  google: "Gemini",
-  groq: "Groq",
-  deepseek: "深度求索",
-  mistral: "Mistral",
-  xai: "xAI",
-  together: "Together",
-  deepinfra: "DeepInfra",
-  cerebras: "Cerebras",
-  cohere: "Cohere",
-  perplexity: "Perplexity",
-  fireworks: "Fireworks",
-  azure: "Azure",
-  openrouter: "聚合平台",
-  qwen: "通义千问",
-  kimi: "Kimi（月之暗面）",
-  minimax: "MiniMax（稀宇科技）",
-  zhipu: "智谱 AI",
-  siliconflow: "硅基流动",
-  xiaomi: "小米 MiMo",
-  "rapid-mlx": "Rapid-MLX",
-};
-
-type SortMode = "name" | "price" | "quality" | "popular" | "free";
-
-function isFreeModel(m: ModelInfo): boolean {
-  return m.pricing.prompt === 0 && m.pricing.completion === 0;
-}
 
 function isLegacyFreeRouterModel(m: ModelInfo): boolean {
   const normalizedName = m.name.trim().toLowerCase();
   return m.id === "openrouter/auto" || normalizedName === "free models router";
 }
-
-const SORT_BUTTONS_FULL: { key: SortMode; i18n: string }[] = [
-  { key: "popular", i18n: "popular" },
-  { key: "quality", i18n: "quality" },
-  { key: "price", i18n: "price" },
-  { key: "free", i18n: "free" },
-  { key: "name", i18n: "name" },
-];
-
-const SORT_BUTTONS_SIMPLE: { key: SortMode; i18n: string }[] = [
-  { key: "name", i18n: "name" },
-  { key: "price", i18n: "price" },
-];
-
-/** Providers that have arena ranking data */
-const ARENA_PROVIDERS = new Set<string | null>([]);
 
 /**
  * Variant keywords that disambiguate providers with explicit tier naming
@@ -132,7 +83,7 @@ function preserveModelSuffix(name: string, max = 42): string {
   return `${name.slice(0, head).trimEnd()}…${name.slice(-tail).trimStart()}`;
 }
 
-export function HeaderModelDropdown() {
+export function HeaderModelDropdown({ compact = false }: { compact?: boolean }) {
   const { t } = useTranslation("common");
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -142,17 +93,9 @@ export function HeaderModelDropdown() {
     isError,
     activeProvider,
   } = useProviderModels();
-  const hasArena = ARENA_PROVIDERS.has(activeProvider);
-  const [sortBy, setSortBy] = useState<SortMode>(hasArena ? "popular" : "name");
   const { selectedModel, selectedProviderId, setSelectedModel } =
     useSettingsStore();
-  const sortButtons = hasArena ? SORT_BUTTONS_FULL : SORT_BUTTONS_SIMPLE;
-  // Reset sort mode when switching between providers with/without arena data
-  useEffect(() => {
-    setSortBy(hasArena ? "popular" : "name");
-  }, [hasArena]);
   const noModels = !activeProvider || (models ?? []).length === 0;
-  const arenaMap = useModelArenaMap(models);
   const visibleModels = useMemo(
     () => (models ?? []).filter((m) => !isLegacyFreeRouterModel(m)),
     [models],
@@ -192,50 +135,12 @@ export function HeaderModelDropdown() {
     activeProvider,
   ]);
 
-  const { freeModels, paidModels } = useMemo(() => {
-    if (visibleModels.length === 0) return { freeModels: [], paidModels: [] };
-
-    const free: ModelInfo[] = [];
-    const paid: ModelInfo[] = [];
-    const isSubscription = activeProvider === "chatgpt";
-
-    for (const m of visibleModels) {
-      if (isFreeModel(m)) free.push(m);
-      else paid.push(m);
-    }
-
-    // Subscription models: keep backend order (newest first). Others: sort normally.
-    if (!isSubscription) {
-      const makeSortFn = () => (a: ModelInfo, b: ModelInfo) => {
-        if (sortBy === "price") return a.pricing.prompt - b.pricing.prompt;
-        if (sortBy === "quality") {
-          const sa = arenaMap.get(a.id)?.arenaScore ?? 0;
-          const sb = arenaMap.get(b.id)?.arenaScore ?? 0;
-          if (sa === 0 && sb === 0) return a.name.localeCompare(b.name);
-          if (sa === 0) return 1;
-          if (sb === 0) return -1;
-          if (sa !== sb) return sb - sa;
-          return a.name.localeCompare(b.name);
-        }
-        if (sortBy === "popular") {
-          const va = arenaMap.get(a.id)?.popularityRank ?? 0;
-          const vb = arenaMap.get(b.id)?.popularityRank ?? 0;
-          if (va === 0 && vb === 0) return a.name.localeCompare(b.name);
-          if (va === 0) return 1;
-          if (vb === 0) return -1;
-          if (va !== vb) return va - vb; // ascending: rank 1 first
-          return a.name.localeCompare(b.name);
-        }
-        // Name sort: reverse natural order — higher version numbers first (newer)
-        return b.name.localeCompare(a.name, undefined, { numeric: true });
-      };
-
-      free.sort(makeSortFn());
-      paid.sort(makeSortFn());
-    }
-
-    return { freeModels: free, paidModels: paid };
-  }, [visibleModels, sortBy, arenaMap, activeProvider]);
+  const sortedModels = useMemo(
+    () => [...visibleModels].sort((a, b) =>
+      b.name.localeCompare(a.name, undefined, { numeric: true }),
+    ),
+    [visibleModels],
+  );
 
   const selectedInfo =
     visibleModels.find(
@@ -256,7 +161,10 @@ export function HeaderModelDropdown() {
       <button
         type="button"
         disabled
-        className="inline-flex h-7 max-w-[220px] items-center gap-1.5 rounded-lg border-none bg-transparent px-3 text-[13px] font-semibold text-[var(--text-tertiary)] shadow-none focus:outline-none cursor-default"
+        className={cn(
+          "inline-flex h-7 items-center gap-1.5 rounded-lg border-none bg-transparent font-semibold text-[var(--text-tertiary)] shadow-none focus:outline-none cursor-default",
+          compact ? "max-w-[160px] px-2 text-[12px]" : "max-w-[220px] px-3 text-[13px]",
+        )}
       >
         <Loader2 className="h-4 w-4 animate-spin shrink-0" />
         <span className="truncate">
@@ -274,7 +182,10 @@ export function HeaderModelDropdown() {
             <button
               type="button"
               onClick={() => router.push("/settings?tab=providers")}
-              className="inline-flex h-7 max-w-[220px] items-center gap-1.5 rounded-lg border-none bg-transparent px-3 text-[13px] font-semibold text-[var(--text-secondary)] shadow-none transition-colors hover:bg-[var(--surface-secondary)] focus:outline-none cursor-pointer"
+              className={cn(
+                "inline-flex h-7 items-center gap-1.5 rounded-lg border-none bg-transparent font-semibold text-[var(--text-secondary)] shadow-none transition-colors hover:bg-[var(--surface-secondary)] focus:outline-none cursor-pointer",
+                compact ? "max-w-[160px] px-2 text-[12px]" : "max-w-[220px] px-3 text-[13px]",
+              )}
             >
               <AlertCircle className="h-4 w-4 shrink-0 text-[var(--color-destructive)]" />
               <span className="truncate">
@@ -301,7 +212,10 @@ export function HeaderModelDropdown() {
       <button
         type="button"
         onClick={() => router.push("/settings?tab=providers")}
-        className="inline-flex h-7 max-w-[220px] items-center gap-1.5 rounded-lg border-none bg-transparent px-3 text-[13px] font-semibold text-[var(--text-secondary)] shadow-none transition-colors hover:bg-[var(--surface-secondary)] focus:outline-none cursor-pointer"
+        className={cn(
+          "inline-flex h-7 items-center gap-1.5 rounded-lg border-none bg-transparent font-semibold text-[var(--text-secondary)] shadow-none transition-colors hover:bg-[var(--surface-secondary)] focus:outline-none cursor-pointer",
+          compact ? "max-w-[160px] px-2 text-[12px]" : "max-w-[220px] px-3 text-[13px]",
+        )}
       >
         <span className="truncate">{t("setupProvider")}</span>
         <ChevronDown className="h-4 w-4 opacity-50 shrink-0" />
@@ -327,12 +241,14 @@ export function HeaderModelDropdown() {
             "inline-flex translate-y-[1px] items-center gap-1.5 rounded-lg border-none bg-transparent px-3 shadow-none transition-colors hover:bg-[var(--surface-secondary)] focus:outline-none cursor-pointer",
             // Two-line layout when a variant is detected; otherwise keep single
             // line so the visual matches the existing dropdown trigger height.
-            modelVariant
-              ? "h-10 max-w-[320px] sm:max-w-[420px] py-1"
-              : "h-7 max-w-[320px] sm:max-w-[420px] text-[13px] font-semibold text-[var(--text-primary)]",
+            compact
+              ? "h-7 max-w-[160px] px-2 text-[12px] font-semibold text-[var(--text-primary)]"
+              : modelVariant
+                ? "h-10 max-w-[320px] sm:max-w-[420px] py-1"
+                : "h-7 max-w-[320px] sm:max-w-[420px] text-[13px] font-semibold text-[var(--text-primary)]",
           )}
         >
-          {modelVariant ? (
+          {modelVariant && !compact ? (
             <span className="flex flex-col items-start min-w-0 leading-tight">
               <span className="truncate max-w-full text-[13px] font-semibold text-[var(--text-primary)]">
                 {modelFamily}
@@ -348,35 +264,13 @@ export function HeaderModelDropdown() {
         </button>
       </PopoverTrigger>
       <PopoverContent
-        className="w-[min(520px,calc(100vw-24px))] p-0 overflow-hidden"
-        align="start"
+        className="w-[min(320px,calc(100vw-24px))] p-0 overflow-hidden"
+        align={compact ? "end" : "start"}
         sideOffset={4}
       >
         <TooltipProvider delayDuration={300}>
           <Command>
             <CommandInput placeholder={t("searchModels")} />
-            {/* Sort bar */}
-            <div className="flex items-center gap-1 px-3 py-1.5 border-b border-[var(--border-default)]">
-              <span className="text-[10px] text-[var(--text-tertiary)] uppercase tracking-wider mr-auto">
-                {t("sortBy")}
-              </span>
-              {sortButtons.map(({ key, i18n }) => (
-                <button
-                  key={key}
-                  type="button"
-                  onPointerDown={(e) => e.preventDefault()}
-                  onClick={() => setSortBy(key)}
-                  className={cn(
-                    "px-2 py-0.5 text-[11px] rounded-md transition-colors",
-                    sortBy === key
-                      ? "bg-[var(--surface-secondary)] text-[var(--text-primary)]"
-                      : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]",
-                  )}
-                >
-                  {t(i18n)}
-                </button>
-              ))}
-            </div>
             <CommandList>
               <CommandEmpty>{t("noModelFound")}</CommandEmpty>
 
@@ -385,55 +279,22 @@ export function HeaderModelDropdown() {
                   <div className="h-5 rounded-md bg-[var(--surface-tertiary)] animate-pulse" />
                 </div>
               ) : (
-                <>
-                  {/* Paid models first (hidden in free filter mode) */}
-                  {sortBy !== "free" && paidModels.length > 0 && (
-                    <CommandGroup
-                      heading={freeModels.length > 0 ? t("premium") : undefined}
-                    >
-                      {paidModels.map((model) => (
-                        <ModelRow
-                          key={`${model.provider_id}/${model.id}`}
-                          model={model}
-                          isSelected={
-                            selectedModel === model.id &&
-                            selectedProviderId === model.provider_id
-                          }
-                          arena={arenaMap.get(model.id)}
-                          sortBy={sortBy}
-                          onSelect={() => {
-                            setSelectedModel(model.id, model.provider_id);
-                            setOpen(false);
-                          }}
-                          t={t}
-                        />
-                      ))}
-                    </CommandGroup>
-                  )}
-
-                  {/* Free models below */}
-                  {freeModels.length > 0 && (
-                    <CommandGroup heading={t("free")}>
-                      {freeModels.map((model) => (
-                        <ModelRow
-                          key={`${model.provider_id}/${model.id}`}
-                          model={model}
-                          isSelected={
-                            selectedModel === model.id &&
-                            selectedProviderId === model.provider_id
-                          }
-                          arena={arenaMap.get(model.id)}
-                          sortBy={sortBy}
-                          onSelect={() => {
-                            setSelectedModel(model.id, model.provider_id);
-                            setOpen(false);
-                          }}
-                          t={t}
-                        />
-                      ))}
-                    </CommandGroup>
-                  )}
-                </>
+                <CommandGroup>
+                  {sortedModels.map((model) => (
+                    <ModelRow
+                      key={`${model.provider_id}/${model.id}`}
+                      model={model}
+                      isSelected={
+                        selectedModel === model.id &&
+                        selectedProviderId === model.provider_id
+                      }
+                      onSelect={() => {
+                        setSelectedModel(model.id, model.provider_id);
+                        setOpen(false);
+                      }}
+                    />
+                  ))}
+                </CommandGroup>
               )}
             </CommandList>
           </Command>
@@ -446,40 +307,18 @@ export function HeaderModelDropdown() {
 function ModelRow({
   model,
   isSelected,
-  arena,
-  sortBy,
   onSelect,
-  t,
 }: {
   model: ModelInfo;
   isSelected: boolean;
-  arena: ArenaScore | undefined;
-  sortBy: SortMode;
   onSelect: () => void;
-  t: (key: string) => string;
 }) {
-  const free = isFreeModel(model);
-  const isSubscription = model.provider_id === "openai-subscription";
-  const inputCents = usdToCentsPerM(model.pricing.prompt);
-  const outputCents = usdToCentsPerM(model.pricing.completion);
-
-  const showArena =
-    (sortBy === "quality" && arena && arena.arenaScore > 0) ||
-    (sortBy === "popular" && arena && arena.popularityRank > 0);
-
-  const providerLabel = PROVIDER_LABELS[model.provider_id] ?? model.provider_id;
-  const showProviderBadge =
-    model.provider_id !== "openrouter" &&
-    model.provider_id !== "openai-subscription" &&
-    model.provider_id !== "ollama" &&
-    model.provider_id !== "rapid-mlx";
-
   return (
     <CommandItem
-      value={`${model.name} ${providerLabel}`}
+      value={model.name}
       onSelect={onSelect}
       className="text-sm"
-      title={`${model.name} (${model.id})`}
+      title={model.name}
     >
       <Check
         className={cn(
@@ -487,80 +326,7 @@ function ModelRow({
           isSelected ? "opacity-100" : "opacity-0",
         )}
       />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate">{model.name}</span>
-        {model.id !== model.name && (
-          <span className="block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-            {model.id}
-          </span>
-        )}
-      </span>
-      {showProviderBadge && (
-        <span className="ml-1.5 shrink-0 text-[9px] font-medium text-[var(--text-tertiary)] bg-[var(--surface-tertiary)] px-1 py-0.5 rounded">
-          {providerLabel}
-        </span>
-      )}
-      {/* Right-side badge: contextual based on sort mode */}
-      {isSubscription ? (
-        <span className="ml-2 shrink-0 text-[10px] font-medium text-[var(--brand-primary)] bg-[var(--brand-primary)]/10 px-1.5 py-0.5 rounded">
-          INCLUDED
-        </span>
-      ) : model.provider_id === "ollama" ||
-        model.provider_id === "rapid-mlx" ? (
-        <span className="ml-2 shrink-0 text-[10px] font-medium text-[var(--text-tertiary)] bg-[var(--surface-tertiary)] px-1.5 py-0.5 rounded">
-          LOCAL
-        </span>
-      ) : free ? (
-        <span className="ml-2 shrink-0 text-[10px] font-medium text-[var(--color-success)] bg-[var(--color-success)]/10 px-1.5 py-0.5 rounded">
-          FREE
-        </span>
-      ) : showArena && arena ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="ml-2 shrink-0 text-[11px] font-mono tabular-nums text-[var(--text-tertiary)]">
-              {sortBy === "quality"
-                ? arena.arenaScore
-                : `#${arena.popularityRank}`}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="right" className="text-xs">
-            {arena.arenaScore > 0 && (
-              <div>Intelligence: {arena.arenaScore}</div>
-            )}
-            {arena.popularityRank > 0 && (
-              <div>Popularity: #{arena.popularityRank}</div>
-            )}
-            <div>
-              {t("inputPrice")}: {formatUsdPerM(inputCents)}
-            </div>
-            <div>
-              {t("outputPrice")}: {formatUsdPerM(outputCents)}
-            </div>
-          </TooltipContent>
-        </Tooltip>
-      ) : (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="ml-2 shrink-0 text-[11px] font-mono tabular-nums text-[var(--text-tertiary)]">
-              {formatUsdPerM(inputCents)}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="right" className="text-xs">
-            <div>
-              {t("inputPrice")}: {formatUsdPerM(inputCents)}
-            </div>
-            <div>
-              {t("outputPrice")}: {formatUsdPerM(outputCents)}
-            </div>
-            {arena && arena.arenaScore > 0 && (
-              <div>Intelligence: {arena.arenaScore}</div>
-            )}
-            {arena && arena.popularityRank > 0 && (
-              <div>Popularity: #{arena.popularityRank}</div>
-            )}
-          </TooltipContent>
-        </Tooltip>
-      )}
+      <span className="min-w-0 flex-1 truncate">{model.name}</span>
     </CommandItem>
   );
 }

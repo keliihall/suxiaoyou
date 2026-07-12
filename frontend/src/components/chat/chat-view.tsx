@@ -32,11 +32,11 @@ export function ChatView({ sessionId }: ChatViewProps) {
     sendMessage,
     queueMessage,
     cancelQueuedInput,
+    updateQueuedInput,
     pendingInputs,
     sendTaskBatch,
     editAndResend,
     stopGeneration,
-    reconnectGeneration,
     recoverInteraction,
     respondToPermission,
     respondToQuestion,
@@ -177,7 +177,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
   return (
     <div className="relative flex flex-1 flex-col h-full overflow-hidden bg-[var(--surface-chat)]">
       <OfflineOverlay />
-      <ChatHeader sessionId={sessionId} />
+      <ChatHeader sessionId={sessionId} title={session?.title} />
 
       {/* Message list */}
       <MessageList
@@ -241,9 +241,9 @@ export function ChatView({ sessionId }: ChatViewProps) {
           onQueue={queueMessage}
           pendingInputs={pendingInputs}
           onCancelInput={cancelQueuedInput}
+          onUpdateInput={updateQueuedInput}
           isProgressStalled={isProgressStalled}
           lastBusinessProgressAt={lastBusinessProgressAt}
-          onReconnect={reconnectGeneration}
           onSendTaskBatch={sendTaskBatch}
           onStop={stopGeneration}
           sessionId={sessionId}

@@ -1,15 +1,13 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Sun, Moon, Monitor, Eye, EyeOff, ExternalLink } from "lucide-react";
+import { Sun, Moon, Monitor, Eye, EyeOff } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
 import { Separator } from "@/components/ui/separator";
 import { IS_DESKTOP } from "@/lib/constants";
 import { TextPart } from "@/components/parts/text-part";
 import { AppearanceCustomize } from "@/components/settings/appearance-customize";
-import { openLatestReleasePage } from "@/lib/release-link";
 import frontendPackage from "../../../package.json";
 
 export function GeneralTab() {
@@ -36,23 +34,6 @@ export function GeneralTab() {
       ? t("light")
       : t("dark")
     : null;
-
-  const handleOpenReleases = async () => {
-    try {
-      await openLatestReleasePage({
-        desktop: IS_DESKTOP,
-        openDesktop: async (url) => {
-          const { desktopAPI } = await import("@/lib/tauri-api");
-          await desktopAPI.openExternal(url);
-        },
-        openWeb: (url, target, features) =>
-          window.open(url, target, features),
-      });
-    } catch (error) {
-      console.error("Failed to open the official release page:", error);
-      toast.error(t("aboutReleasesOpenFailed"));
-    }
-  };
 
   return (
     <div className="space-y-8">
@@ -172,19 +153,6 @@ export function GeneralTab() {
           <p>{t('aboutVersion', { version: appVersion })}</p>
           <p>{t('aboutDesc')}</p>
           <p>{t('aboutCopyright')}</p>
-        </div>
-        <div className="mt-4 rounded-xl border border-[var(--border-default)] bg-[var(--surface-secondary)] p-3">
-          <button
-            type="button"
-            onClick={() => void handleOpenReleases()}
-            className="inline-flex min-h-9 items-center gap-2 rounded-lg px-2 text-ui-caption font-medium text-[var(--text-primary)] hover:bg-[var(--surface-tertiary)]"
-          >
-            <ExternalLink className="h-4 w-4" />
-            {t("aboutReleasesAction")}
-          </button>
-          <p className="mt-1 px-2 text-ui-2xs leading-relaxed text-[var(--text-tertiary)]">
-            {t("aboutReleasesDesc")}
-          </p>
         </div>
       </section>
     </div>

@@ -137,10 +137,10 @@ test("about copy matches the 苏小有 product", () => {
 
   assert.equal(zhSettings.aboutVersion, "苏小有 v{{version}}");
   assert.equal(zhSettings.aboutDesc, "“小有所成，小有智慧。”  面向桌面端工作的AI助理。");
-  assert.equal(zhSettings.aboutCopyright, "超元新智 © 2026");
+  assert.equal(zhSettings.aboutCopyright, "苏小有 © 2026");
   assert.equal(enSettings.aboutVersion, "苏小有 v{{version}}");
   assert.equal(enSettings.aboutDesc, "“小有所成，小有智慧。”  面向桌面端工作的AI助理。");
-  assert.equal(enSettings.aboutCopyright, "超元新智 © 2026");
+  assert.equal(enSettings.aboutCopyright, "苏小有 © 2026");
 });
 
 test("frontend fonts remain reproducible without network access", () => {

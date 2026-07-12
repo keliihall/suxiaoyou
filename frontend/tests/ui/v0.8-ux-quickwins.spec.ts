@@ -221,12 +221,10 @@ test("Windows keeps New Project visible with only an unscoped conversation and o
 
   await page.goto("/c/new");
 
-  await expectStableCreateActions(page);
+  const addProject = page.getByTestId("window-add-project");
+  await expect(addProject).toBeVisible();
   await expect(page.getByText("Only conversation on Windows")).toBeVisible();
-  await page
-    .getByTestId("sidebar-primary-actions")
-    .getByRole("button", { name: "Add new project", exact: true })
-    .click();
+  await addProject.click();
 
   await expect
     .poll(() =>
@@ -260,8 +258,8 @@ test("Windows restores the fixed New Project action after reopening a collapsed 
   await page.goto("/c/new");
 
   const sidebar = page.locator('aside[aria-label="Chat sidebar"]');
-  const actions = sidebar.getByTestId("sidebar-primary-actions");
-  await expect(actions).toBeVisible();
+  const addProject = page.getByTestId("window-add-project");
+  await expect(addProject).toBeVisible();
 
   await page.getByRole("button", { name: "Toggle sidebar" }).click();
   await expect(sidebar).toHaveAttribute("inert", "");
@@ -276,7 +274,7 @@ test("Windows restores the fixed New Project action after reopening a collapsed 
   await expect
     .poll(() => sidebar.evaluate((element) => element.getBoundingClientRect().width))
     .toBeGreaterThan(200);
-  await expect(actions).toBeVisible();
+  await expect(addProject).toBeVisible();
 });
 
 test("a narrow Windows window exposes New Project in the responsive sidebar drawer", async ({
@@ -298,7 +296,7 @@ test("a narrow Windows window exposes New Project in the responsive sidebar draw
   await expect(drawer.getByText("No conversations yet")).toBeVisible();
 });
 
-test("About opens the fixed official Releases page without a silent download", async ({
+test("About shows product information without a GitHub download entry", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -312,16 +310,14 @@ test("About opens the fixed official Releases page without a silent download", a
   });
   await page.goto("/settings");
 
-  await page.getByRole("button", { name: "View latest version and downloads" }).click();
-  await expect(page.getByText(/Nothing is downloaded or installed automatically/i)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "About" })).toBeVisible();
+  await expect(page.getByText(/苏小有 v0\.8\.1/)).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "View latest version and downloads" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("link", { name: /GitHub|download/i })).toHaveCount(0);
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { __RELEASE_WINDOW_OPEN_CALLS__?: unknown[][] })
       .__RELEASE_WINDOW_OPEN_CALLS__,
-  )).toEqual([
-    [
-      "https://github.com/keliihall/suxiaoyou/releases/latest",
-      "_blank",
-      "noopener,noreferrer",
-    ],
-  ]);
+  )).toEqual([]);
 });

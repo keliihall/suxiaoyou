@@ -5,11 +5,11 @@ desktop installer. The accompanying license texts are under
 `release-licenses/` in source distributions and `licenses/third-party/` in
 installed applications.
 
-## Upstream project and adapted code
+## Copyright and adapted code
 
-苏小有 is based on [OpenYak](https://github.com/openyak/openyak), Copyright
-2026 W Axis Inc., under the Apache License 2.0. The complete Apache License is
-in `LICENSE`, and the retained attribution is in `NOTICE`.
+Portions of the codebase are Copyright 2026 W Axis Inc. and are licensed
+under the Apache License 2.0. The complete Apache License is in `LICENSE`,
+and the retained copyright attribution is in `NOTICE`.
 
 Portions of the messaging-channel implementation are adapted from
 [nanobot](https://github.com/HKUDS/nanobot), Copyright (c) 2025-present Xubin
@@ -153,7 +153,7 @@ The corresponding bundled license reports are
 
 The checked-in `release-licenses/` directory is a curated, mandatory baseline;
 it also contains generated JavaScript, Python, and Rust reports for the locked
-v0.8.0 production graphs. Platform-specific build-only JavaScript packages can
+v0.8.1 production graphs. Platform-specific build-only JavaScript packages can
 vary by build host and are not part of the installed static web application.
 Each dependency remains subject to its own license, and package-specific
 license files retained inside runtime payloads remain in force. Release

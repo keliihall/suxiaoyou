@@ -9,12 +9,17 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.dependencies import SessionFactoryDep, StreamManagerDep
-from app.schemas.chat import SessionInputRequest, SessionInputResponse
+from app.schemas.chat import (
+    SessionInputRequest,
+    SessionInputResponse,
+    SessionInputUpdateRequest,
+)
 from app.models.session_input import SessionInput
 from app.session.input_queue import (
     cancel_session_input,
     enqueue_session_input,
     list_session_inputs,
+    update_queued_session_input,
 )
 from app.session.idempotency import canonical_request_hash
 from app.session.managed_workspace import snapshot_attachments
@@ -266,6 +271,44 @@ async def get_session_inputs(
             _response(item)
             for item in await list_session_inputs(db, session_id)
         ]
+
+
+@router.patch(
+    "/chat/inputs/{session_id}/{item_id}",
+    response_model=SessionInputResponse,
+)
+async def patch_session_input(
+    session_id: str,
+    item_id: str,
+    body: SessionInputUpdateRequest,
+    stream_manager: StreamManagerDep,
+    session_factory: SessionFactoryDep,
+) -> SessionInputResponse:
+    if body.mode is None and body.move is None and body.position is None:
+        raise HTTPException(status_code=422, detail="A mode or position operation is required")
+
+    active = stream_manager.active_job_for_session(session_id)
+    if active is None or not active.accepting_session_inputs:
+        raise HTTPException(status_code=409, detail="The current task is no longer accepting inputs")
+
+    async with active.session_input_lock:
+        async with session_factory() as db:
+            async with db.begin():
+                item = await update_queued_session_input(
+                    db,
+                    session_id,
+                    item_id,
+                    mode=body.mode,
+                    target_stream_id=active.stream_id if body.mode == "steer" else None,
+                    move=body.move,
+                    position=body.position,
+                )
+        if item is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Only inputs that have not started can be changed",
+            )
+    return _response(item)
 
 
 @router.delete("/chat/inputs/{session_id}/{item_id}")

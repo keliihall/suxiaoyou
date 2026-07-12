@@ -115,7 +115,7 @@ test("product identifiers use the 苏小有 namespace", () => {
   assert.equal(rootPackage.name, "suxiaoyou");
   assert.equal(frontendPackage.name, "suxiaoyou-frontend");
   assert.equal(tauriPackage.name, "suxiaoyou-desktop-tauri");
-  assert.equal(tauriConfig.identifier, "com.chaoyuanxinzhi.suxiaoyou");
+  assert.equal(tauriConfig.identifier, "com.suxiaoyou.desktop");
   assert.match(cargoToml, /name = "suxiaoyou-desktop"/);
   assert.match(cargoToml, /name = "suxiaoyou_desktop_lib"/);
   assert.equal(existsSync("../backend/suxiaoyou.spec"), true);

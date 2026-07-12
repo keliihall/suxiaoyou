@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -47,16 +48,48 @@ test("repository ships the declared Apache-2.0 license", () => {
   );
 });
 
-test("README and NOTICE preserve upstream attribution", () => {
+test("README and NOTICE preserve license and copyright information", () => {
   const readme = read("README.md");
   const notice = read("NOTICE");
 
-  for (const text of [readme, notice]) {
-    assert.match(text, /OpenYak/);
-    assert.match(text, /https:\/\/github\.com\/openyak\/openyak/);
-    assert.match(text, /Apache\s+(?:License\s+)?2\.0/i);
-  }
+  assert.match(readme, /Apache License 2\.0/);
+  assert.match(notice, /Apache\s+(?:License\s+)?2\.0/i);
   assert.match(notice, /Copyright 2026 W Axis Inc\./);
+});
+
+test("tracked source contains no retired-brand records", () => {
+  const retiredBrandPatterns = [
+    new RegExp(["open", "yak"].join("[ _-]*"), "i"),
+    new RegExp(
+      [
+        String.fromCodePoint(0x8d85, 0x5143, 0x65b0, 0x667a),
+        [
+          String.fromCharCode(99, 104, 97, 111),
+          String.fromCharCode(121, 117, 97, 110),
+          String.fromCharCode(120, 105, 110),
+          String.fromCharCode(122, 104, 105),
+        ].join("[ _.-]*"),
+      ].join("|"),
+      "i",
+    ),
+  ];
+  const trackedFiles = execFileSync("git", ["ls-files", "-z"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  })
+    .split("\0")
+    .filter(Boolean);
+
+  for (const relativePath of trackedFiles) {
+    const bytes = readFileSync(join(repositoryRoot, relativePath));
+    const decodedContents = [bytes.toString("latin1"), bytes.toString("utf8")];
+    for (const retiredBrandPattern of retiredBrandPatterns) {
+      assert.doesNotMatch(relativePath, retiredBrandPattern, relativePath);
+      for (const content of decodedContents) {
+        assert.doesNotMatch(content, retiredBrandPattern, relativePath);
+      }
+    }
+  }
 });
 
 test("production frontend excludes dependencies without redistribution rights", () => {

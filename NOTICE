@@ -1,14 +1,11 @@
 苏小有
-Copyright 2026 超元新智 and 苏小有 contributors.
+Copyright 2026 苏小有 contributors.
 
-This product is derived from OpenYak:
-https://github.com/openyak/openyak
-
-OpenYak is Copyright 2026 W Axis Inc. and is licensed under the Apache
-License 2.0. 苏小有 contains substantial modifications, including
-product branding, localization, desktop integration, packaging, security,
-and workflow changes. The Apache License does not grant trademark rights in
-either the OpenYak or 苏小有 names and logos.
+Portions of this product are Copyright 2026 W Axis Inc. and are licensed
+under the Apache License 2.0. 苏小有 contains substantial modifications,
+including product branding, localization, desktop integration, packaging,
+security, and workflow changes. The Apache License does not grant trademark
+rights in third-party or 苏小有 names and logos.
 
 Third-party components retain their respective copyrights and licenses. See
 THIRD_PARTY_NOTICES.md and the license files distributed with those

@@ -105,3 +105,18 @@ test("an existing folderless conversation never inherits the last global project
     "/new-chat/default",
   );
 });
+
+test("running-task messages default to queue and can be edited, steered, or reordered", () => {
+  const form = readFileSync("src/components/chat/chat-form.tsx", "utf8");
+  const hook = readFileSync("src/hooks/use-chat.ts", "utf8");
+
+  assert.match(form, /onQueue\(text,[\s\S]*"queue"\)/);
+  assert.doesNotMatch(form, /data-testid="input-delivery-mode"/);
+  assert.match(form, /onUpdateInput\?\.\(item\.id, \{ mode: "steer" \}\)/);
+  assert.match(form, /draggable=\{canMove\}/);
+  assert.match(form, /onUpdateInput\?\.\(draggedInputId, \{ position: queuedPosition \}\)/);
+  assert.doesNotMatch(form, /inputMoveUp|inputMoveDown/);
+  assert.match(form, /CornerUpLeft/);
+  assert.match(form, /const canRestore = canCancel/);
+  assert.match(hook, /api\.patch<SessionInputResponse>/);
+});

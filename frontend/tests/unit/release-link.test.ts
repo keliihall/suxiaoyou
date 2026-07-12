@@ -35,13 +35,12 @@ test("web releases open a noopener window without initiating a download", async 
   ]);
 });
 
-test("About names the download destination and uses the existing desktop bridge", () => {
+test("About does not expose a GitHub release or download entry", () => {
   const general = readFileSync("src/components/settings/general-tab.tsx", "utf8");
   const en = JSON.parse(readFileSync("src/i18n/locales/en/settings.json", "utf8"));
   const zh = JSON.parse(readFileSync("src/i18n/locales/zh/settings.json", "utf8"));
 
-  assert.match(general, /desktopAPI\.openExternal\(url\)/);
-  assert.equal(en.aboutReleasesAction, "View latest version and downloads");
-  assert.equal(zh.aboutReleasesAction, "查看最新版本与下载");
-  assert.match(zh.aboutReleasesDesc, /不会自动下载或安装/);
+  assert.doesNotMatch(general, /release-link|openExternal|aboutReleases/);
+  assert.equal(en.aboutReleasesAction, undefined);
+  assert.equal(zh.aboutReleasesAction, undefined);
 });

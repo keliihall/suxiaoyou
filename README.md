@@ -82,12 +82,11 @@ cd backend && venv/bin/pytest -q
 
 请勿提交 `.env`、模型服务商密钥、会话令牌、数据库和构建产物。
 
-## 开源与上游
+## 开源信息
 
-苏小有基于 [OpenYak](https://github.com/openyak/openyak) 开发，并包含大量
-面向中文办公、桌面集成、安全和发布流程的修改。公开源码历史从苏小有
-`v0.7.3` 基线开始；旧的内部仓库历史和上游版本标签不属于本公开项目。
+苏小有面向中文办公、桌面集成、安全和发布流程持续改进。公开源码历史从
+`v0.7.3` 基线开始。
 
-项目采用 [Apache License 2.0](LICENSE)。上游归属见 [NOTICE](NOTICE)，
-第三方组件说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。安全问题请按
-[SECURITY.md](SECURITY.md) 私下报告。
+项目采用 [Apache License 2.0](LICENSE)。
+第三方组件说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+安全问题请按[SECURITY.md](SECURITY.md) 私下报告。

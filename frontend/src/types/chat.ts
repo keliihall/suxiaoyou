@@ -62,6 +62,12 @@ export interface SessionInputResponse {
   error_message?: string | null;
 }
 
+export interface SessionInputUpdateRequest {
+  mode?: SessionInputMode;
+  move?: "up" | "down";
+  position?: number;
+}
+
 export type TaskBatchMode = "sequential" | "parallel";
 
 export interface TaskBatchTask {

@@ -18,7 +18,7 @@ const verifyBundleScript = join(scriptDirectory, "verify-bundle.mjs");
 const expectedProductVersion = JSON.parse(
   readFileSync(join(repositoryRoot, "package.json"), "utf8"),
 ).version;
-const EXPECTED_BUNDLE_IDENTIFIER = "com.chaoyuanxinzhi.suxiaoyou";
+const EXPECTED_BUNDLE_IDENTIFIER = "com.suxiaoyou.desktop";
 const EXPECTED_PRODUCT_NAME = "苏小有";
 const SUPPORTED_ARCHITECTURES = new Set(["arm64", "x86_64"]);
 const DISALLOWED_BUNDLE_XATTRS = Object.freeze([
