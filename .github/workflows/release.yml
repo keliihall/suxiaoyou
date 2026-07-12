@@ -852,7 +852,7 @@ jobs:
             echo "::error::RPM architecture is $RPM_ARCH, expected $EXPECTED_RPM_ARCH"
             exit 1
           }
-          grep -Eq '(^|, )libxdo3([ (]|$)' <<< "$DEB_DEPENDS" || {
+          grep -Eq '(^|, )libxdo3([, (]|$)' <<< "$DEB_DEPENDS" || {
             echo "::error::DEB runtime dependencies do not include libxdo3: $DEB_DEPENDS"
             exit 1
           }

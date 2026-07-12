@@ -445,7 +445,7 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   assert.match(linux, /dpkg-deb -f .* Version/);
   assert.match(linux, /dpkg-deb -f .* Architecture/);
   assert.match(linux, /DEB_DEPENDS=.*dpkg-deb -f .* Depends/);
-  assert.match(linux, /libxdo3/);
+  assert.match(linux, /libxdo3\(\[, \(\]\|\$\)/);
   assert.match(linux, /RPM_PACKAGE=.*rpm -qp --queryformat '%\{NAME\}'/);
   assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
   assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
