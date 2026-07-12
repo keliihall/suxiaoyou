@@ -64,6 +64,18 @@ export function expectedReleaseAssets(version) {
       format: "rpm",
       name: `suxiaoyou-${version}-linux-x86_64.rpm`,
     },
+    {
+      platform: "linux",
+      architecture: "arm64",
+      format: "deb",
+      name: `suxiaoyou-${version}-linux-arm64.deb`,
+    },
+    {
+      platform: "linux",
+      architecture: "arm64",
+      format: "rpm",
+      name: `suxiaoyou-${version}-linux-aarch64.rpm`,
+    },
   ];
 }
 

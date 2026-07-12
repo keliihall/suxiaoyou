@@ -15,6 +15,7 @@ on:
           - macos-x64
           - windows-x64
           - linux-x64
+          - linux-arm64
 
 permissions:
   contents: read
@@ -735,10 +736,18 @@ jobs:
           retention-days: 1
 
   build-linux:
-    name: Build Linux x64
+    name: Build Linux ${{ matrix.target == 'linux-arm64' && 'ARM64' || 'x64' }}
     needs: validate-release
-    if: github.event_name == 'push' || inputs.target == 'linux-x64'
-    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || startsWith(inputs.target, 'linux-')
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event_name == 'push' && '["linux-x64","linux-arm64"]' || inputs.target == 'linux-arm64' && '["linux-arm64"]' || '["linux-x64"]') }}
+    runs-on: ${{ matrix.target == 'linux-arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    env:
+      BUILD_CONFIG: ${{ matrix.target == 'linux-arm64' && 'src-tauri/build.linux-arm64.json' || 'src-tauri/build.linux-x64.json' }}
+      EXPECTED_DEB_ARCH: ${{ matrix.target == 'linux-arm64' && 'arm64' || 'amd64' }}
+      EXPECTED_RPM_ARCH: ${{ matrix.target == 'linux-arm64' && 'aarch64' || 'x86_64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -791,7 +800,7 @@ jobs:
       - name: Build Tauri Linux installers
         run: |
           cd desktop-tauri
-          npm exec tauri build -- --config src-tauri/build.linux-x64.json --no-sign
+          npm exec tauri build -- --config "$BUILD_CONFIG" --no-sign
 
       - name: Verify Linux installers and packaged Node.js toolchain
         run: |
@@ -829,16 +838,16 @@ jobs:
             echo "::error::DEB version is $DEB_VERSION, expected $VERSION"
             exit 1
           }
-          [[ "$DEB_ARCH" == "amd64" ]] || {
-            echo "::error::DEB architecture is $DEB_ARCH, expected amd64"
+          [[ "$DEB_ARCH" == "$EXPECTED_DEB_ARCH" ]] || {
+            echo "::error::DEB architecture is $DEB_ARCH, expected $EXPECTED_DEB_ARCH"
             exit 1
           }
           [[ "$RPM_VERSION" == "$VERSION" ]] || {
             echo "::error::RPM version is $RPM_VERSION, expected $VERSION"
             exit 1
           }
-          [[ "$RPM_ARCH" == "x86_64" ]] || {
-            echo "::error::RPM architecture is $RPM_ARCH, expected x86_64"
+          [[ "$RPM_ARCH" == "$EXPECTED_RPM_ARCH" ]] || {
+            echo "::error::RPM architecture is $RPM_ARCH, expected $EXPECTED_RPM_ARCH"
             exit 1
           }
 
@@ -982,7 +991,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-lifecycle-diagnostics-${{ github.run_attempt }}
+          name: ${{ matrix.target }}-lifecycle-diagnostics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-linux-*
           if-no-files-found: ignore
           retention-days: 7
@@ -991,7 +1000,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-x64-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
+          name: ${{ matrix.target }}-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
           path: |
             desktop-tauri/src-tauri/target/release/bundle/deb/*.deb
             desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
@@ -1048,11 +1057,15 @@ jobs:
           require_one "macOS Intel installer (*.dmg)" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg"
           require_one "Linux Debian installer (*.deb)" artifacts/linux-x64-release "*.deb"
           require_one "Linux RPM installer (*.rpm)" artifacts/linux-x64-release "*.rpm"
+          require_one "Linux ARM64 Debian installer (*.deb)" artifacts/linux-arm64-release "*.deb"
+          require_one "Linux ARM64 RPM installer (*.rpm)" artifacts/linux-arm64-release "*.rpm"
           require_one "Windows NSIS installer for app $APP_VERSION" artifacts/windows-release "*${APP_VERSION}*.exe"
           require_one "macOS Apple Silicon installer for app $APP_VERSION" "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_aarch64.dmg"
           require_one "macOS Intel installer for app $APP_VERSION" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_x64.dmg"
           require_one "Linux Debian installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.deb"
           require_one "Linux RPM installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.rpm"
+          require_one "Linux ARM64 Debian installer for app $APP_VERSION" artifacts/linux-arm64-release "*${APP_VERSION}*.deb"
+          require_one "Linux ARM64 RPM installer for app $APP_VERSION" artifacts/linux-arm64-release "*${APP_VERSION}*.rpm"
 
       - name: Stage release asset names
         run: |
@@ -1078,7 +1091,9 @@ jobs:
           copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suxiaoyou-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
           copy_one artifacts/linux-x64-release "*.deb" "suxiaoyou-${RELEASE_VERSION}-linux-amd64.deb"
           copy_one artifacts/linux-x64-release "*.rpm" "suxiaoyou-${RELEASE_VERSION}-linux-x86_64.rpm"
-          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "5" ]]
+          copy_one artifacts/linux-arm64-release "*.deb" "suxiaoyou-${RELEASE_VERSION}-linux-arm64.deb"
+          copy_one artifacts/linux-arm64-release "*.rpm" "suxiaoyou-${RELEASE_VERSION}-linux-aarch64.rpm"
+          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
 
       - name: Generate SHA-256 checksums
         run: node scripts/generate-checksums.mjs release-assets CHECKSUMS.md
@@ -1117,8 +1132,8 @@ jobs:
           ## 安装包信任与验证状态
 
           - Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
-          - Linux DEB/RPM：当前未配置仓库签名；已验证包元数据、完整解包和内置运行时。
-          - 五个平台安装包均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
+          - Linux x64/ARM64 DEB/RPM：当前未配置仓库签名；已在对应原生 runner 验证包元数据、完整解包、内置运行时和桌面生命周期。
+          - 七个安装包（Windows x64、macOS arm64/x64、Linux x64/ARM64）均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 

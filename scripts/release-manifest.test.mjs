@@ -48,7 +48,7 @@ function fixture(t, tag = TAG) {
   return { assetsDirectory, checksumFile, manifestFile, manifest };
 }
 
-test("generates and verifies a five-installer manual-download manifest", (t) => {
+test("generates and verifies a seven-installer manual-download manifest", (t) => {
   const data = fixture(t);
   const verified = verifyReleaseManifest({
     ...data,
@@ -59,7 +59,16 @@ test("generates and verifies a five-installer manual-download manifest", (t) => 
   assert.equal(verified.updateMode, "manual-download");
   assert.equal(verified.channel, "stable");
   assert.equal(verified.appVersion, "0.8.0");
-  assert.equal(verified.assets.length, 5);
+  assert.equal(verified.assets.length, 7);
+  assert.deepEqual(
+    verified.assets
+      .filter((asset) => asset.platform === "linux" && asset.architecture === "arm64")
+      .map(({ format, name }) => ({ format, name })),
+    [
+      { format: "deb", name: "suxiaoyou-0.8.0-linux-arm64.deb" },
+      { format: "rpm", name: "suxiaoyou-0.8.0-linux-aarch64.rpm" },
+    ],
+  );
   assert.equal(
     verified.checksumUrl,
     "https://github.com/keliihall/suxiaoyou/releases/download/v0.8.0/CHECKSUMS.md",

@@ -1,0 +1,25 @@
+{
+  "productName": "suxiaoyou",
+  "build": {
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "targets": ["deb", "rpm"],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
+      }
+    },
+    "resources": {
+      "../../backend/dist/suxiaoyou-backend": "backend",
+      "../../backend/resources/nodejs": "nodejs",
+      "../../LICENSE": "licenses/LICENSE",
+      "../../NOTICE": "licenses/NOTICE",
+      "../../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../../release-licenses": "licenses/third-party"
+    }
+  }
+}

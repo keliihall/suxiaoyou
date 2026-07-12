@@ -19,6 +19,9 @@ const macIntelConfig = JSON.parse(
 const linuxConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/build.linux-x64.json"), "utf8"),
 );
+const linuxArmConfig = JSON.parse(
+  readFileSync(join(root, "desktop-tauri/src-tauri/build.linux-arm64.json"), "utf8"),
+);
 const installerHooks = readFileSync(
   join(root, "desktop-tauri/src-tauri/installer-hooks.nsh"),
   "utf8",
@@ -105,12 +108,19 @@ test("manual releases select one target while tags keep both native macOS builds
     "macos-x64",
     "windows-x64",
     "linux-x64",
+    "linux-arm64",
   ]) {
     assert.match(workflow, new RegExp(`^\\s{10}- ${escapeRegExp(target)}$`, "m"));
   }
   assert.match(workflow, /^\s{8}default:\s*macos-aarch64$/m);
   assert.match(job("build-windows"), /inputs\.target == 'windows-x64'/);
-  assert.match(job("build-linux"), /inputs\.target == 'linux-x64'/);
+  const linux = job("build-linux");
+  assert.match(linux, /startsWith\(inputs\.target, 'linux-'\)/);
+  assert.match(linux, /fromJSON\([^\n]*linux-x64[^\n]*linux-arm64/);
+  assert.match(linux, /runs-on:[^\n]*ubuntu-22\.04-arm[^\n]*ubuntu-22\.04/);
+  assert.match(linux, /BUILD_CONFIG:[^\n]*build\.linux-arm64\.json[^\n]*build\.linux-x64\.json/);
+  assert.match(linux, /EXPECTED_DEB_ARCH:[^\n]*arm64[^\n]*amd64/);
+  assert.match(linux, /EXPECTED_RPM_ARCH:[^\n]*aarch64[^\n]*x86_64/);
   assert.match(mac, /inputs\.target == 'macos-aarch64'/);
   assert.match(mac, /inputs\.target == 'macos-x64'/);
   assert.match(mac, /fromJSON\([^\n]*aarch64-apple-darwin[^\n]*x86_64-apple-darwin/);
@@ -193,12 +203,17 @@ test("keeps the Chinese UI name while Linux packages use a stable ASCII identity
   assert.equal(tauriConfig.productName, "苏小有");
   assert.ok(tauriConfig.app.windows.every((window) => window.title === "苏小有"));
   assert.equal(linuxConfig.productName, "suxiaoyou");
+  assert.equal(linuxArmConfig.productName, "suxiaoyou");
   assert.equal(linuxConfig.mainBinaryName, undefined);
+  assert.equal(linuxArmConfig.mainBinaryName, undefined);
   assert.deepEqual(linuxConfig.bundle.resources, tauriConfig.bundle.resources);
+  assert.deepEqual(linuxArmConfig.bundle.resources, tauriConfig.bundle.resources);
 
   const templatePath = "linux/suxiaoyou.desktop.hbs";
   assert.equal(linuxConfig.bundle.linux.deb.desktopTemplate, templatePath);
   assert.equal(linuxConfig.bundle.linux.rpm.desktopTemplate, templatePath);
+  assert.equal(linuxArmConfig.bundle.linux.deb.desktopTemplate, templatePath);
+  assert.equal(linuxArmConfig.bundle.linux.rpm.desktopTemplate, templatePath);
   assert.match(linuxDesktopTemplate, /^\[Desktop Entry\]$/m);
   assert.match(linuxDesktopTemplate, /^Categories=\{\{categories\}\}$/m);
   assert.match(linuxDesktopTemplate, /^Comment=\{\{comment\}\}$/m);
@@ -221,7 +236,10 @@ test("ships the Windows installer in Simplified Chinese", () => {
     workflow,
     /Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode/,
   );
-  assert.match(workflow, /五个平台安装包均来自同一提交并通过统一前端功能门禁/);
+  assert.match(
+    workflow,
+    /七个安装包（Windows x64、macOS arm64\/x64、Linux x64\/ARM64）均来自同一提交/,
+  );
 });
 
 test("keeps Apple credentials step-scoped and fails stable tags fast", () => {
@@ -428,8 +446,10 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   assert.match(linux, /EXPECTED_PACKAGE="suxiaoyou"/);
   assert.match(linux, /DEB package is \$DEB_PACKAGE, expected \$EXPECTED_PACKAGE/);
   assert.match(linux, /RPM package is \$RPM_PACKAGE, expected \$EXPECTED_PACKAGE/);
-  assert.match(linux, /expected amd64/);
-  assert.match(linux, /expected x86_64/);
+  assert.match(linux, /EXPECTED_DEB_ARCH:[^\n]*arm64[^\n]*amd64/);
+  assert.match(linux, /EXPECTED_RPM_ARCH:[^\n]*aarch64[^\n]*x86_64/);
+  assert.match(linux, /expected \$EXPECTED_DEB_ARCH/);
+  assert.match(linux, /expected \$EXPECTED_RPM_ARCH/);
   assert.match(linux, /rpm -K/);
   assert.match(linux, /rpm2cpio/);
   assert.match(linux, /rpm2cpio .* > "\$RPM_PAYLOAD"/);
@@ -644,7 +664,7 @@ test("pins the packaged backend graph and excludes unreachable native SDKs", () 
   assert.doesNotMatch(backendProject, /^mcp\s*=\s*\[/m);
 });
 
-test("verifies all five installer types before publishing checksums", () => {
+test("verifies all seven installers before publishing checksums", () => {
   const publish = job("publish");
   const completenessIndex = publish.indexOf("Verify artifact completeness");
   const checksumIndex = publish.indexOf("Generate SHA-256 checksums");
@@ -655,6 +675,8 @@ test("verifies all five installer types before publishing checksums", () => {
   }
   assert.match(publish, /macos-aarch64/);
   assert.match(publish, /macos-x64/);
+  assert.match(publish, /artifacts\/linux-x64-release/);
+  assert.match(publish, /artifacts\/linux-arm64-release/);
   assert.match(publish, /APP_VERSION:\s*\$\{\{ needs\.validate-release\.outputs\.app_version \}\}/);
   assert.match(publish, /RELEASE_VERSION:\s*\$\{\{ needs\.validate-release\.outputs\.release_version \}\}/);
   assert.match(publish, /\*\$\{APP_VERSION\}\*_aarch64\.dmg/);
@@ -667,10 +689,13 @@ test("verifies all five installer types before publishing checksums", () => {
     "windows-x64-setup.exe",
     "linux-amd64.deb",
     "linux-x86_64.rpm",
+    "linux-arm64.deb",
+    "linux-aarch64.rpm",
   ]) {
     assert.match(publish, new RegExp(escapeRegExp(stableName)));
   }
   assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
+  assert.match(publish, /wc -l \| tr -d ' '\)" == "7"/);
 
   const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /draft:\s*true/);
@@ -690,7 +715,7 @@ test("verifies all five installer types before publishing checksums", () => {
   assert.match(trust, /Gatekeeper 可能拦截/);
   assert.match(trust, /先卸载候选版，或显式执行覆盖安装/);
   assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
-  assert.match(trust, /Linux DEB\/RPM[^\n]*未配置仓库签名/);
+  assert.match(trust, /Linux x64\/ARM64 DEB\/RPM[^\n]*未配置仓库签名/);
   assert.match(trust, /release-manifest\.json[^\n]*手动下载/);
   assert.match(trust, /cat CHECKSUMS\.md/);
 });
@@ -881,6 +906,7 @@ test("CI runs the frontend unit suite", () => {
     "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "aarch64-manylinux_2_28",
     "x86_64-manylinux_2_28",
   ]) {
     assert.match(ciWorkflow, new RegExp(escapeRegExp(target)));

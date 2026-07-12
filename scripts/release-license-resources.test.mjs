@@ -74,6 +74,7 @@ const tauriConfigs = [
   "desktop-tauri/src-tauri/build.macos-aarch64.json",
   "desktop-tauri/src-tauri/build.macos-x64.json",
   "desktop-tauri/src-tauri/build.linux-x64.json",
+  "desktop-tauri/src-tauri/build.linux-arm64.json",
 ];
 
 test("all desktop platforms ship the identical release-license resource map", () => {
