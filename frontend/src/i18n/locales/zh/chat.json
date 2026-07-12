@@ -246,6 +246,9 @@
   "noFilePathProvided": "未提供文件路径",
   "failedRenderSpreadsheet": "电子表格渲染失败",
   "failedLoadPdf": "PDF 加载失败",
+  "failedLoadImage": "图片加载失败",
+  "imagePreview": "图片预览",
+  "imagePreviewTooLarge": "图片过大，无法预览（最大 50 MB）",
   "failedRenderDocument": "文档渲染失败",
 
   "statusPending": "等待中",

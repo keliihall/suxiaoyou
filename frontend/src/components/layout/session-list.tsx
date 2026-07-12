@@ -23,7 +23,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Check, ChevronRight, Copy, FolderClosed, FolderOpen, Loader2, MessageSquare, SearchX, SquarePen } from "lucide-react";
 import { getChatRoute } from "@/lib/routes";
-import { cn, groupSessionsByDate, groupSessionsByWorkspace } from "@/lib/utils";
+import { cn, getSessionTimestamp, groupSessionsByDate, groupSessionsByWorkspace, parseBackendDate } from "@/lib/utils";
 import type { SessionResponse } from "@/types/session";
 
 type FlatItem =
@@ -132,9 +132,9 @@ export function SessionList() {
   const sorted = useMemo(() => {
     const list = [...filtered];
     list.sort((a, b) => {
-      const aVal = sortBy === "created" ? a.time_created : a.time_updated;
-      const bVal = sortBy === "created" ? b.time_created : b.time_updated;
-      return new Date(bVal).getTime() - new Date(aVal).getTime();
+      const aVal = parseBackendDate(getSessionTimestamp(a, sortBy)).getTime();
+      const bVal = parseBackendDate(getSessionTimestamp(b, sortBy)).getTime();
+      return bVal - aVal;
     });
     return list;
   }, [filtered, sortBy]);
@@ -157,7 +157,7 @@ export function SessionList() {
     const items: FlatItem[] = [];
 
     if (hasSearch) {
-      for (const s of filtered) {
+      for (const s of sorted) {
         items.push({ type: "session", session: s, snippet: snippetMap.get(s.id), indent: false });
       }
       return items;
@@ -171,7 +171,7 @@ export function SessionList() {
     }
 
     if (organizeMode === "chronological") {
-      const grouped = groupSessionsByDate(unpinned);
+      const grouped = groupSessionsByDate(unpinned, sortBy);
       for (const group of grouped) {
         items.push({ type: "header", label: group.label, first: items.length === 0 });
         for (const s of group.sessions) {
@@ -214,7 +214,7 @@ export function SessionList() {
     }
 
     return items;
-  }, [hasSearch, filtered, pinned, unpinned, snippetMap, collapsedProjects, organizeMode]);
+  }, [hasSearch, sorted, pinned, unpinned, snippetMap, collapsedProjects, organizeMode, sortBy]);
 
   const flatItemsSignature = useMemo(
     () =>
@@ -580,6 +580,8 @@ export function SessionList() {
                 ) : (
                   <SessionItem
                     session={item.session}
+                    timestampType={sortBy}
+                    showTimestamp={hasSearch || organizeMode !== "chronological"}
                     isActive={activeSessionId === item.session.id}
                     onDelete={handleDeleteRequest}
                     onRename={handleRename}

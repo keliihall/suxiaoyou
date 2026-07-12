@@ -2,7 +2,7 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SettingsSidebar } from "@/components/settings/settings-sidebar";
 import { MobileNav } from "@/components/layout/mobile-nav";
@@ -30,6 +30,32 @@ import {
 } from "@/lib/constants";
 import { desktopAPI } from "@/lib/tauri-api";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
+
+function SettingsReturnPathTracker({
+  pathname,
+  onRemember,
+}: {
+  pathname: string | null;
+  onRemember: (href: string) => void;
+}) {
+  const searchParams = useSearchParams();
+  const query = searchParams.toString();
+  const [hash, setHash] = useState("");
+
+  useEffect(() => {
+    const updateHash = () => setHash(window.location.hash);
+    updateHash();
+    window.addEventListener("hashchange", updateHash);
+    return () => window.removeEventListener("hashchange", updateHash);
+  }, []);
+
+  useEffect(() => {
+    if (!pathname || pathname.startsWith("/settings")) return;
+    onRemember(`${pathname}${query ? `?${query}` : ""}${hash}`);
+  }, [hash, onRemember, pathname, query]);
+
+  return null;
+}
 
 export default function MainLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -129,6 +155,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
 
   const isChatPage = pathname?.startsWith("/c/") ?? false;
   const isSettingsPage = pathname?.startsWith("/settings") ?? false;
+  const [settingsReturnHref, setSettingsReturnHref] = useState("/c/new");
   const isActiveChat = isChatPage && pathname !== "/c/new";
   // Settings replaces the sidebar with its own; always keep the gutter.
   const marginLeft =
@@ -151,6 +178,13 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
 
   return (
     <div className="h-full overflow-hidden isolate">
+      <Suspense fallback={null}>
+        <SettingsReturnPathTracker
+          pathname={pathname}
+          onRemember={setSettingsReturnHref}
+        />
+      </Suspense>
+
       {/* Opaque backdrop behind everything right of the sidebar.
           Only the sidebar area stays transparent to preserve macOS vibrancy;
           all other regions sit on solid surface-chat, eliminating any flash of
@@ -181,7 +215,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
       <div className="hidden lg:block">
         {isSettingsPage ? (
           <Suspense fallback={null}>
-            <SettingsSidebar />
+            <SettingsSidebar returnHref={settingsReturnHref} />
           </Suspense>
         ) : (
           <Sidebar />

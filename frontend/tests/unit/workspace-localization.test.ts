@@ -102,13 +102,25 @@ test("general settings typography controls and sample are localized", () => {
 test("sidebar relative time labels are localized", () => {
   const source = readFileSync("src/components/layout/session-item.tsx", "utf8");
   const utils = readFileSync("src/lib/utils.ts", "utf8");
+  const sessionList = readFileSync("src/components/layout/session-list.tsx", "utf8");
+  const zhCommon = readJson<Record<string, string>>("src/i18n/locales/zh/common.json");
+  const enCommon = readJson<Record<string, string>>("src/i18n/locales/en/common.json");
 
   assert.match(source, /formatRelativeTime/);
   assert.match(utils, /刚刚/);
   assert.match(utils, /分钟前/);
   assert.match(utils, /小时前/);
-  assert.match(utils, /天前/);
-  assert.match(utils, /周前/);
+  assert.match(utils, /昨天/);
+  assert.match(utils, /前天/);
+  assert.doesNotMatch(utils, /\$\{days\}天前/);
+  assert.doesNotMatch(utils, /周前/);
+  assert.match(source, /sessionRunning/);
+  assert.match(source, /sessionCreatedAt/);
+  assert.match(source, /sessionUpdatedAt/);
+  assert.match(source, /isLive \|\| showTimestamp \? "pr-16" : "pr-2"/);
+  assert.match(sessionList, /showTimestamp=\{hasSearch \|\| organizeMode !== "chronological"\}/);
+  assert.equal(zhCommon.sessionRunning, "进行中");
+  assert.equal(enCommon.sessionRunning, "Running");
   assert.doesNotMatch(source, /return "now"/);
   assert.doesNotMatch(source, /`\$\{minutes\}m`/);
   assert.doesNotMatch(source, /`\$\{hours\}h`/);
@@ -122,6 +134,8 @@ test("session time display treats backend naive timestamps as UTC and displays i
   assert.match(utils, /APP_TIME_ZONE\s*=\s*"Asia\/Shanghai"/);
   assert.match(utils, /parseBackendDate/);
   assert.match(utils, /trimmed \+ "Z"/);
+  assert.match(sessionItem, /getSessionTimestamp/);
+  assert.match(sessionItem, /formatFullDateTime/);
   assert.match(sessionItem, /formatRelativeTime/);
   assert.match(mobilePage, /formatRelativeTime/);
   assert.doesNotMatch(sessionItem, /new Date\(date\)/);

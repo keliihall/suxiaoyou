@@ -13,7 +13,7 @@
 ; locked files cleanly.
 
 !macro NSIS_HOOK_PREINSTALL
-  DetailPrint "Terminating 苏小有 backend process if running..."
+  DetailPrint "正在关闭运行中的苏小有后台进程..."
 
   ; Kill the backend sidecar. Try current-user first (matches our default
   ; per-user install), then fall back to the machine-wide variant so this

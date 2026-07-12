@@ -32,7 +32,7 @@ async function closeArtifactPanel(page: Page) {
 test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
   test.describe.configure({ timeout: 75_000 });
 
-  test("office artifact workflow: preview DOCX, XLSX, PDF, and PPTX from real binary files", async ({ page }) => {
+  test("office artifact workflow: preview DOCX, XLSX, PDF, and safely fall back for PPTX", async ({ page }) => {
     const state = await setupMockedApp(page);
 
     await page.goto("/c/session-artifacts");
@@ -53,8 +53,15 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     await closeArtifactPanel(page);
 
     await openArtifactFile(page, "office-deck.pptx");
-    await expect(page.getByText("1 / 1")).toBeVisible({ timeout: 20_000 });
-    await expect.poll(() => page.locator("canvas").count(), { timeout: 20_000 }).toBeGreaterThan(0);
+    const pptxFallback = page.getByText(
+      "Presentation preview is temporarily unavailable",
+    );
+    await expect(pptxFallback).toBeVisible({ timeout: 20_000 });
+    await expect(
+      pptxFallback
+        .locator("xpath=..")
+        .getByRole("button", { name: "Download", exact: true }),
+    ).toBeEnabled();
 
     expect(state.binaryReads.join("\n")).toContain("office-brief.docx");
     expect(state.binaryReads.join("\n")).toContain("office-matrix.xlsx");
@@ -125,14 +132,14 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     await mock苏小有Api(page, { healthStatus: 401 });
 
     await page.goto("/m/settings");
-    await expect(page.getByRole("heading", { name: "Connection" })).toBeVisible();
-    await expect(page.getByText("Not connected")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "远程连接" })).toBeVisible();
+    await expect(page.getByText("未连接", { exact: true })).toBeVisible();
     await page.getByPlaceholder("https://xxx.trycloudflare.com").fill("http://127.0.0.1:3317");
     await page.getByPlaceholder("suxiaoyou_rt_...").fill("bad-token");
-    await page.getByRole("button", { name: "Connect" }).click();
+    await page.getByRole("button", { name: "连接", exact: true }).click();
 
-    await expect(page.getByRole("button", { name: "Failed" })).toBeVisible();
-    await expect(page.getByText("Invalid token")).toBeVisible();
+    await expect(page.getByRole("button", { name: "连接失败" })).toBeVisible();
+    await expect(page.getByText("令牌无效")).toBeVisible();
     await expect(page).toHaveURL(/\/m\/settings$/);
     await expectNoAppCrash(page);
   });

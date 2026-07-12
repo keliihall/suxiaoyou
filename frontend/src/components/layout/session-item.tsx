@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Archive, EllipsisVertical, Loader2, MessageCircle, Pin, PinOff } from "lucide-react";
-import { cn, formatRelativeTime } from "@/lib/utils";
+import { cn, formatFullDateTime, formatRelativeTime, getSessionTimestamp, parseBackendDate, type SessionTimestampSort } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { API, IS_DESKTOP, queryKeys } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
@@ -45,6 +45,8 @@ interface SessionItemProps {
   onEditEnd?: () => void;
   snippet?: string;
   isFocused?: boolean;
+  timestampType?: SessionTimestampSort;
+  showTimestamp?: boolean;
 }
 
 export const SessionItem = memo(function SessionItem({
@@ -61,8 +63,10 @@ export const SessionItem = memo(function SessionItem({
   onEditEnd,
   snippet,
   isFocused = false,
+  timestampType = "updated",
+  showTimestamp = true,
 }: SessionItemProps) {
-  const { t } = useTranslation('common');
+  const { t, i18n } = useTranslation('common');
   const platform = usePlatform();
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -81,7 +85,14 @@ export const SessionItem = memo(function SessionItem({
   const title = rawTitle.startsWith("Channel: ")
     ? rawTitle.slice(9).replace(/^(feishu|weixin|wechat|dingtalk|wecom|qq):/, "")
     : rawTitle;
-  const relativeTime = formatRelativeTime(session.time_updated);
+  const displayTimestamp = getSessionTimestamp(session, timestampType);
+  const displayLanguage = i18n.resolvedLanguage || i18n.language || "en";
+  const relativeTime = formatRelativeTime(displayTimestamp, new Date(), displayLanguage);
+  const fullTime = formatFullDateTime(displayTimestamp, displayLanguage);
+  const parsedTimestamp = parseBackendDate(displayTimestamp);
+  const timestampDateTime = Number.isNaN(parsedTimestamp.getTime())
+    ? undefined
+    : parsedTimestamp.toISOString();
   const channelBadge = session.slug ? getChannelBadge(session.slug) : null;
   // Live status badge: shows whenever this session has an in-flight stream
   // attached, including ones the user navigated away from.
@@ -361,7 +372,7 @@ export const SessionItem = memo(function SessionItem({
           <div
             className={cn(
               "min-w-0 flex-1",
-              !isEditing && "pr-16",
+              !isEditing && (isLive || showTimestamp ? "pr-16" : "pr-2"),
             )}
           >
             {isEditing ? (
@@ -393,12 +404,6 @@ export const SessionItem = memo(function SessionItem({
                   >
                     {title}
                   </span>
-                  {isLive && (
-                    <Loader2
-                      aria-label={t('sessionIsGenerating', { defaultValue: 'Generating in background' })}
-                      className="h-3 w-3 shrink-0 animate-spin text-[var(--brand-primary)]"
-                    />
-                  )}
                 </p>
                 {snippet && (
                   <p className="mt-0.5 truncate text-ui-2xs leading-4 text-[var(--text-tertiary)]">
@@ -409,15 +414,33 @@ export const SessionItem = memo(function SessionItem({
             )}
           </div>
 
-          {/* Right-side slot: relative time. Item actions live in the menus. */}
-          {!isEditing && !menuOpen && !dropdownOpen && (
+          {/* Right-side slot: live state replaces time. Chronological groups
+              suppress their redundant row-level timestamps. */}
+          {!isEditing && !menuOpen && !dropdownOpen && (isLive || showTimestamp) && (
             <span
-              aria-hidden
               className={cn(
-                "absolute right-3 top-1/2 -translate-y-1/2 text-ui-2xs text-[var(--text-tertiary)] opacity-100 transition-opacity group-hover/session:opacity-0",
+                "absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1 text-ui-2xs text-[var(--text-tertiary)] opacity-100 transition-opacity group-hover/session:opacity-0",
               )}
             >
-              {relativeTime}
+              {isLive ? (
+                <>
+                  <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-[var(--brand-primary)]" />
+                  <span role="status">
+                    {t("sessionRunning", { defaultValue: "Running" })}
+                  </span>
+                </>
+              ) : (
+                <time
+                  dateTime={timestampDateTime}
+                  title={fullTime}
+                  aria-label={t(
+                    timestampType === "created" ? "sessionCreatedAt" : "sessionUpdatedAt",
+                    { time: fullTime },
+                  )}
+                >
+                  {relativeTime}
+                </time>
+              )}
             </span>
           )}
 

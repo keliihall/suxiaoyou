@@ -246,6 +246,9 @@
   "noFilePathProvided": "No file path provided",
   "failedRenderSpreadsheet": "Failed to render spreadsheet",
   "failedLoadPdf": "Failed to load PDF",
+  "failedLoadImage": "Failed to load image",
+  "imagePreview": "Image preview",
+  "imagePreviewTooLarge": "Image is too large to preview (maximum 50 MB)",
   "failedRenderDocument": "Failed to render document",
 
   "statusPending": "Pending",

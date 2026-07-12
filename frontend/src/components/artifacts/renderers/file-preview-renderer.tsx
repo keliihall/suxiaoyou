@@ -17,6 +17,7 @@ import { XlsxRenderer } from "./xlsx-renderer";
 import { PdfRenderer } from "./pdf-renderer";
 import { PptxRenderer } from "./pptx-renderer";
 import { CsvRenderer } from "./csv-renderer";
+import { ImageRenderer } from "./image-renderer";
 
 interface FilePreviewRendererProps {
   /** Disk path of the file. */
@@ -34,38 +35,64 @@ function BinaryFilePreview({ filePath }: { filePath?: string }) {
   if (type === "xlsx") return <XlsxRenderer filePath={filePath} />;
   if (type === "pdf") return <PdfRenderer filePath={filePath} />;
   if (type === "pptx") return <PptxRenderer filePath={filePath} />;
+  if (type === "image") return <ImageRenderer filePath={filePath} />;
   return null;
 }
 
 export function FilePreviewRenderer({ filePath, content: initialContent, language }: FilePreviewRendererProps) {
   // Check if this is a binary format that handles its own fetching
   const artifactType = filePath ? artifactTypeFromExtension(filePath) : null;
-  const isBinary = artifactType === "docx" || artifactType === "xlsx" || artifactType === "pdf" || artifactType === "pptx";
+  const isBinary =
+    artifactType === "docx" ||
+    artifactType === "xlsx" ||
+    artifactType === "pdf" ||
+    artifactType === "pptx" ||
+    artifactType === "image";
   const workspace = useWorkspaceStore((s) => s.activeWorkspacePath);
 
-  const [content, setContent] = useState<string | null>(initialContent ?? null);
+  const [content, setContent] = useState<string | null>(initialContent || null);
   const [loading, setLoading] = useState(!isBinary && !initialContent && !!filePath);
   const [error, setError] = useState<string | null>(null);
 
   // Fetch text content from disk (skip for binary formats)
   useEffect(() => {
-    if (isBinary || initialContent || !filePath) return;
+    if (isBinary) return;
 
+    if (initialContent) {
+      setContent(initialContent);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    if (!filePath) {
+      setContent(null);
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setContent(null);
     setLoading(true);
     setError(null);
 
-    api
+    void api
       .post<{ content: string }>(API.FILES.CONTENT, { path: filePath, workspace })
       .then((res) => {
-        setContent(res.content);
+        if (!cancelled) setContent(res.content);
       })
       .catch((err) => {
+        if (cancelled) return;
         console.error("[FilePreview] Error:", err);
         setError(apiErrorMessage(err, "Failed to load file"));
       })
       .finally(() => {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [filePath, initialContent, isBinary, workspace]);
 
   // Binary formats delegate to their own renderers

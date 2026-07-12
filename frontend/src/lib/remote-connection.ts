@@ -7,6 +7,10 @@
 
 const STORAGE_KEY = "suxiaoyou_remote_connection";
 
+function isDesktopShell(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 export interface RemoteConfig {
   url: string; // Tunnel URL (e.g., https://xxx.trycloudflare.com)
   token: string; // Bearer token (suxiaoyou_rt_...)
@@ -15,6 +19,10 @@ export interface RemoteConfig {
 /** Get the stored remote connection config, or null if not connected. */
 export function getRemoteConfig(): RemoteConfig | null {
   if (typeof window === "undefined") return null;
+  // Remote connections belong to the mobile/browser client. A stale value
+  // left by an older desktop build must never redirect the native app away
+  // from its bundled backend or hide local-only file actions.
+  if (isDesktopShell()) return null;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;

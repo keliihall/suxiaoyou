@@ -1,6 +1,6 @@
 [package]
 name = "suxiaoyou-desktop"
-version = "0.8.1"
+version = "0.8.2"
 description = "苏小有 — local-first AI agent for desktop work"
 license = "Apache-2.0"
 edition = "2021"

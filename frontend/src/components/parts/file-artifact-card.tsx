@@ -70,6 +70,7 @@ const TYPE_CONFIG: Record<
 > = {
   html: { icon: Globe, label: "Page · HTML" },
   svg: { icon: Image, label: "Image · SVG" },
+  image: { icon: Image, label: "Image" },
   markdown: { icon: FileText, label: "Document · MD" },
   docx: { icon: FileText, label: "Document · Word" },
   pdf: { icon: FileText, label: "Document · PDF" },

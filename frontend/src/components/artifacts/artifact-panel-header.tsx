@@ -9,6 +9,7 @@ const TYPE_CONFIG: Record<ArtifactType, { icon: React.ComponentType<{ className?
   react: { icon: LayoutDashboard, label: "React" },
   html: { icon: Globe, label: "HTML" },
   svg: { icon: Image, label: "SVG" },
+  image: { icon: Image, label: "Image" },
   code: { icon: Code, label: "Code" },
   markdown: { icon: FileText, label: "Markdown" },
   mermaid: { icon: GitBranch, label: "Diagram" },

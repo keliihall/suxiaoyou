@@ -15,7 +15,17 @@ test("uses localized app context menu actions instead of native WebKit actions",
   );
 
   const providerSource = readFileSync("src/components/providers/app-providers.tsx", "utf8");
+  const guardSource = readFileSync(
+    "src/components/providers/localized-context-menu-guard.tsx",
+    "utf8",
+  );
+  const appContextMenuSource = readFileSync(
+    "src/components/ui/context-menu.tsx",
+    "utf8",
+  );
   assert.match(providerSource, /LocalizedContextMenuGuard/);
+  assert.match(guardSource, /\[data-app-context-menu\]/);
+  assert.match(appContextMenuSource, /data-app-context-menu/);
 
   const zhCommon = JSON.parse(readFileSync("src/i18n/locales/zh/common.json", "utf8"));
   assert.equal(zhCommon.contextCopy, "复制");

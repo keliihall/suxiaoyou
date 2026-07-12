@@ -1116,8 +1116,9 @@ jobs:
             cat <<'EOF'
           ## 安装包信任与验证状态
 
-          - Windows NSIS：当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
+          - Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
           - Linux DEB/RPM：当前未配置仓库签名；已验证包元数据、完整解包和内置运行时。
+          - 五个平台安装包均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 

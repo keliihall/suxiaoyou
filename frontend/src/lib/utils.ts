@@ -20,26 +20,66 @@ export function parseBackendDate(dateLike: string | Date): Date {
   return new Date(trimmed);
 }
 
-export function formatRelativeTime(date: string | Date, nowDate: Date = new Date()): string {
+function resolveDisplayLocale(locale: string): "zh-CN" | "en-US" {
+  return locale.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+}
+
+/**
+ * Format the compact timestamp shown beside a task title.
+ *
+ * Relative wording is intentionally limited to today, yesterday, and the day
+ * before yesterday. Older relative labels become hard to map back to a date,
+ * so older tasks use a calendar date instead.
+ */
+export function formatRelativeTime(
+  date: string | Date,
+  nowDate: Date = new Date(),
+  locale = "zh-CN",
+): string {
   const d = parseBackendDate(date);
+  if (Number.isNaN(d.getTime()) || Number.isNaN(nowDate.getTime())) return "";
+
+  const displayLocale = resolveDisplayLocale(locale);
+  const isChinese = displayLocale === "zh-CN";
+  const daysAgo = Math.max(
+    0,
+    dayNumberInAppTimeZone(nowDate) - dayNumberInAppTimeZone(d),
+  );
   const diff = Math.max(0, nowDate.getTime() - d.getTime());
   const seconds = Math.floor(diff / 1000);
   const minutes = Math.floor(seconds / 60);
   const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
 
-  if (seconds < 60) return "刚刚";
-  if (minutes < 60) return `${minutes}分钟前`;
-  if (hours < 24) return `${hours}小时前`;
-  if (days < 7) return `${days}天前`;
-  if (days < 30) return `${Math.floor(days / 7)}周前`;
+  if (daysAgo === 0) {
+    if (seconds < 60) return isChinese ? "刚刚" : "just now";
+    if (minutes < 60) return isChinese ? `${minutes}分钟前` : `${minutes}m ago`;
+    return isChinese ? `${hours}小时前` : `${hours}h ago`;
+  }
+  if (daysAgo === 1) return isChinese ? "昨天" : "yesterday";
+  if (daysAgo === 2) return isChinese ? "前天" : "2d ago";
 
-  return d.toLocaleDateString("zh-CN", {
+  return d.toLocaleDateString(displayLocale, {
     timeZone: APP_TIME_ZONE,
     month: "short",
     day: "numeric",
     year: yearInAppTimeZone(d) !== yearInAppTimeZone(nowDate) ? "numeric" : undefined,
   });
+}
+
+/** Full localized timestamp used by the task-row tooltip and screen readers. */
+export function formatFullDateTime(date: string | Date, locale = "zh-CN"): string {
+  const d = parseBackendDate(date);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat(resolveDisplayLocale(locale), {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
 }
 
 function yearInAppTimeZone(date: Date): string {
@@ -74,10 +114,24 @@ export function extractTextFromPartResponses(parts: Array<{ data: PartData }>): 
     .join("\n");
 }
 
-export function groupSessionsByDate<T extends { time_updated: string }>(
+export type SessionTimestampSort = "created" | "updated";
+
+export function getSessionTimestamp<
+  T extends { time_created?: string; time_updated: string },
+>(session: T, sortBy: SessionTimestampSort): string {
+  return sortBy === "created"
+    ? session.time_created ?? session.time_updated
+    : session.time_updated;
+}
+
+export function groupSessionsByDate<
+  T extends { time_created?: string; time_updated: string },
+>(
   sessions: T[],
+  sortBy: SessionTimestampSort = "updated",
+  nowDate: Date = new Date(),
 ): { label: string; sessions: T[] }[] {
-  const today = dayNumberInAppTimeZone(new Date());
+  const today = dayNumberInAppTimeZone(nowDate);
 
   const groups: Record<string, T[]> = {
     today: [],
@@ -88,7 +142,8 @@ export function groupSessionsByDate<T extends { time_updated: string }>(
   };
 
   for (const session of sessions) {
-    const daysAgo = today - dayNumberInAppTimeZone(parseBackendDate(session.time_updated));
+    const timestamp = getSessionTimestamp(session, sortBy);
+    const daysAgo = today - dayNumberInAppTimeZone(parseBackendDate(timestamp));
     if (daysAgo <= 0) groups["today"].push(session);
     else if (daysAgo === 1) groups["yesterday"].push(session);
     else if (daysAgo < 7) groups["previous7Days"].push(session);

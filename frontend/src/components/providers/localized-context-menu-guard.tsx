@@ -50,7 +50,12 @@ export function LocalizedContextMenuGuard() {
         : event.target instanceof Node
           ? event.target.parentElement
           : null;
-      if (!target || target.closest("[data-allow-native-context-menu]")) return;
+      if (
+        !target ||
+        target.closest("[data-allow-native-context-menu], [data-app-context-menu]")
+      ) {
+        return;
+      }
 
       event.preventDefault();
       const isEditable = isEditableElement(target);

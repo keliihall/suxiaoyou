@@ -4,6 +4,7 @@ export type ArtifactType =
   | "react"
   | "html"
   | "svg"
+  | "image"
   | "code"
   | "markdown"
   | "mermaid"

@@ -190,6 +190,34 @@ test("sidebar create actions survive a chronological list with only a pinned con
   await expect(page.getByText("Conversation without a project")).toBeVisible();
 });
 
+test("chronological groups suppress duplicate row timestamps", async ({ page }) => {
+  await seedSidebarState(page, { organizeMode: "chronological" });
+  await mockSessionList(page, [unscopedSession]);
+
+  await page.goto("/c/new");
+
+  const row = page.locator('[role="option"]').filter({ hasText: unscopedSession.title });
+  await expect(row).toBeVisible();
+  await expect(row.locator("time")).toHaveCount(0);
+  await expect(row.locator("div.min-w-0.flex-1").first()).toHaveClass(/\bpr-2\b/);
+  await expect(row.locator("div.min-w-0.flex-1").first()).not.toHaveClass(/\bpr-16\b/);
+});
+
+test("task timestamp exposes the selected field as a full accessible tooltip", async ({ page }) => {
+  await seedSidebarState(page, { sortBy: "created" });
+  await mockSessionList(page, [unscopedSession]);
+
+  await page.goto("/c/new");
+
+  const row = page.locator('[role="option"]').filter({ hasText: unscopedSession.title });
+  const timestamp = row.locator("time");
+  await expect(timestamp).toBeVisible();
+  await expect(row.locator("div.min-w-0.flex-1").first()).toHaveClass(/\bpr-16\b/);
+  await expect(timestamp).toHaveAttribute("datetime", "2026-07-11T10:00:00.000Z");
+  await expect(timestamp).toHaveAttribute("title", /2026/);
+  await expect(timestamp).toHaveAttribute("aria-label", /^Created /);
+});
+
 test("sidebar create actions remain available when there are no conversations", async ({
   page,
 }) => {
@@ -311,7 +339,7 @@ test("About shows product information without a GitHub download entry", async ({
   await page.goto("/settings");
 
   await expect(page.getByRole("heading", { name: "About" })).toBeVisible();
-  await expect(page.getByText(/苏小有 v0\.8\.1/)).toBeVisible();
+  await expect(page.getByText(/苏小有 v0\.8\.2/)).toBeVisible();
   await expect(
     page.getByRole("button", { name: "View latest version and downloads" }),
   ).toHaveCount(0);

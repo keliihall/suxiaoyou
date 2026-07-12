@@ -8,7 +8,11 @@ import {
 
 const outputPath = "/Users/alex/suxiaoyou-demo/slides/office-deck.pptx";
 
-async function mockOutputFileMessage(page: Page) {
+async function mockOutputFileMessage(
+  page: Page,
+  artifactPath = outputPath,
+  artifactTitle = "Office deck",
+) {
   await page.route("**/api/messages/session-artifacts**", async (route) => {
     await route.fulfill({
       status: 200,
@@ -48,9 +52,9 @@ async function mockOutputFileMessage(page: Page) {
                   call_id: "present-office-deck",
                   state: {
                     status: "completed",
-                    input: { file_path: outputPath, title: "Office deck" },
+                    input: { file_path: artifactPath, title: artifactTitle },
                     output: null,
-                    metadata: { file_path: outputPath, title: "Office deck" },
+                    metadata: { file_path: artifactPath, title: artifactTitle },
                     time_start: "2026-07-11T12:00:00.000Z",
                     time_end: "2026-07-11T12:00:01.000Z",
                   },
@@ -251,6 +255,161 @@ test("local desktop menu opens, reveals, copies, and saves the output file", asy
       }),
     )
     .toEqual(["office-deck.pptx"]);
+});
+
+for (const {
+  platform,
+  artifactPath,
+  revealLabel,
+} of [
+  {
+    platform: "macos" as const,
+    artifactPath: "/Users/alex/Documents/苏小有/office deck.pptx",
+    revealLabel: "Reveal in Finder",
+  },
+  {
+    platform: "windows" as const,
+    artifactPath: "C:\\Users\\Alex\\Documents\\苏小有\\office deck.pptx",
+    revealLabel: "Show in File Explorer",
+  },
+  {
+    platform: "linux" as const,
+    artifactPath: "/home/alex/Documents/苏小有/office deck.pptx",
+    revealLabel: "Show in file manager",
+  },
+]) {
+  test(`local ${platform} right-click and dropdown expose the same host file actions`, async ({
+    page,
+  }) => {
+    await installLocalTauriMock(page, platform);
+    await mockOutputFileMessage(page, artifactPath);
+    await page.goto("/c/session-artifacts");
+
+    const card = page.getByTestId("file-artifact-card").filter({ hasText: "Office deck" });
+    await card.click({ button: "right" });
+    await expect(page.locator("[data-localized-context-menu]")).toHaveCount(0);
+    for (const label of [
+      "Open preview",
+      "Open with default app",
+      revealLabel,
+      "Copy file path",
+      "Save as…",
+    ]) {
+      await expect(page.getByRole("menuitem", { name: label })).toBeVisible();
+    }
+    await page.keyboard.press("Escape");
+
+    await card.getByRole("button", { name: "Open with" }).click();
+    for (const label of [
+      "Open preview",
+      "Open with default app",
+      revealLabel,
+      "Copy file path",
+      "Save as…",
+    ]) {
+      await expect(page.getByRole("menuitem", { name: label })).toBeVisible();
+    }
+  });
+}
+
+test("generated CSV preview loads its content from the output path", async ({ page }) => {
+  const csvPath = "/Users/alex/suxiaoyou-demo/data/generated-summary.csv";
+  let contentRequest: Record<string, unknown> | null = null;
+  await mockOutputFileMessage(page, csvPath, "Generated summary");
+  await page.route("**/api/files/content", async (route) => {
+    const request = route.request().postDataJSON() as Record<string, unknown>;
+    if (request.path !== csvPath) {
+      await route.fallback();
+      return;
+    }
+    contentRequest = request;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        content: "Name,Status\nPreview loaded from disk,Ready",
+        name: "generated-summary.csv",
+        mime_type: "text/csv",
+        size: 47,
+      }),
+    });
+  });
+
+  await page.goto("/c/session-artifacts");
+  await page.getByRole("button", { name: "Open preview Generated summary" }).click();
+
+  await expect(page.getByText("Preview loaded from disk", { exact: true })).toBeVisible();
+  await expect(page.getByText("Ready", { exact: true })).toBeVisible();
+  expect(contentRequest).toEqual({
+    path: csvPath,
+    workspace: "/Users/alex/suxiaoyou-demo",
+  });
+});
+
+test("generated raster image uses a bounded binary preview and revokes its blob URL", async ({
+  page,
+}) => {
+  const imagePath = "/Users/alex/suxiaoyou-demo/images/preview-pixel.png";
+  const onePixelPng =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  let binaryRequest: Record<string, unknown> | null = null;
+
+  await page.addInitScript(() => {
+    const revoked: string[] = [];
+    const originalRevoke = URL.revokeObjectURL.bind(URL);
+    Object.defineProperty(window, "__REVOKED_BLOB_URLS__", {
+      configurable: true,
+      value: revoked,
+    });
+    URL.revokeObjectURL = (url: string) => {
+      revoked.push(url);
+      originalRevoke(url);
+    };
+  });
+  await mockOutputFileMessage(page, imagePath, "Preview image");
+  await page.route("**/api/files/content-binary", async (route) => {
+    const request = route.request().postDataJSON() as Record<string, unknown>;
+    if (request.path !== imagePath) {
+      await route.fallback();
+      return;
+    }
+    binaryRequest = request;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        content_base64: onePixelPng,
+        name: "preview-pixel.png",
+        mime_type: "image/png",
+        size: 68,
+      }),
+    });
+  });
+
+  await page.goto("/c/session-artifacts");
+  await page.getByRole("button", { name: "Open preview Preview image" }).click();
+
+  const image = page.getByTestId("raster-image-preview");
+  await expect(image).toBeVisible();
+  const blobUrl = await image.getAttribute("src");
+  expect(blobUrl).toMatch(/^blob:/);
+  expect(binaryRequest).toEqual({
+    path: imagePath,
+    workspace: "/Users/alex/suxiaoyou-demo",
+  });
+
+  const previewAside = page.locator("aside").filter({ has: image });
+  const header = previewAside.getByText("Preview image", { exact: true }).locator("xpath=../..");
+  await header.getByRole("button").last().click();
+  await expect(image).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __REVOKED_BLOB_URLS__: string[] })
+          .__REVOKED_BLOB_URLS__,
+      ),
+    )
+    .toContain(blobUrl);
 });
 
 test("a missing output file reports a visible save error", async ({ page }) => {

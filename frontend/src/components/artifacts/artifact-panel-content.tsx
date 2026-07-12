@@ -7,6 +7,7 @@ import { MarkdownRenderer } from "./renderers/markdown-renderer";
 import { SvgRenderer } from "./renderers/svg-renderer";
 import { MermaidRenderer } from "./renderers/mermaid-renderer";
 import { HtmlRenderer } from "./renderers/html-renderer";
+import { ImageRenderer } from "./renderers/image-renderer";
 import { FilePreviewRenderer } from "./renderers/file-preview-renderer";
 import { CsvRenderer } from "./renderers/csv-renderer";
 // Heavy renderers - lazy loaded to reduce bundle size
@@ -29,26 +30,31 @@ export function ArtifactPanelContent() {
     );
   }
 
+  // File cards intentionally carry only a path. Route every path-backed,
+  // content-based artifact through the same loader instead of maintaining a
+  // per-renderer allowlist that can silently leave new formats blank.
+  if (!artifact.content && artifact.filePath) {
+    return (
+      <FilePreviewRenderer
+        filePath={artifact.filePath}
+        content={artifact.content}
+        language={artifact.language}
+      />
+    );
+  }
+
   switch (artifact.type) {
     case "code":
-      if (!artifact.content && artifact.filePath) {
-        return <FilePreviewRenderer filePath={artifact.filePath} content={artifact.content} language={artifact.language} />;
-      }
       return <CodeRenderer content={artifact.content} language={artifact.language} />;
     case "markdown":
-      // If content is empty but filePath exists, load from disk via FilePreviewRenderer
-      if (!artifact.content && artifact.filePath) {
-        return <FilePreviewRenderer filePath={artifact.filePath} content={artifact.content} language={artifact.language} />;
-      }
       return <MarkdownRenderer content={artifact.content} title={artifact.title} />;
     case "svg":
       return <SvgRenderer content={artifact.content} />;
+    case "image":
+      return <ImageRenderer filePath={artifact.filePath} />;
     case "mermaid":
       return <MermaidRenderer content={artifact.content} />;
     case "html":
-      if (!artifact.content && artifact.filePath) {
-        return <FilePreviewRenderer filePath={artifact.filePath} content={artifact.content} language={artifact.language} />;
-      }
       return <HtmlRenderer content={artifact.content} title={artifact.title} />;
     case "react":
       return <ReactRenderer code={artifact.content} title={artifact.title} />;

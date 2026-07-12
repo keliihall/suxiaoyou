@@ -5,7 +5,17 @@ import * as ContextMenuPrimitive from "@radix-ui/react-context-menu";
 import { cn } from "@/lib/utils";
 
 const ContextMenu = ContextMenuPrimitive.Root;
-const ContextMenuTrigger = ContextMenuPrimitive.Trigger;
+const ContextMenuTrigger = React.forwardRef<
+  React.ComponentRef<typeof ContextMenuPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Trigger>
+>((props, ref) => (
+  <ContextMenuPrimitive.Trigger
+    ref={ref}
+    data-app-context-menu
+    {...props}
+  />
+));
+ContextMenuTrigger.displayName = ContextMenuPrimitive.Trigger.displayName;
 
 const ContextMenuContent = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Content>,

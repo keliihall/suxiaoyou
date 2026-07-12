@@ -5,6 +5,7 @@ import test from "node:test";
 const remoteSource = readFileSync("src/app/(main)/remote/content.tsx", "utf8");
 const settingsTabs = readFileSync("src/components/settings/settings-tabs.ts", "utf8");
 const remotePage = readFileSync("src/app/(main)/remote/page.tsx", "utf8");
+const remoteConnection = readFileSync("src/lib/remote-connection.ts", "utf8");
 
 test("v0.8.0 does not expose unfinished messaging channel setup", () => {
   for (const hidden of [
@@ -31,4 +32,6 @@ test("v0.8.0 hides remote access until the 1.0 service is ready", () => {
   assert.doesNotMatch(settingsTabs, /id: "remote"/);
   assert.match(remotePage, /router\.replace\("\/settings\?tab=general"\)/);
   assert.doesNotMatch(remotePage, /RemoteTabContent/);
+  assert.match(remoteConnection, /"__TAURI_INTERNALS__" in window/);
+  assert.match(remoteConnection, /if \(isDesktopShell\(\)\) return null/);
 });

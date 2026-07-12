@@ -12,7 +12,13 @@ import { useSidebarStore } from "@/stores/sidebar-store";
 import { SidebarResizeHandle } from "@/components/layout/sidebar-resize-handle";
 import { SETTINGS_TABS, type SettingsTabId } from "./settings-tabs";
 
-export function SettingsSidebar() {
+interface SettingsSidebarProps {
+  returnHref?: string;
+}
+
+export function SettingsSidebar({
+  returnHref = "/c/new",
+}: SettingsSidebarProps) {
   const { t } = useTranslation(["settings"]);
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -38,19 +44,20 @@ export function SettingsSidebar() {
       <SidebarResizeHandle />
       <div
         data-tauri-drag-region
-        className="flex items-center"
-        style={
-          IS_DESKTOP && isMac
-            ? { height: 60, paddingLeft: 91, paddingRight: 16 }
-            : { height: 56, paddingTop: 4, paddingLeft: 16, paddingRight: 16 }
-        }
-      >
+        data-testid="settings-drag-region"
+        aria-hidden="true"
+        className="shrink-0"
+        style={{ height: IS_DESKTOP && isMac ? 48 : IS_DESKTOP ? 0 : 12 }}
+      />
+
+      <div className="shrink-0 px-2 pb-2">
         <Link
-          href="/c/new"
-          className="flex items-center gap-2 text-ui-body text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+          href={returnHref}
+          data-testid="settings-back-to-app"
+          className="flex min-h-11 w-full items-center gap-2 rounded-lg px-3 text-ui-body text-[var(--text-secondary)] outline-none transition-colors hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)] focus-visible:bg-[var(--sidebar-hover)] focus-visible:text-[var(--text-primary)] focus-visible:ring-2 focus-visible:ring-[var(--ring)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--sidebar-translucent-bg)]"
         >
-          <ArrowLeft className="h-4 w-4" />
-          {t("settings:backToApp")}
+          <ArrowLeft className="h-4 w-4 shrink-0" />
+          <span className="truncate">{t("settings:backToApp")}</span>
         </Link>
       </div>
 

@@ -29,6 +29,7 @@ const ARTIFACT_TYPE_CONFIG: Record<
   react:    { icon: LayoutDashboard, label: "Component \u00b7 TSX" },
   html:     { icon: Globe,           label: "Page \u00b7 HTML" },
   svg:      { icon: Image,           label: "Image \u00b7 SVG" },
+  image:    { icon: Image,           label: "Image" },
   code:     { icon: Code,            label: "Code" },
   markdown: { icon: FileText,        label: "Document \u00b7 MD" },
   mermaid:  { icon: GitBranch,       label: "Diagram \u00b7 Mermaid" },

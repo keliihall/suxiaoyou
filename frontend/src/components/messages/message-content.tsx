@@ -31,18 +31,24 @@ const VISIBLE_TOOL_PARTS = new Set(["artifact", "present_file", "submit_plan"]);
 const FILE_CARD_TOOL_PARTS = new Set(["present_file", "write", "edit", "code_execute"]);
 const GENERATED_FILE_TOOL_PARTS = new Set(["write", "edit", "code_execute"]);
 const FILE_CARD_EXTENSIONS = new Set([
+  ".bmp",
   ".csv",
   ".docx",
+  ".gif",
   ".html",
   ".htm",
+  ".jpeg",
+  ".jpg",
   ".md",
   ".mdx",
   ".pdf",
+  ".png",
   ".ppt",
   ".pptx",
   ".svg",
   ".tsv",
   ".txt",
+  ".webp",
   ".xls",
   ".xlsx",
 ]);

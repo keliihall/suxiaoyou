@@ -19,6 +19,10 @@ const macIntelConfig = JSON.parse(
 const linuxConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/build.linux-x64.json"), "utf8"),
 );
+const installerHooks = readFileSync(
+  join(root, "desktop-tauri/src-tauri/installer-hooks.nsh"),
+  "utf8",
+);
 const linuxDesktopTemplate = readFileSync(
   join(root, "desktop-tauri/src-tauri/linux/suxiaoyou.desktop.hbs"),
   "utf8",
@@ -206,6 +210,18 @@ test("keeps the Chinese UI name while Linux packages use a stable ASCII identity
   assert.match(linuxDesktopTemplate, /^Type=Application$/m);
   assert.match(linuxDesktopTemplate, /^MimeType=\{\{mime_type\}\}$/m);
   assert.doesNotMatch(linuxDesktopTemplate, /^Name=\{\{name\}\}$/m);
+});
+
+test("ships the Windows installer in Simplified Chinese", () => {
+  assert.deepEqual(tauriConfig.bundle.windows.nsis.languages, ["SimpChinese"]);
+  assert.equal(tauriConfig.bundle.windows.nsis.displayLanguageSelector, false);
+  assert.match(installerHooks, /DetailPrint "正在关闭运行中的苏小有后台进程\.\.\."/);
+  assert.doesNotMatch(installerHooks, /DetailPrint "[A-Za-z]/);
+  assert.match(
+    workflow,
+    /Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode/,
+  );
+  assert.match(workflow, /五个平台安装包均来自同一提交并通过统一前端功能门禁/);
 });
 
 test("keeps Apple credentials step-scoped and fails stable tags fast", () => {

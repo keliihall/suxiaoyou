@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { useRouter } from "next/navigation";
 import { SquarePen, Settings, Loader2, ChevronRight, Inbox, MessageCircle } from "lucide-react";
 import { toast } from "sonner";
@@ -36,6 +37,7 @@ function getTaskRoute(sessionId: string): string {
 
 export default function MobileTaskListPage() {
   const router = useRouter();
+  const { i18n } = useTranslation("common");
   const healthStatus = useRemoteHealth();
   const [sessions, setSessions] = useState<SessionResponse[]>([]);
   const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(new Set());
@@ -151,7 +153,11 @@ export default function MobileTaskListPage() {
                       ) : null}
                     </div>
                     <p className="text-[12px] text-[var(--text-tertiary)] mt-0.5">
-                      {formatRelativeTime(session.time_updated)}
+                      {formatRelativeTime(
+                        session.time_updated,
+                        new Date(),
+                        i18n.resolvedLanguage || i18n.language || "en",
+                      )}
                       {session.summary_files > 0 && (
                         <span className="ml-1.5 opacity-60">
                           &middot; {session.summary_files} 个文件
