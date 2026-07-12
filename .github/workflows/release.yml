@@ -823,9 +823,11 @@ jobs:
           DEB_PACKAGE="$(dpkg-deb -f "${debs[0]}" Package)"
           DEB_VERSION="$(dpkg-deb -f "${debs[0]}" Version)"
           DEB_ARCH="$(dpkg-deb -f "${debs[0]}" Architecture)"
+          DEB_DEPENDS="$(dpkg-deb -f "${debs[0]}" Depends)"
           RPM_PACKAGE="$(rpm -qp --queryformat '%{NAME}' "${rpms[0]}")"
           RPM_VERSION="$(rpm -qp --queryformat '%{VERSION}' "${rpms[0]}")"
           RPM_ARCH="$(rpm -qp --queryformat '%{ARCH}' "${rpms[0]}")"
+          RPM_REQUIRES="$(rpm -qp --requires "${rpms[0]}")"
           [[ "$DEB_PACKAGE" == "$EXPECTED_PACKAGE" ]] || {
             echo "::error::DEB package is $DEB_PACKAGE, expected $EXPECTED_PACKAGE"
             exit 1
@@ -848,6 +850,14 @@ jobs:
           }
           [[ "$RPM_ARCH" == "$EXPECTED_RPM_ARCH" ]] || {
             echo "::error::RPM architecture is $RPM_ARCH, expected $EXPECTED_RPM_ARCH"
+            exit 1
+          }
+          grep -Eq '(^|, )libxdo3([ (]|$)' <<< "$DEB_DEPENDS" || {
+            echo "::error::DEB runtime dependencies do not include libxdo3: $DEB_DEPENDS"
+            exit 1
+          }
+          grep -qx 'xdotool' <<< "$RPM_REQUIRES" || {
+            printf '::error::RPM runtime dependencies do not include xdotool:\n%s\n' "$RPM_REQUIRES"
             exit 1
           }
 

@@ -214,6 +214,10 @@ test("keeps the Chinese UI name while Linux packages use a stable ASCII identity
   assert.equal(linuxConfig.bundle.linux.rpm.desktopTemplate, templatePath);
   assert.equal(linuxArmConfig.bundle.linux.deb.desktopTemplate, templatePath);
   assert.equal(linuxArmConfig.bundle.linux.rpm.desktopTemplate, templatePath);
+  assert.deepEqual(linuxConfig.bundle.linux.deb.depends, ["libxdo3"]);
+  assert.deepEqual(linuxConfig.bundle.linux.rpm.depends, ["xdotool"]);
+  assert.deepEqual(linuxArmConfig.bundle.linux.deb.depends, ["libxdo3"]);
+  assert.deepEqual(linuxArmConfig.bundle.linux.rpm.depends, ["xdotool"]);
   assert.match(linuxDesktopTemplate, /^\[Desktop Entry\]$/m);
   assert.match(linuxDesktopTemplate, /^Categories=\{\{categories\}\}$/m);
   assert.match(linuxDesktopTemplate, /^Comment=\{\{comment\}\}$/m);
@@ -440,9 +444,13 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   assert.match(linux, /DEB_PACKAGE=.*dpkg-deb -f .* Package/);
   assert.match(linux, /dpkg-deb -f .* Version/);
   assert.match(linux, /dpkg-deb -f .* Architecture/);
+  assert.match(linux, /DEB_DEPENDS=.*dpkg-deb -f .* Depends/);
+  assert.match(linux, /libxdo3/);
   assert.match(linux, /RPM_PACKAGE=.*rpm -qp --queryformat '%\{NAME\}'/);
   assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
   assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
+  assert.match(linux, /RPM_REQUIRES=.*rpm -qp --requires/);
+  assert.match(linux, /xdotool/);
   assert.match(linux, /EXPECTED_PACKAGE="suxiaoyou"/);
   assert.match(linux, /DEB package is \$DEB_PACKAGE, expected \$EXPECTED_PACKAGE/);
   assert.match(linux, /RPM package is \$RPM_PACKAGE, expected \$EXPECTED_PACKAGE/);
