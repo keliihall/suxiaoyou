@@ -52,6 +52,7 @@ async def _enqueue(
     text: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     target_stream_id: str | None = None,
+    language: str = "zh",
 ) -> SessionInput:
     async with factory() as db:
         async with db.begin():
@@ -65,6 +66,7 @@ async def _enqueue(
                 model_id="model",
                 provider_id="provider",
                 agent="build",
+                language=language,
                 workspace=None,
                 reasoning=False,
                 permission_presets=None,
@@ -79,8 +81,12 @@ async def test_queued_inputs_run_fifo_on_one_stream_with_one_done(
     execution_db,
     monkeypatch,
 ) -> None:
-    first = await _enqueue(execution_db, "queue-request-1", text="first queued")
-    second = await _enqueue(execution_db, "queue-request-2", text="second queued")
+    first = await _enqueue(
+        execution_db, "queue-request-1", text="first queued", language="en"
+    )
+    second = await _enqueue(
+        execution_db, "queue-request-2", text="second queued", language="zh"
+    )
     job = GenerationJob("stream", "session")
     late_steer = await _enqueue(
         execution_db,
@@ -88,6 +94,7 @@ async def test_queued_inputs_run_fifo_on_one_stream_with_one_done(
         mode="steer",
         text="late steer fallback",
         target_stream_id=job.stream_id,
+        language="en",
     )
 
     class FakePrompt:
@@ -132,6 +139,12 @@ async def test_queued_inputs_run_fifo_on_one_stream_with_one_done(
         "first queued",
         "second queued",
         "late steer fallback",
+    ]
+    assert [request.language for request in FakePrompt.requests] == [
+        "zh",
+        "en",
+        "zh",
+        "en",
     ]
     started = [event for event in job.events if event.event == INPUT_STARTED]
     assert [event.data["mode"] for event in started] == ["queue", "queue", "steer"]
@@ -288,6 +301,7 @@ async def test_task_cancellation_blocks_the_claimed_queued_input(
 def _steer_prompt(job: GenerationJob, execution_db) -> SessionPrompt:
     prompt = object.__new__(SessionPrompt)
     prompt.job = job
+    prompt.request = PromptRequest(session_id="session", text="initial", language="zh")
     prompt.session_factory = execution_db
     return prompt
 
@@ -304,11 +318,15 @@ async def test_steer_safe_boundary_atomically_persists_message_and_parts(
         text="Please change direction",
         attachments=[{"type": "untrusted", "name": "notes.txt", "path": "/tmp/notes.txt"}],
         target_stream_id=job.stream_id,
+        language="en",
     )
 
-    applied = await _steer_prompt(job, execution_db)._apply_pending_steers()
+    prompt = _steer_prompt(job, execution_db)
+    applied = await prompt._apply_pending_steers()
 
     assert applied == 1
+    assert prompt.request.language == "en"
+    assert job.language == "en"
     assert [event.event for event in job.events] == [INPUT_APPLIED]
     async with execution_db() as db:
         stored = await db.get(SessionInput, item.id)

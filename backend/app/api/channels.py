@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.channels.registry import CHINA_READY_CHANNELS
+from app.i18n import localize, request_language
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ async def add_channel(request: Request, body: ChannelAddRequest) -> dict:
     channels = config.setdefault("channels", {})
 
     if body.channel not in CHINA_READY_CHANNELS:
-        raise HTTPException(400, "暂不支持该消息渠道")
+        raise HTTPException(400, localize(request_language(request), "暂不支持该消息渠道", "This messaging channel is not supported"))
 
     # Build channel config
     ch_config: dict[str, Any] = {
@@ -195,7 +196,7 @@ async def add_channel(request: Request, body: ChannelAddRequest) -> dict:
 
     if body.channel == "feishu":
         if not body.app_id or not body.app_secret:
-            raise HTTPException(400, "飞书需要应用 ID 和应用密钥")
+            raise HTTPException(400, localize(request_language(request), "飞书需要应用 ID 和应用密钥", "Feishu requires an App ID and App Secret"))
         ch_config["app_id"] = body.app_id
         ch_config["app_secret"] = body.app_secret
 
@@ -248,7 +249,7 @@ async def login_channel(request: Request, body: ChannelLoginRequest):
     WhatsApp bridge must remain unreachable in v0.8.0.
     """
     if body.channel not in CHINA_READY_CHANNELS:
-        raise HTTPException(400, "暂不支持该消息渠道")
+        raise HTTPException(400, localize(request_language(request), "暂不支持该消息渠道", "This messaging channel is not supported"))
 
     mgr = _get_channel_manager(request)
     if mgr is None:

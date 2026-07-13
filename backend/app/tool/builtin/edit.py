@@ -170,9 +170,15 @@ class EditTool(ToolDefinition):
         diff = generate_unified_diff(original, content, file_path)
 
         if len(edits) == 1:
-            title = f"已编辑 {os.path.basename(file_path)}（{total_replacements} 处替换）"
+            title = ctx.tr(
+                f"已编辑 {os.path.basename(file_path)}（{total_replacements} 处替换）",
+                f"Edited {os.path.basename(file_path)} ({total_replacements} replacements)",
+            )
         else:
-            title = f"已编辑 {os.path.basename(file_path)}（{len(edits)} 个编辑，{total_replacements} 处替换）"
+            title = ctx.tr(
+                f"已编辑 {os.path.basename(file_path)}（{len(edits)} 个编辑，{total_replacements} 处替换）",
+                f"Edited {os.path.basename(file_path)} ({len(edits)} edits, {total_replacements} replacements)",
+            )
 
         return ToolResult(
             output=diff,

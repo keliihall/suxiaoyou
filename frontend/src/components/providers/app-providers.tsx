@@ -17,13 +17,43 @@ import { IS_DESKTOP } from "@/lib/constants";
 import type { BackendStatus } from "@/lib/backend-lifecycle";
 import { useTranslation } from "react-i18next";
 
+type NativeLanguage = "en" | "zh";
+
+function normalizeNativeLanguage(language: string): NativeLanguage {
+  return language.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+function displayNameForLanguage(language: string): string {
+  return normalizeNativeLanguage(language) === "zh" ? "苏小有" : "suyo";
+}
+
 function LanguageSync({ onReady }: { onReady: () => void }) {
   const { i18n } = useTranslation();
 
   useEffect(() => {
     let mounted = true;
+    let queuedNativeLanguage: NativeLanguage | null = null;
+    let nativeSync = Promise.resolve();
+    const syncNativeLanguage = (lng: string) => {
+      if (!IS_DESKTOP) return Promise.resolve();
+      const language = normalizeNativeLanguage(lng);
+      if (queuedNativeLanguage === language) return nativeSync;
+      queuedNativeLanguage = language;
+      nativeSync = nativeSync.then(async () => {
+        try {
+          const { desktopAPI } = await import("@/lib/tauri-api");
+          await desktopAPI.setUiLanguage(language);
+        } catch (error) {
+          // Native synchronization is best-effort and must not block web UI startup.
+          console.error("[LanguageSync] Failed to synchronize native language", error);
+        }
+      });
+      return nativeSync;
+    };
     const handler = (lng: string) => {
       document.documentElement.lang = lng;
+      document.title = displayNameForLanguage(lng);
+      void syncNativeLanguage(lng);
     };
     i18n.on("languageChanged", handler);
 
@@ -38,7 +68,10 @@ function LanguageSync({ onReady }: { onReady: () => void }) {
         console.error("[LanguageSync] Failed to apply language", error);
       } finally {
         if (!mounted) return;
-        document.documentElement.lang = i18n.resolvedLanguage || i18n.language || "en";
+        const activeLanguage = i18n.resolvedLanguage || i18n.language || "en";
+        document.documentElement.lang = activeLanguage;
+        document.title = displayNameForLanguage(activeLanguage);
+        void syncNativeLanguage(activeLanguage);
         onReady();
       }
     };

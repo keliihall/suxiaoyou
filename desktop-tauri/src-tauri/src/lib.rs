@@ -1,4 +1,4 @@
-//! 苏小有 Desktop — Tauri 2.0 application entry point.
+//! suyo Desktop — Tauri 2.0 application entry point.
 //!
 //! Registers plugins, sets up the backend sidecar, tray, menu,
 //! and all IPC command handlers.
@@ -13,7 +13,7 @@ use backend::BackendState;
 use log::{error, info};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -23,6 +23,67 @@ use tokio::sync::Mutex;
 use url::Url;
 
 pub struct PendingNavigationState(Mutex<Option<String>>);
+
+pub struct NativeUiState {
+    snapshot: RwLock<NativeUiSnapshot>,
+}
+
+struct NativeUiSnapshot {
+    language: menu::UiLanguage,
+    tray_recents: Vec<tray::TrayRecent>,
+}
+
+impl NativeUiState {
+    fn new(language: menu::UiLanguage) -> Self {
+        Self {
+            snapshot: RwLock::new(NativeUiSnapshot {
+                language,
+                tray_recents: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn language(&self) -> menu::UiLanguage {
+        self.snapshot
+            .read()
+            .map_or_else(|_| Default::default(), |snapshot| snapshot.language)
+    }
+
+    pub(crate) fn apply_language(
+        &self,
+        app: &tauri::AppHandle,
+        language: menu::UiLanguage,
+    ) -> Result<(), String> {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .map_err(|_| "Native UI language state is unavailable".to_string())?;
+        let app_menu = menu::create_menu(app, language).map_err(|e| e.to_string())?;
+        app.set_menu(app_menu).map_err(|e| e.to_string())?;
+        tray::set_tray(app, &snapshot.tray_recents, language).map_err(|e| e.to_string())?;
+        if let Some(window) = app.get_webview_window("main") {
+            window
+                .set_title(language.app_name())
+                .map_err(|e| e.to_string())?;
+        }
+        snapshot.language = language;
+        Ok(())
+    }
+
+    pub(crate) fn apply_tray_recents(
+        &self,
+        app: &tauri::AppHandle,
+        recents: Vec<tray::TrayRecent>,
+    ) -> Result<(), String> {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .map_err(|_| "Native tray state is unavailable".to_string())?;
+        tray::set_tray(app, &recents, snapshot.language).map_err(|e| e.to_string())?;
+        snapshot.tray_recents = recents;
+        Ok(())
+    }
+}
 
 impl PendingNavigationState {
     fn new() -> Self {
@@ -44,6 +105,7 @@ pub fn run() {
 
     let backend_state = BackendState::new();
     let pending_navigation = PendingNavigationState::new();
+    let native_ui_state = NativeUiState::new(menu::UiLanguage::detect_system());
     let exit_cleanup_started = Arc::new(AtomicBool::new(false));
     let exit_cleanup_complete = Arc::new(AtomicBool::new(false));
 
@@ -78,6 +140,7 @@ pub fn run() {
         // -- Managed state --
         .manage(backend_state)
         .manage(pending_navigation)
+        .manage(native_ui_state)
         // -- Commands --
         .invoke_handler(tauri::generate_handler![
             commands::get_backend_url,
@@ -96,10 +159,12 @@ pub fn run() {
             commands::save_authorized_file_as,
             commands::open_authorized_file_with,
             commands::update_tray_recents,
+            commands::set_ui_language,
         ])
         // -- Setup --
         .setup(|app| {
             let handle = app.handle().clone();
+            let language = app.state::<NativeUiState>().language();
 
             // Windows/Linux use custom in-app title bar via CSS; strip native decorations.
             // macOS window already has titleBarStyle=Overlay + hiddenTitle from config.
@@ -130,11 +195,10 @@ pub fn run() {
 
                 // Warn users when launching directly from mounted DMG volume.
                 if is_running_from_dmg_volume(app) {
+                    let (title, message) = dmg_install_warning(language);
                     app.dialog()
-                        .message(
-                            "苏小有正在从 DMG 磁盘映像中运行。\n\n请先将苏小有.app 复制到“应用程序”文件夹，再从那里启动。",
-                        )
-                        .title("将苏小有安装到应用程序")
+                        .message(message)
+                        .title(title)
                         .kind(MessageDialogKind::Warning)
                         .blocking_show();
                 }
@@ -169,11 +233,15 @@ pub fn run() {
             // before ``window.show()`` below.
 
             // Create system tray once for background mode.
-            tray::create_tray(&handle)?;
+            tray::create_tray(&handle, language)?;
 
             // Create app menu
-            let menu = menu::create_menu(&handle)?;
+            let menu = menu::create_menu(&handle, language)?;
             app.set_menu(menu)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(language.app_name());
+            }
 
             // Handle menu events
             app.on_menu_event(move |app_handle, event| {
@@ -373,6 +441,20 @@ fn is_running_from_dmg_volume(app: &tauri::App) -> bool {
         .resource_dir()
         .map(|p| p.to_string_lossy().starts_with("/Volumes/"))
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn dmg_install_warning(language: menu::UiLanguage) -> (&'static str, &'static str) {
+    match language {
+        menu::UiLanguage::Zh => (
+            "将苏小有安装到应用程序",
+            "苏小有正在从 DMG 磁盘映像中运行。\n\n请先将应用复制到“应用程序”文件夹，再从那里启动。",
+        ),
+        menu::UiLanguage::En => (
+            "Install suyo in Applications",
+            "suyo is running from a DMG disk image.\n\nCopy the app to the Applications folder, then launch it from there.",
+        ),
+    }
 }
 
 fn extract_route_from_urls<'a>(mut urls: impl Iterator<Item = &'a str>) -> Option<String> {

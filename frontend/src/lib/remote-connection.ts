@@ -2,7 +2,7 @@
  * Remote connection state manager.
  *
  * Stores {url, token} in localStorage for persistent remote connections.
- * Used by mobile PWA to connect to a desktop 苏小有 instance over the internet.
+ * Used by the mobile PWA to connect to a desktop suyo instance over the internet.
  */
 
 const STORAGE_KEY = "suxiaoyou_remote_connection";
@@ -72,16 +72,6 @@ export const CHINA_REMOTE_PROVIDERS = [
 ] as const;
 
 export type RemoteProvider = (typeof CHINA_REMOTE_PROVIDERS)[number];
-
-export const REMOTE_PROVIDER_LABELS: Record<RemoteProvider, string> = {
-  deepseek: "深度求索（DeepSeek）",
-  qwen: "通义千问",
-  kimi: "Kimi（月之暗面）",
-  zhipu: "智谱 AI",
-  minimax: "MiniMax（稀宇科技）",
-  siliconflow: "硅基流动",
-  xiaomi: "小米 MiMo",
-};
 
 export function isRemoteProvider(value: string | null): value is RemoteProvider {
   return CHINA_REMOTE_PROVIDERS.includes(value as RemoteProvider);

@@ -120,7 +120,7 @@ test("all release metadata matches the root product version", () => {
   }
 
   assert.equal(zhCommon.poweredBy, `苏小有 v${rootPackage.version}`);
-  assert.equal(enCommon.poweredBy, `苏小有 v${rootPackage.version}`);
+  assert.equal(enCommon.poweredBy, `suyo v${rootPackage.version}`);
 });
 
 test("settings version fallback is derived from frontend/package.json", () => {
@@ -131,16 +131,16 @@ test("settings version fallback is derived from frontend/package.json", () => {
   assert.doesNotMatch(generalTab, /useState\(["']\d+\.\d+\.\d+["']\)/);
 });
 
-test("about copy matches the 苏小有 product", () => {
+test("about copy follows the localized product-name contract", () => {
   const zhSettings = readJson<Record<string, string>>("src/i18n/locales/zh/settings.json");
   const enSettings = readJson<Record<string, string>>("src/i18n/locales/en/settings.json");
 
   assert.equal(zhSettings.aboutVersion, "苏小有 v{{version}}");
   assert.equal(zhSettings.aboutDesc, "“小有所成，小有智慧。”  面向桌面端工作的AI助理。");
   assert.equal(zhSettings.aboutCopyright, "苏小有 © 2026");
-  assert.equal(enSettings.aboutVersion, "苏小有 v{{version}}");
-  assert.equal(enSettings.aboutDesc, "“小有所成，小有智慧。”  面向桌面端工作的AI助理。");
-  assert.equal(enSettings.aboutCopyright, "苏小有 © 2026");
+  assert.equal(enSettings.aboutVersion, "suyo v{{version}}");
+  assert.doesNotMatch(enSettings.aboutDesc, /[\u3400-\u9fff]/);
+  assert.equal(enSettings.aboutCopyright, "suyo © 2026");
 });
 
 test("frontend fonts remain reproducible without network access", () => {
@@ -244,7 +244,7 @@ test("macOS tray template icon uses a detailed black alpha mask", () => {
   assert.ok(twoX.pixels[38][34][3] > 0);
 });
 
-test("native macOS tray and application menus use Chinese visible labels", () => {
+test("native tray and application menus provide complete English and Chinese labels", () => {
   const tray = readText("../desktop-tauri/src-tauri/src/tray.rs");
   const menu = readText("../desktop-tauri/src-tauri/src/menu.rs");
   const nativeSources = `${tray}\n${menu}`;
@@ -253,21 +253,16 @@ test("native macOS tray and application menus use Chinese visible labels", () =>
     "New Chat",
     "Search Chats",
     "Recent Chats",
-    "No recent chats",
+    "No Recent Chats",
     "Show All Chats",
-    "Untitled chat",
-    "Open 苏小有",
+    "Untitled Chat",
+    "Open suyo",
     "Settings",
     "Reload",
-    "Quit 苏小有",
+    "Quit suyo",
     "Toggle Sidebar",
     "Developer Tools",
-    "About 苏小有",
-  ]) {
-    assert.doesNotMatch(nativeSources, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  }
-
-  for (const label of [
+    "About suyo",
     "新对话",
     "搜索对话…",
     "最近对话",
@@ -284,15 +279,30 @@ test("native macOS tray and application menus use Chinese visible labels", () =>
   ]) {
     assert.match(nativeSources, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+  assert.match(menu, /GetUserDefaultUILanguage/);
+  assert.doesNotMatch(menu, /GetUserDefaultLocaleName/);
+});
+
+test("language changes synchronize the web, window, menu, and tray surfaces", () => {
+  const providers = readText("src/components/providers/app-providers.tsx");
+  const tauriApi = readText("src/lib/tauri-api.ts");
+  const commands = readText("../desktop-tauri/src-tauri/src/commands.rs");
+  const nativeLib = readText("../desktop-tauri/src-tauri/src/lib.rs");
+
+  assert.match(providers, /desktopAPI\.setUiLanguage\(language\)/);
+  assert.match(providers, /document\.title = displayNameForLanguage/);
+  assert.match(tauriApi, /setUiLanguage:[\s\S]*invoke\("set_ui_language"/);
+  assert.match(commands, /pub fn set_ui_language/);
+  assert.match(nativeLib, /commands::set_ui_language/);
 });
 
 test("native macOS install warning is localized", () => {
   const lib = readText("../desktop-tauri/src-tauri/src/lib.rs");
 
-  assert.doesNotMatch(lib, /running from the DMG volume/);
-  assert.doesNotMatch(lib, /copy .*Applications/);
-  assert.doesNotMatch(lib, /Install 苏小有 to Applications/);
+  assert.match(lib, /suyo is running from a DMG disk image/);
+  assert.match(lib, /Copy the app to the Applications folder/);
+  assert.match(lib, /Install suyo in Applications/);
   assert.match(lib, /苏小有正在从 DMG 磁盘映像中运行/);
-  assert.match(lib, /请先将苏小有\.app 复制到“应用程序”文件夹/);
+  assert.match(lib, /请先将应用复制到“应用程序”文件夹/);
   assert.match(lib, /将苏小有安装到应用程序/);
 });

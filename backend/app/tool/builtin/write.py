@@ -63,13 +63,16 @@ class WriteTool(ToolDefinition):
             atomic_write_text(file_path, content)
 
             lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-            action = "已更新" if existed else "已创建"
+            action = ctx.tr("已更新", "Updated") if existed else ctx.tr("已创建", "Created")
 
             return ToolResult(
-                output=f"{action} {file_path}（{lines} 行）",
+                output=ctx.tr(
+                    f"{action} {file_path}（{lines} 行）",
+                    f"{action} {file_path} ({lines} lines)",
+                ),
                 title=f"{action} {os.path.basename(file_path)}",
                 metadata={"file_path": file_path},
             )
 
         except PermissionError:
-            return ToolResult(error=f"没有权限写入：{file_path}")
+            return ToolResult(error=ctx.tr(f"没有权限写入：{file_path}", f"Permission denied writing: {file_path}"))

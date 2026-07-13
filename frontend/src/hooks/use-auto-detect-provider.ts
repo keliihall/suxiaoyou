@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import {
   useSettingsHasHydrated,
   useSettingsStore,
@@ -24,12 +25,15 @@ interface RapidMLXRuntimeStatus {
  * Should be called at the layout level so it runs regardless of which page the user visits.
  */
 export function useAutoDetectProvider(): { hasProvider: boolean } {
+  const { i18n } = useTranslation();
   const activeProvider = useSettingsStore((s) => s.activeProvider);
   const setActiveProvider = useSettingsStore((s) => s.setActiveProvider);
   const settingsHydrated = useSettingsHasHydrated();
 
   const { data: providers } = useQuery({
-    queryKey: queryKeys.providers,
+    queryKey: queryKeys.providersForLanguage(
+      i18n.resolvedLanguage || i18n.language,
+    ),
     queryFn: () => api.get<ProviderInfo[]>(API.CONFIG.PROVIDERS),
   });
 

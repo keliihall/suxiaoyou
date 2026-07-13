@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import { ArrowLeft, ArrowUp, Loader2, Paperclip, Camera, X, ChevronDown, FolderOpen } from "lucide-react";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
@@ -18,8 +19,6 @@ import {
 } from "@/lib/prompt-idempotency";
 import type { FileAttachment, PromptRequest } from "@/types/chat";
 
-const VISION_MODEL_REQUIRED_MESSAGE = "The selected model does not support images. Choose a vision model and try again.";
-
 /**
  * Mobile new task page.
  *
@@ -30,6 +29,7 @@ const VISION_MODEL_REQUIRED_MESSAGE = "The selected model does not support image
  */
 export default function MobileNewTaskPage() {
   const router = useRouter();
+  const { t } = useTranslation("common");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -83,7 +83,7 @@ export default function MobileNewTaskPage() {
     if ((!text.trim() && files.length === 0) || sending) return;
     const selectedModelInfo = models.find((model) => model.id === selectedModel);
     if (files.some((file) => file.type.startsWith("image/")) && selectedModelInfo?.capabilities.vision !== true) {
-      toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+      toast.error(t("mobileVisionModelRequired"));
       return;
     }
     setSending(true);
@@ -152,10 +152,10 @@ export default function MobileNewTaskPage() {
       ) {
         clearPromptRequestId("mobile-new", promptRequestId);
       }
-      toast.error("Failed to send task. Check your connection.");
+      toast.error(t("mobileSendFailed"));
       setSending(false);
     }
-  }, [text, sending, files, models, selectedModel, workspaceDirectory, router]);
+  }, [text, sending, files, models, selectedModel, workspaceDirectory, router, t]);
 
   // Current model name for display
   return (
@@ -168,7 +168,7 @@ export default function MobileNewTaskPage() {
         >
           <ArrowLeft className="w-5 h-5" />
         </button>
-        <h1 className="text-lg font-semibold tracking-tight">New Task</h1>
+        <h1 className="text-lg font-semibold tracking-tight">{t("mobileNewTask")}</h1>
       </header>
 
       {/* Main content — push input to bottom like a chat app */}
@@ -186,9 +186,9 @@ export default function MobileNewTaskPage() {
             className="w-full appearance-none pl-3 pr-7 py-2 rounded-full bg-[var(--surface-secondary)] text-[16px] font-medium border border-[var(--border-default)] text-[var(--text-primary)] disabled:opacity-50 focus:outline-none focus:border-[var(--border-heavy)]"
           >
             {loadingModels ? (
-              <option>Loading...</option>
+              <option>{t("mobileLoadingModels")}</option>
             ) : models.length === 0 ? (
-              <option>No models — check Settings</option>
+              <option>{t("mobileNoModels")}</option>
             ) : (
               models.map((m) => (
                 <option key={m.id} value={m.id}>{m.name}</option>
@@ -207,7 +207,7 @@ export default function MobileNewTaskPage() {
           <span className={`flex-1 text-left text-[15px] truncate ${workspaceDirectory ? "text-[var(--text-primary)] font-medium" : "text-[var(--text-tertiary)]"}`}>
             {workspaceDirectory
               ? workspaceDirectory.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~")
-              : "No workspace (full access)"}
+              : t("mobileNoWorkspace")}
           </span>
           {workspaceDirectory && (
             <button
@@ -256,7 +256,7 @@ export default function MobileNewTaskPage() {
               ref={textareaRef}
               value={text}
               onChange={handleTextChange}
-              placeholder="What should 苏小有 do?"
+              placeholder={t("mobilePromptPlaceholder")}
               rows={1}
               className="w-full resize-none bg-transparent text-[16px] leading-relaxed outline-none placeholder:text-[var(--text-tertiary)] min-h-[28px] max-h-[200px]"
               autoFocus
@@ -296,7 +296,7 @@ export default function MobileNewTaskPage() {
         </div>
 
         <p className="mt-2.5 text-center text-[11px] text-[var(--text-tertiary)]">
-          Tasks execute on your desktop computer
+          {t("mobileTasksRunOnDesktop")}
         </p>
       </div>
     </div>

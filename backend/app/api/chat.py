@@ -65,6 +65,7 @@ from app.streaming.events import (
 )
 from app.streaming.manager import GenerationJob, SessionBusyError, StreamManager
 from app.utils.id import generate_ulid
+from app.i18n import request_language
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +329,7 @@ async def _get_session_context_usage_ratio(
 @router.post("/chat/prompt", response_model=PromptResponse)
 async def start_prompt(
     body: PromptRequest,
+    request: Request,
     sm: StreamManagerDep,
     session_factory: SessionFactoryDep,
     provider_registry: ProviderRegistryDep,
@@ -336,6 +338,7 @@ async def start_prompt(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Start a new generation. Returns stream_id for SSE subscription."""
+    body.language = request_language(request)
     request_key = body.client_request_id
     request_hash = canonical_request_hash(
         body.model_dump(mode="json", exclude={"client_request_id"})
@@ -382,6 +385,7 @@ async def start_prompt(
         session_id = body.session_id or generate_ulid()
         stream_id = generate_ulid()
         job = _create_session_job(sm, stream_id=stream_id, session_id=session_id)
+        job.language = body.language
 
         if request_key:
             record = IdempotencyRecord(
@@ -471,6 +475,7 @@ async def start_prompt(
 @router.post("/chat/task-batch", response_model=PromptResponse)
 async def start_task_batch(
     body: TaskBatchRequest,
+    request: Request,
     sm: StreamManagerDep,
     session_factory: SessionFactoryDep,
     provider_registry: ProviderRegistryDep,
@@ -479,10 +484,12 @@ async def start_task_batch(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Start an explicit sequential or parallel multi-agent task batch."""
+    body.language = request_language(request)
     session_id = body.session_id or generate_ulid()
     stream_id = generate_ulid()
 
     job = _create_session_job(sm, stream_id=stream_id, session_id=session_id)
+    job.language = body.language
     job.interactive = True
     # A task batch owns child streams and cannot safely splice a user follow-up
     # into its parent orchestration stream.
@@ -597,6 +604,7 @@ async def start_compaction(
 @router.post("/chat/edit", response_model=PromptResponse)
 async def edit_and_resend(
     body: EditAndResendRequest,
+    request: Request,
     sm: StreamManagerDep,
     session_factory: SessionFactoryDep,
     provider_registry: ProviderRegistryDep,
@@ -605,6 +613,7 @@ async def edit_and_resend(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Edit a user message, delete all subsequent messages, and re-generate."""
+    body.language = request_language(request)
     active = sm.active_job_for_session(body.session_id)
     if active is not None:
         raise HTTPException(
@@ -637,6 +646,7 @@ async def edit_and_resend(
             await db.execute(sa_delete(Todo).where(Todo.session_id == body.session_id))
 
     job = _create_session_job(sm, stream_id=stream_id, session_id=body.session_id)
+    job.language = body.language
     job.interactive = True
 
     # Build a PromptRequest for run_generation (reuses existing flow)
@@ -651,6 +661,7 @@ async def edit_and_resend(
         permission_rules=body.permission_rules,
         reasoning=body.reasoning,
         workspace=body.workspace,
+        language=body.language,
     )
 
     coro = run_generation(

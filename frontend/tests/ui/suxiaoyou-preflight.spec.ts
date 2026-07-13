@@ -20,7 +20,7 @@ async function openNewChat(page: Page, workspace = false) {
   await expect(
     page
       .getByRole("heading", {
-        name: /What should (苏小有 help you do|we do in)/i,
+        name: /What should (suyo help you do|we do in)/i,
       })
       .first(),
   ).toBeVisible();
@@ -898,7 +898,7 @@ test.describe("苏小有 UI preflight", () => {
 
     await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Light" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "中文" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Chinese" })).toBeVisible();
 
     await page.getByRole("button", { name: "Providers" }).click();
     await expect(
@@ -1157,35 +1157,28 @@ test.describe("苏小有 mobile remote preflight", () => {
   }) => {
     await page.goto("/m/settings?token=remote-token");
     await expect(
-      page.getByRole("heading", { name: "Connection" }),
+      page.getByRole("heading", { name: "Remote connection" }),
     ).toBeVisible();
     await expect(page.getByText("Connected")).toBeVisible();
-    await expect(page.getByText("Model Access")).toBeVisible();
-    await expect(page.getByText("OpenRouter")).toBeVisible();
-    await page.getByText("ChatGPT Subscription").click();
-    await expect(
-      page.getByRole("button", {
-        name: /ChatGPT Subscription 1 model available/i,
-      }),
-    ).toBeVisible();
+    await expect(page.getByText("How to connect")).toBeVisible();
   });
 
   test("mobile task path: task list, new task, submit", async ({ page }) => {
     await page.goto("/m?token=remote-token");
-    await expect(page.getByRole("heading", { name: "苏小有" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "suyo" })).toBeVisible();
     await expect(page.getByText("Quarterly planning notes")).toBeVisible();
 
     await page.getByRole("button", { name: "New task" }).click({ force: true });
-    await expect(page.getByRole("heading", { name: "New Task" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New task" })).toBeVisible();
     await expect(page.locator("select")).toContainText("Claude Sonnet 4.5");
 
     await page
-      .getByPlaceholder("What should 苏小有 do?")
+      .getByPlaceholder("What should suyo do?")
       .fill("Check the release notes from my phone");
     const promptResponse = page.waitForResponse(
       (res) => res.url().includes("/api/chat/prompt") && res.status() === 200,
     );
-    await page.getByPlaceholder("What should 苏小有 do?").press("Enter");
+    await page.getByPlaceholder("What should suyo do?").press("Enter");
     await promptResponse;
   });
 });

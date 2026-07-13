@@ -338,7 +338,7 @@ def test_alembic_connection_reference_is_dropped_before_engine_dispose_on_error(
     connection = FakeConnection()
 
     class FakeEngine:
-        def connect(self) -> FakeConnection:
+        def begin(self) -> FakeConnection:
             return connection
 
         def dispose(self) -> None:
@@ -427,6 +427,53 @@ def test_real_v073_fixture_upgrades_without_losing_data(tmp_path: Path) -> None:
     assert columns == migrations.V080_SESSION_INPUT_COLUMNS
     assert "ix_session_input_dispatch" in indexes
     assert "sqlite_autoindex_session_input_2" in indexes
+
+
+def test_rc1_database_adds_language_to_existing_queued_inputs(tmp_path: Path) -> None:
+    database = tmp_path / "rc1.db"
+    engine = migrations.create_sync_engine(f"sqlite:///{database}")
+    try:
+        with engine.connect() as connection:
+            config = migrations._alembic_config(connection)
+            try:
+                migrations.command.upgrade(config, migrations.V080_IDEMPOTENCY_REVISION)
+            finally:
+                config.attributes.pop("connection", None)
+    finally:
+        engine.dispose()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO session_input (
+                id, session_id, client_request_id, mode, status, position,
+                text, attachments, agent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "queued-before-rc2",
+                "session-before-rc2",
+                "request-before-rc2",
+                "queue",
+                "queued",
+                1,
+                "continue",
+                "[]",
+                "build",
+            ),
+        )
+
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert result is not None
+    assert result.previous_revision == migrations.V080_IDEMPOTENCY_REVISION
+    assert result.current_revision == V080_HEAD_REVISION
+    with sqlite3.connect(database) as connection:
+        language = connection.execute(
+            "SELECT language FROM session_input WHERE id = ?",
+            ("queued-before-rc2",),
+        ).fetchone()
+    assert language == ("zh",)
 
 
 def test_repeated_startup_is_idempotent_and_does_not_add_backups(

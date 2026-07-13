@@ -78,6 +78,17 @@ export const REQUIRED_RELEASE_LICENSE_FILES = Object.freeze([
   "licenses/third-party/python-runtime/python-build-standalone-20260623/licenses/LICENSE.zlib.txt",
 ]);
 
+export const REQUIRED_LOCALIZED_INFO_PLISTS = Object.freeze([
+  {
+    path: "en.lproj/InfoPlist.strings",
+    displayName: "suyo",
+  },
+  {
+    path: "zh-Hans.lproj/InfoPlist.strings",
+    displayName: "苏小有",
+  },
+]);
+
 export async function verifyMacOSBundle(
   appPath,
   expectedArchitecture,
@@ -114,6 +125,17 @@ export async function verifyMacOSBundle(
       join(resources, relativePath),
       `bundled release license ${relativePath}`,
     );
+  }
+  for (const localization of REQUIRED_LOCALIZED_INFO_PLISTS) {
+    const localizedInfo = join(resources, localization.path);
+    requirePath(localizedInfo, `localized bundle metadata ${localization.path}`);
+    const localizedText = readFileSync(localizedInfo, "utf8");
+    const expectedDisplayName = localization.displayName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!new RegExp(`"CFBundleDisplayName"\\s*=\\s*"${expectedDisplayName}";`).test(localizedText)) {
+      throw new Error(
+        `${localization.path}: expected CFBundleDisplayName ${JSON.stringify(localization.displayName)}`,
+      );
+    }
   }
 
   const recursiveXattrs = await commandText(runCommand, "xattr", ["-lr", app]);

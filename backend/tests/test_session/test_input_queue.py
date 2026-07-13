@@ -42,6 +42,7 @@ async def _enqueue(db, request_id: str, mode: str = "queue"):
         model_id="model",
         provider_id="provider",
         agent="build",
+        language="zh",
         workspace=None,
         reasoning=False,
         permission_presets=None,

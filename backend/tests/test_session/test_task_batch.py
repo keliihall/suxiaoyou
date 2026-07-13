@@ -34,10 +34,10 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
     session_factory,
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, str]] = []
 
     async def fake_run_generation(job, request, **_kwargs):
-        calls.append((request.text, request.model))
+        calls.append((request.text, request.model, request.language))
         job.publish(SSEEvent(TEXT_DELTA, {"text": f"done {request.text}"}))
 
     monkeypatch.setattr("app.session.task_batch.run_generation", fake_run_generation)
@@ -50,6 +50,7 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
             _task("One", "first", model="model-a"),
             _task("Two", "second", model="model-b"),
         ],
+        language="en",
     )
 
     await run_task_batch(
@@ -61,7 +62,7 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
         tool_registry=MagicMock(),
     )
 
-    assert calls == [("first", "model-a"), ("second", "model-b")]
+    assert calls == [("first", "model-a", "en"), ("second", "model-b", "en")]
     assert [event.event for event in job.events].count(TASK_BATCH_START) == 1
     assert [event.event for event in job.events].count(TASK_BATCH_FINISH) == 1
     assert job.events[-1].event == DONE

@@ -136,6 +136,7 @@ class TaskTool(ToolDefinition):
         child_job = GenerationJob(
             stream_id=child_stream_id,
             session_id=child_session_id,
+            language=ctx.language,
         )
         # Propagate depth for nested recursion guard
         child_job._depth = parent_depth + 1
@@ -146,6 +147,7 @@ class TaskTool(ToolDefinition):
             text=prompt,
             model=getattr(ctx, "_model_id", None),
             agent=agent_name,
+            language=ctx.language,
         )
 
         # Publish subtask start to parent stream
@@ -208,17 +210,17 @@ class TaskTool(ToolDefinition):
         # can see what the subagent discovered, not just its text summary.
         if tool_results:
             recent_results = tool_results[-5:]
-            output += "\n\n--- 关键工具结果 ---\n"
+            output += ctx.tr("\n\n--- 关键工具结果 ---\n", "\n\n--- Key tool results ---\n")
             output += "\n\n".join(recent_results)
 
         if error_parts:
-            output += "\n[错误：" + "; ".join(error_parts) + "]"
+            output += ctx.tr("\n[错误：", "\n[Errors: ") + "; ".join(error_parts) + "]"
         if not output.strip():
-            output = "（子任务没有产生文本输出）"
+            output = ctx.tr("（子任务没有产生文本输出）", "(The subtask produced no text output)")
 
         return ToolResult(
             output=output,
-            title=f"子任务（{agent_name}）：{description}",
+            title=ctx.tr(f"子任务（{agent_name}）：{description}", f"Subtask ({agent_name}): {description}"),
             metadata={
                 "task_id": child_session_id,
                 "session_id": child_session_id,

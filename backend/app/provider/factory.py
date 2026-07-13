@@ -49,6 +49,7 @@ def create_provider(
             pdef = ProviderDef(
                 id=provider_id,
                 name="Custom Endpoint",
+                name_en="Custom Endpoint",
                 settings_key="custom_endpoints",
                 kind="openai_compat_custom",
             )

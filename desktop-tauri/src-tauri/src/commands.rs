@@ -18,7 +18,7 @@ use std::process::Stdio;
 
 use crate::{
     backend::{BackendState, BackendStatus},
-    tray, PendingNavigationState,
+    menu, tray, NativeUiState, PendingNavigationState,
 };
 
 /// Get the backend URL (http://127.0.0.1:{port}).
@@ -921,8 +921,23 @@ pub async fn download_and_save(
 
 /// Replace the tray's Recent Chats list with the given sessions (top first).
 #[tauri::command]
-pub fn update_tray_recents(app: AppHandle, recents: Vec<tray::TrayRecent>) -> Result<(), String> {
-    tray::set_tray_recents(&app, &recents).map_err(|e| e.to_string())
+pub fn update_tray_recents(
+    app: AppHandle,
+    state: tauri::State<'_, NativeUiState>,
+    recents: Vec<tray::TrayRecent>,
+) -> Result<(), String> {
+    state.apply_tray_recents(&app, recents)
+}
+
+/// Synchronize native window, application-menu, and tray labels with the web UI.
+#[tauri::command]
+pub fn set_ui_language(
+    app: AppHandle,
+    state: tauri::State<'_, NativeUiState>,
+    language: String,
+) -> Result<(), String> {
+    let language = menu::UiLanguage::parse(&language)?;
+    state.apply_language(&app, language)
 }
 
 #[cfg(test)]

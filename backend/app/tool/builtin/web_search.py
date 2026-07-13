@@ -15,6 +15,7 @@ import httpx
 
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
+from app.i18n import localize
 
 
 class WebSearchTool(ToolDefinition):
@@ -63,8 +64,9 @@ class WebSearchTool(ToolDefinition):
             return await self._search_proxy(
                 query, max_results,
                 settings.proxy_url, settings.proxy_token,
+                ctx,
             )
-        return await self._search_ddg(query, max_results)
+        return await self._search_ddg(query, max_results, ctx)
 
     # ------------------------------------------------------------------ #
     # Proxy search (Serper via deployed proxy)
@@ -73,6 +75,7 @@ class WebSearchTool(ToolDefinition):
     async def _search_proxy(
         self, query: str, max_results: int,
         proxy_url: str, proxy_token: str,
+        ctx: ToolContext | None = None,
     ) -> ToolResult:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -100,7 +103,7 @@ class WebSearchTool(ToolDefinition):
                 "daily_search_limit": proxy_usage.get("daily_search_limit", 0),
             }
 
-            return self._format_serper_results(query, max_results, serper_data, usage_meta)
+            return self._format_serper_results(query, max_results, serper_data, usage_meta, ctx)
 
         except Exception as e:
             return ToolResult(error=f"Search failed: {e}")
@@ -109,6 +112,7 @@ class WebSearchTool(ToolDefinition):
     def _format_serper_results(
         query: str, max_results: int,
         data: dict[str, Any], usage_meta: dict[str, Any],
+        ctx: ToolContext | None = None,
     ) -> ToolResult:
         output_lines: list[str] = []
         results_data: list[dict[str, str]] = []
@@ -144,15 +148,18 @@ class WebSearchTool(ToolDefinition):
 
         if not organic:
             return ToolResult(
-                output="未找到结果。",
-                title=f"搜索：{query[:50]}",
+                output=(ctx.tr if ctx else lambda zh, en: localize("zh", zh, en))("未找到结果。", "No results found."),
+                title=(ctx.tr if ctx else lambda zh, en: localize("zh", zh, en))(f"搜索：{query[:50]}", f"Search: {query[:50]}"),
                 metadata=usage_meta,
             )
 
         count = min(len(organic), max_results)
         return ToolResult(
             output="\n".join(output_lines),
-            title=f"搜索：{query[:50]}（{count} 条结果）",
+            title=(ctx.tr if ctx else lambda zh, en: localize("zh", zh, en))(
+                f"搜索：{query[:50]}（{count} 条结果）",
+                f"Search: {query[:50]} ({count} results)",
+            ),
             metadata={
                 "query": query,
                 "count": count,
@@ -165,12 +172,12 @@ class WebSearchTool(ToolDefinition):
     # DuckDuckGo fallback (no API key needed)
     # ------------------------------------------------------------------ #
 
-    async def _search_ddg(self, query: str, max_results: int) -> ToolResult:
+    async def _search_ddg(self, query: str, max_results: int, ctx: ToolContext) -> ToolResult:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
-                    headers={"User-Agent": "苏小有/0.1"},
+                    headers={"User-Agent": "suyo/0.1"},
                 )
                 resp.raise_for_status()
 
@@ -178,8 +185,8 @@ class WebSearchTool(ToolDefinition):
 
             if not results:
                 return ToolResult(
-                    output="未找到结果。",
-                    title=f"搜索：{query[:50]}",
+                    output=ctx.tr("未找到结果。", "No results found."),
+                    title=ctx.tr(f"搜索：{query[:50]}", f"Search: {query[:50]}"),
                 )
 
             output_lines = []
@@ -194,7 +201,10 @@ class WebSearchTool(ToolDefinition):
 
             return ToolResult(
                 output="\n".join(output_lines),
-                title=f"搜索：{query[:50]}（{len(results)} 条结果）",
+                title=ctx.tr(
+                    f"搜索：{query[:50]}（{len(results)} 条结果）",
+                    f"Search: {query[:50]} ({len(results)} results)",
+                ),
                 metadata={"query": query, "count": len(results), "results": results_data},
             )
 

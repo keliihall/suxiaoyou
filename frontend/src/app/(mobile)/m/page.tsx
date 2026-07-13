@@ -37,7 +37,7 @@ function getTaskRoute(sessionId: string): string {
 
 export default function MobileTaskListPage() {
   const router = useRouter();
-  const { i18n } = useTranslation("common");
+  const { t, i18n } = useTranslation("common");
   const healthStatus = useRemoteHealth();
   const [sessions, setSessions] = useState<SessionResponse[]>([]);
   const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(new Set());
@@ -55,11 +55,11 @@ export default function MobileTaskListPage() {
       setNeedsInputIds(new Set(active.filter((j) => j.needs_input).map((j) => j.session_id)));
     } catch (err) {
       console.error("Failed to load sessions:", err);
-      toast.error("加载任务失败");
+      toast.error(t("mobileLoadTasksFailed"));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     autoConnectFromUrl();
@@ -86,21 +86,21 @@ export default function MobileTaskListPage() {
       {/* Header */}
       <header className="flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),12px)] pb-3">
         <div className="flex items-center gap-2">
-          <h1 className="text-xl font-semibold tracking-tight">苏小有</h1>
+          <h1 className="text-xl font-semibold tracking-tight">{t("appName")}</h1>
           <ConnectionDot status={healthStatus} />
         </div>
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => router.push("/m/new")}
             className="h-9 w-9 flex items-center justify-center rounded-full bg-[var(--text-primary)] text-[var(--surface-primary)] active:scale-[0.95] transition-transform"
-            aria-label="新任务"
+            aria-label={t("mobileNewTask")}
           >
             <SquarePen className="w-[18px] h-[18px]" />
           </button>
           <button
             onClick={() => router.push("/m/settings")}
             className="h-9 w-9 flex items-center justify-center rounded-full hover:bg-[var(--surface-secondary)] active:scale-[0.95] transition-all"
-            aria-label="设置"
+            aria-label={t("settings")}
           >
             <Settings className="w-[18px] h-[18px] text-[var(--text-secondary)]" />
           </button>
@@ -119,12 +119,12 @@ export default function MobileTaskListPage() {
               <div className="h-12 w-12 rounded-full bg-[var(--surface-secondary)] flex items-center justify-center">
                 <Inbox className="w-5 h-5 text-[var(--text-tertiary)]" />
               </div>
-              <p className="text-sm text-[var(--text-tertiary)]">暂无任务</p>
+              <p className="text-sm text-[var(--text-tertiary)]">{t("mobileNoTasks")}</p>
               <button
                 onClick={() => router.push("/m/new")}
                 className="mt-2 px-5 py-2.5 rounded-full bg-[var(--text-primary)] text-[var(--surface-primary)] text-sm font-medium active:scale-[0.97] transition-transform"
               >
-                创建第一个任务
+                {t("mobileCreateFirstTask")}
               </button>
             </div>
           ) : (
@@ -138,17 +138,17 @@ export default function MobileTaskListPage() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-1.5">
                       <p className="text-[15px] font-medium truncate leading-tight">
-                        {session.title || "未命名任务"}
+                        {session.title || t("mobileUntitledTask")}
                       </p>
                       {needsInputIds.has(session.id) ? (
                         <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-500 text-[10px] font-medium">
                           <MessageCircle className="w-2.5 h-2.5" />
-                          需要输入
+                          {t("mobileNeedsInput")}
                         </span>
                       ) : activeSessionIds.has(session.id) ? (
                         <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 text-[10px] font-medium">
                           <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                          运行中
+                          {t("mobileRunning")}
                         </span>
                       ) : null}
                     </div>
@@ -160,7 +160,7 @@ export default function MobileTaskListPage() {
                       )}
                       {session.summary_files > 0 && (
                         <span className="ml-1.5 opacity-60">
-                          &middot; {session.summary_files} 个文件
+                          &middot; {t("mobileFileCount", { count: session.summary_files })}
                         </span>
                       )}
                     </p>

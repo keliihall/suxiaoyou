@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { FolderOpen, ChevronRight, ArrowLeft, Check, Home, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
+import { useTranslation } from "react-i18next";
 
 interface DirectoryEntry {
   name: string;
@@ -29,6 +30,7 @@ export function MobileDirectoryBrowser({
   onSelect,
   initialPath,
 }: MobileDirectoryBrowserProps) {
+  const { t } = useTranslation("common");
   const [currentPath, setCurrentPath] = useState<string>("");
   const [parentPath, setParentPath] = useState<string | null>(null);
   const [dirs, setDirs] = useState<DirectoryEntry[]>([]);
@@ -76,13 +78,13 @@ export function MobileDirectoryBrowser({
         >
           <ArrowLeft className="w-5 h-5" />
         </button>
-        <h1 className="text-lg font-semibold tracking-tight flex-1">Select Workspace</h1>
+        <h1 className="text-lg font-semibold tracking-tight flex-1">{t("mobileSelectWorkspace")}</h1>
         <button
           onClick={handleSelect}
           className="h-9 px-4 flex items-center gap-1.5 rounded-full bg-[var(--text-primary)] text-[var(--surface-primary)] text-sm font-medium active:scale-[0.95] transition-transform"
         >
           <Check className="w-4 h-4" />
-          Select
+          {t("mobileSelect")}
         </button>
       </header>
 
@@ -101,7 +103,7 @@ export function MobileDirectoryBrowser({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[var(--surface-secondary)] text-sm text-[var(--text-secondary)] active:scale-[0.97] transition-transform"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
-            Up
+            {t("mobileUp")}
           </button>
         )}
         <button
@@ -109,7 +111,7 @@ export function MobileDirectoryBrowser({
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[var(--surface-secondary)] text-sm text-[var(--text-secondary)] active:scale-[0.97] transition-transform"
         >
           <Home className="w-3.5 h-3.5" />
-          Home
+          {t("mobileHome")}
         </button>
       </div>
 
@@ -122,7 +124,7 @@ export function MobileDirectoryBrowser({
         ) : dirs.length === 0 ? (
           <div className="flex flex-col items-center justify-center pt-16 gap-2">
             <FolderOpen className="w-8 h-8 text-[var(--text-tertiary)]" />
-            <p className="text-sm text-[var(--text-tertiary)]">No subdirectories</p>
+            <p className="text-sm text-[var(--text-tertiary)]">{t("mobileNoSubdirectories")}</p>
           </div>
         ) : (
           <div className="py-1">

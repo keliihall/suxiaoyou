@@ -58,7 +58,7 @@ class WebFetchTool(ToolDefinition):
                 timeout=30.0,
             ) as client:
                 resp = await client.get(url, headers={
-                    "User-Agent": "苏小有/0.1 (tool; web_fetch)",
+                    "User-Agent": "suyo/0.1 (tool; web_fetch)",
                 })
                 resp.raise_for_status()
 
@@ -73,7 +73,7 @@ class WebFetchTool(ToolDefinition):
 
             return ToolResult(
                 output=text,
-                title=f"已获取 {url[:60]}",
+                title=ctx.tr(f"已获取 {url[:60]}", f"Fetched {url[:60]}"),
                 metadata={"url": url, "status_code": resp.status_code, "length": len(text)},
             )
 

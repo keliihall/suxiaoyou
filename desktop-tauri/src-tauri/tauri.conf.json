@@ -63,10 +63,15 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installerHooks": "installer-hooks.nsh",
+        "template": "windows/installer.nsi",
         "languages": [
+          "English",
           "SimpChinese"
         ],
-        "displayLanguageSelector": false
+        "customLanguageFiles": {
+          "English": "windows/English.nsh"
+        },
+        "displayLanguageSelector": true
       }
     },
     "macOS": {

@@ -93,7 +93,7 @@ export const SessionItem = memo(function SessionItem({
   const timestampDateTime = Number.isNaN(parsedTimestamp.getTime())
     ? undefined
     : parsedTimestamp.toISOString();
-  const channelBadge = session.slug ? getChannelBadge(session.slug) : null;
+  const channelBadge = session.slug ? getChannelBadge(session.slug, displayLanguage) : null;
   // Live status badge: shows whenever this session has an in-flight stream
   // attached, including ones the user navigated away from.
   const liveBucket = useChatSession(session.id);
@@ -495,15 +495,16 @@ export const SessionItem = memo(function SessionItem({
 });
 
 /** Map session slug prefix to a channel badge. */
-function getChannelBadge(slug: string): { label: string; color: string } | null {
+function getChannelBadge(slug: string, language: string): { label: string; color: string } | null {
   if (!slug) return null;
   const prefix = slug.split(":")[0];
+  const isChinese = language.toLowerCase().startsWith("zh");
   switch (prefix) {
-    case "feishu":   return { label: "飞书", color: "text-blue-500" };
+    case "feishu":   return { label: isChinese ? "飞书" : "Lark", color: "text-blue-500" };
     case "wechat":
-    case "weixin":   return { label: "微信", color: "text-green-500" };
-    case "dingtalk": return { label: "钉钉", color: "text-sky-500" };
-    case "wecom":    return { label: "企业微信", color: "text-blue-500" };
+    case "weixin":   return { label: isChinese ? "微信" : "WeChat", color: "text-green-500" };
+    case "dingtalk": return { label: isChinese ? "钉钉" : "DingTalk", color: "text-sky-500" };
+    case "wecom":    return { label: isChinese ? "企业微信" : "WeCom", color: "text-blue-500" };
     case "qq":       return { label: "QQ", color: "text-sky-400" };
     default: return slug.includes(":") ? { label: prefix, color: "text-[var(--text-tertiary)]" } : null;
   }

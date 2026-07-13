@@ -23,6 +23,7 @@ from app.models.message import Part
 
 
 _MANAGED_ROOT_ENV = "SUXIAOYOU_MANAGED_WORKSPACE_ROOT"
+_LEGACY_MANAGED_ROOT_ENV = "SUXIAOYOU_LEGACY_MANAGED_WORKSPACE_ROOT"
 _DEFAULT_MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
 _DEFAULT_MAX_INPUT_ENTRIES = 5_000
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
@@ -39,9 +40,22 @@ def managed_workspace_root() -> Path:
     return (Path.cwd() / "data" / "managed-workspaces").resolve()
 
 
+def _legacy_managed_workspace_root() -> Path | None:
+    configured = os.environ.get(_LEGACY_MANAGED_ROOT_ENV, "").strip()
+    if not configured:
+        return None
+    return Path(configured).expanduser().resolve()
+
+
 def managed_workspace_for_session(session_id: str, *, create: bool = True) -> Path:
+    """Resolve a session, using the legacy root only when the current one is absent."""
     safe_session_id = _safe_component(session_id, fallback="session")
     workspace = managed_workspace_root() / safe_session_id
+    legacy_root = _legacy_managed_workspace_root()
+    if not workspace.exists() and legacy_root is not None:
+        legacy_workspace = legacy_root / safe_session_id
+        if legacy_workspace.is_dir():
+            workspace = legacy_workspace
     if create:
         for child in ("inputs", "suxiaoyou_written", ".tmp"):
             (workspace / child).mkdir(parents=True, exist_ok=True)

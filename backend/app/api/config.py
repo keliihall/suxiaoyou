@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.config import get_custom_endpoints
@@ -33,6 +33,7 @@ from app.schemas.provider import (
     ProviderKeyUpdate,
     RESERVED_CUSTOM_SLUGS,
 )
+from app.i18n import request_language
 
 logger = logging.getLogger(__name__)
 
@@ -342,9 +343,10 @@ def _get_disabled_set(settings) -> set[str]:
 
 
 @router.get("/config/providers", response_model=list[ProviderInfo])
-async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -> list[ProviderInfo]:
+async def list_providers(request: Request, settings: SettingsDep, registry: ProviderRegistryDep) -> list[ProviderInfo]:
     """List all BYOK providers with their configuration status."""
     disabled = _get_disabled_set(settings)
+    language = request_language(request)
 
     result: list[ProviderInfo] = []
     for pid, pdef in PROVIDER_CATALOG.items():
@@ -359,7 +361,7 @@ async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -
         if api_key and is_disabled:
             result.append(ProviderInfo(
                 id=pid,
-                name=pdef.name,
+                name=pdef.display_name(language),
                 is_configured=True,
                 enabled=False,
                 masked_key=_mask_key(api_key),
@@ -370,7 +372,7 @@ async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -
             models = [m for p, m in registry._full_models if m.provider_id == pid]
             result.append(ProviderInfo(
                 id=pid,
-                name=pdef.name,
+                name=pdef.display_name(language),
                 is_configured=True,
                 enabled=True,
                 masked_key=_mask_key(api_key),
@@ -381,7 +383,7 @@ async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -
         elif api_key:
             result.append(ProviderInfo(
                 id=pid,
-                name=pdef.name,
+                name=pdef.display_name(language),
                 is_configured=True,
                 enabled=True,
                 masked_key=_mask_key(api_key),
@@ -391,7 +393,7 @@ async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -
         else:
             result.append(ProviderInfo(
                 id=pid,
-                name=pdef.name,
+                name=pdef.display_name(language),
                 is_configured=False,
                 enabled=not is_disabled,
                 status="unconfigured",
@@ -442,7 +444,7 @@ async def list_providers(settings: SettingsDep, registry: ProviderRegistryDep) -
 
 @router.post("/config/providers/{provider_id}/key", response_model=ProviderInfo)
 async def set_provider_key(
-    provider_id: str, body: ProviderKeyUpdate, settings: SettingsDep, registry: ProviderRegistryDep,
+    provider_id: str, body: ProviderKeyUpdate, request: Request, settings: SettingsDep, registry: ProviderRegistryDep,
 ) -> ProviderInfo:
     """Set/update API key for a provider. Validates, registers, and persists."""
     pdef = PROVIDER_CATALOG.get(provider_id)
@@ -503,7 +505,7 @@ async def set_provider_key(
 
     return ProviderInfo(
         id=provider_id,
-        name=pdef.name,
+        name=pdef.display_name(request_language(request)),
         is_configured=True,
         masked_key=_mask_key(api_key),
         model_count=len(models),
@@ -514,7 +516,7 @@ async def set_provider_key(
 
 @router.delete("/config/providers/{provider_id}/key", response_model=ProviderInfo)
 async def delete_provider_key(
-    provider_id: str, settings: SettingsDep, registry: ProviderRegistryDep,
+    provider_id: str, request: Request, settings: SettingsDep, registry: ProviderRegistryDep,
 ) -> ProviderInfo:
     """Remove API key for a provider."""
     pdef = PROVIDER_CATALOG.get(provider_id)
@@ -537,7 +539,7 @@ async def delete_provider_key(
 
     return ProviderInfo(
         id=provider_id,
-        name=pdef.name,
+        name=pdef.display_name(request_language(request)),
         is_configured=False,
         status="unconfigured",
     )
@@ -545,7 +547,7 @@ async def delete_provider_key(
 
 @router.post("/config/providers/{provider_id}/toggle", response_model=ProviderInfo)
 async def toggle_provider(
-    provider_id: str, settings: SettingsDep, registry: ProviderRegistryDep,
+    provider_id: str, request: Request, settings: SettingsDep, registry: ProviderRegistryDep,
 ) -> ProviderInfo:
     """Enable or disable a provider. Disabled providers keep their key but aren't used."""
     pdef = PROVIDER_CATALOG.get(provider_id)
@@ -586,17 +588,17 @@ async def toggle_provider(
     if new_enabled and provider and api_key:
         models = [m for p, m in registry._full_models if m.provider_id == provider_id]
         return ProviderInfo(
-            id=provider_id, name=pdef.name, is_configured=True, enabled=True,
+            id=provider_id, name=pdef.display_name(request_language(request)), is_configured=True, enabled=True,
             masked_key=_mask_key(api_key), model_count=len(models), status="connected",
         )
     elif api_key and not new_enabled:
         return ProviderInfo(
-            id=provider_id, name=pdef.name, is_configured=True, enabled=False,
+            id=provider_id, name=pdef.display_name(request_language(request)), is_configured=True, enabled=False,
             masked_key=_mask_key(api_key), status="disabled",
         )
     else:
         return ProviderInfo(
-            id=provider_id, name=pdef.name, is_configured=bool(api_key),
+            id=provider_id, name=pdef.display_name(request_language(request)), is_configured=bool(api_key),
             enabled=new_enabled, status="unconfigured",
         )
 

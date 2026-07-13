@@ -38,6 +38,7 @@ export interface DesktopAPI {
   maximize: () => Promise<void>;
   close: () => Promise<void>;
   isMaximized: () => Promise<boolean>;
+  setUiLanguage: (language: "en" | "zh") => Promise<void>;
   updateTrayRecents: (recents: TrayRecent[]) => Promise<void>;
   onMaximizeChange: (callback: (maximized: boolean) => void) => () => void;
   onBackendRestarting: (callback: () => void) => () => void;
@@ -96,6 +97,7 @@ export const desktopAPI: DesktopAPI = {
   maximize: () => invoke("window_maximize"),
   close: () => invoke("window_close"),
   isMaximized: () => invoke<boolean>("is_maximized"),
+  setUiLanguage: (language) => invoke("set_ui_language", { language }),
   updateTrayRecents: (recents) => invoke("update_tray_recents", { recents }),
   onMaximizeChange: (callback) =>
     listenSync<boolean>("maximize-change", callback),

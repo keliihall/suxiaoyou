@@ -478,8 +478,8 @@ def html_to_pdf(html_body: str) -> bytes:
         rightMargin=2.5 * cm,
         topMargin=2 * cm,
         bottomMargin=2 * cm,
-        title="苏小有 export",
-        author="苏小有",
+        title="suyo export",
+        author="suyo",
     )
     document.build(story)
     return output.getvalue()

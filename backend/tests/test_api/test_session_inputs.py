@@ -8,6 +8,7 @@ import pytest
 
 from app.dependencies import set_stream_manager
 from app.models.session import Session
+from app.models.session_input import SessionInput
 from app.streaming.events import INPUT_QUEUED
 from app.streaming.manager import StreamManager
 
@@ -48,7 +49,11 @@ async def test_queue_input_post_get_delete_and_idempotency(
     await _create_session(session_factory)
     job = stream_manager.create_job("stream-1", "session-1")
 
-    created = await app_client.post("/api/chat/inputs", json=_payload())
+    created = await app_client.post(
+        "/api/chat/inputs",
+        json=_payload(),
+        headers={"Accept-Language": "en-US,en;q=0.9"},
+    )
     assert created.status_code == 200
     body = created.json()
     assert body["session_id"] == "session-1"
@@ -57,6 +62,10 @@ async def test_queue_input_post_get_delete_and_idempotency(
     assert body["position"] == 1
     assert job.events[-1].event == INPUT_QUEUED
     assert job.events[-1].data["input_id"] == body["id"]
+    async with session_factory() as db:
+        stored = await db.get(SessionInput, body["id"])
+    assert stored is not None and stored.language == "en"
+    assert job.language == "zh"
 
     # A retry after a lost HTTP response resolves to the original durable row,
     # even if the in-memory stream already completed in the meantime.

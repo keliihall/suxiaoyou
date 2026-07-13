@@ -270,7 +270,7 @@ async def refresh_token(
 async def register_client(
     auth_meta: AuthServerMeta,
     redirect_uris: list[str],
-    client_name: str = "苏小有",
+    client_name: str = "suyo",
 ) -> str | None:
     """Dynamically register an OAuth client (RFC 7591).
 

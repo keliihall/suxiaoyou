@@ -284,7 +284,7 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     const state = await setupMockedApp(page, { failUploads: ["broken-upload.txt"] });
 
     await page.goto("/c/new");
-    await expect(page.getByRole("heading", { name: /What should (苏小有 help you do|we do in)/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /What should (suyo help you do|we do in)/i })).toBeVisible();
     await page.locator('input[type="file"]').setInputFiles({
       name: "broken-upload.txt",
       mimeType: "text/plain",
@@ -332,14 +332,14 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     await mock苏小有Api(page, { healthStatus: 401 });
 
     await page.goto("/m/settings");
-    await expect(page.getByRole("heading", { name: "远程连接" })).toBeVisible();
-    await expect(page.getByText("未连接", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Remote connection" })).toBeVisible();
+    await expect(page.getByText("Not connected", { exact: true })).toBeVisible();
     await page.getByPlaceholder("https://xxx.trycloudflare.com").fill("http://127.0.0.1:3317");
     await page.getByPlaceholder("suxiaoyou_rt_...").fill("bad-token");
-    await page.getByRole("button", { name: "连接", exact: true }).click();
+    await page.getByRole("button", { name: "Connect", exact: true }).click();
 
-    await expect(page.getByRole("button", { name: "连接失败" })).toBeVisible();
-    await expect(page.getByText("令牌无效")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Connection failed" })).toBeVisible();
+    await expect(page.getByText("Invalid token")).toBeVisible();
     await expect(page).toHaveURL(/\/m\/settings$/);
     await expectNoAppCrash(page);
   });

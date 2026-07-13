@@ -269,7 +269,7 @@ async function setupCleanLightApp(page: Page, options?: Parameters<typeof mock�
 }
 
 async function expectHome(page: Page) {
-  await expect(page.getByRole("heading", { name: /What should (苏小有 help you do|we do in)/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /What should (suyo help you do|we do in)/i })).toBeVisible();
   await expect(page.locator("html")).not.toHaveClass(/dark/);
   await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);

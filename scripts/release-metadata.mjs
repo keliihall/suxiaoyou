@@ -197,12 +197,12 @@ export function collectReleaseMetadata(rootDir) {
     {
       source: "frontend/src/i18n/locales/en/common.json poweredBy",
       read: () => readJson(rootDir, "frontend/src/i18n/locales/en/common.json").poweredBy,
-      kind: "poweredBy",
+      kind: "poweredByEn",
     },
     {
       source: "frontend/src/i18n/locales/zh/common.json poweredBy",
       read: () => readJson(rootDir, "frontend/src/i18n/locales/zh/common.json").poweredBy,
-      kind: "poweredBy",
+      kind: "poweredByZh",
     },
     {
       source: "THIRD_PARTY_NOTICES.md release graph",
@@ -252,9 +252,13 @@ export function collectReleaseMetadata(rootDir) {
 export function verifyReleaseMetadata(rootDir, expectedVersion) {
   assertReleaseVersion(expectedVersion);
 
-  const expectedPoweredBy = `苏小有 v${expectedVersion}`;
   const mismatches = collectReleaseMetadata(rootDir).flatMap(({ source, value, error, kind }) => {
-    const expected = kind === "poweredBy" ? expectedPoweredBy : expectedVersion;
+    const expected =
+      kind === "poweredByEn"
+        ? `suyo v${expectedVersion}`
+        : kind === "poweredByZh"
+          ? `苏小有 v${expectedVersion}`
+          : expectedVersion;
     if (error) return [{ source, expected, error }];
     return value === expected ? [] : [{ source, expected, value }];
   });

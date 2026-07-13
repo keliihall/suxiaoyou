@@ -47,7 +47,7 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     });
 
     await page.goto("/m?token=remote-token");
-    await expect(page.getByRole("heading", { name: "苏小有" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "suyo" })).toBeVisible();
     await expect(page.getByText("Needs input")).toBeVisible();
     await page.getByText("Quarterly planning notes").click();
 
@@ -67,7 +67,7 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await setupMockedApp(page, { remoteProviderInfoStatus: 503 });
 
     await page.goto("/m?token=remote-token");
-    await expect(page.getByRole("heading", { name: "苏小有" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "suyo" })).toBeVisible();
     await expect(page.getByText("Quarterly planning notes")).toBeVisible();
     await expect(page.locator('span[title="disconnected"]')).toBeVisible({ timeout: 20_000 });
     await expectNoAppCrash(page);

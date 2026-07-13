@@ -511,6 +511,7 @@ function ModelCard({
   isPulling: boolean;
   onPull: (name: string) => void;
 }) {
+  const { t } = useTranslation("settings");
   return (
     <div className="rounded-lg border border-[var(--border-default)] p-3 space-y-2">
       <div>
@@ -544,8 +545,7 @@ function ModelCard({
           const fullName = `${model.name}:${size}`;
           const isInstalled = installedNames.has(fullName);
           const isCloud = size.toLowerCase() === "cloud";
-          const cloudTooltip =
-            "云端托管的 Ollama 模型暂不支持。请使用本地权重标签，或在“设置 > 服务商”选择国内模型服务商。";
+          const cloudTooltip = t("ollamaCloudUnsupported");
           return (
             <button
               key={size}

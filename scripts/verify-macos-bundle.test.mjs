@@ -12,6 +12,7 @@ import { basename, join } from "node:path";
 import { afterEach, test } from "node:test";
 
 import {
+  REQUIRED_LOCALIZED_INFO_PLISTS,
   REQUIRED_RELEASE_LICENSE_FILES,
   verifyMacOSBundle,
 } from "./verify-macos-bundle.mjs";
@@ -56,6 +57,12 @@ function appFixture() {
     mkdirSync(join(path, ".."), { recursive: true });
     writeFileSync(path, basename(path));
   }
+  const localizedInfoFiles = REQUIRED_LOCALIZED_INFO_PLISTS.map(({ path, displayName }) => {
+    const localizedPath = join(resources, path);
+    mkdirSync(join(localizedPath, ".."), { recursive: true });
+    writeFileSync(localizedPath, `"CFBundleDisplayName" = "${displayName}";\n`);
+    return localizedPath;
+  });
 
   return {
     app,
@@ -63,6 +70,7 @@ function appFixture() {
     executable,
     backendExecutable,
     info,
+    localizedInfoFiles,
     node,
     npm,
     npx,
@@ -170,7 +178,7 @@ test("checks every Mach-O, Node, Info.plist, and the embedded backend", async ()
   assert.equal(result.releaseLicenseCount, REQUIRED_RELEASE_LICENSE_FILES.length);
   assert.equal(
     runner.calls.filter(({ command }) => command === "file").length,
-    7 + REQUIRED_RELEASE_LICENSE_FILES.length,
+    7 + REQUIRED_RELEASE_LICENSE_FILES.length + REQUIRED_LOCALIZED_INFO_PLISTS.length,
     "every regular file must be classified with file(1)",
   );
   assert.equal(runner.calls.filter(({ command }) => command === "lipo").length, 3);
@@ -208,6 +216,20 @@ test("rejects an app that omits a mandatory release-license resource", async () 
       log: () => {},
     }),
     /bundled release license licenses\/LICENSE does not exist/,
+  );
+});
+
+test("rejects an app that omits localized display-name metadata", async () => {
+  const fixture = appFixture();
+  unlinkSync(fixture.localizedInfoFiles[1]);
+  const runner = commandRunner(fixture);
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+    }),
+    /localized bundle metadata zh-Hans\.lproj\/InfoPlist\.strings does not exist/,
   );
 });
 

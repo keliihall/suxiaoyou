@@ -37,7 +37,7 @@ test.describe("苏小有 complete GUI workflows", () => {
     );
     await expect(
       page.getByRole("heading", {
-        name: /What should (苏小有 help you do|we do in)/i,
+        name: /What should (suyo help you do|we do in)/i,
       }),
     ).toBeVisible();
     await expect(
@@ -272,16 +272,16 @@ test.describe("苏小有 complete GUI workflows", () => {
       .toBe("chatgpt");
 
     await page.goto("/m/new");
-    await expect(page.getByRole("heading", { name: "New Task" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New task" })).toBeVisible();
     await expect(page.locator("select")).toContainText("GPT-5.5");
     await page
-      .getByPlaceholder("What should 苏小有 do?")
+      .getByPlaceholder("What should suyo do?")
       .fill("Check the release notes from my phone");
 
     const promptResponse = page.waitForResponse(
       (res) => res.url().includes("/api/chat/prompt") && res.status() === 200,
     );
-    await page.getByPlaceholder("What should 苏小有 do?").press("Enter");
+    await page.getByPlaceholder("What should suyo do?").press("Enter");
     await promptResponse;
 
     await expect(page).toHaveURL(

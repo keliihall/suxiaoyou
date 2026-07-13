@@ -30,11 +30,11 @@ const second = "yak";
 const compact = `${first}${second}`;
 const capitalized = `${first[0].toUpperCase()}${first.slice(1)}${second[0].toUpperCase()}${second.slice(1)}`;
 const replacements = [
-  [new RegExp(capitalized, "g"), "苏小有"],
-  [new RegExp(compact.toUpperCase(), "g"), "SUXIAOYOU"],
-  [new RegExp(`${first}-${second}`, "g"), "suxiaoyou"],
-  [new RegExp(`${first} ${second}`, "g"), "suxiaoyou"],
-  [new RegExp(compact, "g"), "suxiaoyou"],
+  [new RegExp(capitalized, "g"), "suyo"],
+  [new RegExp(compact.toUpperCase(), "g"), "SUYO"],
+  [new RegExp(`${first}-${second}`, "g"), "suyo"],
+  [new RegExp(`${first} ${second}`, "g"), "suyo"],
+  [new RegExp(compact, "g"), "suyo"],
 ];
 
 function decodeText(path, buffer) {

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="620" height="170" viewBox="0 0 620 170">
-              <title>苏小有横向组合标</title>
+              <title>suyo horizontal logo</title>
               <defs>
                 <clipPath id="horizontalOpen">
                   <path d="M68 128V72C68 51 79 39 96 39C113 39 124 51 124 72V128Z"/>
@@ -12,6 +12,6 @@
                 <path d="M73 84C81 78 89 78 97 84C105 90 113 90 121 84" fill="none" stroke="#B99A58" stroke-width="6.2" stroke-linecap="round"/>
                 <path d="M76 100C84 94 92 94 100 100C108 106 116 106 124 100" fill="none" stroke="#0D5F58" stroke-width="6.2" stroke-linecap="round"/>
               </g>
-              <text x="190" y="84" fill="#111C20" font-size="46" font-weight="650" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Arial, sans-serif">苏小有</text>
-              <text x="192" y="118" fill="#788287" font-size="12" letter-spacing="4.2" font-family="Arial, sans-serif">SU XIAO YOU</text>
+              <text x="190" y="84" fill="#111C20" font-size="46" font-weight="650" font-family="Inter, Arial, sans-serif">suyo</text>
+              <text x="192" y="118" fill="#788287" font-size="12" letter-spacing="3.2" font-family="Arial, sans-serif">LOCAL-FIRST AI</text>
             </svg>

@@ -52,7 +52,7 @@ function pickModelForMode(
 }
 
 export function ProvidersTab() {
-  const { t } = useTranslation("settings");
+  const { t, i18n } = useTranslation("settings");
   const { activeProvider, setActiveProvider } = useSettingsStore();
   const normalizedActiveProvider: ProviderMode | null =
     activeProvider === "byok" ||
@@ -70,7 +70,9 @@ export function ProvidersTab() {
   const { data: allModels } = useModels();
 
   const { data: providers } = useQuery({
-    queryKey: queryKeys.providers,
+    queryKey: queryKeys.providersForLanguage(
+      i18n.resolvedLanguage || i18n.language,
+    ),
     queryFn: () => api.get<ProviderInfo[]>(API.CONFIG.PROVIDERS),
   });
   const { data: localStatus } = useQuery({

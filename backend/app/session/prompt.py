@@ -607,6 +607,10 @@ class SessionPrompt:
                 )
                 continue
 
+            # A steer changes the language of the work that follows it, but
+            # only after the durable input was applied successfully.
+            self.job.language = item.language
+            self.request.language = item.language
             self.job.publish(
                 SSEEvent(
                     INPUT_APPLIED,

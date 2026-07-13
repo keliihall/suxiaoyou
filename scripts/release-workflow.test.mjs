@@ -10,6 +10,9 @@ const ciWorkflow = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
 const tauriConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/tauri.conf.json"), "utf8"),
 );
+const macPlatformConfig = JSON.parse(
+  readFileSync(join(root, "desktop-tauri/src-tauri/tauri.macos.conf.json"), "utf8"),
+);
 const macArmConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/build.macos-aarch64.json"), "utf8"),
 );
@@ -26,8 +29,24 @@ const installerHooks = readFileSync(
   join(root, "desktop-tauri/src-tauri/installer-hooks.nsh"),
   "utf8",
 );
+const nsisTemplate = readFileSync(
+  join(root, "desktop-tauri/src-tauri/windows/installer.nsi"),
+  "utf8",
+);
+const nsisEnglish = readFileSync(
+  join(root, "desktop-tauri/src-tauri/windows/English.nsh"),
+  "utf8",
+);
 const linuxDesktopTemplate = readFileSync(
   join(root, "desktop-tauri/src-tauri/linux/suxiaoyou.desktop.hbs"),
+  "utf8",
+);
+const macEnglishInfoPlist = readFileSync(
+  join(root, "desktop-tauri/src-tauri/macos-locales/en.lproj/InfoPlist.strings"),
+  "utf8",
+);
+const macChineseInfoPlist = readFileSync(
+  join(root, "desktop-tauri/src-tauri/macos-locales/zh-Hans.lproj/InfoPlist.strings"),
   "utf8",
 );
 const desktopCargo = readFileSync(
@@ -135,8 +154,26 @@ test("manual releases select one target while tags keep both native macOS builds
   assert.match(mac, /node scripts\/verify-macos-bundle\.mjs/);
   assert.doesNotMatch(mac, /VERIFY_BUNDLE_SKIP_SMOKE/);
   assert.doesNotMatch(mac, /dist-x86_64/);
-  assert.deepEqual(macArmConfig.bundle.resources, tauriConfig.bundle.resources);
-  assert.deepEqual(macIntelConfig.bundle.resources, tauriConfig.bundle.resources);
+  assert.deepEqual(macPlatformConfig.bundle.targets, ["dmg", "app"]);
+  assert.equal(
+    macPlatformConfig.bundle.resources["macos-locales/en.lproj/InfoPlist.strings"],
+    "en.lproj/InfoPlist.strings",
+  );
+  assert.equal(
+    macPlatformConfig.bundle.resources["macos-locales/zh-Hans.lproj/InfoPlist.strings"],
+    "zh-Hans.lproj/InfoPlist.strings",
+  );
+  for (const config of [macArmConfig, macIntelConfig]) {
+    for (const [source, destination] of Object.entries(tauriConfig.bundle.resources)) {
+      assert.equal(config.bundle.resources[source], destination);
+    }
+    assert.equal(
+      Object.keys(config.bundle.resources).some((path) => path.includes("macos-locales")),
+      false,
+    );
+  }
+  assert.match(macEnglishInfoPlist, /"CFBundleDisplayName" = "suyo";/);
+  assert.match(macChineseInfoPlist, /"CFBundleDisplayName" = "苏小有";/);
   assert.ok(
     Object.hasOwn(
       macArmConfig.bundle.resources,
@@ -199,7 +236,7 @@ test("sets the declared macOS minimum everywhere", () => {
   assert.match(job("build-macos"), /MACOSX_DEPLOYMENT_TARGET:\s*"11\.0"/);
 });
 
-test("keeps the Chinese UI name while Linux packages use a stable ASCII identity", () => {
+test("preserves package upgrade identities while localizing visible display names", () => {
   assert.equal(tauriConfig.productName, "苏小有");
   assert.ok(tauriConfig.app.windows.every((window) => window.title === "苏小有"));
   assert.equal(linuxConfig.productName, "suxiaoyou");
@@ -224,21 +261,94 @@ test("keeps the Chinese UI name while Linux packages use a stable ASCII identity
   assert.match(linuxDesktopTemplate, /^Exec=\{\{exec\}\}$/m);
   assert.match(linuxDesktopTemplate, /^StartupWMClass=\{\{exec\}\}$/m);
   assert.match(linuxDesktopTemplate, /^Icon=\{\{icon\}\}$/m);
-  assert.match(linuxDesktopTemplate, /^Name=苏小有$/m);
+  assert.match(linuxDesktopTemplate, /^Name=suyo$/m);
+  assert.match(linuxDesktopTemplate, /^Name\[zh_CN\]=苏小有$/m);
   assert.match(linuxDesktopTemplate, /^Terminal=false$/m);
   assert.match(linuxDesktopTemplate, /^Type=Application$/m);
   assert.match(linuxDesktopTemplate, /^MimeType=\{\{mime_type\}\}$/m);
   assert.doesNotMatch(linuxDesktopTemplate, /^Name=\{\{name\}\}$/m);
 });
 
-test("ships the Windows installer in Simplified Chinese", () => {
-  assert.deepEqual(tauriConfig.bundle.windows.nsis.languages, ["SimpChinese"]);
-  assert.equal(tauriConfig.bundle.windows.nsis.displayLanguageSelector, false);
-  assert.match(installerHooks, /DetailPrint "正在关闭运行中的苏小有后台进程\.\.\."/);
-  assert.doesNotMatch(installerHooks, /DetailPrint "[A-Za-z]/);
+test("preserves stable NSIS identity while localizing visible installer copy", () => {
+  const nsis = tauriConfig.bundle.windows.nsis;
+  assert.deepEqual(nsis.languages, ["English", "SimpChinese"]);
+  assert.equal(nsis.displayLanguageSelector, true);
+  assert.equal(nsis.template, "windows/installer.nsi");
+  assert.deepEqual(nsis.customLanguageFiles, {
+    English: "windows/English.nsh",
+  });
+  assert.match(installerHooks, /LangString SuyoClosingProcesses \$\{LANG_ENGLISH\} "Closing running suyo background processes\.\.\."/);
+  assert.match(installerHooks, /LangString SuyoClosingProcesses \$\{LANG_SIMPCHINESE\} "正在关闭运行中的苏小有后台进程\.\.\."/);
+  assert.match(installerHooks, /DetailPrint "\$\(SuyoClosingProcesses\)"/);
+  assert.match(
+    nsisTemplate,
+    /Vendored from tauri-bundler 2\.9\.4's stock NSIS installer template/,
+  );
+  assert.match(
+    nsisTemplate,
+    /Upstream SHA-256: 20f4ecc730defb71f1342eaeaec4021df13be3d843abba0effe88ea5835fa079/,
+  );
+  assert.ok(nsisTemplate.includes('!define PRODUCTNAME "{{product_name}}"'));
+  assert.ok(
+    nsisTemplate.includes(
+      '!define UNINSTKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCTNAME}"',
+    ),
+  );
+  assert.ok(nsisTemplate.includes('!define MANUPRODUCTKEY "${MANUKEY}\\${PRODUCTNAME}"'));
+  assert.ok(nsisTemplate.includes('!define PLACEHOLDER_INSTALL_DIR "placeholder\\${PRODUCTNAME}"'));
+  assert.ok(nsisTemplate.includes('StrCpy $INSTDIR "$LOCALAPPDATA\\${PRODUCTNAME}"'));
+  assert.match(nsisTemplate, /LangString SuyoDisplayName \$\{LANG_ENGLISH\} "suyo"/);
+  assert.match(nsisTemplate, /LangString SuyoDisplayName \$\{LANG_SIMPCHINESE\} "苏小有"/);
+  assert.ok(nsisTemplate.includes('Name "$(SuyoDisplayName)"'));
+  assert.ok(nsisTemplate.includes('VIAddVersionKey "ProductName" "suyo"'));
+  assert.ok(nsisTemplate.includes('VIAddVersionKey "FileDescription" "suyo"'));
+  assert.equal(
+    nsisTemplate.match(
+      /CheckIfAppIsRunning "\$\{MAINBINARYNAME\}\.exe" "\$\(SuyoDisplayName\)"/g,
+    )?.length,
+    2,
+  );
+  assert.ok(nsisTemplate.includes('"Open with $(SuyoDisplayName)"'));
+  assert.ok(
+    nsisTemplate.includes(
+      'WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$(SuyoDisplayName)"',
+    ),
+  );
+  assert.ok(
+    nsisTemplate.includes(
+      'CreateShortcut "$SMPROGRAMS\\$(SuyoDisplayName).lnk" "$INSTDIR\\${MAINBINARYNAME}.exe"',
+    ),
+  );
+  assert.ok(
+    nsisTemplate.includes(
+      'CreateShortcut "$DESKTOP\\$(SuyoDisplayName).lnk" "$INSTDIR\\${MAINBINARYNAME}.exe"',
+    ),
+  );
+  assert.doesNotMatch(nsisTemplate, /CreateShortcut "[^"\n]*\$\{PRODUCTNAME\}\.lnk"/);
+  for (const shortcutPath of [
+    "$SMPROGRAMS\\${PRODUCTNAME}.lnk",
+    "$SMPROGRAMS\\suyo.lnk",
+    "$DESKTOP\\${PRODUCTNAME}.lnk",
+    "$DESKTOP\\suyo.lnk",
+  ]) {
+    assert.ok(
+      nsisTemplate.includes(
+        `SuyoDeleteShortcutIfTarget "${shortcutPath}" "$INSTDIR\\\${MAINBINARYNAME}.exe"`,
+      ),
+      shortcutPath,
+    );
+  }
+  assert.ok(nsisTemplate.includes("Call MigrateOwnedDesktopShortcut"));
+  assert.doesNotMatch(nsisTemplate, /^Name "\$\{PRODUCTNAME\}"$/m);
+  assert.doesNotMatch(nsisEnglish, /[\u3400-\u9fff]/u);
+  assert.doesNotMatch(nsisEnglish, /\$\{PRODUCTNAME\}/);
+  assert.equal(nsisEnglish.match(/\{\{product_name\}\}/g)?.length, 3);
+  assert.match(nsisEnglish, /suyo \$\{VERSION\} is already installed/);
+  assert.match(nsisEnglish, /Choose how you want to install suyo\./);
+  assert.match(nsisEnglish, /Uninstall suyo/);
   assert.match(
     workflow,
-    /Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode/,
+    /Windows NSIS：安装界面支持 English 与简体中文并提供语言选择；当前未配置 Authenticode/,
   );
   assert.match(
     workflow,
@@ -486,11 +596,27 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /Start-Process/);
   assert.match(install, /"\/S"/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
+  assert.match(install, /installer\[0\]\.VersionInfo\.ProductName/);
+  assert.match(install, /installer ProductName is \$installerProductName, expected suyo/);
+  assert.match(
+    install,
+    /HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\苏小有/,
+  );
+  assert.match(install, /uninstallMetadata\.DisplayName -ne "suyo"/);
+  assert.match(install, /uninstallMetadata\.InstallLocation/);
+  assert.match(install, /GetFullPath\(\$recordedInstallLocation\)/);
+  assert.match(install, /GetFullPath\(\$installDirectory\)/);
+  assert.match(install, /legacyShortcuts/);
+  assert.match(install, /localizedShortcuts/);
+  assert.match(install, /CreateShortcut\(\$legacyShortcut\)/);
+  assert.match(install, /Localized shortcut is missing/);
+  assert.match(install, /Legacy Chinese shortcut was not migrated/);
   assert.match(desktopCargo, /^\[package\]\nname = "suxiaoyou-desktop"$/m);
   assert.equal(tauriConfig.mainBinaryName, undefined);
   assert.match(install, /id:\s*install-windows/);
   assert.match(install, /expectedAppExecutable = "suxiaoyou-desktop\.exe"/);
-  assert.match(install, /appBinary = Join-Path \$installDirectory \$expectedAppExecutable/);
+  assert.match(install, /expectedAppPath = Join-Path \$installDirectory \$expectedAppExecutable/);
+  assert.match(install, /appBinary = \$expectedAppPath/);
   assert.match(install, /Test-Path -LiteralPath \$appBinary -PathType Leaf/);
   assert.match(install, /VersionInfo\.ProductVersion/);
   assert.match(install, /Filter node\.exe/);
@@ -689,9 +815,9 @@ test("verifies all seven installers before publishing checksums", () => {
   assert.match(publish, /RELEASE_VERSION:\s*\$\{\{ needs\.validate-release\.outputs\.release_version \}\}/);
   assert.match(publish, /\*\$\{APP_VERSION\}\*_aarch64\.dmg/);
   assert.match(publish, /\*\$\{APP_VERSION\}\*_x64\.dmg/);
-  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-windows-x64-setup\.exe/);
-  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-macos-aarch64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
-  assert.match(publish, /suxiaoyou-\$\{RELEASE_VERSION\}-macos-x64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
+  assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-windows-x64-setup\.exe/);
+  assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-macos-aarch64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
+  assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-macos-x64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
   assert.match(publish, /MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED"/);
   for (const stableName of [
     "windows-x64-setup.exe",

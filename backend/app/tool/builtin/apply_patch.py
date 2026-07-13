@@ -89,7 +89,7 @@ class ApplyPatchTool(ToolDefinition):
                         error=f"Cannot add file '{hunk.path}': already exists"
                     )
                 atomic_write_text(resolved, hunk.contents)
-                summaries.append(f"+ 已新增 {hunk.path}")
+                summaries.append(ctx.tr(f"+ 已新增 {hunk.path}", f"+ Added {hunk.path}"))
 
             elif hunk.type == HunkType.DELETE:
                 if not os.path.exists(resolved):
@@ -97,7 +97,7 @@ class ApplyPatchTool(ToolDefinition):
                         error=f"Cannot delete file '{hunk.path}': not found"
                     )
                 os.remove(resolved)
-                summaries.append(f"- 已删除 {hunk.path}")
+                summaries.append(ctx.tr(f"- 已删除 {hunk.path}", f"- Deleted {hunk.path}"))
 
             elif hunk.type == HunkType.UPDATE:
                 if not os.path.exists(resolved):
@@ -126,10 +126,10 @@ class ApplyPatchTool(ToolDefinition):
                     atomic_write_text(target, modified)
                     if resolved != target:
                         os.remove(resolved)
-                    label = f"~ 已更新 {hunk.path} → {hunk.move_to}"
+                    label = ctx.tr(f"~ 已更新 {hunk.path} → {hunk.move_to}", f"~ Updated {hunk.path} → {hunk.move_to}")
                 else:
                     atomic_write_text(target, modified)
-                    label = f"~ 已更新 {hunk.path}"
+                    label = ctx.tr(f"~ 已更新 {hunk.path}", f"~ Updated {hunk.path}")
 
                 summaries.append(label)
 
@@ -144,6 +144,6 @@ class ApplyPatchTool(ToolDefinition):
 
         return ToolResult(
             output="\n".join(output_parts) + warnings,
-            title=f"已应用补丁（{len(parsed.hunks)} 个文件）",
+            title=ctx.tr(f"已应用补丁（{len(parsed.hunks)} 个文件）", f"Applied patch ({len(parsed.hunks)} files)"),
             metadata={"files": len(parsed.hunks)},
         )

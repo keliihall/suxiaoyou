@@ -22,6 +22,9 @@ class PromptRequest(BaseModel):
     reasoning: bool | None = None  # Explicitly enable/disable reasoning
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}
+    # Request-scoped backend display language.  API handlers derive this from
+    # Accept-Language; exclude it from wire serialization/idempotency hashes.
+    language: Literal["zh", "en"] = Field("zh", exclude=True)
 
 
 class PromptResponse(BaseModel):
@@ -48,6 +51,7 @@ class TaskBatchRequest(BaseModel):
     mode: Literal["sequential", "parallel"] = "parallel"
     tasks: list[TaskBatchTask] = Field(..., min_length=1, max_length=12)
     workspace: str | None = None
+    language: Literal["zh", "en"] = Field("zh", exclude=True)
 
 
 class CompactRequest(BaseModel):
@@ -72,6 +76,7 @@ class EditAndResendRequest(BaseModel):
     reasoning: bool | None = None
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}
+    language: Literal["zh", "en"] = Field("zh", exclude=True)
 
 
 class AbortRequest(BaseModel):

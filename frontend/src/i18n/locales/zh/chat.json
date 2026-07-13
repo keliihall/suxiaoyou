@@ -420,5 +420,7 @@
   "loadingModel": "正在加载模型到内存...",
   "setupProvider": "选择模型来源后开始对话",
   "setupProviderDesc": "优先使用 Rapid-MLX、Ollama 或本地 endpoint；需要云端模型时，再添加自己的 provider key。",
-  "configureSettings": "前往配置"
+  "configureSettings": "前往配置",
+  "permissionNotificationTitle": "苏小有 — 需要权限",
+  "permissionNotificationBody": "助手想要使用 {{tool}}，需要你的批准。"
 }

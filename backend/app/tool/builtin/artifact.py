@@ -114,7 +114,7 @@ class ArtifactTool(ToolDefinition):
             }
 
             return ToolResult(
-                output=f"已创建制品“{title}”。",
+                output=ctx.tr(f"已创建制品“{title}”。", f'Created artifact "{title}".'),
                 metadata={
                     "command": "create",
                     "type": artifact_type,
@@ -158,7 +158,7 @@ class ArtifactTool(ToolDefinition):
                 cached["type"] = artifact_type
 
             return ToolResult(
-                output=f"已更新制品“{identifier}”（替换 {len(old_str)} 个字符）。",
+                output=ctx.tr(f"已更新制品“{identifier}”（替换 {len(old_str)} 个字符）。", f'Updated artifact "{identifier}" (replaced {len(old_str)} characters).'),
                 metadata={
                     "command": "update",
                     "type": cached["type"],
@@ -190,7 +190,7 @@ class ArtifactTool(ToolDefinition):
                 cached["type"] = artifact_type
 
             return ToolResult(
-                output=f"已重写制品“{identifier}”。",
+                output=ctx.tr(f"已重写制品“{identifier}”。", f'Rewrote artifact "{identifier}".'),
                 metadata={
                     "command": "rewrite",
                     "type": artifact_type or cached["type"],

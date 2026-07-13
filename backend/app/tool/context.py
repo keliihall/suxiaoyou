@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
 from app.schemas.agent import AgentInfo
+from app.i18n import Language, localize
 
 
 @dataclass
@@ -25,6 +26,7 @@ class ToolContext:
     message_id: str
     agent: AgentInfo
     call_id: str
+    language: Language = "zh"
     abort_event: asyncio.Event = field(default_factory=asyncio.Event)
     workspace: str | None = None  # workspace directory restriction
     index_manager: Any | None = None  # FTS IndexManager; None when FTS disabled
@@ -66,3 +68,8 @@ class ToolContext:
     @property
     def is_aborted(self) -> bool:
         return self.abort_event.is_set()
+
+    def tr(self, zh: str, en: str) -> str:
+        """Select request-localized dynamic tool text."""
+
+        return localize(self.language, zh, en)

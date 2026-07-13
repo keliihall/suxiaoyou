@@ -7,14 +7,15 @@ import { Minus, Square, X, Copy } from "lucide-react";
 import { IS_DESKTOP, TITLE_BAR_HEIGHT } from "@/lib/constants";
 import { desktopAPI } from "@/lib/tauri-api";
 import { usePlatform } from "@/hooks/use-platform";
+import { useTranslation } from "react-i18next";
 
-function SuxiaoyouLogo() {
+function SuxiaoyouLogo({ alt }: { alt: string }) {
   return (
     <Image
       src="/favicon.svg"
       width={18}
       height={18}
-      alt="苏小有"
+      alt={alt}
       className="shrink-0"
       unoptimized
     />
@@ -29,7 +30,15 @@ function SuxiaoyouLogo() {
  *   overlay title bar style; page headers provide the visible content.
  * - Windows/Linux: full custom title bar with brand + min/max/close controls.
  */
-export function TitleBar({ recoveryActive = false }: { recoveryActive?: boolean }) {
+export function TitleBar({
+  recoveryActive = false,
+  appName,
+}: {
+  recoveryActive?: boolean;
+  appName?: string;
+}) {
+  const { t } = useTranslation("common");
+  const displayName = appName ?? t("appName");
   const [isMaximized, setIsMaximized] = useState(false);
   const platform = usePlatform();
   const isMac = platform === "macos";
@@ -87,9 +96,9 @@ export function TitleBar({ recoveryActive = false }: { recoveryActive?: boolean 
       }}
     >
       <div className="flex items-center gap-2 pl-3 h-full shrink-0">
-        <SuxiaoyouLogo />
+        <SuxiaoyouLogo alt={displayName} />
         <span className="text-xs font-medium text-[var(--text-secondary)] tracking-wide">
-          苏小有
+          {displayName}
         </span>
       </div>
 

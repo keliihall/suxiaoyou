@@ -104,7 +104,7 @@ async function sendPrompt(page: Page, prompt: string) {
 
 async function startOfficeWorkflow(page: Page, uploadFixtures: UploadFixture[], prompt: string) {
   await page.goto("/c/new");
-  await expect(page.getByRole("heading", { name: /What should (苏小有 help you do|we do in)/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /What should (suyo help you do|we do in)/i })).toBeVisible();
   await uploadFiles(page, uploadFixtures);
   await sendPrompt(page, prompt);
 }

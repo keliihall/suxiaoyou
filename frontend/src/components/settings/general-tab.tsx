@@ -106,7 +106,14 @@ export function GeneralTab() {
               className="mt-3 rounded-xl border border-[var(--border-default)] bg-[var(--surface-chat)] p-5 overflow-y-auto max-h-[70vh]"
               style={{ ["--prose-font" as string]: PROSE_FONT_STACKS[proseFont] }}
             >
-              <TextPart data={{ type: "text", text: TYPOGRAPHY_SAMPLE }} />
+              <TextPart
+                data={{
+                  type: "text",
+                  text: i18n.resolvedLanguage?.startsWith("zh")
+                    ? TYPOGRAPHY_SAMPLE_ZH
+                    : TYPOGRAPHY_SAMPLE_EN,
+                }}
+              />
             </div>
           </>
         )}
@@ -164,7 +171,76 @@ const PROSE_FONT_STACKS = {
   sans: '"Inter", "Noto Sans SC", ui-sans-serif, system-ui, sans-serif',
 } as const;
 
-const TYPOGRAPHY_SAMPLE = `# 一级标题
+const TYPOGRAPHY_SAMPLE_EN = `# Level-one heading
+
+This introduction provides context. It should have comfortable spacing from the content below, while the heading above should feel like a clear starting point.
+
+## Level-two heading — Section title
+
+This paragraph follows the section heading and should sit close enough to form a complete content group.
+
+This is a second body paragraph. Consecutive paragraphs should have a steady rhythm: related, but not crowded.
+
+### Level-three heading — Feature list
+
+Lists should be structured and easy to scan:
+
+- **First item** — Begin with bold text and add a short explanation
+- Second item includes an [example link](https://example.com)
+- Third item includes an \`inline code\` reference
+  - Nested item one
+  - Nested item two
+    - One level deeper
+
+#### Level-four heading
+
+Ordered lists should use clear numbering:
+
+1. Install dependencies
+2. Configure environment variables
+3. Start the development server
+
+---
+
+## Code block
+
+Here is a code example:
+
+\`\`\`python
+def hello(name: str) -> str:
+    """Greet someone by name."""
+    return f"Hello, {name}!"
+
+# Example usage
+result = hello("suyo")
+print(result)
+\`\`\`
+
+The code block above should read as a distinct area with a clear, restrained boundary.
+
+## Table and quote
+
+| Capability | Traditional API | Flexible query |
+|------------|-----------------|----------------|
+| Entry points | Multiple | One |
+| Data retrieval | Easy to overfetch or underfetch | Precise fields |
+| Caching | Browser-native | Custom |
+| Learning curve | Low | Medium |
+
+> A quote should have a clear visual boundary without feeling heavy. This text tests blockquote typography.
+
+## Lightly structured text
+
+Project: suyo
+Type: Desktop AI assistant
+Stack: Desktop + web interface + local service
+License: Open source
+Core value: Local first
+
+This normally sized paragraph tests the transition between short, lightly structured lines and regular body copy. The short lines above should form a compact visual group rather than a set of scattered breaks.
+`;
+
+const TYPOGRAPHY_SAMPLE_ZH = `# 一级标题
 
 这是一段用于提供上下文的导语。它应该和下方内容保持舒适间距，上方标题也应该像清晰的章节起点。
 

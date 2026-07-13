@@ -427,6 +427,8 @@ export const queryKeys = {
   usage: (days: number) => ["usage", days] as const,
   apiKeyStatus: ["apiKeyStatus"] as const,
   providers: ["providers"] as const,
+  providersForLanguage: (language: string) =>
+    ["providers", language.toLowerCase().startsWith("zh") ? "zh" : "en"] as const,
   openaiSubscription: ["openaiSubscription"] as const,
   localProvider: ["localProvider"] as const,
   ollamaStatus: ["ollamaStatus"] as const,

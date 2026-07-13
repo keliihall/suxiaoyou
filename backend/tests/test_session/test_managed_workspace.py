@@ -50,6 +50,44 @@ def test_managed_session_id_cannot_escape_root(
     assert workspace.name == "outside"
 
 
+def test_managed_session_selects_legacy_only_when_current_session_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_root = tmp_path / "suyo" / "Generated Files"
+    legacy_root = tmp_path / "苏小有" / "生成文件"
+    monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(managed_root))
+    monkeypatch.setenv(
+        "SUXIAOYOU_LEGACY_MANAGED_WORKSPACE_ROOT", str(legacy_root)
+    )
+
+    legacy_session = legacy_root / "legacy-session"
+    legacy_session.mkdir(parents=True)
+    legacy_file = legacy_session / "existing.txt"
+    legacy_file.write_text("keep me", encoding="utf-8")
+
+    assert (
+        managed_workspace_for_session("legacy-session", create=False)
+        == legacy_session
+    )
+    assert managed_workspace_for_session("legacy-session") == legacy_session
+    assert legacy_file.read_text(encoding="utf-8") == "keep me"
+    assert not (managed_root / "legacy-session").exists()
+
+    new_session = managed_workspace_for_session("new-session")
+    assert new_session == managed_root / "new-session"
+    assert not (legacy_root / "new-session").exists()
+
+    current_session = managed_root / "both-session"
+    current_session.mkdir(parents=True)
+    old_duplicate = legacy_root / "both-session"
+    old_duplicate.mkdir(parents=True)
+    old_file = old_duplicate / "old.txt"
+    old_file.write_text("untouched", encoding="utf-8")
+
+    assert managed_workspace_for_session("both-session") == current_session
+    assert old_file.read_text(encoding="utf-8") == "untouched"
+
+
 def test_directory_attachment_with_symlink_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.models.todo import Todo
+from app.i18n import localize
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
 from app.utils.id import generate_ulid
@@ -72,7 +73,7 @@ class TodoTool(ToolDefinition):
         app_state = getattr(ctx, "_app_state", None)
         if not app_state or "session_factory" not in app_state:
             logger.warning("TodoTool: no session_factory available, todos not persisted")
-            return self._build_result(todos)
+            return self._build_result(todos, ctx)
 
         session_factory = app_state["session_factory"]
         async with session_factory() as db:
@@ -93,24 +94,28 @@ class TodoTool(ToolDefinition):
                         position=i,
                     ))
 
-        return self._build_result(todos)
+        return self._build_result(todos, ctx)
 
     @staticmethod
-    def _build_result(todos: list[dict[str, Any]]) -> ToolResult:
+    def _build_result(todos: list[dict[str, Any]], ctx: ToolContext | None = None) -> ToolResult:
         total = len(todos)
         completed = sum(1 for t in todos if t.get("status") == "completed")
         in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
         pending = total - completed - in_progress
 
-        summary = f"待办清单已更新：已完成 {completed}/{total}"
+        tr = ctx.tr if ctx is not None else lambda zh, en: localize("zh", zh, en)
+        summary = tr(
+            f"待办清单已更新：已完成 {completed}/{total}",
+            f"Todo list updated: {completed}/{total} completed",
+        )
         if in_progress:
-            summary += f"，{in_progress} 个进行中"
+            summary += tr(f"，{in_progress} 个进行中", f", {in_progress} in progress")
         if pending:
-            summary += f"，{pending} 个待处理"
+            summary += tr(f"，{pending} 个待处理", f", {pending} pending")
 
         return ToolResult(
             output=summary,
-            title="待办清单",
+            title=tr("待办清单", "Todo list"),
             metadata={"todos": todos},
         )
 

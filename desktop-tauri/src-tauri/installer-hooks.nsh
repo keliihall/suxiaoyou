@@ -1,6 +1,6 @@
-; Custom NSIS installer hooks for 苏小有.
+; Custom NSIS installer hooks for suyo.
 ;
-; 苏小有 runs as two processes: the Tauri UI (苏小有.exe) and a PyInstaller
+; suyo runs as two processes: the Tauri UI (suxiaoyou-desktop.exe) and a PyInstaller
 ; sidecar (suxiaoyou-backend.exe). The backend keeps several .pyd files loaded
 ; (e.g. PIL's _imaging.pyd, mypyc-compiled modules), which locks them on disk.
 ;
@@ -12,8 +12,11 @@
 ; (and any leftover main binary instances) so the install can overwrite
 ; locked files cleanly.
 
+LangString SuyoClosingProcesses ${LANG_ENGLISH} "Closing running suyo background processes..."
+LangString SuyoClosingProcesses ${LANG_SIMPCHINESE} "正在关闭运行中的苏小有后台进程..."
+
 !macro NSIS_HOOK_PREINSTALL
-  DetailPrint "正在关闭运行中的苏小有后台进程..."
+  DetailPrint "$(SuyoClosingProcesses)"
 
   ; Kill the backend sidecar. Try current-user first (matches our default
   ; per-user install), then fall back to the machine-wide variant so this
@@ -35,10 +38,10 @@
   ; Also make sure the main binary is gone. Tauri's CheckIfAppIsRunning
   ; handles this later too, but doing it here means we don't race the
   ; backend respawning a UI process between the two steps.
-  nsis_tauri_utils::FindProcessCurrentUser "苏小有.exe"
+  nsis_tauri_utils::FindProcessCurrentUser "suxiaoyou-desktop.exe"
   Pop $R0
   ${If} $R0 = 0
-    nsis_tauri_utils::KillProcessCurrentUser "苏小有.exe"
+    nsis_tauri_utils::KillProcessCurrentUser "suxiaoyou-desktop.exe"
     Pop $R0
   ${EndIf}
 

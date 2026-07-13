@@ -59,7 +59,7 @@ class OpenRouterProvider(OpenAICompatProvider):
             base_url=self._base_url,
             default_headers={
                 "HTTP-Referer": "https://github.com/suxiaoyou/desktop",
-                "X-Title": "苏小有",
+                "X-Title": "suyo",
             },
         )
         self._api_key = api_key
@@ -197,7 +197,7 @@ class OpenRouterProvider(OpenAICompatProvider):
             base_url=self._base_url,
             default_headers={
                 "HTTP-Referer": "https://github.com/suxiaoyou/desktop",
-                "X-Title": "苏小有",
+                "X-Title": "suyo",
             },
         )
         self.clear_cache()

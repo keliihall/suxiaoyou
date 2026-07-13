@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -25,6 +25,7 @@ from app.session.idempotency import canonical_request_hash
 from app.session.managed_workspace import snapshot_attachments
 from app.session.manager import get_session
 from app.streaming.events import INPUT_QUEUED, SSEEvent
+from app.i18n import request_language
 
 
 router = APIRouter()
@@ -134,6 +135,7 @@ def _validate_replay(item: SessionInput, body: SessionInputRequest, *, workspace
 @router.post("/chat/inputs", response_model=SessionInputResponse)
 async def create_session_input(
     body: SessionInputRequest,
+    request: Request,
     stream_manager: StreamManagerDep,
     session_factory: SessionFactoryDep,
 ) -> SessionInputResponse:
@@ -172,6 +174,11 @@ async def create_session_input(
                 "message": "The current task already finished; send this as a normal message.",
             },
         )
+
+    # Language is snapshotted per queued turn. Multiple clients can enqueue in
+    # different languages while one job is running, so the owning job cannot
+    # safely hold this as one mutable queue-wide value.
+    language = request_language(request)
 
     attachments = body.attachments
     if session_directory == "." and attachments:
@@ -213,6 +220,7 @@ async def create_session_input(
                         model_id=body.model,
                         provider_id=body.provider_id,
                         agent=body.agent,
+                        language=language,
                         # The persisted session directory is authoritative. A
                         # stale global workspace selection must not redirect a
                         # folderless conversation's queued outputs.

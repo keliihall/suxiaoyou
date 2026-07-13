@@ -72,31 +72,25 @@ test("multi-agent task batch popover uses localized visible labels", () => {
 test("general settings typography controls and sample are localized", () => {
   const generalTab = readFileSync("src/components/settings/general-tab.tsx", "utf8");
   const appearanceCustomize = readFileSync("src/components/settings/appearance-customize.tsx", "utf8");
-  const combined = `${generalTab}\n${appearanceCustomize}`;
-
-  for (const phrase of [
-    "Typography Preview",
-    "Heading Level 1",
-    "This is an introductory paragraph",
-    "Section Heading",
-    "First item",
-    "link example",
-    "Nested item",
-    "Install the dependencies",
-    "Configure the environment variables",
-  ]) {
-    assert.doesNotMatch(combined, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  }
+  assert.match(generalTab, /TYPOGRAPHY_SAMPLE_EN/);
+  assert.match(generalTab, /TYPOGRAPHY_SAMPLE_ZH/);
+  assert.match(generalTab, /i18n\.resolvedLanguage\?\.startsWith\("zh"\)/);
   assert.doesNotMatch(generalTab, /label:\s*"Serif"/);
   assert.doesNotMatch(generalTab, /label:\s*"Sans-serif"/);
   assert.doesNotMatch(appearanceCustomize, /\n\s*reset\s*\n/);
 
   const zhSettings = readJson<Record<string, string>>("src/i18n/locales/zh/settings.json");
+  const enSettings = readJson<Record<string, string>>("src/i18n/locales/en/settings.json");
   assert.equal(zhSettings.typographyPreview, "排版预览");
   assert.equal(zhSettings.serifFont, "衬线");
   assert.equal(zhSettings.sansSerifFont, "无衬线");
   assert.equal(zhSettings.resetColor, "重置");
+  assert.equal(enSettings.typographyPreview, "Typography preview");
+  assert.equal(enSettings.serifFont, "Serif");
+  assert.equal(enSettings.sansSerifFont, "Sans serif");
+  assert.equal(enSettings.resetColor, "Reset");
   assert.match(generalTab, /# 一级标题/);
+  assert.match(generalTab, /# Level-one heading/);
 });
 
 test("sidebar relative time labels are localized", () => {

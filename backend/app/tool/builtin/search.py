@@ -91,7 +91,7 @@ class SearchTool(ToolDefinition):
         if not results:
             return ToolResult(
                 output="(no results)",
-                title=f'未找到“{query}”的结果',
+                title=ctx.tr(f'未找到“{query}”的结果', f'No results for "{query}"'),
                 metadata={"count": 0},
             )
 
@@ -112,6 +112,6 @@ class SearchTool(ToolDefinition):
         output = "\n".join(lines).rstrip()
         return ToolResult(
             output=output,
-            title=f'{len(results)} 条“{query}”的搜索结果',
+            title=ctx.tr(f'{len(results)} 条“{query}”的搜索结果', f'{len(results)} search results for "{query}"'),
             metadata={"count": len(results), "total": data.get("total", len(results)), "query": query, "source": "fts"},
         )

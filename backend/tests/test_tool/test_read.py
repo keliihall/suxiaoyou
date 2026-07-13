@@ -10,12 +10,13 @@ from app.tool.builtin.read import ReadTool
 from app.tool.context import ToolContext
 
 
-def _make_ctx() -> ToolContext:
+def _make_ctx(language: str = "zh") -> ToolContext:
     return ToolContext(
         session_id="test-session",
         message_id="test-msg",
         agent=AgentInfo(name="test", description="", mode="primary"),
         call_id="test-call",
+        language=language,
     )
 
 
@@ -61,6 +62,12 @@ class TestReadTool:
         assert result.success
         assert "a.txt" in result.output
         assert "b.txt" in result.output
+        assert result.title == f"已列出 {tmp_path.name} 中的 2 个条目"
+
+        english = await tool.execute(
+            {"file_path": str(tmp_path)}, _make_ctx(language="en")
+        )
+        assert english.title == f"Listed 2 entries in {tmp_path.name}"
 
     @pytest.mark.asyncio
     async def test_line_numbers_format(self, tool: ReadTool, tmp_path: Path):

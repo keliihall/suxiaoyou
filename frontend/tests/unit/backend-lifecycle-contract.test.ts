@@ -81,7 +81,7 @@ test("desktop recovery chrome stays outside the lifecycle gate and above its ove
   assert.match(providerSource, /showDesktopLifecycle && <TitleBar recoveryActive=/);
   assert.match(providerSource, /inert=\{recoveryActive \? true : undefined\}/);
   assert.doesNotMatch(mainLayoutSource, /<TitleBar/);
-  assert.match(globalErrorSource, /<TitleBar recoveryActive \/>/);
+  assert.match(globalErrorSource, /<TitleBar recoveryActive appName=\{copy\.appName\} \/>/);
   assert.match(titleBarSource, /data-tauri-drag-region/);
   assert.match(titleBarSource, /z-\[10000\]/);
   assert.match(titleBarSource, /isChatPage && !recoveryActive/);

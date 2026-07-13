@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.i18n import Language, localize
+
 
 @dataclass
 class ProviderDef:
@@ -16,6 +18,7 @@ class ProviderDef:
 
     id: str
     name: str
+    name_en: str
     settings_key: str  # Field name in app.config.Settings (e.g. "openai_api_key")
     kind: str  # "openai_compat" | "native_anthropic" | "native_gemini"
     base_url: str = ""  # Only used by openai_compat providers
@@ -23,6 +26,11 @@ class ProviderDef:
     # Small, conservative network-free seed used until remote model metadata
     # has refreshed.  Keep this intentionally narrower than the live catalog.
     seed_models: tuple[tuple[str, str], ...] = ()
+
+    def display_name(self, language: Language | str) -> str:
+        """Return localized UI text while keeping provider IDs stable."""
+
+        return localize(language, self.name, self.name_en)
 
 
 # All remote providers that can be configured via direct API key (BYOK).
@@ -32,6 +40,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "deepseek": ProviderDef(
         id="deepseek",
         name="深度求索（DeepSeek）",
+        name_en="DeepSeek",
         settings_key="deepseek_api_key",
         kind="openai_compat",
         base_url="https://api.deepseek.com/v1",
@@ -43,6 +52,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "qwen": ProviderDef(
         id="qwen",
         name="通义千问",
+        name_en="Qwen",
         settings_key="qwen_api_key",
         kind="openai_compat",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -54,6 +64,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "kimi": ProviderDef(
         id="kimi",
         name="Kimi（月之暗面）",
+        name_en="Kimi",
         settings_key="kimi_api_key",
         kind="openai_compat",
         base_url="https://api.moonshot.cn/v1",
@@ -62,6 +73,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "minimax": ProviderDef(
         id="minimax",
         name="MiniMax（稀宇科技）",
+        name_en="MiniMax",
         settings_key="minimax_api_key",
         kind="openai_compat",
         base_url="https://api.minimaxi.com/v1",
@@ -70,6 +82,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "zhipu": ProviderDef(
         id="zhipu",
         name="智谱 AI",
+        name_en="Zhipu AI",
         settings_key="zhipu_api_key",
         kind="openai_compat",
         base_url="https://open.bigmodel.cn/api/paas/v4",
@@ -78,6 +91,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "siliconflow": ProviderDef(
         id="siliconflow",
         name="硅基流动",
+        name_en="SiliconFlow",
         settings_key="siliconflow_api_key",
         kind="openai_compat",
         base_url="https://api.siliconflow.cn/v1",
@@ -86,6 +100,7 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "xiaomi": ProviderDef(
         id="xiaomi",
         name="小米 MiMo",
+        name_en="Xiaomi MiMo",
         settings_key="xiaomi_api_key",
         kind="openai_compat",
         base_url="https://api.xiaomimimo.com/v1",

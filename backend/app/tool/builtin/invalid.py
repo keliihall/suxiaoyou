@@ -34,5 +34,5 @@ class InvalidTool(ToolDefinition):
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         name = args.get("name", "unknown")
         return ToolResult(
-            error=f"工具“{name}”不可用。请检查工具名称后重试。",
+            error=ctx.tr(f"工具“{name}”不可用。请检查工具名称后重试。", f'Tool "{name}" is unavailable. Check the tool name and try again.'),
         )

@@ -891,7 +891,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings = Settings()
 
     app = FastAPI(
-        title="苏小有",
+        title="suyo",
         version="0.0.1",
         lifespan=lifespan,
     )

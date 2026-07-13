@@ -293,9 +293,13 @@ class ReadTool(ToolDefinition):
             try:
                 entries = sorted(os.listdir(file_path))
                 listing = "\n".join(entries)
+                directory_name = os.path.basename(file_path)
                 return ToolResult(
                     output=listing,
-                    title=f"Listed {len(entries)} entries in {os.path.basename(file_path)}",
+                    title=ctx.tr(
+                        f"已列出 {directory_name} 中的 {len(entries)} 个条目",
+                        f"Listed {len(entries)} entries in {directory_name}",
+                    ),
                     metadata={"source": "filesystem"},
                 )
             except PermissionError:

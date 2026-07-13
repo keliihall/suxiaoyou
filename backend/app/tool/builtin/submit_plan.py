@@ -146,8 +146,8 @@ class SubmitPlanTool(ToolDefinition):
         # If no job context or not interactive — degrade gracefully
         if not should_wait:
             return ToolResult(
-                output=f"[没有用户连接] 已提交计划：{title}",
-                title=f"计划：{title}",
+                output=ctx.tr(f"[没有用户连接] 已提交计划：{title}", f"[No user connected] Submitted plan: {title}"),
+                title=ctx.tr(f"计划：{title}", f"Plan: {title}"),
                 metadata=plan_meta,
             )
 
@@ -168,11 +168,11 @@ class SubmitPlanTool(ToolDefinition):
                 if action == "accept":
                     mode = response.get("mode", "auto")
                     return ToolResult(
-                        output=(
-                            f"用户已接受计划（模式：{mode}）。"
-                            f"切换到构建模式并执行计划：\n\n{plan}"
+                        output=ctx.tr(
+                            f"用户已接受计划（模式：{mode}）。切换到构建模式并执行计划：\n\n{plan}",
+                            f"The user accepted the plan (mode: {mode}). Switch to build mode and execute it:\n\n{plan}",
                         ),
-                        title=f"计划已接受：{title}",
+                        title=ctx.tr(f"计划已接受：{title}", f"Plan accepted: {title}"),
                         metadata={
                             **plan_meta,
                             "switch_agent": "build",
@@ -183,34 +183,34 @@ class SubmitPlanTool(ToolDefinition):
                 elif action == "stop":
                     # User wants to stop and review the plan at their leisure
                     return ToolResult(
-                        output=(
-                            "用户选择停止并自行审查计划。计划已保存。不要继续执行，等待用户下一条消息。"
+                        output=ctx.tr(
+                            "用户选择停止并自行审查计划。计划已保存。不要继续执行，等待用户下一条消息。",
+                            "The user chose to stop and review the saved plan. Do not continue; wait for the user's next message.",
                         ),
-                        title=f"计划已保存：{title}",
+                        title=ctx.tr(f"计划已保存：{title}", f"Plan saved: {title}"),
                         metadata={**plan_meta, "plan_stopped": True},
                     )
                 else:  # revise
                     feedback = response.get("feedback", "")
                     return ToolResult(
-                        output=(
-                            f"用户要求修改计划。\n"
-                            f"反馈：{feedback}\n\n"
-                            "请根据反馈修改计划，并再次调用 submit_plan。"
+                        output=ctx.tr(
+                            f"用户要求修改计划。\n反馈：{feedback}\n\n请根据反馈修改计划，并再次调用 submit_plan。",
+                            f"The user requested plan revisions.\nFeedback: {feedback}\n\nRevise the plan and call submit_plan again.",
                         ),
-                        title="已请求修改计划",
+                        title=ctx.tr("已请求修改计划", "Plan revision requested"),
                         metadata={**plan_meta, "plan_revised": True, "feedback": feedback},
                     )
             else:
                 # Simple string response — treat as feedback
                 return ToolResult(
-                    output=f"用户反馈：{response}\n\n请修改计划并再次调用 submit_plan。",
-                    title="已收到计划反馈",
+                    output=ctx.tr(f"用户反馈：{response}\n\n请修改计划并再次调用 submit_plan。", f"User feedback: {response}\n\nRevise the plan and call submit_plan again."),
+                    title=ctx.tr("已收到计划反馈", "Plan feedback received"),
                     metadata=plan_meta,
                 )
 
         except TimeoutError:
             return ToolResult(
-                output="（用户在 10 分钟内没有回复）",
-                error="计划审查超时：用户未回复",
+                output=ctx.tr("（用户在 10 分钟内没有回复）", "(The user did not respond within 10 minutes)"),
+                error=ctx.tr("计划审查超时：用户未回复", "Plan review timed out: the user did not respond"),
                 metadata=plan_meta,
             )

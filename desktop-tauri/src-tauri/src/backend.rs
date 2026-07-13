@@ -200,6 +200,15 @@ fn predecessor_data_dir(app_data_dir: &Path) -> Option<PathBuf> {
     Some(data_root.join(predecessor_identifier).join("data"))
 }
 
+fn managed_workspace_root(base_dir: &Path) -> PathBuf {
+    base_dir.join("suyo").join("Generated Files")
+}
+
+fn legacy_managed_workspace_root(base_dir: &Path) -> Option<PathBuf> {
+    let legacy = base_dir.join("苏小有").join("生成文件");
+    legacy.is_dir().then_some(legacy)
+}
+
 fn bundled_node_bin_dir(resource_dir: &Path) -> PathBuf {
     let runtime_root = resource_dir.join("nodejs");
     if cfg!(target_os = "windows") {
@@ -518,12 +527,12 @@ impl BackendState {
         // boundary. Resolve the platform's real Documents directory through
         // Tauri (important for OneDrive/redirection on Windows) and fall back
         // to app data only on platforms that do not expose one.
-        let managed_workspace_root = app
+        let managed_workspace_base = app
             .path()
             .document_dir()
-            .unwrap_or_else(|_| app_data_dir.clone())
-            .join("苏小有")
-            .join("生成文件");
+            .unwrap_or_else(|_| app_data_dir.clone());
+        let managed_workspace_root = managed_workspace_root(&managed_workspace_base);
+        let legacy_managed_workspace_root = legacy_managed_workspace_root(&managed_workspace_base);
 
         // Ensure data directory exists
         std::fs::create_dir_all(&data_dir)
@@ -542,10 +551,13 @@ impl BackendState {
         write_desktop_log(
             &desktop_log_path,
             &format!(
-                "Starting desktop backend | app_version={} | data_dir={} | managed_workspace_root={} | log_dir={}",
+                "Starting desktop backend | app_version={} | data_dir={} | managed_workspace_root={} | legacy_managed_workspace_root={} | log_dir={}",
                 app.package_info().version,
                 data_dir.display(),
                 managed_workspace_root.display(),
+                legacy_managed_workspace_root
+                    .as_deref()
+                    .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
                 log_dir.display()
             ),
         );
@@ -590,6 +602,9 @@ impl BackendState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
+            if let Some(legacy_root) = legacy_managed_workspace_root.as_ref() {
+                cmd.env("SUXIAOYOU_LEGACY_MANAGED_WORKSPACE_ROOT", legacy_root);
+            }
 
             // Windows: isolate process group so CTRL_BREAK_EVENT doesn't leak to Tauri
             #[cfg(target_os = "windows")]
@@ -654,6 +669,9 @@ impl BackendState {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::null());
+            if let Some(legacy_root) = legacy_managed_workspace_root.as_ref() {
+                cmd.env("SUXIAOYOU_LEGACY_MANAGED_WORKSPACE_ROOT", legacy_root);
+            }
 
             // Windows: isolate process group so CTRL_BREAK_EVENT doesn't leak to Tauri
             #[cfg(target_os = "windows")]
@@ -1585,7 +1603,8 @@ async fn kill_process_tree(child: &mut Child) -> Result<(), String> {
 #[cfg(test)]
 mod startup_contract_tests {
     use super::{
-        bundled_node_bin_dir, clear_watchdog_generation, kill_process_tree, next_backend_status,
+        bundled_node_bin_dir, clear_watchdog_generation, kill_process_tree,
+        legacy_managed_workspace_root, managed_workspace_root, next_backend_status,
         predecessor_data_dir, prepend_runtime_path, take_process_for_generation, BackendPhase,
         BackendState, StatusUpdate, HEALTH_STARTUP_TIMEOUT, MAX_STATUS_DETAIL_CHARS,
     };
@@ -1633,6 +1652,35 @@ mod startup_contract_tests {
         std::fs::create_dir_all(&predecessor).unwrap();
 
         assert_eq!(predecessor_data_dir(&current), Some(predecessor));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_workspace_uses_neutral_root_and_discovers_legacy_root_separately() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "suxiaoyou-workspace-root-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(
+            managed_workspace_root(&root),
+            root.join("suyo").join("Generated Files")
+        );
+        assert_eq!(legacy_managed_workspace_root(&root), None);
+
+        let legacy = root.join("苏小有").join("生成文件");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(
+            managed_workspace_root(&root),
+            root.join("suyo").join("Generated Files")
+        );
+        assert_eq!(legacy_managed_workspace_root(&root), Some(legacy));
 
         std::fs::remove_dir_all(root).unwrap();
     }

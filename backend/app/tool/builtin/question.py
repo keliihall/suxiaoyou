@@ -139,14 +139,14 @@ class QuestionTool(ToolDefinition):
 
         # If no job context or not interactive — degrade gracefully
         summary = (
-            f"[多问题] {len(questions)} 个问题"
+            ctx.tr(f"[多问题] {len(questions)} 个问题", f"[Multiple questions] {len(questions)} questions")
             if is_multi
-            else f"已提问：{question}"
+            else ctx.tr(f"已提问：{question}", f"Asked: {question}")
         )
         if not should_wait:
             return ToolResult(
-                output=f"[没有用户连接] {summary}",
-                title="提问（无监听）",
+                output=ctx.tr(f"[没有用户连接] {summary}", f"[No user connected] {summary}"),
+                title=ctx.tr("提问（无监听）", "Question (no listener)"),
                 metadata={"questions": questions} if is_multi else {"question": question, "options": options},
             )
 
@@ -166,17 +166,20 @@ class QuestionTool(ToolDefinition):
                     formatted = str(response)
                 return ToolResult(
                     output=formatted,
-                    title=f"用户回答了 {len(answers) if isinstance(answers, dict) else 1} 个问题",
+                    title=ctx.tr(
+                        f"用户回答了 {len(answers) if isinstance(answers, dict) else 1} 个问题",
+                        f"User answered {len(answers) if isinstance(answers, dict) else 1} questions",
+                    ),
                     metadata={"questions": questions, "answers": answers},
                 )
             else:
                 return ToolResult(
                     output=str(response),
-                    title=f"用户回答：{str(response)[:100]}",
+                    title=ctx.tr(f"用户回答：{str(response)[:100]}", f"User answered: {str(response)[:100]}"),
                     metadata={"question": question, "answer": response},
                 )
         except TimeoutError:
             return ToolResult(
-                output="（用户在 5 分钟内没有回复）",
-                error="提问超时：用户未回复",
+                output=ctx.tr("（用户在 5 分钟内没有回复）", "(The user did not respond within 5 minutes)"),
+                error=ctx.tr("提问超时：用户未回复", "Question timed out: the user did not respond"),
             )

@@ -57,9 +57,9 @@ class PresentFileTool(ToolDefinition):
         if os.path.isdir(resolved):
             return ToolResult(error=f"Cannot present a directory: {file_path}")
 
-        title = args.get("title") or os.path.basename(resolved) or "文件预览"
+        title = args.get("title") or os.path.basename(resolved) or ctx.tr("文件预览", "File preview")
         return ToolResult(
-            output=f"已展示 {resolved}",
-            title=f"已展示 {title}",
+            output=ctx.tr(f"已展示 {resolved}", f"Presented {resolved}"),
+            title=ctx.tr(f"已展示 {title}", f"Presented {title}"),
             metadata={"file_path": resolved, "title": title},
         )

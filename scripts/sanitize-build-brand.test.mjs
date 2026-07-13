@@ -41,8 +41,8 @@ test("sanitizes recognized UTF-8 text files without rewriting legal notices", as
 
     await sanitize(buildDir);
 
-    assert.equal(await readFile(textPath, "utf8"), "苏小有 text");
-    assert.equal(await readFile(uppercaseHtmlPath, "utf8"), "苏小有 page");
+    assert.equal(await readFile(textPath, "utf8"), "suyo text");
+    assert.equal(await readFile(uppercaseHtmlPath, "utf8"), "suyo page");
     assert.equal(await readFile(licensePath, "utf8"), `${legacyBrand} license`);
     assert.equal(await readFile(noticePath, "utf8"), `${legacyBrand} notice`);
   });

@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { ShieldAlert, ShieldCheck, ShieldX, Clock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { useTranslation } from "react-i18next";
 import { PERMISSION_TIMEOUT } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
 import { canSubmitInteraction } from "@/lib/interaction-response";
@@ -137,12 +138,12 @@ function PermissionDetails({
 }
 
 /** Send a browser notification if tab is not focused. */
-function notifyIfHidden(tool: string) {
+function notifyIfHidden(title: string, body: string) {
   if (typeof document === "undefined" || document.visibilityState !== "hidden") return;
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
   try {
-    new Notification("苏小有 — Permission Required", {
-      body: `The assistant wants to use ${tool} and needs your approval.`,
+    new Notification(title, {
+      body,
       tag: "suxiaoyou-permission", // deduplicate
     });
   } catch {
@@ -160,6 +161,7 @@ function useRequestNotificationPermission() {
 }
 
 export function PermissionDialog({ permission, onRespond, onRecover, onStop }: PermissionDialogProps) {
+  const { t, i18n } = useTranslation("chat");
   const [remainingMs, setRemainingMs] = useState(PERMISSION_TIMEOUT);
   const [rememberChoice, setRememberChoice] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -214,8 +216,11 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
 
   // Send browser notification when permission request appears
   useEffect(() => {
-    notifyIfHidden(permission.tool);
-  }, [permission.tool]);
+    notifyIfHidden(
+      t("permissionNotificationTitle"),
+      t("permissionNotificationBody", { tool: permission.tool }),
+    );
+  }, [i18n.resolvedLanguage, permission.tool, t]);
 
   useEffect(() => {
     setSubmitting(false);

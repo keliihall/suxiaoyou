@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.streaming.events import AGENT_ERROR, DESYNC, DONE, SSEEvent
+from app.i18n import Language
 
 # Events that MUST be delivered to the frontend even when the queue overflows.
 # Losing these causes the UI to get permanently stuck in "generating" state.
@@ -73,9 +74,12 @@ class GenerationJob:
     # Max events to keep in the replay buffer per job
     _MAX_EVENT_BUFFER = 5000
 
-    def __init__(self, stream_id: str, session_id: str):
+    def __init__(self, stream_id: str, session_id: str, *, language: Language = "zh"):
         self.stream_id = stream_id
         self.session_id = session_id
+        # Request-scoped display language for generated tool/API activity.
+        # This is presentation state, not part of the persisted session identity.
+        self.language: Language = language
         self.events: list[SSEEvent] = []
         self.subscribers: list[asyncio.Queue[SSEEvent | None]] = []
         self.abort_event = asyncio.Event()

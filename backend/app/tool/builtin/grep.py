@@ -154,6 +154,6 @@ class GrepTool(ToolDefinition):
 
         return ToolResult(
             output=output,
-            title=f"{total_matches} 处匹配 /{pattern_str}/",
+            title=ctx.tr(f"{total_matches} 处匹配 /{pattern_str}/", f"{total_matches} matches /{pattern_str}/"),
             metadata={"matches": total_matches},
         )

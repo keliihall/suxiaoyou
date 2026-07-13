@@ -2,6 +2,7 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import {
   CHINA_REMOTE_PROVIDERS,
   isRemoteMode,
@@ -17,6 +18,7 @@ import { API } from "@/lib/constants";
 import type { ModelInfo } from "@/types/model";
 
 function MobileLoadingScreen() {
+  const { t } = useTranslation("common");
   return (
     <div className="flex flex-col items-center justify-center h-full gap-4">
       <div className="relative w-10 h-10">
@@ -24,7 +26,7 @@ function MobileLoadingScreen() {
         <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-[var(--text-primary)] animate-spin" />
       </div>
       <p className="text-sm text-[var(--text-secondary)] animate-pulse">
-        正在连接苏小有...
+        {t("mobileConnecting")}
       </p>
     </div>
   );

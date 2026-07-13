@@ -357,6 +357,9 @@ async def run_generation(
         finish_session_input,
     )
 
+    # Keep directly invoked/headless generations aligned with API-created
+    # jobs. A later queued input may update this field through its request.
+    job.language = request.language
     current_request = request
     current_input_id: str | None = None
     current_skip_user_message = skip_user_message
@@ -399,6 +402,7 @@ async def run_generation(
             record_status = "running"
 
         while True:
+            job.language = current_request.language
             # The replay list is capped and trims from the front.  A list index
             # captured here becomes invalid once a long task crosses 5,000
             # events, so use the monotonic event id as the generation boundary.
@@ -498,6 +502,7 @@ async def run_generation(
                 permission_rules=next_input.permission_rules,
                 reasoning=next_input.reasoning,
                 workspace=next_input.workspace,
+                language=next_input.language,
             )
             job.publish(
                 SSEEvent(
@@ -1077,6 +1082,7 @@ class SessionProcessor:
             session_id=job.session_id,
             message_id=self._assistant_msg_id,
             agent=sp.agent, call_id=ci,
+            language=sp.request.language,
             abort_event=job.abort_event,
             workspace=sp.workspace,
             index_manager=getattr(sp, "index_manager", None),
@@ -1179,8 +1185,16 @@ class SessionProcessor:
             results_data.append({"url": url, "title": title, "snippet": snippet})
 
         count = len(results_data)
-        output_text = "\n".join(output_lines) if output_lines else "未找到结果。"
-        ws_title = f"搜索：{ws_query[:50]}（{count} 条结果）"
+        from app.i18n import localize
+
+        output_text = "\n".join(output_lines) if output_lines else localize(
+            sp.request.language, "未找到结果。", "No results found."
+        )
+        ws_title = localize(
+            sp.request.language,
+            f"搜索：{ws_query[:50]}（{count} 条结果）",
+            f"Search: {ws_query[:50]} ({count} results)",
+        )
         ws_metadata = {
             "query": ws_query,
             "count": count,

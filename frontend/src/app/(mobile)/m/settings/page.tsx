@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useTranslation } from "react-i18next";
 import {
   ArrowLeft, Camera, CheckCircle2, XCircle, Loader2,
   Wifi, WifiOff, KeyRound, Link2, Trash2, Cpu,
@@ -9,7 +10,6 @@ import {
 import { toast } from "sonner";
 import {
   CHINA_REMOTE_PROVIDERS,
-  REMOTE_PROVIDER_LABELS,
   getRemoteConfig,
   saveRemoteConfig,
   clearRemoteConfig,
@@ -29,6 +29,7 @@ import type { ModelInfo } from "@/types/model";
 
 export default function MobileSettingsPage() {
   const router = useRouter();
+  const { t } = useTranslation("settings");
   const [config, setConfig] = useState<RemoteConfig | null>(null);
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -41,7 +42,7 @@ export default function MobileSettingsPage() {
 
   // Provider state
   const [activeProvider, setActiveProvider] = useState<RemoteProvider | null>(null);
-  const [availableProviders, setAvailableProviders] = useState<{ id: RemoteProvider; label: string; icon: typeof Cpu; count: number }[]>([]);
+  const [availableProviders, setAvailableProviders] = useState<{ id: RemoteProvider; icon: typeof Cpu; count: number }[]>([]);
   const [allModels, setAllModels] = useState<ModelInfo[]>([]);
 
   useEffect(() => {
@@ -72,7 +73,6 @@ export default function MobileSettingsPage() {
           if (providerModels.length > 0) {
             providers.push({
               id,
-              label: REMOTE_PROVIDER_LABELS[id],
               icon: Cpu,
               count: providerModels.length,
             });
@@ -120,15 +120,15 @@ export default function MobileSettingsPage() {
         setTimeout(() => router.push("/m"), 800);
       } else {
         setTestResult("error");
-        toast.error(res.status === 401 ? "令牌无效" : "连接失败");
+        toast.error(res.status === 401 ? t("mobileInvalidToken") : t("mobileConnectionFailed"));
       }
     } catch {
       setTestResult("error");
-      toast.error("无法访问服务，请检查地址。");
+      toast.error(t("mobileServiceUnreachable"));
     } finally {
       setTesting(false);
     }
-  }, [router]);
+  }, [router, t]);
 
   const handleDisconnect = useCallback(() => {
     clearRemoteConfig();
@@ -181,15 +181,15 @@ export default function MobileSettingsPage() {
         };
         requestAnimationFrame(scanLoop);
       } else {
-        toast.error("当前浏览器不支持二维码扫描");
+        toast.error(t("mobileQrUnsupported"));
         stopScan();
       }
     } catch {
-      toast.error("无法访问摄像头");
+      toast.error(t("mobileCameraUnavailable"));
       setScanning(false);
       scanningRef.current = false;
     }
-  }, [handleConnect, stopScan]);
+  }, [handleConnect, stopScan, t]);
 
   useEffect(() => {
     return () => {
@@ -213,7 +213,7 @@ export default function MobileSettingsPage() {
             <ArrowLeft className="w-5 h-5" />
           </button>
         )}
-        <h1 className="text-lg font-semibold tracking-tight">远程连接</h1>
+        <h1 className="text-lg font-semibold tracking-tight">{t("mobileRemoteTitle")}</h1>
       </header>
 
       <div className="flex-1 overflow-y-auto px-4 pb-[max(env(safe-area-inset-bottom),16px)] space-y-5">
@@ -231,7 +231,7 @@ export default function MobileSettingsPage() {
             )}
             <div className="flex-1 min-w-0">
               <p className="text-[15px] font-medium">
-                {isConnected ? "已连接" : "未连接"}
+                {isConnected ? t("mobileConnected") : t("mobileDisconnected")}
               </p>
               {isConnected && (
                 <p className="text-[12px] text-[var(--text-tertiary)] truncate mt-0.5">
@@ -254,7 +254,7 @@ export default function MobileSettingsPage() {
         {!isConnected && (
           <div className="space-y-3">
             <p className="text-[13px] font-medium text-[var(--text-secondary)] px-1">
-              扫描二维码
+              {t("mobileScanQr")}
             </p>
 
             {scanning ? (
@@ -265,7 +265,7 @@ export default function MobileSettingsPage() {
                   onClick={stopScan}
                   className="absolute bottom-4 left-1/2 -translate-x-1/2 px-5 py-2 rounded-full bg-black/60 backdrop-blur-sm text-white text-[13px] font-medium active:scale-[0.97]"
                 >
-                  取消
+                  {t("channelCancel")}
                 </button>
               </div>
             ) : (
@@ -274,7 +274,7 @@ export default function MobileSettingsPage() {
                 className="w-full flex items-center justify-center gap-2.5 py-3.5 rounded-2xl border border-[var(--border-default)] bg-[var(--surface-secondary)] text-[14px] font-medium active:scale-[0.98] active:bg-[var(--surface-tertiary)] transition-all"
               >
                 <Camera className="w-[18px] h-[18px] text-[var(--text-secondary)]" />
-                打开摄像头
+                {t("mobileOpenCamera")}
               </button>
             )}
           </div>
@@ -284,7 +284,7 @@ export default function MobileSettingsPage() {
         {!isConnected && (
           <div className="space-y-3">
             <p className="text-[13px] font-medium text-[var(--text-secondary)] px-1">
-              或手动输入
+              {t("mobileManualEntry")}
             </p>
 
             <div className="space-y-2.5">
@@ -322,7 +322,13 @@ export default function MobileSettingsPage() {
                 ) : testResult === "error" ? (
                   <XCircle className="w-4 h-4" />
                 ) : null}
-                {testing ? "连接中..." : testResult === "success" ? "已连接" : testResult === "error" ? "连接失败" : "连接"}
+                {testing
+                  ? t("mobileConnecting")
+                  : testResult === "success"
+                    ? t("mobileConnected")
+                    : testResult === "error"
+                      ? t("mobileConnectionFailed")
+                      : t("mobileConnect")}
               </button>
             </div>
           </div>
@@ -332,7 +338,7 @@ export default function MobileSettingsPage() {
         {isConnected && availableProviders.length > 0 && (
           <div className="space-y-3">
             <p className="text-[13px] font-medium text-[var(--text-secondary)] px-1">
-              模型服务商
+              {t("mobileModelProvider")}
             </p>
             <div className="space-y-2">
               {availableProviders.map((p) => {
@@ -354,9 +360,9 @@ export default function MobileSettingsPage() {
                       <Icon className="w-5 h-5" />
                     </div>
                     <div className="flex-1 text-left min-w-0">
-                      <p className="text-[15px] font-medium">{p.label}</p>
+                      <p className="text-[15px] font-medium">{t(`providerName_${p.id}`)}</p>
                       <p className="text-[12px] text-[var(--text-tertiary)]">
-                        已有 {p.count} 个模型
+                        {t("mobileModelCount", { count: p.count })}
                       </p>
                     </div>
                     {isActive && (
@@ -371,11 +377,11 @@ export default function MobileSettingsPage() {
 
         {/* Instructions */}
         <div className="rounded-2xl bg-[var(--surface-secondary)] border border-[var(--border-default)] p-4 space-y-2.5">
-          <p className="text-[13px] font-medium">如何连接</p>
+          <p className="text-[13px] font-medium">{t("mobileHowToConnect")}</p>
           <ol className="text-[12px] text-[var(--text-secondary)] space-y-1.5 list-decimal list-inside">
-            <li>在桌面端打开苏小有</li>
-            <li>进入“设置 &gt; 远程”</li>
-            <li>启用远程访问并扫描二维码</li>
+            <li>{t("mobileConnectStep1")}</li>
+            <li>{t("mobileConnectStep2")}</li>
+            <li>{t("mobileConnectStep3")}</li>
           </ol>
         </div>
       </div>

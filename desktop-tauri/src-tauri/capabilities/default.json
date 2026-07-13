@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicerobot/tauri/dev/crates/tauri-utils/schema.json",
   "identifier": "default",
-  "description": "Default capabilities for 苏小有 desktop",
+  "description": "Default capabilities for suyo desktop",
   "windows": ["main"],
   "permissions": [
     "core:default",

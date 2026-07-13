@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import {
   AlertCircle,
   Check,
@@ -45,6 +46,7 @@ interface RapidMLXRuntimeStatus {
 }
 
 export function RapidMLXPanel() {
+  const { t } = useTranslation("settings");
   const qc = useQueryClient();
   const { setActiveProvider } = useSettingsStore();
   const [modelInput, setModelInput] = useState("qwen3.5-4b");
@@ -330,16 +332,16 @@ export function RapidMLXPanel() {
                   }
                   title={
                     stopMutation.isPending
-                      ? "Wait for the current stop to finish"
+                      ? t("rapidMlxWaitForStop")
                       : startMutation.isPending
-                        ? "Wait for the current start to finish"
+                        ? t("rapidMlxWaitForStart")
                         : removeMutation.isPending
-                          ? "Wait for the model removal to finish"
-                          : "Uninstall Rapid-MLX from 苏小有"
+                          ? t("rapidMlxWaitForRemoval")
+                          : t("rapidMlxUninstallFromApp")
                   }
                 >
                   <PowerOff className="mr-1 h-3 w-3" />
-                  Uninstall
+                  {t("rapidMlxUninstall")}
                 </Button>
               </div>
             </div>
@@ -679,11 +681,9 @@ export function RapidMLXPanel() {
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Uninstall Rapid-MLX from 苏小有?</DialogTitle>
+            <DialogTitle>{t("rapidMlxUninstallTitle")}</DialogTitle>
             <DialogDescription>
-              This stops the Rapid-MLX runtime, deletes every downloaded MLX
-              model from the HuggingFace cache, and clears 苏小有&apos;s
-              Rapid-MLX settings.
+              {t("rapidMlxUninstallDescription")}
             </DialogDescription>
           </DialogHeader>
 
@@ -691,23 +691,21 @@ export function RapidMLXPanel() {
             <div className="space-y-3">
               <div className="rounded-md border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--text-secondary)]">
                 <div className="font-medium text-[var(--text-primary)]">
-                  What this does
+                  {t("rapidMlxWhatThisDoes")}
                 </div>
                 <ul className="mt-1 list-inside list-disc space-y-0.5 text-ui-3xs">
-                  <li>Stops the running Rapid-MLX process (if any)</li>
-                  <li>Deletes all downloaded MLX model snapshots</li>
-                  <li>Clears the saved base URL and last-used model</li>
-                  <li>Unregisters Rapid-MLX as an active provider</li>
+                  <li>{t("rapidMlxUninstallStopProcess")}</li>
+                  <li>{t("rapidMlxUninstallDeleteModels")}</li>
+                  <li>{t("rapidMlxUninstallClearSettings")}</li>
+                  <li>{t("rapidMlxUninstallUnregisterProvider")}</li>
                 </ul>
               </div>
               <div className="rounded-md border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-2">
                 <div className="text-xs font-medium text-[var(--text-primary)]">
-                  Remove the binary itself
+                  {t("rapidMlxRemoveBinaryTitle")}
                 </div>
                 <p className="mt-0.5 text-ui-3xs text-[var(--text-tertiary)]">
-                  苏小有 can&apos;t uninstall a brew/pip-managed binary for
-                  you. Run one of these after this dialog if you want a full
-                  removal:
+                  {t("rapidMlxRemoveBinaryDescription")}
                 </p>
                 <div className="mt-2 space-y-1">
                   <code className="block rounded bg-[var(--surface-primary)] px-2 py-1 font-mono text-ui-3xs">
@@ -724,7 +722,7 @@ export function RapidMLXPanel() {
                   <span>
                     {errorToMessage(
                       uninstallMutation.error,
-                      "Failed to uninstall Rapid-MLX",
+                      t("rapidMlxUninstallFailed"),
                     )}
                   </span>
                 </div>
@@ -736,7 +734,7 @@ export function RapidMLXPanel() {
                   onClick={() => setUninstallOpen(false)}
                   disabled={uninstallMutation.isPending}
                 >
-                  Cancel
+                  {t("cancel")}
                 </Button>
                 <Button
                   variant="destructive"
@@ -749,7 +747,7 @@ export function RapidMLXPanel() {
                   ) : (
                     <PowerOff className="mr-1.5 h-3.5 w-3.5" />
                   )}
-                  Uninstall
+                  {t("rapidMlxUninstall")}
                 </Button>
               </div>
             </div>
@@ -759,25 +757,32 @@ export function RapidMLXPanel() {
             <div className="space-y-3">
               <div className="rounded-md border border-[var(--color-success)]/40 bg-[var(--color-success)]/10 px-3 py-2 text-xs">
                 <div className="font-medium text-[var(--text-primary)]">
-                  Rapid-MLX cleaned up
+                  {t("rapidMlxCleanedUp")}
                 </div>
                 <ul className="mt-1 list-inside list-disc space-y-0.5 text-ui-3xs text-[var(--text-secondary)]">
                   <li>
-                    Runtime stopped: {uninstallResult.stopped ? "yes" : "was not running"}
+                    {t("rapidMlxRuntimeStopped", {
+                      status: uninstallResult.stopped
+                        ? t("rapidMlxYes")
+                        : t("rapidMlxWasNotRunning"),
+                    })}
                   </li>
                   <li>
-                    Removed {uninstallResult.removed_models.length} model
-                    {uninstallResult.removed_models.length === 1 ? "" : "s"}
+                    {t("rapidMlxRemovedModelCount", {
+                      count: uninstallResult.removed_models.length,
+                    })}
                     {uninstallResult.freed_bytes > 0
-                      ? ` (${(uninstallResult.freed_bytes / 1_073_741_824).toFixed(2)} GB freed)`
+                      ? t("rapidMlxFreedSpace", {
+                          size: (uninstallResult.freed_bytes / 1_073_741_824).toFixed(2),
+                        })
                       : ""}
                   </li>
-                  <li>苏小有 settings cleared</li>
+                  <li>{t("rapidMlxSettingsCleared")}</li>
                 </ul>
               </div>
               <div className="rounded-md border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-2">
                 <div className="text-xs font-medium text-[var(--text-primary)]">
-                  To remove the binary, run one of:
+                  {t("rapidMlxRemoveBinaryCommand")}
                 </div>
                 <div className="mt-2 space-y-1">
                   {uninstallResult.binary_install_commands.map((cmd) => (
@@ -799,7 +804,7 @@ export function RapidMLXPanel() {
                     setUninstallResult(null);
                   }}
                 >
-                  Done
+                  {t("rapidMlxDone")}
                 </Button>
               </div>
             </div>

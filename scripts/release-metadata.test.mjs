@@ -53,7 +53,7 @@ function createFixture(overrides = {}) {
     tauri: VERSION,
     cargo: VERSION,
     cargoLock: VERSION,
-    enPoweredBy: `苏小有 v${VERSION}`,
+    enPoweredBy: `suyo v${VERSION}`,
     zhPoweredBy: `苏小有 v${VERSION}`,
     thirdParty: VERSION,
     sourceAvailability: VERSION,

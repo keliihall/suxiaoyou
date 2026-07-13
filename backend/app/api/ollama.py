@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.dependencies import ProviderRegistryDep, SettingsDep
 from app.ollama.library import CATEGORIES, get_library as fetch_library
+from app.i18n import localize, request_language
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +75,15 @@ def _is_cloud_model_tag(name: str) -> bool:
     return name.split("/")[-1].endswith(":cloud")
 
 
-_CLOUD_BLOCK_MESSAGE = (
-    "{name} 是云端托管的 Ollama 模型，苏小有暂不支持。"
-    "请使用本地（local）权重标签（例如 qwen3:8b、llama3.2:3b），"
-    "或在“设置 > 服务商”选择国内模型服务商。"
-)
+def _cloud_block_message(name: str, language: str) -> str:
+    return localize(
+        language,
+        f"{name} 是云端托管的 Ollama 模型，苏小有暂不支持。"
+        "请使用本地（local）权重标签（例如 qwen3:8b、llama3.2:3b），"
+        "或在“设置 > 服务商”选择国内模型服务商。",
+        f"{name} is an Ollama cloud-hosted model, which suyo does not currently support. "
+        "Use a local weight tag (for example qwen3:8b or llama3.2:3b), or choose another provider in Settings > Providers.",
+    )
 
 
 # ── Runtime endpoints ─────────────────────────────────────────────────────
@@ -219,7 +224,7 @@ async def get_library(
 async def pull_model(request: Request, registry: ProviderRegistryDep, body: ModelPullRequest):
     """Pull (download) a model. Returns SSE stream with progress."""
     if _is_cloud_model_tag(body.name):
-        message = _CLOUD_BLOCK_MESSAGE.format(name=body.name)
+        message = _cloud_block_message(body.name, request_language(request))
         logger.info("Ollama: blocked pull for cloud-tagged model %s", body.name)
 
         async def cloud_block_stream():

@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 V073_BASELINE_REVISION: Final = "0001_v073_baseline"
 V080_SESSION_INPUT_REVISION: Final = "0002_v080_session_input"
-V080_HEAD_REVISION: Final = "0003_v080_idempotency_record"
+V080_IDEMPOTENCY_REVISION: Final = "0003_v080_idempotency_record"
+V080_HEAD_REVISION: Final = "0004_v083_session_input_language"
 
 # This is the schema shipped by v0.7.3.  It is deliberately independent from
 # current ORM metadata: using the current models here would silently bless an
@@ -157,6 +158,7 @@ V080_SESSION_INPUT_COLUMNS: Final[frozenset[str]] = frozenset(
         "model_id",
         "provider_id",
         "agent",
+        "language",
         "workspace",
         "reasoning",
         "permission_presets",
@@ -168,6 +170,10 @@ V080_SESSION_INPUT_COLUMNS: Final[frozenset[str]] = frozenset(
         "time_created",
         "time_updated",
     }
+)
+
+V080_SESSION_INPUT_COLUMNS_BEFORE_LANGUAGE: Final[frozenset[str]] = (
+    V080_SESSION_INPUT_COLUMNS - {"language"}
 )
 
 V080_IDEMPOTENCY_RECORD_COLUMNS: Final[frozenset[str]] = frozenset(
@@ -348,16 +354,29 @@ def _upgrade_existing_database(
         stamp_revision = previous_revision
         if previous_revision is None:
             _validate_v073_schema(staging_path)
-            if _has_valid_v080_session_input(staging_path):
+            session_input_columns = _session_input_columns(staging_path)
+            if session_input_columns in {
+                V080_SESSION_INPUT_COLUMNS,
+                V080_SESSION_INPUT_COLUMNS_BEFORE_LANGUAGE,
+            }:
                 # Development snapshots briefly created this table with
                 # create_all before v0.8.0 acquired a formal migration chain.
                 # Validate complete shapes and stamp the newest schema that is
                 # actually present; never guess or add individual columns.
-                stamp_revision = (
-                    V080_HEAD_REVISION
-                    if _has_valid_v080_idempotency_record(staging_path)
-                    else V080_SESSION_INPUT_REVISION
-                )
+                has_idempotency = _has_valid_v080_idempotency_record(staging_path)
+                if session_input_columns == V080_SESSION_INPUT_COLUMNS:
+                    if not has_idempotency:
+                        raise RuntimeError(
+                            "Unversioned database has the current session_input "
+                            "schema but is missing idempotency_record"
+                        )
+                    stamp_revision = V080_HEAD_REVISION
+                else:
+                    stamp_revision = (
+                        V080_IDEMPOTENCY_REVISION
+                        if has_idempotency
+                        else V080_SESSION_INPUT_REVISION
+                    )
             else:
                 stamp_revision = V073_BASELINE_REVISION
 
@@ -419,7 +438,11 @@ def _run_alembic(database_path: Path, *, stamp_revision: str | None) -> None:
     # lives in the main file that will be atomically installed.
     engine = create_sync_engine(URL.create("sqlite", database=str(database_path)))
     try:
-        with engine.connect() as connection:
+        # One explicit outer transaction ensures Alembic's revision-table
+        # update is committed even when a SQLite migration consists only of
+        # ALTER TABLE. DDL may persist independently while the version row is
+        # otherwise rolled back as the connection closes.
+        with engine.begin() as connection:
             config = _alembic_config(connection)
             try:
                 if stamp_revision is not None:
@@ -552,14 +575,20 @@ def _validate_v073_schema(database_path: Path) -> None:
         )
 
 
-def _has_valid_v080_session_input(database_path: Path) -> bool:
+def _session_input_columns(database_path: Path) -> frozenset[str] | None:
     with _sqlite_connection(database_path) as connection:
         if "session_input" not in _table_names(connection):
-            return False
-        columns = {
+            return None
+        return frozenset(
             str(row[1])
             for row in connection.execute('PRAGMA table_info("session_input")')
-        }
+        )
+
+
+def _has_valid_v080_session_input(database_path: Path) -> bool:
+    columns = _session_input_columns(database_path)
+    if columns is None:
+        return False
     if columns != V080_SESSION_INPUT_COLUMNS:
         missing = sorted(V080_SESSION_INPUT_COLUMNS - columns)
         extra = sorted(columns - V080_SESSION_INPUT_COLUMNS)

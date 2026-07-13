@@ -65,8 +65,8 @@ test("generates and verifies a seven-installer manual-download manifest", (t) =>
       .filter((asset) => asset.platform === "linux" && asset.architecture === "arm64")
       .map(({ format, name }) => ({ format, name })),
     [
-      { format: "deb", name: "suxiaoyou-0.8.0-linux-arm64.deb" },
-      { format: "rpm", name: "suxiaoyou-0.8.0-linux-aarch64.rpm" },
+      { format: "deb", name: "suyo-0.8.0-linux-arm64.deb" },
+      { format: "rpm", name: "suyo-0.8.0-linux-aarch64.rpm" },
     ],
   );
   assert.equal(

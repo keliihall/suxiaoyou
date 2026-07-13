@@ -49,7 +49,7 @@ test.describe("苏小有 conversation scale and compaction GUI workflows", () =>
     await setupMockedApp(page);
 
     await page.goto("/c/new");
-    await expect(page.getByRole("heading", { name: /What should (苏小有 help you do|we do in)/i })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /What should (suyo help you do|we do in)/i })).toBeVisible();
     await sendPrompt(page, "Trigger auto compress during a long context answer");
 
     await expect(page).toHaveURL(/\/c\/session-new$/);

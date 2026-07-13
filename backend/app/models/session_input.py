@@ -39,6 +39,7 @@ class SessionInput(Base, TimestampMixin):
     model_id: Mapped[str | None] = mapped_column(String, nullable=True)
     provider_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent: Mapped[str] = mapped_column(String, nullable=False, default="build")
+    language: Mapped[str] = mapped_column(String, nullable=False, default="zh")
     workspace: Mapped[str | None] = mapped_column(String, nullable=True)
     reasoning: Mapped[bool | None] = mapped_column(nullable=True)
     permission_presets: Mapped[dict[str, bool] | None] = mapped_column(JSON, nullable=True)

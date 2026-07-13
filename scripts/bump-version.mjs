@@ -135,7 +135,7 @@ function updatePoweredBy(rootDir, version) {
       "common.json",
     );
     const common = readJson(commonPath);
-    common.poweredBy = `苏小有 v${version}`;
+    common.poweredBy = `${locale === "zh" ? "苏小有" : "suyo"} v${version}`;
     writeJson(commonPath, common);
   }
 }

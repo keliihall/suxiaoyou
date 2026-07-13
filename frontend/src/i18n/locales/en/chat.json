@@ -1,5 +1,5 @@
 {
-  "greeting": "What should 苏小有 help you do?",
+  "greeting": "What should suyo help you do?",
   "greetingInWorkspace": "What should we do in {{workspace}}?",
   "subtitle": "Describe the result you want and add files or broader access only when needed.",
   "placeholder": "Describe the result you want",
@@ -66,7 +66,7 @@
   "pptxPreviewUnavailable": "Presentation preview is temporarily unavailable",
   "pptxOpenExternally": "Download the original file and open it with PowerPoint, WPS Office, LibreOffice, or another trusted presentation app.",
   "pptxLegacyTitle": "Legacy PPT preview is not supported",
-  "pptxLegacyUnsupported": "This is a legacy .ppt file. To avoid unsafe conversion, 苏小有 will not parse it as PPTX; download it or open it in a local presentation app.",
+  "pptxLegacyUnsupported": "This is a legacy .ppt file. To avoid unsafe conversion, suyo will not parse it as PPTX; download it or open it in a local presentation app.",
   "pptxInvalidFile": "This file is not a valid PPTX presentation, or it is damaged.",
   "pptxLimitExceeded": "This presentation exceeds the safe preview limits. The original file can still be downloaded or opened externally.",
   "pptxPreviewTimedOut": "The presentation could not be rendered within the preview time limit.",
@@ -123,7 +123,7 @@
   "contextFull": "{{percent}}% full",
   "contextPercent": "{{percent}}% of context window in use",
   "contextTokensUsed": "{{used}} / {{total}} tokens used",
-  "contextAutoCompact": "苏小有 automatically compacts its context",
+  "contextAutoCompact": "suyo automatically compacts its context",
   "contextCompactNow": "Click to compact now",
   "contextCompactingNow": "Compacting context…",
   "contextCompactingPrune": "Pruning old context…",
@@ -290,7 +290,7 @@
   "loadingDiagram": "Loading diagram...",
   "mermaidSyntaxError": "Mermaid Syntax Error",
   "showSourceCode": "Show source code",
-  "tryFixWithBrand": "Try fixing with 苏小有",
+  "tryFixWithBrand": "Try fixing with suyo",
   "artifact": "artifact",
   "reactComponent": "React component",
   "mermaidDiagram": "Mermaid diagram",
@@ -420,5 +420,7 @@
   "loadingModel": "Loading model into memory...",
   "setupProvider": "Choose a model source to start",
   "setupProviderDesc": "Use Rapid-MLX or Ollama locally, connect a local endpoint, or add your own provider key.",
-  "configureSettings": "Configure"
+  "configureSettings": "Configure",
+  "permissionNotificationTitle": "suyo — Permission Required",
+  "permissionNotificationBody": "The assistant wants to use {{tool}} and needs your approval."
 }

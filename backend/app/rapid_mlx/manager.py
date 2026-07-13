@@ -173,7 +173,7 @@ class RapidMLXManager:
                 pid = await _find_rapid_mlx_server_pid(port)
                 if pid is None:
                     raise RuntimeError(
-                        "Rapid-MLX is already running on this port, but 苏小有 "
+                        "Rapid-MLX is already running on this port, but suyo "
                         "could not identify its process. Stop it first, then switch models."
                     )
                 await _terminate_pid(pid)
@@ -214,7 +214,7 @@ class RapidMLXManager:
 
         pid = await _find_rapid_mlx_server_pid(self._port)
         if pid is None:
-            raise RuntimeError("Rapid-MLX was not started by 苏小有 in this session.")
+            raise RuntimeError("Rapid-MLX was not started by suyo in this session.")
         await _terminate_pid(pid)
 
     async def uninstall(self, *, delete_models: bool = True) -> dict[str, Any]:
@@ -357,7 +357,7 @@ async def _terminate_pid(pid: int) -> None:
     except ProcessLookupError:
         return
     except PermissionError:
-        raise RuntimeError("苏小有 does not have permission to stop Rapid-MLX.")
+        raise RuntimeError("suyo does not have permission to stop Rapid-MLX.")
 
     for _ in range(40):
         await asyncio.sleep(0.2)
@@ -371,7 +371,7 @@ async def _terminate_pid(pid: int) -> None:
     except ProcessLookupError:
         return
     except PermissionError:
-        raise RuntimeError("苏小有 does not have permission to force stop Rapid-MLX.")
+        raise RuntimeError("suyo does not have permission to force stop Rapid-MLX.")
 
 
 def _port_from_base_url(base_url: str) -> int | None:

@@ -120,10 +120,11 @@ class SkillTool(ToolDefinition):
             f"</skill_content>"
         )
 
-        ctx.publish_metadata(title=f"已加载技能：{skill.name}")
+        localized_title = ctx.tr(f"已加载技能：{skill.name}", f"Loaded skill: {skill.name}")
+        ctx.publish_metadata(title=localized_title)
         return ToolResult(
             output=output,
-            title=f"已加载技能：{skill.name}",
+            title=localized_title,
             metadata={"name": skill.name, "dir": str(skill_dir)},
         )
 

@@ -36,7 +36,11 @@ import { useActivityStore, computeDuration, type ChainItem } from "@/stores/acti
 import { ACTIVITY_PANEL_WIDTH } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import { extractSourcesFromTool } from "@/lib/sources";
-import { getToolDisplayTitle, localizeVisibleProcessText } from "@/lib/activity-labels";
+import {
+  getToolDisplayTitle,
+  localizeVisibleProcessText,
+  translatePersistedToolOutput,
+} from "@/lib/activity-labels";
 import { formatElapsedDuration, formatElapsedMilliseconds } from "@/lib/duration";
 import type { ToolPart, StepFinishPart } from "@/types/message";
 
@@ -162,7 +166,12 @@ function ToolRow({ tool }: { tool: ToolPart }) {
   const isRunning = tool.state.status === "running" || tool.state.status === "pending";
   const isError = tool.state.status === "error";
   const elapsed = getElapsed(tool, i18n.language);
-  const title = getToolDisplayTitle(tool, t);
+  const title = getToolDisplayTitle(tool, t, i18n.language);
+  const output = translatePersistedToolOutput(
+    tool.tool,
+    tool.state.output,
+    i18n.language,
+  );
 
   // Source badges for web tools
   const sources = useMemo(() => {
@@ -251,7 +260,7 @@ function ToolRow({ tool }: { tool: ToolPart }) {
                   </pre>
                 </div>
               )}
-              {tool.state.output && (
+              {output && (
                 <div>
                   <p className={cn(
                     "px-3 py-1 text-[10px] font-semibold uppercase tracking-wider bg-[var(--surface-tertiary)]",
@@ -260,9 +269,9 @@ function ToolRow({ tool }: { tool: ToolPart }) {
                     {t("output")}
                   </p>
                   <pre className="p-2 text-[11px] text-[var(--text-secondary)] overflow-x-auto font-mono leading-relaxed max-h-[200px] overflow-y-auto">
-                    {tool.state.output.length > 3000
-                      ? tool.state.output.slice(0, 3000) + "\n" + t("truncated")
-                      : tool.state.output}
+                    {output.length > 3000
+                      ? output.slice(0, 3000) + "\n" + t("truncated")
+                      : output}
                   </pre>
                 </div>
               )}

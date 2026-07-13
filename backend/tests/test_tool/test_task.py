@@ -1,5 +1,7 @@
 """Task tool (SubAgent) tests — recursion guard, validation."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from app.schemas.agent import AgentInfo
@@ -97,3 +99,31 @@ class TestRecursionGuard:
         }, ctx)
         assert result.error is not None
         assert "app state" in result.error
+
+
+@pytest.mark.asyncio
+async def test_child_generation_inherits_english_locale(session_factory, monkeypatch):
+    captured: dict[str, str] = {}
+
+    async def fake_run_generation(job, request, **_kwargs):
+        captured["job"] = job.language
+        captured["request"] = request.language
+
+    monkeypatch.setattr("app.session.processor.run_generation", fake_run_generation)
+    ctx = _make_ctx(depth=0)
+    ctx.language = "en"
+    ctx._app_state = {  # type: ignore[attr-defined]
+        "session_factory": session_factory,
+        "provider_registry": MagicMock(),
+        "agent_registry": MagicMock(),
+        "tool_registry": MagicMock(),
+    }
+
+    result = await TaskTool().execute(
+        {"description": "locale propagation", "prompt": "Inspect locale"},
+        ctx,
+    )
+
+    assert result.success
+    assert captured == {"job": "en", "request": "en"}
+    assert result.title == "Subtask (explore): locale propagation"

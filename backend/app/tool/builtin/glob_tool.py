@@ -94,7 +94,7 @@ class GlobTool(ToolDefinition):
 
         return ToolResult(
             output=output if output else "(no matches)",
-            title=f"{len(files)} 个文件匹配 {pattern}",
+            title=ctx.tr(f"{len(files)} 个文件匹配 {pattern}", f"{len(files)} files match {pattern}"),
             metadata={"count": len(files), "truncated": truncated, "source": "filesystem"},
         )
 

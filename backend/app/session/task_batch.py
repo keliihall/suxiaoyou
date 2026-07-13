@@ -282,7 +282,11 @@ async def run_task_batch(
             state.status = "running"
             job.publish(SSEEvent(TASK_BATCH_UPDATE, _snapshot(batch_id, body.mode, states)))
 
-            child_job = GenerationJob(stream_id=generate_ulid(), session_id=state.session_id)
+            child_job = GenerationJob(
+                stream_id=generate_ulid(),
+                session_id=state.session_id,
+                language=body.language,
+            )
             child_job.abort_event = job.abort_event
             child_job._depth = getattr(job, "_depth", 0) + 1
 
@@ -293,6 +297,7 @@ async def run_task_batch(
                 provider_id=state.provider_id,
                 agent=state.agent,
                 workspace=body.workspace,
+                language=body.language,
             )
 
             try:

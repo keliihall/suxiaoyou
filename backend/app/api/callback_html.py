@@ -1,4 +1,4 @@
-"""Shared OAuth callback HTML template — 苏小有 dark theme."""
+"""Shared OAuth callback HTML template — suyo dark theme."""
 
 import json
 
@@ -61,7 +61,7 @@ def render_callback(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>苏小有 — {title}</title>
+<title>suyo — {title}</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{

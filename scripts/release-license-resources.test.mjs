@@ -77,15 +77,30 @@ const tauriConfigs = [
   "desktop-tauri/src-tauri/build.linux-arm64.json",
 ];
 
-test("all desktop platforms ship the identical release-license resource map", () => {
+const macPlatformConfig = JSON.parse(
+  read("desktop-tauri/src-tauri/tauri.macos.conf.json"),
+);
+
+test("all desktop platforms ship the required release-license resources", () => {
   const resourceMaps = tauriConfigs.map(
     (path) => JSON.parse(read(path)).bundle.resources,
   );
 
   for (const [index, resources] of resourceMaps.entries()) {
-    assert.deepEqual(resources, expectedResources, tauriConfigs[index]);
-    assert.deepEqual(resources, resourceMaps[0], tauriConfigs[index]);
+    for (const [source, destination] of Object.entries(expectedResources)) {
+      assert.equal(resources[source], destination, `${tauriConfigs[index]}: ${source}`);
+    }
   }
+
+  for (const index of [0, 1, 2, 3, 4, 5]) {
+    assert.deepEqual(resourceMaps[index], expectedResources, tauriConfigs[index]);
+  }
+  assert.equal(macPlatformConfig.bundle.targets[0], "dmg");
+  assert.equal(macPlatformConfig.bundle.targets[1], "app");
+  assert.deepEqual(macPlatformConfig.bundle.resources, {
+    "macos-locales/en.lproj/InfoPlist.strings": "en.lproj/InfoPlist.strings",
+    "macos-locales/zh-Hans.lproj/InfoPlist.strings": "zh-Hans.lproj/InfoPlist.strings",
+  });
 });
 
 test("the checked-in static license baseline contains every required text", () => {

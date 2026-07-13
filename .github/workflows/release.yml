@@ -250,9 +250,32 @@ jobs:
           if ($installer[0].Name -notmatch [regex]::Escape($expectedVersion)) {
             throw "NSIS installer name does not contain version ${expectedVersion}: $($installer[0].Name)"
           }
+          $installerProductName = $installer[0].VersionInfo.ProductName
+          if ($installerProductName -ne "suyo") {
+            throw "NSIS installer ProductName is $installerProductName, expected suyo"
+          }
 
           $installDirectory = Join-Path $env:RUNNER_TEMP "suxiaoyou-nsis-install"
+          $expectedAppExecutable = "suxiaoyou-desktop.exe"
+          $expectedAppPath = Join-Path $installDirectory $expectedAppExecutable
+          $startMenuPrograms = [Environment]::GetFolderPath("Programs")
+          $desktopDirectory = [Environment]::GetFolderPath("Desktop")
+          $legacyShortcuts = @(
+            (Join-Path $startMenuPrograms "苏小有.lnk"),
+            (Join-Path $desktopDirectory "苏小有.lnk")
+          )
+          $localizedShortcuts = @(
+            (Join-Path $startMenuPrograms "suyo.lnk"),
+            (Join-Path $desktopDirectory "suyo.lnk")
+          )
           Remove-Item -Recurse -Force $installDirectory -ErrorAction SilentlyContinue
+          Remove-Item -Force -LiteralPath ($legacyShortcuts + $localizedShortcuts) -ErrorAction SilentlyContinue
+          $shortcutShell = New-Object -ComObject WScript.Shell
+          foreach ($legacyShortcut in $legacyShortcuts) {
+            $shortcut = $shortcutShell.CreateShortcut($legacyShortcut)
+            $shortcut.TargetPath = $expectedAppPath
+            $shortcut.Save()
+          }
           $process = Start-Process `
             -FilePath $installer[0].FullName `
             -ArgumentList @("/S", "/D=$installDirectory") `
@@ -262,8 +285,35 @@ jobs:
             throw "NSIS installer exited with code $($process.ExitCode)"
           }
 
-          $expectedAppExecutable = "suxiaoyou-desktop.exe"
-          $appBinary = Join-Path $installDirectory $expectedAppExecutable
+          $uninstallRegistryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\苏小有"
+          if (-not (Test-Path -LiteralPath $uninstallRegistryPath)) {
+            throw "Stable NSIS uninstall registry key is missing: $uninstallRegistryPath"
+          }
+          $uninstallMetadata = Get-ItemProperty -LiteralPath $uninstallRegistryPath
+          if ($uninstallMetadata.DisplayName -ne "suyo") {
+            throw "Installed app DisplayName is $($uninstallMetadata.DisplayName), expected suyo"
+          }
+          $recordedInstallLocation = ([string]$uninstallMetadata.InstallLocation).Trim('"')
+          if ([IO.Path]::GetFullPath($recordedInstallLocation) -ne [IO.Path]::GetFullPath($installDirectory)) {
+            throw "Installed app location is $recordedInstallLocation, expected $installDirectory"
+          }
+
+          foreach ($localizedShortcut in $localizedShortcuts) {
+            if (-not (Test-Path -LiteralPath $localizedShortcut -PathType Leaf)) {
+              throw "Localized shortcut is missing: $localizedShortcut"
+            }
+            $shortcutTarget = $shortcutShell.CreateShortcut($localizedShortcut).TargetPath
+            if ([IO.Path]::GetFullPath($shortcutTarget) -ne [IO.Path]::GetFullPath($expectedAppPath)) {
+              throw "Localized shortcut target is $shortcutTarget, expected $expectedAppPath"
+            }
+          }
+          foreach ($legacyShortcut in $legacyShortcuts) {
+            if (Test-Path -LiteralPath $legacyShortcut) {
+              throw "Legacy Chinese shortcut was not migrated: $legacyShortcut"
+            }
+          }
+
+          $appBinary = $expectedAppPath
           if (-not (Test-Path -LiteralPath $appBinary -PathType Leaf)) {
             throw "Installed app executable is missing from the install root: $appBinary"
           }
@@ -590,7 +640,7 @@ jobs:
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
           DMG_DIRECTORY="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="$DMG_DIRECTORY/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="$DMG_DIRECTORY/suyo_${VERSION}_${DMG_ARCH}.dmg"
           STAGING_DIRECTORY="$(mktemp -d)"
           trap 'rm -rf "$STAGING_DIRECTORY"' EXIT
 
@@ -604,7 +654,7 @@ jobs:
             rm -f "$DMG_PATH"
             set +e
             hdiutil_output="$(
-              hdiutil create -volname "苏小有" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH" 2>&1
+              hdiutil create -volname "suyo" -srcfolder "$STAGING_DIRECTORY" -fs APFS -ov -format UDZO "$DMG_PATH" 2>&1
             )"
             hdiutil_status=$?
             set -e
@@ -641,7 +691,7 @@ jobs:
           SIGNING_IDENTITY: ${{ steps.apple-signing.outputs.identity }}
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
           codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$DMG_PATH"
 
       - name: Notarize and staple final DMG
@@ -653,7 +703,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
           xcrun notarytool submit "$DMG_PATH" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
           xcrun stapler staple "$DMG_PATH"
           xcrun stapler validate "$DMG_PATH"
@@ -664,7 +714,7 @@ jobs:
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign --verify --strict --verbose=2 "$DMG_PATH"
           spctl --assess --type open --context context:primary-signature -vv "$DMG_PATH"
@@ -675,7 +725,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
           if codesign --verify --strict --verbose=2 "$DMG_PATH"; then
             echo "::error::RC DMG unexpectedly has a code signature"
             exit 1
@@ -689,7 +739,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
-          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/苏小有_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
           MOUNT_DIRECTORY="$(mktemp -d)"
           INSTALL_TEST_DIRECTORY="$(mktemp -d)"
           cleanup() {
@@ -1096,13 +1146,13 @@ jobs:
             [[ -n "$source" ]]
             cp -- "$source" "release-assets/$destination"
           }
-          copy_one artifacts/windows-release "*.exe" "suxiaoyou-${RELEASE_VERSION}-windows-x64-setup.exe"
-          copy_one "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suxiaoyou-${RELEASE_VERSION}-macos-aarch64${MACOS_TRUST_SUFFIX}.dmg"
-          copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suxiaoyou-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
-          copy_one artifacts/linux-x64-release "*.deb" "suxiaoyou-${RELEASE_VERSION}-linux-amd64.deb"
-          copy_one artifacts/linux-x64-release "*.rpm" "suxiaoyou-${RELEASE_VERSION}-linux-x86_64.rpm"
-          copy_one artifacts/linux-arm64-release "*.deb" "suxiaoyou-${RELEASE_VERSION}-linux-arm64.deb"
-          copy_one artifacts/linux-arm64-release "*.rpm" "suxiaoyou-${RELEASE_VERSION}-linux-aarch64.rpm"
+          copy_one artifacts/windows-release "*.exe" "suyo-${RELEASE_VERSION}-windows-x64-setup.exe"
+          copy_one "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-aarch64${MACOS_TRUST_SUFFIX}.dmg"
+          copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
+          copy_one artifacts/linux-x64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-amd64.deb"
+          copy_one artifacts/linux-x64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-x86_64.rpm"
+          copy_one artifacts/linux-arm64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-arm64.deb"
+          copy_one artifacts/linux-arm64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-aarch64.rpm"
           [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
 
       - name: Generate SHA-256 checksums
@@ -1141,7 +1191,7 @@ jobs:
             cat <<'EOF'
           ## 安装包信任与验证状态
 
-          - Windows NSIS：安装界面使用简体中文；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
+          - Windows NSIS：安装界面支持 English 与简体中文并提供语言选择；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
           - Linux x64/ARM64 DEB/RPM：当前未配置仓库签名；已在对应原生 runner 验证包元数据、完整解包、内置运行时和桌面生命周期。
           - 七个安装包（Windows x64、macOS arm64/x64、Linux x64/ARM64）均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。

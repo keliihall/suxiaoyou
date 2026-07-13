@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslation } from "react-i18next";
 
 // Module-level flag: ensures splash only shows once per app session
 let splashHasBeenShown = false;
@@ -10,12 +11,13 @@ let splashHasBeenShown = false;
  * Animated logo component with fade-in effect
  */
 export function AnimatedSuxiaoyouLogo({ size = 80 }: { size?: number }) {
+  const { t } = useTranslation("common");
   return (
     <motion.img
       src="/favicon.svg"
       width={size}
       height={size}
-      alt="苏小有"
+      alt={t("appName")}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 1.0, ease: "easeInOut", delay: 0.2 }}
@@ -28,6 +30,7 @@ export function AnimatedSuxiaoyouLogo({ size = 80 }: { size?: number }) {
  * Displays animated logo and app name
  */
 export function SplashScreen() {
+  const { t } = useTranslation("common");
   const [isVisible, setIsVisible] = useState(() => {
     if (splashHasBeenShown) return false;
     splashHasBeenShown = true;
@@ -91,10 +94,10 @@ export function SplashScreen() {
             transition={{ duration: 0.6, delay: 1.4 }}
           >
             <h1 className="text-3xl font-semibold text-[var(--text-primary)] tracking-wide">
-              苏小有
+              {t("appName")}
             </h1>
             <p className="mt-2 text-sm text-[var(--text-tertiary)]">
-              本地优先的桌面 AI 助理
+              {t("localFirstTagline")}
             </p>
           </motion.div>
 

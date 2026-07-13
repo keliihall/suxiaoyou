@@ -101,7 +101,7 @@ class ToolSearchTool(ToolDefinition):
 
         deferred = self._get_deferred_tools()
         if not deferred:
-            return ToolResult(output="没有可用的延迟加载工具。", title="工具搜索")
+            return ToolResult(output=ctx.tr("没有可用的延迟加载工具。", "No deferred tools are available."), title=ctx.tr("工具搜索", "Tool search"))
 
         # --- Match ---
         if query.startswith("select:"):
@@ -113,8 +113,8 @@ class ToolSearchTool(ToolDefinition):
         if not matches:
             available = ", ".join(t.id for t in deferred[:20])
             return ToolResult(
-                output=f"未找到匹配“{query}”的延迟加载工具。\n\n可用工具：{available}",
-                title="工具搜索：无结果",
+                output=ctx.tr(f"未找到匹配“{query}”的延迟加载工具。\n\n可用工具：{available}", f'No deferred tools matched "{query}".\n\nAvailable tools: {available}'),
+                title=ctx.tr("工具搜索：无结果", "Tool search: no results"),
             )
 
         # --- Mark discovered ---
@@ -135,10 +135,11 @@ class ToolSearchTool(ToolDefinition):
             )
 
         output = "\n\n".join(sections)
-        ctx.publish_metadata(title=f"找到 {len(matches)} 个工具")
+        localized_title = ctx.tr(f"找到 {len(matches)} 个工具", f"Found {len(matches)} tools")
+        ctx.publish_metadata(title=localized_title)
         return ToolResult(
             output=output,
-            title=f"找到 {len(matches)} 个工具",
+            title=localized_title,
             metadata={"discovered": [t.id for t in matches]},
         )
 

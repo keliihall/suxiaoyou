@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["dmg", "app"],
+    "resources": {
+      "macos-locales/en.lproj/InfoPlist.strings": "en.lproj/InfoPlist.strings",
+      "macos-locales/zh-Hans.lproj/InfoPlist.strings": "zh-Hans.lproj/InfoPlist.strings"
+    }
+  }
+}

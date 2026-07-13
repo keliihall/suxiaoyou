@@ -182,7 +182,7 @@ function ToolLine({ tool }: { tool: ToolPart }) {
   const { t, i18n } = useTranslation("chat");
   const isRunning = tool.state.status === "running" || tool.state.status === "pending";
   const isError = tool.state.status === "error";
-  const label = getToolLabel(tool, t);
+  const label = getToolLabel(tool, t, i18n.language);
 
   let elapsed = "";
   if (tool.state.time_start && tool.state.time_end) {
@@ -208,6 +208,6 @@ function ToolLine({ tool }: { tool: ToolPart }) {
 }
 
 /** Generate a short label for a tool call */
-function getToolLabel(tool: ToolPart, t: TFunction): string {
-  return getToolDisplayTitle(tool, t);
+function getToolLabel(tool: ToolPart, t: TFunction, language: string): string {
+  return getToolDisplayTitle(tool, t, language);
 }

@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AnimatedSuxiaoyouLogo } from "@/components/layout/splash-screen";
@@ -9,6 +10,7 @@ import { useSettingsStore } from "@/stores/settings-store";
 
 export function OnboardingScreen() {
   const router = useRouter();
+  const { t } = useTranslation("common");
   const completeOnboarding = useSettingsStore((s) => s.completeOnboarding);
 
   const openProviderSetup = () => {
@@ -32,20 +34,19 @@ export function OnboardingScreen() {
           <AnimatedSuxiaoyouLogo size={80} />
 
           <h1 className="mt-8 text-2xl font-semibold text-[var(--text-primary)] tracking-tight">
-            欢迎使用苏小有
+            {t("onboardingWelcome")}
           </h1>
           <p className="mt-2 max-w-xs text-sm text-[var(--text-secondary)]">
-            本地优先的桌面 AI 助理。可先连接本地端点、Rapid-MLX 或
-            Ollama，也可以添加国内模型服务商密钥。
+            {t("onboardingDescription")}
           </p>
 
           <div className="mt-10 w-full space-y-3">
             <Button className="w-full" onClick={openProviderSetup}>
-              配置服务商
+              {t("onboardingConfigureProvider")}
               <ArrowRight className="ml-2 h-4 w-4" />
             </Button>
             <Button variant="outline" className="w-full" onClick={startNow}>
-              直接开始
+              {t("onboardingStartNow")}
             </Button>
           </div>
         </div>
