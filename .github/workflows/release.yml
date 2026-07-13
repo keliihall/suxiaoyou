@@ -271,10 +271,18 @@ jobs:
           Remove-Item -Recurse -Force $installDirectory -ErrorAction SilentlyContinue
           Remove-Item -Force -LiteralPath ($legacyShortcuts + $localizedShortcuts) -ErrorAction SilentlyContinue
           $shortcutShell = New-Object -ComObject WScript.Shell
-          foreach ($legacyShortcut in $legacyShortcuts) {
-            $shortcut = $shortcutShell.CreateShortcut($legacyShortcut)
+          for ($shortcutIndex = 0; $shortcutIndex -lt $legacyShortcuts.Count; $shortcutIndex++) {
+            # WScript.Shell on GitHub's runner cannot save a shortcut directly
+            # to a non-ASCII path. Save through an ASCII temporary path, then
+            # let PowerShell perform the Unicode-safe rename that seeds the
+            # real rc.1 shortcut migration scenario.
+            $legacyShortcut = $legacyShortcuts[$shortcutIndex]
+            $shortcutSeed = Join-Path $env:RUNNER_TEMP "suxiaoyou-legacy-$shortcutIndex.lnk"
+            Remove-Item -Force -LiteralPath $shortcutSeed -ErrorAction SilentlyContinue
+            $shortcut = $shortcutShell.CreateShortcut($shortcutSeed)
             $shortcut.TargetPath = $expectedAppPath
             $shortcut.Save()
+            Move-Item -Force -LiteralPath $shortcutSeed -Destination $legacyShortcut
           }
           $process = Start-Process `
             -FilePath $installer[0].FullName `

@@ -608,7 +608,8 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /GetFullPath\(\$installDirectory\)/);
   assert.match(install, /legacyShortcuts/);
   assert.match(install, /localizedShortcuts/);
-  assert.match(install, /CreateShortcut\(\$legacyShortcut\)/);
+  assert.match(install, /CreateShortcut\(\$shortcutSeed\)/);
+  assert.match(install, /Move-Item -Force -LiteralPath \$shortcutSeed -Destination \$legacyShortcut/);
   assert.match(install, /Localized shortcut is missing/);
   assert.match(install, /Legacy Chinese shortcut was not migrated/);
   assert.match(desktopCargo, /^\[package\]\nname = "suxiaoyou-desktop"$/m);
