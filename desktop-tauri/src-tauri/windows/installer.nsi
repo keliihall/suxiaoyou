@@ -40,9 +40,6 @@ ${StrLoc}
 !include "{{installer_hooks}}"
 {{/if}}
 
-LangString SuyoDisplayName ${LANG_ENGLISH} "suyo"
-LangString SuyoDisplayName ${LANG_SIMPCHINESE} "苏小有"
-
 !define WEBVIEW2APPGUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 !define MANUFACTURER "{{manufacturer}}"
@@ -84,6 +81,8 @@ Var NoShortcutMode
 Var WixMode
 Var OldMainBinaryName
 Var SuyoRequestedLanguage
+Var SuyoLocalizedName
+Var SuyoLocalizedShortcutName
 
 !macro SuyoDeleteShortcutIfTarget shortcutPath targetPath foundMarker
   !insertmacro IsShortcutTarget "${shortcutPath}" "${targetPath}"
@@ -493,6 +492,15 @@ FunctionEnd
   !include "{{this}}"
 {{/each}}
 
+; Language IDs are defined by MUI_LANGUAGE/LoadLanguageFile above. Declaring
+; custom LangStrings earlier makes NSIS silently fall back to English (1033),
+; allowing the later Chinese value to overwrite the English value.
+LangString SuyoDisplayName ${LANG_ENGLISH} "suyo"
+LangString SuyoDisplayName ${LANG_SIMPCHINESE} "苏小有"
+!ifmacrodef NSIS_HOOK_LANGSTRINGS
+  !insertmacro NSIS_HOOK_LANGSTRINGS
+!endif
+
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
@@ -523,18 +531,32 @@ Function .onInit
     ${EndIf}
   ${EndIf}
 
+  ; MUI_LANGDLL_DISPLAY reads the saved language into $LANGUAGE during
+  ; .onInit; NSIS binds the active LangString table after .onInit returns.
+  ; Pre-seed an explicit override so silent installs do not inherit an older
+  ; preference. With a saved value the GUI selector is skipped as well.
   ${If} $SuyoRequestedLanguage != ""
-    Goto SuyoApplyRequestedLanguage
+    StrCpy $LANGUAGE $SuyoRequestedLanguage
+    WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE
   ${EndIf}
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     !insertmacro MUI_LANGDLL_DISPLAY
   !endif
-  Goto SuyoLanguageReady
 
-  SuyoApplyRequestedLanguage:
+  ; Keep /L authoritative after MUI initialization and cache the visible
+  ; product name in a normal variable. This avoids resolving installer-owned
+  ; registry and shortcut names through a stale language table.
+  ${If} $SuyoRequestedLanguage != ""
     StrCpy $LANGUAGE $SuyoRequestedLanguage
     WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE
-  SuyoLanguageReady:
+  ${EndIf}
+  ${If} $LANGUAGE == "${LANG_SIMPCHINESE}"
+    StrCpy $SuyoLocalizedName "苏小有"
+    StrCpy $SuyoLocalizedShortcutName "苏小有.lnk"
+  ${Else}
+    StrCpy $SuyoLocalizedName "suyo"
+    StrCpy $SuyoLocalizedShortcutName "suyo.lnk"
+  ${EndIf}
 
   !insertmacro SetContext
 
@@ -678,19 +700,13 @@ Section WebView2
 SectionEnd
 
 Section Install
-  ; Keep the requested language authoritative for every LangString used by
-  ; registry metadata and shortcut creation later in this section.
-  ${If} $SuyoRequestedLanguage != ""
-    StrCpy $LANGUAGE $SuyoRequestedLanguage
-  ${EndIf}
-
   SetOutPath $INSTDIR
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "$(SuyoDisplayName)"
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "$SuyoLocalizedName"
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -711,7 +727,7 @@ Section Install
   ; Create file associations
   {{#each file_associations as |association| ~}}
     {{#each association.ext as |ext| ~}}
-       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with $(SuyoDisplayName)" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
+       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with $SuyoLocalizedName" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
     {{/each}}
   {{/each}}
 
@@ -746,7 +762,7 @@ Section Install
   WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
 
   ; Registry information for add/remove programs
-  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$(SuyoDisplayName)"
+  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$SuyoLocalizedName"
   WriteRegStr SHCTX "${UNINSTKEY}" "DisplayIcon" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
   WriteRegStr SHCTX "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${MANUFACTURER}"
@@ -987,11 +1003,11 @@ Function CreateOrUpdateStartMenuShortcut
 
   !if "${STARTMENUFOLDER}" != ""
     CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
-    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\$(SuyoDisplayName).lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\$(SuyoDisplayName).lnk"
+    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\$SuyoLocalizedShortcutName" "$INSTDIR\${MAINBINARYNAME}.exe"
+    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\$SuyoLocalizedShortcutName"
   !else
-    CreateShortcut "$SMPROGRAMS\$(SuyoDisplayName).lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$(SuyoDisplayName).lnk"
+    CreateShortcut "$SMPROGRAMS\$SuyoLocalizedShortcutName" "$INSTDIR\${MAINBINARYNAME}.exe"
+    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$SuyoLocalizedShortcutName"
   !endif
 FunctionEnd
 
@@ -1005,8 +1021,8 @@ Function MigrateOwnedDesktopShortcut
   ${EndIf}
 
   ${If} $R0 = 1
-    CreateShortcut "$DESKTOP\$(SuyoDisplayName).lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-    !insertmacro SetLnkAppUserModelId "$DESKTOP\$(SuyoDisplayName).lnk"
+    CreateShortcut "$DESKTOP\$SuyoLocalizedShortcutName" "$INSTDIR\${MAINBINARYNAME}.exe"
+    !insertmacro SetLnkAppUserModelId "$DESKTOP\$SuyoLocalizedShortcutName"
   ${EndIf}
 FunctionEnd
 
@@ -1024,6 +1040,6 @@ Function CreateOrUpdateDesktopShortcut
     ${EndIf}
   ${EndIf}
 
-  CreateShortcut "$DESKTOP\$(SuyoDisplayName).lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-  !insertmacro SetLnkAppUserModelId "$DESKTOP\$(SuyoDisplayName).lnk"
+  CreateShortcut "$DESKTOP\$SuyoLocalizedShortcutName" "$INSTDIR\${MAINBINARYNAME}.exe"
+  !insertmacro SetLnkAppUserModelId "$DESKTOP\$SuyoLocalizedShortcutName"
 FunctionEnd

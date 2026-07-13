@@ -339,6 +339,75 @@ jobs:
             }
           }
 
+          # Exercise both localized names on the same installation. The first
+          # update proves English -> Chinese shortcut migration; the second
+          # returns to English and proves the reverse migration before launch.
+          $chineseUpdate = Start-Process `
+            -FilePath $installer[0].FullName `
+            -ArgumentList @("/S", "/UPDATE", "/L=2052", "/D=$installDirectory") `
+            -Wait `
+            -PassThru
+          if ($chineseUpdate.ExitCode -ne 0) {
+            throw "Chinese NSIS language update exited with code $($chineseUpdate.ExitCode)"
+          }
+          $installedLanguage = (Get-ItemProperty `
+            -LiteralPath $installerLanguageRegistryPath `
+            -Name "Installer Language")."Installer Language"
+          $uninstallMetadata = Get-ItemProperty -LiteralPath $uninstallRegistryPath
+          if ([string]$installedLanguage -ne "2052") {
+            throw "Chinese language update saved $installedLanguage, expected 2052"
+          }
+          if ($uninstallMetadata.DisplayName -ne "苏小有") {
+            throw "Chinese DisplayName is $($uninstallMetadata.DisplayName), expected 苏小有"
+          }
+          foreach ($chineseShortcut in $legacyShortcuts) {
+            if (-not (Test-Path -LiteralPath $chineseShortcut -PathType Leaf)) {
+              throw "Chinese shortcut is missing after language update: $chineseShortcut"
+            }
+            $shortcutTarget = $shortcutShell.CreateShortcut($chineseShortcut).TargetPath
+            if ([IO.Path]::GetFullPath($shortcutTarget) -ne [IO.Path]::GetFullPath($expectedAppPath)) {
+              throw "Chinese shortcut target is $shortcutTarget, expected $expectedAppPath"
+            }
+          }
+          foreach ($englishShortcut in $localizedShortcuts) {
+            if (Test-Path -LiteralPath $englishShortcut) {
+              throw "English shortcut remained after Chinese language update: $englishShortcut"
+            }
+          }
+
+          $englishUpdate = Start-Process `
+            -FilePath $installer[0].FullName `
+            -ArgumentList @("/S", "/UPDATE", "/L=1033", "/D=$installDirectory") `
+            -Wait `
+            -PassThru
+          if ($englishUpdate.ExitCode -ne 0) {
+            throw "English NSIS language update exited with code $($englishUpdate.ExitCode)"
+          }
+          $installedLanguage = (Get-ItemProperty `
+            -LiteralPath $installerLanguageRegistryPath `
+            -Name "Installer Language")."Installer Language"
+          $uninstallMetadata = Get-ItemProperty -LiteralPath $uninstallRegistryPath
+          if ([string]$installedLanguage -ne "1033") {
+            throw "English language update saved $installedLanguage, expected 1033"
+          }
+          if ($uninstallMetadata.DisplayName -ne "suyo") {
+            throw "English DisplayName is $($uninstallMetadata.DisplayName), expected suyo"
+          }
+          foreach ($englishShortcut in $localizedShortcuts) {
+            if (-not (Test-Path -LiteralPath $englishShortcut -PathType Leaf)) {
+              throw "English shortcut is missing after language update: $englishShortcut"
+            }
+            $shortcutTarget = $shortcutShell.CreateShortcut($englishShortcut).TargetPath
+            if ([IO.Path]::GetFullPath($shortcutTarget) -ne [IO.Path]::GetFullPath($expectedAppPath)) {
+              throw "English shortcut target is $shortcutTarget, expected $expectedAppPath"
+            }
+          }
+          foreach ($chineseShortcut in $legacyShortcuts) {
+            if (Test-Path -LiteralPath $chineseShortcut) {
+              throw "Chinese shortcut remained after English language update: $chineseShortcut"
+            }
+          }
+
           $appBinary = $expectedAppPath
           if (-not (Test-Path -LiteralPath $appBinary -PathType Leaf)) {
             throw "Installed app executable is missing from the install root: $appBinary"

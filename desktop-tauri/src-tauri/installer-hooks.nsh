@@ -12,8 +12,13 @@
 ; (and any leftover main binary instances) so the install can overwrite
 ; locked files cleanly.
 
-LangString SuyoClosingProcesses ${LANG_ENGLISH} "Closing running suyo background processes..."
-LangString SuyoClosingProcesses ${LANG_SIMPCHINESE} "正在关闭运行中的苏小有后台进程..."
+; The installer template expands this only after MUI_LANGUAGE has loaded the
+; language IDs. Defining these LangStrings at include time makes NSIS treat
+; both IDs as English and lets the Chinese value overwrite the English one.
+!macro NSIS_HOOK_LANGSTRINGS
+  LangString SuyoClosingProcesses ${LANG_ENGLISH} "Closing running suyo background processes..."
+  LangString SuyoClosingProcesses ${LANG_SIMPCHINESE} "正在关闭运行中的苏小有后台进程..."
+!macroend
 
 !macro NSIS_HOOK_PREINSTALL
   DetailPrint "$(SuyoClosingProcesses)"

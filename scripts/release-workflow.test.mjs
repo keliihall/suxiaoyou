@@ -279,6 +279,7 @@ test("preserves stable NSIS identity while localizing visible installer copy", (
   });
   assert.match(installerHooks, /LangString SuyoClosingProcesses \$\{LANG_ENGLISH\} "Closing running suyo background processes\.\.\."/);
   assert.match(installerHooks, /LangString SuyoClosingProcesses \$\{LANG_SIMPCHINESE\} "正在关闭运行中的苏小有后台进程\.\.\."/);
+  assert.match(installerHooks, /!macro NSIS_HOOK_LANGSTRINGS/);
   assert.match(installerHooks, /DetailPrint "\$\(SuyoClosingProcesses\)"/);
   assert.match(
     nsisTemplate,
@@ -299,29 +300,50 @@ test("preserves stable NSIS identity while localizing visible installer copy", (
   assert.ok(nsisTemplate.includes('StrCpy $INSTDIR "$LOCALAPPDATA\\${PRODUCTNAME}"'));
   assert.match(nsisTemplate, /LangString SuyoDisplayName \$\{LANG_ENGLISH\} "suyo"/);
   assert.match(nsisTemplate, /LangString SuyoDisplayName \$\{LANG_SIMPCHINESE\} "苏小有"/);
+  const muiLanguageLoad = '!insertmacro MUI_LANGUAGE "{{this}}"';
+  const displayNameLangString =
+    'LangString SuyoDisplayName ${LANG_ENGLISH} "suyo"';
+  assert.ok(
+    nsisTemplate.indexOf(muiLanguageLoad) < nsisTemplate.indexOf(displayNameLangString),
+    "custom LangStrings must be declared only after MUI has defined the language IDs",
+  );
+  assert.ok(
+    nsisTemplate.indexOf(displayNameLangString)
+      < nsisTemplate.indexOf("!insertmacro NSIS_HOOK_LANGSTRINGS"),
+  );
   assert.ok(nsisTemplate.includes('Name "$(SuyoDisplayName)"'));
   assert.ok(nsisTemplate.includes('VIAddVersionKey "ProductName" "suyo"'));
   assert.ok(nsisTemplate.includes('VIAddVersionKey "FileDescription" "suyo"'));
+  assert.ok(
+    nsisTemplate.includes(
+      'CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "$SuyoLocalizedName"',
+    ),
+  );
+  assert.ok(
+    nsisTemplate.includes(
+      'CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "$(SuyoDisplayName)"',
+    ),
+  );
+  assert.ok(nsisTemplate.includes('"Open with $SuyoLocalizedName"'));
+  assert.ok(
+    nsisTemplate.includes(
+      'WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$SuyoLocalizedName"',
+    ),
+  );
   assert.equal(
     nsisTemplate.match(
-      /CheckIfAppIsRunning "\$\{MAINBINARYNAME\}\.exe" "\$\(SuyoDisplayName\)"/g,
+      /WriteRegStr SHCTX "\$\{UNINSTKEY\}" "DisplayName"/g,
     )?.length,
-    2,
+    1,
   );
-  assert.ok(nsisTemplate.includes('"Open with $(SuyoDisplayName)"'));
   assert.ok(
     nsisTemplate.includes(
-      'WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$(SuyoDisplayName)"',
+      'CreateShortcut "$SMPROGRAMS\\$SuyoLocalizedShortcutName" "$INSTDIR\\${MAINBINARYNAME}.exe"',
     ),
   );
   assert.ok(
     nsisTemplate.includes(
-      'CreateShortcut "$SMPROGRAMS\\$(SuyoDisplayName).lnk" "$INSTDIR\\${MAINBINARYNAME}.exe"',
-    ),
-  );
-  assert.ok(
-    nsisTemplate.includes(
-      'CreateShortcut "$DESKTOP\\$(SuyoDisplayName).lnk" "$INSTDIR\\${MAINBINARYNAME}.exe"',
+      'CreateShortcut "$DESKTOP\\$SuyoLocalizedShortcutName" "$INSTDIR\\${MAINBINARYNAME}.exe"',
     ),
   );
   assert.doesNotMatch(nsisTemplate, /CreateShortcut "[^"\n]*\$\{PRODUCTNAME\}\.lnk"/);
@@ -604,11 +626,41 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(nsisTemplate, /\$\{GetOptions\} \$R1 "\/L=" \$R0/);
   assert.match(nsisTemplate, /\$R0 == "\$\{LANG_ENGLISH\}"/);
   assert.match(nsisTemplate, /\$R0 == "\$\{LANG_SIMPCHINESE\}"/);
+  const explicitLanguageWrite =
+    'WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE';
+  const muiLanguageInitialization = "!insertmacro MUI_LANGDLL_DISPLAY";
+  const initStart = nsisTemplate.indexOf("Function .onInit");
+  const installStart = nsisTemplate.indexOf("Section Install");
+  const uninstallStart = nsisTemplate.indexOf("Section Uninstall");
+  const ordering = [
+    nsisTemplate.indexOf(explicitLanguageWrite, initStart),
+    nsisTemplate.indexOf(muiLanguageInitialization, initStart),
+    nsisTemplate.indexOf('StrCpy $SuyoLocalizedName "suyo"', initStart),
+    nsisTemplate.indexOf("!insertmacro NSIS_HOOK_PREINSTALL", installStart),
+    nsisTemplate.indexOf(
+      'WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$SuyoLocalizedName"',
+      installStart,
+    ),
+    nsisTemplate.indexOf("!insertmacro NSIS_HOOK_POSTINSTALL", installStart),
+  ];
+  assert.ok(
+    ordering.every((position) => position >= 0)
+      && ordering.every((position, index) => index === 0 || position > ordering[index - 1]),
+    "language seed, MUI initialization, cached name, and installer hooks must stay ordered",
+  );
+  assert.doesNotMatch(
+    nsisTemplate.slice(installStart, uninstallStart),
+    /StrCpy \$LANGUAGE/,
+    "$LANGUAGE can only select the active NSIS language table during .onInit",
+  );
   assert.match(
     nsisTemplate,
     /WriteRegStr HKCU "\$\{MANUPRODUCTKEY\}" "Installer Language" \$LANGUAGE/,
   );
-  assert.match(nsisTemplate, /Goto SuyoLanguageReady/);
+  assert.match(nsisTemplate, /StrCpy \$SuyoLocalizedName "suyo"/);
+  assert.match(nsisTemplate, /StrCpy \$SuyoLocalizedName "苏小有"/);
+  assert.match(nsisTemplate, /StrCpy \$SuyoLocalizedShortcutName "suyo\.lnk"/);
+  assert.match(nsisTemplate, /StrCpy \$SuyoLocalizedShortcutName "苏小有\.lnk"/);
   assert.match(install, /-Value "2052"/);
   assert.match(install, /Installed language is \$installedLanguage, expected 1033/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
@@ -628,6 +680,20 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   assert.match(install, /Move-Item -Force -LiteralPath \$shortcutSeed -Destination \$legacyShortcut/);
   assert.match(install, /Localized shortcut is missing/);
   assert.match(install, /Legacy Chinese shortcut was not migrated/);
+  assert.match(
+    install,
+    /-ArgumentList @\("\/S", "\/UPDATE", "\/L=2052", "\/D=\$installDirectory"\)/,
+  );
+  assert.match(install, /Chinese DisplayName is \$\(\$uninstallMetadata\.DisplayName\), expected 苏小有/);
+  assert.match(install, /Chinese shortcut is missing after language update/);
+  assert.match(install, /English shortcut remained after Chinese language update/);
+  assert.match(
+    install,
+    /-ArgumentList @\("\/S", "\/UPDATE", "\/L=1033", "\/D=\$installDirectory"\)/,
+  );
+  assert.match(install, /English DisplayName is \$\(\$uninstallMetadata\.DisplayName\), expected suyo/);
+  assert.match(install, /English shortcut is missing after language update/);
+  assert.match(install, /Chinese shortcut remained after English language update/);
   assert.match(desktopCargo, /^\[package\]\nname = "suxiaoyou-desktop"$/m);
   assert.equal(tauriConfig.mainBinaryName, undefined);
   assert.match(install, /id:\s*install-windows/);
