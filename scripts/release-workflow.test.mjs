@@ -594,7 +594,7 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
     "Install NSIS package and verify packaged Node.js toolchain",
   );
   assert.match(install, /Start-Process/);
-  assert.match(install, /"\/S"/);
+  assert.match(install, /-ArgumentList @\("\/S", "\/LANG=1033", "\/D=\$installDirectory"\)/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
   assert.match(install, /installer\[0\]\.VersionInfo\.ProductName/);
   assert.match(install, /installer ProductName is \$installerProductName, expected suyo/);
