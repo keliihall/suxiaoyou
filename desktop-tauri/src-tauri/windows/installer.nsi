@@ -508,9 +508,25 @@ Function .onInit
     StrCpy $UpdateMode 1
   ${EndIf}
 
+  ; MUI_LANGDLL_DISPLAY reads the remembered/OS language during silent
+  ; installs but does not expose a command-line override. Support a bounded
+  ; /LANG=<LCID> contract so unattended installs can select either language
+  ; deterministically and the uninstaller remembers the same choice.
+  ClearErrors
+  ${GetOptions} $CMDLINE "/LANG=" $R0
+  ${IfNot} ${Errors}
+    ${If} $R0 == "${LANG_ENGLISH}"
+    ${OrIf} $R0 == "${LANG_SIMPCHINESE}"
+      StrCpy $LANGUAGE $R0
+      WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE
+      Goto SuyoLanguageReady
+    ${EndIf}
+  ${EndIf}
+
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     !insertmacro MUI_LANGDLL_DISPLAY
   !endif
+  SuyoLanguageReady:
 
   !insertmacro SetContext
 

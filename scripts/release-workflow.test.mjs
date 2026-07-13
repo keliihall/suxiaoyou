@@ -599,6 +599,14 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
     install.indexOf("# NSIS silent mode") < install.indexOf("$process = Start-Process `"),
     "comments must stay outside the PowerShell line-continuation block",
   );
+  assert.match(nsisTemplate, /\$\{GetOptions\} \$CMDLINE "\/LANG=" \$R0/);
+  assert.match(nsisTemplate, /\$R0 == "\$\{LANG_ENGLISH\}"/);
+  assert.match(nsisTemplate, /\$R0 == "\$\{LANG_SIMPCHINESE\}"/);
+  assert.match(
+    nsisTemplate,
+    /WriteRegStr HKCU "\$\{MANUPRODUCTKEY\}" "Installer Language" \$LANGUAGE/,
+  );
+  assert.match(nsisTemplate, /Goto SuyoLanguageReady/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
   assert.match(install, /installer\[0\]\.VersionInfo\.ProductName/);
   assert.match(install, /installer ProductName is \$installerProductName, expected suyo/);
