@@ -595,6 +595,10 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   );
   assert.match(install, /Start-Process/);
   assert.match(install, /-ArgumentList @\("\/S", "\/LANG=1033", "\/D=\$installDirectory"\)/);
+  assert.ok(
+    install.indexOf("# NSIS silent mode") < install.indexOf("$process = Start-Process `"),
+    "comments must stay outside the PowerShell line-continuation block",
+  );
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
   assert.match(install, /installer\[0\]\.VersionInfo\.ProductName/);
   assert.match(install, /installer ProductName is \$installerProductName, expected suyo/);

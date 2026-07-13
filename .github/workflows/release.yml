@@ -284,12 +284,12 @@ jobs:
             $shortcut.Save()
             Move-Item -Force -LiteralPath $shortcutSeed -Destination $legacyShortcut
           }
+          # NSIS silent mode does not show the language selector and can
+          # retain the last compiled/default language. Pin English so this
+          # runner validates the English display-name contract explicitly;
+          # /D must remain the final argument per the NSIS CLI contract.
           $process = Start-Process `
             -FilePath $installer[0].FullName `
-            # NSIS silent mode does not show the language selector and can
-            # retain the last compiled/default language. Pin English so this
-            # runner validates the English display-name contract explicitly;
-            # /D must remain the final argument per the NSIS CLI contract.
             -ArgumentList @("/S", "/LANG=1033", "/D=$installDirectory") `
             -Wait `
             -PassThru
