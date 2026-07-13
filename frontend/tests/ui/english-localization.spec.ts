@@ -40,7 +40,10 @@ test.describe("English localization guard", () => {
       });
     });
 
-    await page.goto("/");
+    // Exercise the onboarding surface directly. The root route is only a
+    // client-side redirect shim, whose scheduling under a cold CI dev server
+    // is unrelated to localization and can leave this assertion on `/`.
+    await page.goto("/c/new");
     await expect(page.getByRole("heading", { name: "Welcome to suyo" })).toBeVisible();
     await expectNoVisibleCjk(page, "English onboarding");
 
