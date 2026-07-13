@@ -112,11 +112,28 @@ test.describe("苏小有 conversation outline navigation", () => {
       page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
     ).toBeVisible({ timeout: 15_000 });
 
+    const frozenHistoryPage = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/api/messages/session-long"
+        && url.searchParams.get("offset") === "100"
+        && response.status() === 200;
+    });
+
     appendLongConversationTurn(
       state,
       "A remote teammate added a final launch check.",
       "The new final check is persisted on the live latest page.",
     );
+
+    // Deliberately traverse to the end of the frozen history window. The
+    // final request must stop at the pre-navigation total instead of leaking
+    // messages that arrived while the user was reading history.
+    await delay(800);
+    await page.getByTestId("message-list-scroller").evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    const frozenResponse = await frozenHistoryPage;
+    expect(new URL(frozenResponse.url()).searchParams.get("limit")).toBe("20");
 
     const returnButton = page.getByRole("button", {
       name: "Return to latest messages",

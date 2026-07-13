@@ -17,9 +17,26 @@ import type {
 export const MESSAGE_PAGE_SIZE = 50;
 
 interface HistoryWindow {
+  id: number;
   sessionId: string;
   pages: PaginatedMessages[];
   createdAt: number;
+  /** Latest message count when navigation began; newer arrivals stay unread. */
+  snapshotTotal: number;
+}
+
+function clipHistoryPage(
+  page: PaginatedMessages,
+  snapshotTotal: number,
+): PaginatedMessages {
+  return {
+    ...page,
+    total: snapshotTotal,
+    messages: page.messages.slice(
+      0,
+      Math.max(0, snapshotTotal - page.offset),
+    ),
+  };
 }
 
 function flattenPages(pages: PaginatedMessages[] | undefined) {
@@ -45,6 +62,8 @@ export function useMessages(sessionId: string | undefined) {
   const historyRequestRef = useRef(0);
   const historyLoadAbortRef = useRef<AbortController | null>(null);
   const [historyWindow, setHistoryWindow] = useState<HistoryWindow | null>(null);
+  const historyWindowIdRef = useRef<number | null>(null);
+  historyWindowIdRef.current = historyWindow?.id ?? null;
   const [isFetchingHistoryPreviousPage, setIsFetchingHistoryPreviousPage] =
     useState(false);
   const [isFetchingHistoryNextPage, setIsFetchingHistoryNextPage] =
@@ -119,10 +138,12 @@ export function useMessages(sessionId: string | undefined) {
     async (messageOffset: number): Promise<void> => {
       if (!sessionId) return;
       if (knownTotal <= 0) return;
+      const snapshotTotal = knownTotal;
+      const startedAt = Date.now();
 
       const offsets = conversationHistoryWindowOffsets(
         messageOffset,
-        knownTotal,
+        snapshotTotal,
         MESSAGE_PAGE_SIZE,
       );
 
@@ -134,12 +155,22 @@ export function useMessages(sessionId: string | undefined) {
         const pages = await Promise.all(
           offsets.map((offset) =>
             api.get<PaginatedMessages>(
-              API.MESSAGES.LIST(sessionId, MESSAGE_PAGE_SIZE, offset),
+              API.MESSAGES.LIST(
+                sessionId,
+                Math.min(MESSAGE_PAGE_SIZE, snapshotTotal - offset),
+                offset,
+              ),
               { signal: controller.signal },
             ),
           ),
         );
-        pages.sort((a, b) => a.offset - b.offset);
+        const effectiveSnapshotTotal = pages.reduce(
+          (total, page) => Math.min(total, page.total),
+          snapshotTotal,
+        );
+        const clippedPages = pages
+          .map((page) => clipHistoryPage(page, effectiveSnapshotTotal))
+          .sort((a, b) => a.offset - b.offset);
         if (
           requestId !== historyRequestRef.current
           || controller.signal.aborted
@@ -147,7 +178,15 @@ export function useMessages(sessionId: string | undefined) {
         ) {
           return;
         }
-        setHistoryWindow({ sessionId, pages, createdAt: Date.now() });
+        setHistoryWindow({
+          id: requestId,
+          sessionId,
+          pages: clippedPages,
+          createdAt: startedAt,
+          snapshotTotal: effectiveSnapshotTotal,
+        });
+        setIsFetchingHistoryPreviousPage(false);
+        setIsFetchingHistoryNextPage(false);
       } finally {
         if (historyLoadAbortRef.current === controller) {
           historyLoadAbortRef.current = null;
@@ -188,7 +227,11 @@ export function useMessages(sessionId: string | undefined) {
             ),
           }))
           .filter((page) => page.messages.length > 0);
-        return { ...current, pages };
+        return {
+          ...current,
+          pages,
+          snapshotTotal: Math.min(current.snapshotTotal, indexedTotal),
+        };
       });
     }
   }, [
@@ -201,7 +244,13 @@ export function useMessages(sessionId: string | undefined) {
   ]);
 
   const fetchHistoryPreviousPage = useCallback(async (): Promise<void> => {
-    if (!sessionId || !activeHistoryPages?.length || isFetchingHistoryPreviousPage) {
+    const windowId = historyWindow?.id;
+    if (
+      !sessionId
+      || windowId === undefined
+      || !activeHistoryPages?.length
+      || isFetchingHistoryPreviousPage
+    ) {
       return;
     }
     const firstOffset = activeHistoryPages[0].offset;
@@ -214,48 +263,93 @@ export function useMessages(sessionId: string | undefined) {
       );
       if (activeSessionRef.current !== sessionId) return;
       setHistoryWindow((current) => {
-        if (current?.sessionId !== sessionId) return current;
-        const pages = [page, ...current.pages.filter((item) => item.offset !== page.offset)]
+        if (
+          current?.sessionId !== sessionId
+          || current.id !== windowId
+          || historyRequestRef.current !== windowId
+        ) {
+          return current;
+        }
+        const effectiveBound = Math.min(current.snapshotTotal, page.total);
+        const clippedPage = clipHistoryPage(page, effectiveBound);
+        const pages = [
+          clippedPage,
+          ...current.pages.filter((item) => item.offset !== clippedPage.offset),
+        ]
+          .map((item) => clipHistoryPage(item, effectiveBound))
+          .filter((item) => item.messages.length > 0)
           .sort((a, b) => a.offset - b.offset);
-        return { sessionId, pages, createdAt: current.createdAt };
+        return { ...current, pages, snapshotTotal: effectiveBound };
       });
     } finally {
-      if (activeSessionRef.current === sessionId) {
+      if (
+        activeSessionRef.current === sessionId
+        && historyWindowIdRef.current === windowId
+        && historyRequestRef.current === windowId
+      ) {
         setIsFetchingHistoryPreviousPage(false);
       }
     }
   }, [
     activeHistoryPages,
+    historyWindow?.id,
     isFetchingHistoryPreviousPage,
     sessionId,
   ]);
 
   const fetchHistoryNextPage = useCallback(async (): Promise<void> => {
-    if (!sessionId || !activeHistoryPages?.length || isFetchingHistoryNextPage) {
+    const windowId = historyWindow?.id;
+    if (
+      !sessionId
+      || windowId === undefined
+      || !activeHistoryPages?.length
+      || isFetchingHistoryNextPage
+    ) {
       return;
     }
     const lastPage = activeHistoryPages.at(-1)!;
     const offset = lastPage.offset + lastPage.messages.length;
-    if (lastPage.messages.length === 0 || offset >= knownTotal) return;
+    const snapshotTotal = historyWindow?.snapshotTotal ?? knownTotal;
+    if (lastPage.messages.length === 0 || offset >= snapshotTotal) return;
+    const limit = Math.min(MESSAGE_PAGE_SIZE, snapshotTotal - offset);
     setIsFetchingHistoryNextPage(true);
     try {
       const page = await api.get<PaginatedMessages>(
-        API.MESSAGES.LIST(sessionId, MESSAGE_PAGE_SIZE, offset),
+        API.MESSAGES.LIST(sessionId, limit, offset),
       );
       if (activeSessionRef.current !== sessionId) return;
       setHistoryWindow((current) => {
-        if (current?.sessionId !== sessionId) return current;
-        const pages = [...current.pages.filter((item) => item.offset !== page.offset), page]
+        if (
+          current?.sessionId !== sessionId
+          || current.id !== windowId
+          || historyRequestRef.current !== windowId
+        ) {
+          return current;
+        }
+        const effectiveBound = Math.min(current.snapshotTotal, page.total);
+        const clippedPage = clipHistoryPage(page, effectiveBound);
+        const pages = [
+          ...current.pages.filter((item) => item.offset !== clippedPage.offset),
+          clippedPage,
+        ]
+          .map((item) => clipHistoryPage(item, effectiveBound))
+          .filter((item) => item.messages.length > 0)
           .sort((a, b) => a.offset - b.offset);
-        return { sessionId, pages, createdAt: current.createdAt };
+        return { ...current, pages, snapshotTotal: effectiveBound };
       });
     } finally {
-      if (activeSessionRef.current === sessionId) {
+      if (
+        activeSessionRef.current === sessionId
+        && historyWindowIdRef.current === windowId
+        && historyRequestRef.current === windowId
+      ) {
         setIsFetchingHistoryNextPage(false);
       }
     }
   }, [
     activeHistoryPages,
+    historyWindow?.id,
+    historyWindow?.snapshotTotal,
     isFetchingHistoryNextPage,
     knownTotal,
     sessionId,
@@ -276,9 +370,10 @@ export function useMessages(sessionId: string | undefined) {
   const hasHistoryPreviousPage =
     !!activeHistoryPages?.length && activeHistoryPages[0].offset > 0;
   const lastHistoryPage = activeHistoryPages?.at(-1);
+  const historySnapshotTotal = historyWindow?.snapshotTotal ?? knownTotal;
   const hasHistoryNextPage = !!lastHistoryPage
     && lastHistoryPage.messages.length > 0
-    && lastHistoryPage.offset + lastHistoryPage.messages.length < knownTotal;
+    && lastHistoryPage.offset + lastHistoryPage.messages.length < historySnapshotTotal;
   const fetchMainPreviousPage = query.fetchPreviousPage;
 
   const fetchDisplayPreviousPage = useCallback(async (): Promise<void> => {
