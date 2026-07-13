@@ -594,12 +594,14 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
     "Install NSIS package and verify packaged Node.js toolchain",
   );
   assert.match(install, /Start-Process/);
-  assert.match(install, /-ArgumentList @\("\/S", "\/LANG=1033", "\/D=\$installDirectory"\)/);
+  assert.match(install, /-ArgumentList @\("\/S", "\/L=1033", "\/D=\$installDirectory"\)/);
   assert.ok(
-    install.indexOf("# NSIS silent mode") < install.indexOf("$process = Start-Process `"),
+    install.indexOf("# Seed the legacy Chinese preference")
+      < install.indexOf("$process = Start-Process `"),
     "comments must stay outside the PowerShell line-continuation block",
   );
-  assert.match(nsisTemplate, /\$\{GetOptions\} \$CMDLINE "\/LANG=" \$R0/);
+  assert.match(nsisTemplate, /\$\{GetParameters\} \$R1/);
+  assert.match(nsisTemplate, /\$\{GetOptions\} \$R1 "\/L=" \$R0/);
   assert.match(nsisTemplate, /\$R0 == "\$\{LANG_ENGLISH\}"/);
   assert.match(nsisTemplate, /\$R0 == "\$\{LANG_SIMPCHINESE\}"/);
   assert.match(
@@ -607,6 +609,8 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
     /WriteRegStr HKCU "\$\{MANUPRODUCTKEY\}" "Installer Language" \$LANGUAGE/,
   );
   assert.match(nsisTemplate, /Goto SuyoLanguageReady/);
+  assert.match(install, /-Value "2052"/);
+  assert.match(install, /Installed language is \$installedLanguage, expected 1033/);
   assert.match(install, /require\('\.\/package\.json'\)\.version/);
   assert.match(install, /installer\[0\]\.VersionInfo\.ProductName/);
   assert.match(install, /installer ProductName is \$installerProductName, expected suyo/);

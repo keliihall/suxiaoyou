@@ -284,13 +284,21 @@ jobs:
             $shortcut.Save()
             Move-Item -Force -LiteralPath $shortcutSeed -Destination $legacyShortcut
           }
-          # NSIS silent mode does not show the language selector and can
-          # retain the last compiled/default language. Pin English so this
-          # runner validates the English display-name contract explicitly;
+          # Seed the legacy Chinese preference, then require the documented
+          # custom /L override to replace it with English. This proves the
+          # silent installer does not merely inherit its saved/default locale;
           # /D must remain the final argument per the NSIS CLI contract.
+          $installerLanguageRegistryPath = "HKCU:\Software\suxiaoyou\苏小有"
+          New-Item -Path $installerLanguageRegistryPath -Force | Out-Null
+          New-ItemProperty `
+            -Path $installerLanguageRegistryPath `
+            -Name "Installer Language" `
+            -PropertyType String `
+            -Value "2052" `
+            -Force | Out-Null
           $process = Start-Process `
             -FilePath $installer[0].FullName `
-            -ArgumentList @("/S", "/LANG=1033", "/D=$installDirectory") `
+            -ArgumentList @("/S", "/L=1033", "/D=$installDirectory") `
             -Wait `
             -PassThru
           if ($process.ExitCode -ne 0) {
@@ -302,6 +310,12 @@ jobs:
             throw "Stable NSIS uninstall registry key is missing: $uninstallRegistryPath"
           }
           $uninstallMetadata = Get-ItemProperty -LiteralPath $uninstallRegistryPath
+          $installedLanguage = (Get-ItemProperty `
+            -LiteralPath $installerLanguageRegistryPath `
+            -Name "Installer Language")."Installer Language"
+          if ([string]$installedLanguage -ne "1033") {
+            throw "Installed language is $installedLanguage, expected 1033"
+          }
           if ($uninstallMetadata.DisplayName -ne "suyo") {
             throw "Installed app DisplayName is $($uninstallMetadata.DisplayName), expected suyo"
           }

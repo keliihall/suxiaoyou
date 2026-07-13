@@ -83,6 +83,7 @@ Var UpdateMode
 Var NoShortcutMode
 Var WixMode
 Var OldMainBinaryName
+Var SuyoRequestedLanguage
 
 !macro SuyoDeleteShortcutIfTarget shortcutPath targetPath foundMarker
   !insertmacro IsShortcutTarget "${shortcutPath}" "${targetPath}"
@@ -508,24 +509,31 @@ Function .onInit
     StrCpy $UpdateMode 1
   ${EndIf}
 
-  ; MUI_LANGDLL_DISPLAY reads the remembered/OS language during silent
-  ; installs but does not expose a command-line override. Support a bounded
-  ; /LANG=<LCID> contract so unattended installs can select either language
-  ; deterministically and the uninstaller remembers the same choice.
+  ; MUI_LANGDLL_DISPLAY reads the remembered language during silent installs.
+  ; Follow NSIS's documented GetParameters/GetOptions pattern so /L=<LCID>
+  ; can explicitly override it for deterministic unattended installs.
+  StrCpy $SuyoRequestedLanguage ""
+  ${GetParameters} $R1
   ClearErrors
-  ${GetOptions} $CMDLINE "/LANG=" $R0
+  ${GetOptions} $R1 "/L=" $R0
   ${IfNot} ${Errors}
     ${If} $R0 == "${LANG_ENGLISH}"
     ${OrIf} $R0 == "${LANG_SIMPCHINESE}"
-      StrCpy $LANGUAGE $R0
-      WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE
-      Goto SuyoLanguageReady
+      StrCpy $SuyoRequestedLanguage $R0
     ${EndIf}
   ${EndIf}
 
+  ${If} $SuyoRequestedLanguage != ""
+    Goto SuyoApplyRequestedLanguage
+  ${EndIf}
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     !insertmacro MUI_LANGDLL_DISPLAY
   !endif
+  Goto SuyoLanguageReady
+
+  SuyoApplyRequestedLanguage:
+    StrCpy $LANGUAGE $SuyoRequestedLanguage
+    WriteRegStr HKCU "${MANUPRODUCTKEY}" "Installer Language" $LANGUAGE
   SuyoLanguageReady:
 
   !insertmacro SetContext
@@ -670,6 +678,12 @@ Section WebView2
 SectionEnd
 
 Section Install
+  ; Keep the requested language authoritative for every LangString used by
+  ; registry metadata and shortcut creation later in this section.
+  ${If} $SuyoRequestedLanguage != ""
+    StrCpy $LANGUAGE $SuyoRequestedLanguage
+  ${EndIf}
+
   SetOutPath $INSTDIR
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
