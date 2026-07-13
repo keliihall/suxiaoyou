@@ -360,11 +360,19 @@ jobs:
           if ($uninstallMetadata.DisplayName -ne "苏小有") {
             throw "Chinese DisplayName is $($uninstallMetadata.DisplayName), expected 苏小有"
           }
-          foreach ($chineseShortcut in $legacyShortcuts) {
+          for ($shortcutIndex = 0; $shortcutIndex -lt $legacyShortcuts.Count; $shortcutIndex++) {
+            $chineseShortcut = $legacyShortcuts[$shortcutIndex]
             if (-not (Test-Path -LiteralPath $chineseShortcut -PathType Leaf)) {
               throw "Chinese shortcut is missing after language update: $chineseShortcut"
             }
-            $shortcutTarget = $shortcutShell.CreateShortcut($chineseShortcut).TargetPath
+            # WScript.Shell returns an empty TargetPath when it opens a .lnk
+            # through a non-ASCII path on GitHub's Windows runner. Copy the
+            # exact shortcut bytes to an ASCII probe path before inspecting it.
+            $shortcutProbe = Join-Path $env:RUNNER_TEMP "suxiaoyou-chinese-probe-$shortcutIndex.lnk"
+            Remove-Item -Force -LiteralPath $shortcutProbe -ErrorAction SilentlyContinue
+            Copy-Item -Force -LiteralPath $chineseShortcut -Destination $shortcutProbe
+            $shortcutTarget = $shortcutShell.CreateShortcut($shortcutProbe).TargetPath
+            Remove-Item -Force -LiteralPath $shortcutProbe
             if ([IO.Path]::GetFullPath($shortcutTarget) -ne [IO.Path]::GetFullPath($expectedAppPath)) {
               throw "Chinese shortcut target is $shortcutTarget, expected $expectedAppPath"
             }

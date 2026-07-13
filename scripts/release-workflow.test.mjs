@@ -686,6 +686,8 @@ test("silently installs Windows NSIS and executes its packaged Node toolchain", 
   );
   assert.match(install, /Chinese DisplayName is \$\(\$uninstallMetadata\.DisplayName\), expected 苏小有/);
   assert.match(install, /Chinese shortcut is missing after language update/);
+  assert.match(install, /Copy-Item -Force -LiteralPath \$chineseShortcut -Destination \$shortcutProbe/);
+  assert.match(install, /CreateShortcut\(\$shortcutProbe\)\.TargetPath/);
   assert.match(install, /English shortcut remained after Chinese language update/);
   assert.match(
     install,
