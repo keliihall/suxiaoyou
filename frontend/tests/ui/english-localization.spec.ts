@@ -10,6 +10,7 @@ async function expectNoVisibleCjk(page: Page, surface: string) {
 
 test.describe("English localization guard", () => {
   test("onboarding, landing, and settings remain fully English", async ({ page }) => {
+    test.setTimeout(90_000);
     await seed苏小有Storage(page, { force: true, hasCompletedOnboarding: false });
     await mock苏小有Api(page);
     await page.route("**/api/config/providers", async (route) => {
@@ -52,7 +53,10 @@ test.describe("English localization guard", () => {
     await expectNoVisibleCjk(page, "English landing page");
 
     await page.getByRole("link", { name: "Settings", exact: true }).click();
-    await expect(page).toHaveURL(/\/settings$/);
+    // A cold CI dev server can spend more than the default assertion timeout
+    // compiling the settings RSC route; the click and request are already in
+    // flight, so give that first navigation its own bounded allowance.
+    await expect(page).toHaveURL(/\/settings$/, { timeout: 30_000 });
     await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
     await expect(page.getByRole("button", { name: "English" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Chinese" })).toBeVisible();
