@@ -44,6 +44,7 @@ def test_main_uses_cli_port_for_settings_and_uvicorn(monkeypatch, tmp_path):
     monkeypatch.delenv("SUXIAOYOU_PORT", raising=False)
     monkeypatch.delenv("SUXIAOYOU_RESOURCE_DIR", raising=False)
     monkeypatch.delenv("SUXIAOYOU_NODE_BIN_DIR", raising=False)
+    monkeypatch.delenv(run._APP_PRIVATE_DIR_ENV, raising=False)
     monkeypatch.setenv("PATH", run.os.environ.get("PATH", ""))
     resource_dir = tmp_path / "resources"
     node_bin_dir = resource_dir / "nodejs"
@@ -78,6 +79,7 @@ def test_main_uses_cli_port_for_settings_and_uvicorn(monkeypatch, tmp_path):
     assert env_file.read_text(encoding="utf-8") == original_env
     assert Path(run.os.environ["PATH"].split(run.os.pathsep)[0]) == node_bin_dir
     assert Path(run.os.environ["SUXIAOYOU_NODE_BIN_DIR"]) == node_bin_dir
+    assert Path(run.os.environ[run._APP_PRIVATE_DIR_ENV]) == tmp_path.resolve()
     windows_job.assert_called_once_with()
     parent_watchdog.assert_called_once_with()
 

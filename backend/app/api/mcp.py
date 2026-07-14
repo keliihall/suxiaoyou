@@ -13,6 +13,14 @@ from pydantic import BaseModel
 from app.api.oauth_redirect import loopback_redirect_uri
 
 router = APIRouter(prefix="/mcp")
+_GOOGLE_WORKSPACE = "google-workspace"
+
+
+def _direct_google_oauth_error() -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": "Google Workspace credentials require the direct OAuth flow",
+    }
 
 
 def _get_registry(request: Request):
@@ -46,6 +54,8 @@ async def mcp_reconnect(name: str, request: Request) -> dict[str, Any]:
     if registry:
         success = await registry.reconnect(name)
         return {"success": success, "servers": registry.status()}
+    if name == _GOOGLE_WORKSPACE:
+        return _direct_google_oauth_error()
     manager = _get_manager(request)
     if manager is None:
         return {"success": False, "error": "MCP not configured"}
@@ -66,6 +76,8 @@ class AuthCallbackBody(BaseModel):
 @router.post("/{name}/auth-start")
 async def mcp_auth_start(name: str, request: Request) -> dict[str, Any]:
     """Start an OAuth flow for an MCP server."""
+    if name == _GOOGLE_WORKSPACE:
+        return _direct_google_oauth_error()
     registry = _get_registry(request)
     settings = request.app.state.settings
     redirect_uri = loopback_redirect_uri(settings, "/api/connectors/oauth/callback")
@@ -114,6 +126,8 @@ async def mcp_auth_callback_api(
     name: str, body: AuthCallbackBody, request: Request
 ) -> dict[str, Any]:
     """API-based auth callback."""
+    if name == _GOOGLE_WORKSPACE:
+        return _direct_google_oauth_error()
     registry = _get_registry(request)
     if registry:
         success = await registry.complete_auth(body.state, body.code)
@@ -132,6 +146,8 @@ async def mcp_disconnect(name: str, request: Request) -> dict[str, Any]:
     if registry:
         success = await registry.disconnect(name)
         return {"success": success, "servers": registry.status()}
+    if name == _GOOGLE_WORKSPACE:
+        return _direct_google_oauth_error()
     manager = _get_manager(request)
     if manager is None:
         return {"success": False, "error": "MCP not configured"}

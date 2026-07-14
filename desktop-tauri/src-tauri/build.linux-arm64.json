@@ -7,11 +7,11 @@
     "targets": ["deb", "rpm"],
     "linux": {
       "deb": {
-        "depends": ["libxdo3"],
+        "depends": ["bubblewrap", "libxdo3"],
         "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
       },
       "rpm": {
-        "depends": ["xdotool"],
+        "depends": ["bubblewrap", "xdotool"],
         "desktopTemplate": "linux/suxiaoyou.desktop.hbs"
       }
     },

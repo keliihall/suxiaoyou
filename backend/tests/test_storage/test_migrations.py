@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +16,12 @@ import pytest
 from app.storage import migrations
 from app.storage.migrations import (
     DatabaseMigrationError,
+    DatabaseRestoreError,
+    CURRENT_HEAD_REVISION,
     V080_HEAD_REVISION,
+    database_lease,
+    list_database_backups,
+    restore_database_backup,
     upgrade_sqlite_database,
 )
 
@@ -39,13 +48,32 @@ def _table_names(path: Path) -> set[str]:
 
 def _revision(path: Path) -> str | None:
     with sqlite3.connect(path) as connection:
-        row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        try:
+            row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        except sqlite3.OperationalError:
+            return None
         return str(row[0]) if row else None
 
 
 def _quick_check(path: Path) -> str:
     with sqlite3.connect(path) as connection:
         return str(connection.execute("PRAGMA quick_check").fetchone()[0])
+
+
+def _rewrite_manifest_for_backup(
+    manifest_path: Path,
+    backup_path: Path,
+    *,
+    source_revision: str | None,
+) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["source_revision"] = source_revision
+    payload["size"] = backup_path.stat().st_size
+    payload["sha256"] = migrations._sha256_file(backup_path)
+    manifest_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 class _TrackedSQLiteConnection:
@@ -172,7 +200,7 @@ def test_existing_database_closes_all_handles_before_windows_replace(
 
     token = "windows-existing-handle-order"
     staging = database.with_name(f".{database.name}.{token}.migrating")
-    backup = database.with_name(f"{database.name}.pre-v0.8.0-{token}.bak")
+    backup = database.with_name(f"{database.name}.pre-v0.9.0-{token}.bak")
     real_connect = migrations.sqlite3.connect
     tracked: list[tuple[Path, sqlite3.Connection]] = []
 
@@ -483,7 +511,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     _materialize_v073_database(database)
 
     first = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
-    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v0.8.0-*.bak"))
+    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v0.9.0-*.bak"))
     second = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
 
     assert first is not None and first.upgraded is True
@@ -492,7 +520,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     assert second.created is False
     assert second.previous_revision == V080_HEAD_REVISION
     assert second.backup_path is None
-    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v0.8.0-*.bak")) == backups_after_first
+    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v0.9.0-*.bak")) == backups_after_first
     assert len(backups_after_first) == 1
     assert _revision(database) == V080_HEAD_REVISION
     with sqlite3.connect(database) as connection:
@@ -506,10 +534,10 @@ def test_unsupported_directory_fsync_does_not_report_false_rollback(
     database = tmp_path / "suxiaoyou.db"
     _materialize_v073_database(database)
 
-    def unsupported_fsync(_fd: int) -> None:
+    def unsupported_fsync(_directory: Path) -> None:
         raise OSError("directory fsync unsupported")
 
-    monkeypatch.setattr(migrations.os, "fsync", unsupported_fsync)
+    monkeypatch.setattr(migrations, "_fsync_directory", unsupported_fsync)
 
     result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
 
@@ -598,3 +626,547 @@ def test_unversioned_partial_schema_is_rejected_without_guessing(
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT id FROM session").fetchone() == ("keep-me",)
         assert "alembic_version" not in _table_names(database)
+
+
+def test_v083_database_advances_to_formal_v090_boundary(tmp_path: Path) -> None:
+    database = tmp_path / "v083.db"
+    engine = migrations.create_sync_engine(f"sqlite:///{database}")
+    try:
+        with engine.begin() as connection:
+            config = migrations._alembic_config(connection)
+            try:
+                migrations.command.upgrade(
+                    config,
+                    migrations.V083_SESSION_INPUT_LANGUAGE_REVISION,
+                )
+            finally:
+                config.attributes.pop("connection", None)
+    finally:
+        engine.dispose()
+
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert result is not None
+    assert result.previous_revision == migrations.V083_SESSION_INPUT_LANGUAGE_REVISION
+    assert result.current_revision == CURRENT_HEAD_REVISION
+    assert result.backup_metadata_path is not None
+    assert _revision(database) == CURRENT_HEAD_REVISION
+
+
+def test_future_revision_is_rejected_without_backup_or_mutation(tmp_path: Path) -> None:
+    database = tmp_path / "future.db"
+    upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE alembic_version SET version_num = '9999_future'")
+
+    with pytest.raises(DatabaseMigrationError, match="newer build"):
+        upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert _revision(database) == "9999_future"
+    assert not list(tmp_path.glob("future.db.*.bak"))
+
+
+def test_upgrade_backup_has_checksum_manifest_and_is_listed(tmp_path: Path) -> None:
+    database = tmp_path / "suxiaoyou.db"
+    _materialize_v073_database(database)
+
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert result is not None and result.backup_path is not None
+    assert result.backup_metadata_path is not None
+    manifest = json.loads(result.backup_metadata_path.read_text(encoding="utf-8"))
+    assert manifest["app_version"] == "0.9.0"
+    assert manifest["database_name"] == database.name
+    assert manifest["database_path"] == str(database.resolve())
+    assert manifest["backup_file"] == result.backup_path.name
+    assert manifest["source_revision"] is None
+    assert manifest["target_revision"] == CURRENT_HEAD_REVISION
+    assert len(manifest["sha256"]) == 64
+    assert manifest["size"] == result.backup_path.stat().st_size
+    assert manifest["integrity_verified"] is True
+    records = list_database_backups(f"sqlite+aiosqlite:///{database}")
+    assert len(records) == 1
+    assert records[0]["verified"] is True
+
+
+def test_forged_known_revision_schema_is_not_verified_or_restored(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "forged.db"
+    upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    backup = tmp_path / "forged.db.claimed-v073.bak"
+    migrations._online_backup(database, backup)
+    manifest = migrations._write_backup_manifest(
+        database_path=database,
+        backup_path=backup,
+        source_revision=CURRENT_HEAD_REVISION,
+        target_revision=CURRENT_HEAD_REVISION,
+        reason="test",
+        integrity_verified=True,
+    )
+
+    # Model a self-consistent but false manifest/revision claim: checksum,
+    # size, and the revision row all agree, while the table shape is newer.
+    with sqlite3.connect(backup) as connection:
+        connection.execute(
+            "UPDATE alembic_version SET version_num = ?",
+            (migrations.V073_BASELINE_REVISION,),
+        )
+    with pytest.raises(RuntimeError, match="does not exactly match revision"):
+        migrations._write_backup_manifest(
+            database_path=database,
+            backup_path=backup,
+            source_revision=migrations.V073_BASELINE_REVISION,
+            target_revision=CURRENT_HEAD_REVISION,
+            reason="test-forged-claim",
+            integrity_verified=True,
+        )
+    _rewrite_manifest_for_backup(
+        manifest,
+        backup,
+        source_revision=migrations.V073_BASELINE_REVISION,
+    )
+
+    records = list_database_backups(f"sqlite+aiosqlite:///{database}")
+    assert len(records) == 1
+    assert records[0]["verified"] is False
+    assert "schema does not match" in str(records[0]["error"])
+    with pytest.raises(DatabaseRestoreError, match="schema does not match"):
+        restore_database_backup(f"sqlite+aiosqlite:///{database}", manifest)
+    assert _revision(database) == CURRENT_HEAD_REVISION
+
+
+def test_incompatible_unversioned_schema_is_not_verified_or_restored(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "unversioned.db"
+    upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    backup = tmp_path / "unversioned.db.incompatible.bak"
+    migrations._online_backup(database, backup)
+    manifest = migrations._write_backup_manifest(
+        database_path=database,
+        backup_path=backup,
+        source_revision=CURRENT_HEAD_REVISION,
+        target_revision=CURRENT_HEAD_REVISION,
+        reason="test",
+        integrity_verified=True,
+    )
+
+    # A current session_input without its idempotency table is not one of the
+    # explicitly supported historical unversioned snapshots.
+    with sqlite3.connect(backup) as connection:
+        connection.execute("DROP TABLE alembic_version")
+        connection.execute("DROP TABLE idempotency_record")
+    with pytest.raises(RuntimeError, match="explicitly compatible legacy snapshot"):
+        migrations._write_backup_manifest(
+            database_path=database,
+            backup_path=backup,
+            source_revision=None,
+            target_revision=CURRENT_HEAD_REVISION,
+            reason="test-incompatible-legacy",
+            integrity_verified=True,
+        )
+    _rewrite_manifest_for_backup(manifest, backup, source_revision=None)
+
+    records = list_database_backups(f"sqlite+aiosqlite:///{database}")
+    assert len(records) == 1
+    assert records[0]["verified"] is False
+    assert "explicitly compatible legacy snapshot" in str(records[0]["error"])
+    with pytest.raises(
+        DatabaseRestoreError,
+        match="explicitly compatible legacy snapshot",
+    ):
+        restore_database_backup(f"sqlite+aiosqlite:///{database}", manifest)
+    assert _revision(database) == CURRENT_HEAD_REVISION
+
+
+def test_revision_schema_rejects_text_only_idempotency_table_with_duplicates(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "constraints.db"
+    upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    backup = tmp_path / "constraints.db.malformed.bak"
+    migrations._online_backup(database, backup)
+    manifest = migrations._write_backup_manifest(
+        database_path=database,
+        backup_path=backup,
+        source_revision=CURRENT_HEAD_REVISION,
+        target_revision=CURRENT_HEAD_REVISION,
+        reason="test",
+        integrity_verified=True,
+    )
+
+    with sqlite3.connect(backup) as connection:
+        connection.execute(
+            "ALTER TABLE idempotency_record RENAME TO idempotency_record_valid"
+        )
+        connection.execute(
+            """
+            CREATE TABLE idempotency_record (
+                id TEXT,
+                scope TEXT,
+                request_key TEXT,
+                request_hash TEXT,
+                status TEXT,
+                response TEXT,
+                error_message TEXT,
+                time_created TEXT,
+                time_updated TEXT
+            )
+            """
+        )
+        duplicate = (
+            "duplicate-id",
+            "session",
+            "same-key",
+            "hash",
+            "pending",
+            "{}",
+            None,
+            "2026-07-14",
+            "2026-07-14",
+        )
+        connection.execute(
+            "INSERT INTO idempotency_record VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            duplicate,
+        )
+        connection.execute(
+            "INSERT INTO idempotency_record VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            duplicate,
+        )
+        connection.execute("DROP TABLE idempotency_record_valid")
+    _rewrite_manifest_for_backup(
+        manifest,
+        backup,
+        source_revision=CURRENT_HEAD_REVISION,
+    )
+
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM idempotency_record "
+            "WHERE scope = 'session' AND request_key = 'same-key'"
+        ).fetchone() == (2,)
+    records = list_database_backups(f"sqlite+aiosqlite:///{database}")
+    assert records[0]["verified"] is False
+    assert "column type/not-null/default/primary-key" in str(records[0]["error"])
+    assert "unique/index definition differs" in str(records[0]["error"])
+    with pytest.raises(DatabaseRestoreError, match="schema does not match"):
+        restore_database_backup(f"sqlite+aiosqlite:///{database}", manifest)
+    assert _revision(database) == CURRENT_HEAD_REVISION
+
+
+def test_database_lease_blocks_second_app_and_offline_recovery_processes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "leased.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_metadata_path is not None
+    database_url = f"sqlite+aiosqlite:///{database}"
+    run_py = Path(__file__).resolve().parents[2] / "run.py"
+    environment = dict(os.environ)
+    backend_root = str(Path(__file__).resolve().parents[2])
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (backend_root, environment.get("PYTHONPATH", "")))
+    )
+    startup_probe = (
+        "import sys; "
+        "from app.storage.migrations import upgrade_sqlite_database; "
+        "upgrade_sqlite_database(sys.argv[1])"
+    )
+
+    with database_lease(database_url):
+        attempted_start = subprocess.run(
+            [sys.executable, "-c", startup_probe, database_url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+        attempted_list = subprocess.run(
+            [
+                sys.executable,
+                str(run_py),
+                "--database-url",
+                database_url,
+                "--list-backups",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+        attempted_restore = subprocess.run(
+            [
+                sys.executable,
+                str(run_py),
+                "--database-url",
+                database_url,
+                "--restore-backup",
+                str(migration.backup_metadata_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+
+    for attempt in (attempted_start, attempted_list, attempted_restore):
+        assert attempt.returncode != 0
+        assert "already in use by another app or recovery process" in attempt.stderr
+    assert _revision(database) == CURRENT_HEAD_REVISION
+
+
+def test_upgrade_refuses_to_replace_live_database_after_late_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "late-upgrade.db"
+    _materialize_v073_database(database)
+    real_run_alembic = migrations._run_alembic
+
+    def migrate_then_write_live(
+        staging_path: Path,
+        *,
+        stamp_revision: str | None,
+    ) -> None:
+        real_run_alembic(staging_path, stamp_revision=stamp_revision)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE session SET title = 'late-write' WHERE id = 'session-v073'"
+            )
+
+    monkeypatch.setattr(migrations, "_run_alembic", migrate_then_write_live)
+
+    with pytest.raises(DatabaseMigrationError, match="changed after the safety snapshot") as exc:
+        upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert exc.value.backup_path is not None and exc.value.backup_path.is_file()
+    assert _revision(database) is None
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("late-write",)
+    with sqlite3.connect(exc.value.backup_path) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("需要保留的 v0.7.3 对话",)
+
+
+def test_restore_refuses_to_replace_live_database_after_late_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "late-restore.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_metadata_path is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE session SET title = 'before-restore' WHERE id = 'session-v073'"
+        )
+    real_prepare_staging_journal = migrations._prepare_staging_journal
+
+    def prepare_then_write_live(staging_path: Path) -> None:
+        real_prepare_staging_journal(staging_path)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE session SET title = 'late-write' WHERE id = 'session-v073'"
+            )
+
+    monkeypatch.setattr(
+        migrations,
+        "_prepare_staging_journal",
+        prepare_then_write_live,
+    )
+
+    with pytest.raises(DatabaseRestoreError, match="changed after the safety snapshot"):
+        restore_database_backup(
+            f"sqlite+aiosqlite:///{database}",
+            migration.backup_metadata_path,
+        )
+
+    assert _revision(database) == CURRENT_HEAD_REVISION
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("late-write",)
+    safety_backups = list(tmp_path.glob("late-restore.db.pre-restore-*.bak"))
+    assert len(safety_backups) == 1
+    with sqlite3.connect(safety_backups[0]) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("before-restore",)
+
+
+def test_restore_is_atomic_and_keeps_verified_safety_backup(tmp_path: Path) -> None:
+    database = tmp_path / "suxiaoyou.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_metadata_path is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE session SET title = 'changed-after-upgrade' WHERE id = 'session-v073'"
+        )
+
+    restored = restore_database_backup(
+        f"sqlite+aiosqlite:///{database}",
+        migration.backup_metadata_path,
+    )
+
+    assert restored.restored_revision is None
+    assert restored.safety_backup_path is not None
+    assert restored.safety_backup_metadata_path is not None
+    assert restored.safety_backup_path.is_file()
+    assert restored.safety_backup_metadata_path.is_file()
+    assert _revision(restored.safety_backup_path) == CURRENT_HEAD_REVISION
+    assert _revision(database) is None
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("需要保留的 v0.7.3 对话",)
+
+
+def test_restore_rejects_backup_changed_after_manifest_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "restore-toctou-reject.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_path is not None
+    assert migration.backup_metadata_path is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE session SET title = 'live-must-survive' WHERE id = 'session-v073'"
+        )
+    real_copy = migrations._copy_manifest_backup_to_staging
+
+    def tamper_then_copy(*args, **kwargs) -> None:
+        with sqlite3.connect(migration.backup_path) as connection:
+            connection.execute(
+                "UPDATE session SET title = 'changed-after-validation' "
+                "WHERE id = 'session-v073'"
+            )
+        real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        migrations,
+        "_copy_manifest_backup_to_staging",
+        tamper_then_copy,
+    )
+
+    with pytest.raises(DatabaseRestoreError, match="checksum changed before staging"):
+        restore_database_backup(
+            f"sqlite+aiosqlite:///{database}",
+            migration.backup_metadata_path,
+        )
+
+    assert _revision(database) == CURRENT_HEAD_REVISION
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("live-must-survive",)
+    assert list(tmp_path.glob("restore-toctou-reject.db.pre-restore-*.bak"))
+
+
+def test_restore_staging_is_immutable_after_verified_backup_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "restore-toctou-isolated.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_path is not None
+    assert migration.backup_metadata_path is not None
+    real_copy = migrations._copy_manifest_backup_to_staging
+
+    def copy_then_tamper_source(*args, **kwargs) -> None:
+        real_copy(*args, **kwargs)
+        with sqlite3.connect(migration.backup_path) as connection:
+            connection.execute(
+                "UPDATE session SET title = 'source-changed-after-copy' "
+                "WHERE id = 'session-v073'"
+            )
+
+    monkeypatch.setattr(
+        migrations,
+        "_copy_manifest_backup_to_staging",
+        copy_then_tamper_source,
+    )
+
+    restore_database_backup(
+        f"sqlite+aiosqlite:///{database}",
+        migration.backup_metadata_path,
+    )
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("需要保留的 v0.7.3 对话",)
+    with sqlite3.connect(migration.backup_path) as connection:
+        assert connection.execute(
+            "SELECT title FROM session WHERE id = 'session-v073'"
+        ).fetchone() == ("source-changed-after-copy",)
+
+
+def test_checksum_mismatch_refuses_restore_and_preserves_live_db(tmp_path: Path) -> None:
+    database = tmp_path / "suxiaoyou.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_path is not None
+    assert migration.backup_metadata_path is not None
+    with migration.backup_path.open("ab") as handle:
+        handle.write(b"tamper")
+
+    with pytest.raises(DatabaseRestoreError, match="size mismatch|checksum mismatch"):
+        restore_database_backup(
+            f"sqlite+aiosqlite:///{database}",
+            migration.backup_metadata_path,
+        )
+
+    assert _revision(database) == CURRENT_HEAD_REVISION
+    assert not list(tmp_path.glob("suxiaoyou.db.pre-restore-*.bak"))
+
+
+def test_offline_recovery_cli_lists_and_restores_without_app_startup(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "suxiaoyou.db"
+    _materialize_v073_database(database)
+    migration = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert migration is not None and migration.backup_metadata_path is not None
+    database_url = f"sqlite+aiosqlite:///{database}"
+    run_py = Path(__file__).resolve().parents[2] / "run.py"
+
+    listed = subprocess.run(
+        [
+            sys.executable,
+            str(run_py),
+            "--database-url",
+            database_url,
+            "--list-backups",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert json.loads(listed.stdout)["backups"][0]["verified"] is True
+
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(run_py),
+            "--database-url",
+            database_url,
+            "--restore-backup",
+            str(migration.backup_metadata_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert json.loads(restored.stdout)["status"] == "restored"
+    assert _revision(database) is None

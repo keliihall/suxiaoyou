@@ -34,7 +34,9 @@ class ProviderDef:
 
 
 # All remote providers that can be configured via direct API key (BYOK).
-# Keep this desktop catalog focused on China-accessible defaults; Ollama,
+# China-accessible providers remain first in the list. Anthropic and Gemini use
+# their official native SDKs so Claude/Gemini-specific streaming and tool calls
+# do not silently degrade through an OpenAI-compatibility shim. Ollama,
 # Rapid-MLX and custom OpenAI-compatible endpoints have dedicated local flows.
 PROVIDER_CATALOG: dict[str, ProviderDef] = {
     "deepseek": ProviderDef(
@@ -105,5 +107,27 @@ PROVIDER_CATALOG: dict[str, ProviderDef] = {
         kind="openai_compat",
         base_url="https://api.xiaomimimo.com/v1",
         seed_models=(("mimo-v2-flash", "MiMo V2 Flash"),),
+    ),
+    "anthropic": ProviderDef(
+        id="anthropic",
+        name="Anthropic Claude",
+        name_en="Anthropic Claude",
+        settings_key="anthropic_api_key",
+        kind="native_anthropic",
+        seed_models=(
+            ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+            ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        ),
+    ),
+    "google": ProviderDef(
+        id="google",
+        name="Google Gemini",
+        name_en="Google Gemini",
+        settings_key="google_api_key",
+        kind="native_gemini",
+        seed_models=(
+            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+        ),
     ),
 }

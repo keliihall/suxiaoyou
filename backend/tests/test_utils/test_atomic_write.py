@@ -74,3 +74,15 @@ def test_new_file_respects_process_umask(tmp_path: Path) -> None:
     atomic_write.atomic_write_text(target, "content")
 
     assert stat.S_IMODE(target.stat().st_mode) == 0o666 & ~current_umask
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode semantics")
+def test_explicit_mode_hardens_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "credentials.json"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o644)
+
+    atomic_write.atomic_write_text(target, "new", mode=0o600)
+
+    assert target.read_text(encoding="utf-8") == "new"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600

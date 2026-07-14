@@ -1,16 +1,17 @@
-"""Gemini provider adapter for the desktop backend.
-
-Delegates to yakAgent's GeminiProvider (native google-genai SDK with full
-Gemini feature support: thinking, multimodal, native function calling)
-and converts between yakAgent and desktop schema types.
-"""
+"""Native Gemini provider backed by Google's official ``google-genai`` SDK."""
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from typing import Any, AsyncIterator
 
+from google import genai
+from google.genai import types
+
 from app.provider.base import BaseProvider
+from app.provider.catalog import PROVIDER_CATALOG
 from app.schemas.provider import (
     ModelCapabilities,
     ModelInfo,
@@ -22,90 +23,229 @@ from app.schemas.provider import (
 logger = logging.getLogger(__name__)
 
 
-def _convert_model_info(m: Any) -> ModelInfo:
-    """Convert a yakAgent ModelInfo to the desktop schema."""
-    return ModelInfo(
-        id=m.id,
-        name=m.name,
-        provider_id=m.provider_id,
-        capabilities=ModelCapabilities(
-            function_calling=m.capabilities.function_calling,
-            vision=m.capabilities.vision,
-            reasoning=m.capabilities.reasoning,
-            json_output=m.capabilities.json_output,
-            max_context=m.capabilities.max_context,
-            max_output=m.capabilities.max_output,
-        ),
-        pricing=ModelPricing(
-            prompt=m.pricing.prompt,
-            completion=m.pricing.completion,
-        ),
-        metadata=m.metadata if hasattr(m, "metadata") else {},
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {"_raw": value}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _gemini_parts(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if not isinstance(content, list):
+        text = str(content or "")
+        return [{"text": text}] if text else []
+
+    converted: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            text = str(part)
+            if text:
+                converted.append({"text": text})
+            continue
+        if part.get("type") in {"text", "input_text"}:
+            text = str(part.get("text", ""))
+            if text:
+                converted.append({"text": text})
+            continue
+        if part.get("type") in {"image", "image_url", "input_image"}:
+            image = part.get("image_url", part.get("source", {}))
+            url = image.get("url", "") if isinstance(image, dict) else str(image)
+            if url.startswith("data:") and ";base64," in url:
+                header, data = url.split(",", 1)
+                converted.append(
+                    {
+                        "inline_data": {
+                            "mime_type": header[5:].split(";", 1)[0],
+                            "data": base64.b64decode(data),
+                        }
+                    }
+                )
+            elif url:
+                converted.append(
+                    {
+                        "file_data": {
+                            "file_uri": url,
+                            "mime_type": part.get("mime_type", "application/octet-stream"),
+                        }
+                    }
+                )
+    return converted
+
+
+def _system_text(system: str | list[dict[str, Any]] | None) -> str | None:
+    if isinstance(system, str):
+        return system
+    if not system:
+        return None
+    return "\n\n".join(
+        str(part.get("text", ""))
+        for part in system
+        if isinstance(part, dict) and part.get("text")
     )
 
 
-class GeminiDesktopProvider(BaseProvider):
-    """Gemini provider for the desktop backend.
+def _build_contents(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    contents: list[dict[str, Any]] = []
+    embedded_system: list[str] = []
+    tool_names: dict[str, str] = {}
 
-    Wraps yakAgent's native GeminiProvider to get full Gemini support
-    (thinking, multimodal, native function calling) while returning
-    the desktop backend's schema types.
-    """
+    def append(role: str, parts: list[dict[str, Any]]) -> None:
+        if not parts:
+            return
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].extend(parts)
+        else:
+            contents.append({"role": role, "parts": parts})
+
+    for message in messages:
+        role = message.get("role")
+        if role in {"system", "developer"}:
+            embedded_system.append(str(message.get("content", "")))
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id", ""))
+            append(
+                "user",
+                [
+                    {
+                        "function_response": {
+                            "id": call_id or None,
+                            "name": tool_names.get(call_id, "tool"),
+                            "response": {"output": message.get("content", "")},
+                        }
+                    }
+                ],
+            )
+            continue
+
+        target_role = "model" if role == "assistant" else "user"
+        parts = _gemini_parts(message.get("content", ""))
+        if target_role == "model":
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call.get("function", {})
+                call_id = str(tool_call.get("id", ""))
+                name = str(function.get("name", ""))
+                if call_id:
+                    tool_names[call_id] = name
+                parts.append(
+                    {
+                        "function_call": {
+                            "id": call_id or None,
+                            "name": name,
+                            "args": _json_object(function.get("arguments")),
+                        }
+                    }
+                )
+        append(target_role, parts)
+    return contents, embedded_system
+
+
+def _gemini_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    declarations = []
+    for tool in tools:
+        function = tool.get("function", tool)
+        declarations.append(
+            {
+                "name": function["name"],
+                "description": function.get("description", ""),
+                "parameters_json_schema": function.get(
+                    "parameters", {"type": "object", "properties": {}}
+                ),
+            }
+        )
+    return [{"function_declarations": declarations}]
+
+
+class GeminiDesktopProvider(BaseProvider):
+    """Gemini Generate Content adapter with native text, vision, and tools."""
 
     def __init__(self, api_key: str, **kwargs: Any):
-        from yakagent.provider.gemini import GeminiProvider
-
         self._api_key = api_key
-        self._inner = GeminiProvider(api_key=api_key, **kwargs)
+        self._client = genai.Client(api_key=api_key, **kwargs)
 
     @property
     def id(self) -> str:
         return "google"
 
-    async def list_models(self) -> list[ModelInfo]:
-        # Start with models.dev (live pricing/capabilities)
-        models = await self._load_models_dev()
-        # Merge with yakAgent's hardcoded list to fill gaps
-        inner_models = await self._inner.list_models()
-        seen_ids = {m.id for m in models}
-        for m in inner_models:
-            if m.id not in seen_ids:
-                models.append(_convert_model_info(m))
-        return models
+    def local_models(self) -> list[ModelInfo]:
+        return [
+            ModelInfo(
+                id=model_id,
+                name=name,
+                provider_id=self.id,
+                capabilities=ModelCapabilities(
+                    function_calling=True,
+                    vision=True,
+                    reasoning=False,
+                    json_output=True,
+                    max_context=1_048_576,
+                ),
+            )
+            for model_id, name in PROVIDER_CATALOG[self.id].seed_models
+        ]
 
-    async def _load_models_dev(self) -> list[ModelInfo]:
+    async def list_models(self) -> list[ModelInfo]:
+        """Validate the key against Gemini, then enrich its live model list."""
+        pager = await self._client.aio.models.list()
+        live = [
+            model
+            async for model in pager
+            if not model.supported_actions or "generateContent" in model.supported_actions
+        ]
+
+        metadata: dict[str, dict[str, Any]] = {}
         try:
             from app.provider.models_dev import models_dev
-            raw = await models_dev.get_models("google")
-            if not raw:
-                return []
-            models = []
-            for m in raw:
-                caps = m.get("capabilities", {})
-                pricing = m.get("pricing", {})
-                meta = m.get("metadata", {})
-                models.append(ModelInfo(
-                    id=m["id"],
-                    name=m.get("name", m["id"]),
-                    provider_id="google",
+
+            metadata = {
+                raw["id"].removeprefix("models/"): raw
+                for raw in await models_dev.get_models(self.id) or []
+            }
+        except Exception as exc:
+            logger.debug("models.dev unavailable for google: %s", exc)
+
+        models: list[ModelInfo] = []
+        for model in live:
+            model_id = (model.name or "").removeprefix("models/")
+            if not model_id:
+                continue
+            raw = metadata.get(model_id, {})
+            caps = raw.get("capabilities", {})
+            pricing = raw.get("pricing", {})
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    name=raw.get("name", model.display_name or model_id),
+                    provider_id=self.id,
                     capabilities=ModelCapabilities(
                         function_calling=caps.get("function_calling", True),
-                        vision=caps.get("vision", False),
-                        reasoning=caps.get("reasoning", False),
-                        json_output=caps.get("json_output", False),
-                        max_context=caps.get("max_context", 1_048_576),
-                        max_output=caps.get("max_output"),
+                        vision=caps.get("vision", True),
+                        # Thought signatures must be retained across tool turns
+                        # before native Gemini reasoning can be advertised.
+                        reasoning=False,
+                        json_output=caps.get("json_output", True),
+                        max_context=caps.get(
+                            "max_context", model.input_token_limit or 1_048_576
+                        ),
+                        max_output=caps.get("max_output", model.output_token_limit),
                     ),
                     pricing=ModelPricing(
                         prompt=pricing.get("prompt", 0),
                         completion=pricing.get("completion", 0),
                     ),
-                    metadata=meta,
-                ))
-            return models
-        except Exception as e:
-            logger.debug("models.dev unavailable for google: %s", e)
-            return []
+                    metadata=raw.get("metadata", {}),
+                )
+            )
+        return models
 
     async def stream_chat(
         self,
@@ -119,25 +259,92 @@ class GeminiDesktopProvider(BaseProvider):
         extra_body: dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamChunk]:
-        async for chunk in self._inner.stream_chat(
-            model,
-            messages,
-            tools=tools,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-            response_format=response_format,
-        ):
-            yield StreamChunk(type=chunk.type, data=chunk.data)
+        contents, embedded_system = _build_contents(messages)
+        system_instruction = _system_text(system)
+        if embedded_system:
+            system_instruction = "\n\n".join(
+                part for part in [system_instruction, *embedded_system] if part
+            )
+
+        config: dict[str, Any] = {}
+        if system_instruction:
+            config["system_instruction"] = system_instruction
+        if tools:
+            config["tools"] = _gemini_tools(tools)
+        if temperature is not None:
+            config["temperature"] = temperature
+        if max_tokens is not None:
+            config["max_output_tokens"] = max_tokens
+        if response_format and response_format.get("type") == "json_schema":
+            config["response_mime_type"] = "application/json"
+            config["response_json_schema"] = response_format.get("json_schema", {}).get(
+                "schema", {}
+            )
+        # Omit thinking_config for every request path. The frontend can still
+        # carry an old reasoning=true preference even though this provider
+        # advertises reasoning=false; ignoring it keeps core prompts working
+        # without opting into unpreservable thought signatures.
+
+        try:
+            stream = await self._client.aio.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config),
+            )
+            tool_index = 0
+            async for response in stream:
+                candidate = response.candidates[0] if response.candidates else None
+                if candidate and candidate.content:
+                    for part in candidate.content.parts or []:
+                        if part.text:
+                            yield StreamChunk(
+                                type="reasoning-delta" if part.thought else "text-delta",
+                                data={"text": part.text},
+                            )
+                        if part.function_call:
+                            call = part.function_call
+                            tool_index += 1
+                            yield StreamChunk(
+                                type="tool-call",
+                                data={
+                                    "id": call.id or f"call_google_{tool_index}",
+                                    "name": call.name or "",
+                                    "arguments": call.args or {},
+                                },
+                            )
+
+                if candidate and candidate.finish_reason:
+                    raw_reason = getattr(
+                        candidate.finish_reason, "value", str(candidate.finish_reason)
+                    )
+                    reason = "length" if raw_reason == "MAX_TOKENS" else "stop"
+                    if candidate.content and any(
+                        part.function_call for part in candidate.content.parts or []
+                    ):
+                        reason = "tool_calls"
+                    yield StreamChunk(type="finish", data={"reason": reason})
+
+                usage = response.usage_metadata
+                if usage and candidate and candidate.finish_reason:
+                    normalized = {
+                        "input": usage.prompt_token_count or 0,
+                        "output": usage.candidates_token_count or 0,
+                        "reasoning": usage.thoughts_token_count or 0,
+                        "cache_read": usage.cached_content_token_count or 0,
+                        "cache_write": 0,
+                        "total": usage.total_token_count or 0,
+                    }
+                    yield StreamChunk(type="usage", data=normalized)
+        except Exception as exc:
+            logger.error("Gemini stream error for %s: %s", model, exc, exc_info=True)
+            yield StreamChunk(type="error", data={"message": str(exc)})
 
     async def health_check(self) -> ProviderStatus:
-        inner = await self._inner.health_check()
-        return ProviderStatus(
-            status=inner.status,
-            model_count=inner.model_count,
-            error=inner.error,
-        )
+        try:
+            models = await self.list_models()
+            return ProviderStatus(status="connected", model_count=len(models))
+        except Exception as exc:
+            return ProviderStatus(status="error", error=str(exc))
 
     def clear_cache(self) -> None:
-        self._inner.clear_cache()
+        return None

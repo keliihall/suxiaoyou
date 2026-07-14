@@ -1199,7 +1199,7 @@ function seededSettings(options: 苏小有SeedOptions = {}) {
       language: "en",
       activeProvider: "byok",
     },
-    version: 2,
+    version: 4,
   };
 }
 

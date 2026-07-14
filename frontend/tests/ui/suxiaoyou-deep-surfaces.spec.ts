@@ -193,32 +193,14 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await expectNoAppCrash(page);
   });
 
-  test("remote workflow: QR, permission mode, token rotation, channel setup, and disable path", async ({ page }) => {
-    const state = await setupMockedApp(page);
+  test("unreleased Remote and Channels controls stay hidden", async ({ page }) => {
+    await setupMockedApp(page);
 
-    await page.goto("/settings?tab=remote");
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
-    await page.getByRole("switch").first().click();
-    await expect(page.getByText("Remote Access Active")).toBeVisible();
-
-    await expect(page.getByRole("img", { name: /remote/i })).toBeVisible();
-    await page.getByRole("button", { name: /Hide QR/i }).click();
-    await page.getByRole("button", { name: /Show QR/i }).click();
-    await expect(page.getByRole("img", { name: /remote/i })).toBeVisible();
-
-    await page.locator("select").selectOption("ask");
-    await expect.poll(() => JSON.stringify(state.remoteConfigUpdates)).toContain('"permission_mode":"ask"');
-    await page.getByRole("button", { name: /Rotate Token/i }).click();
-
-    await page.getByRole("button", { name: "Connect" }).nth(1).click();
-    const telegramInput = page.getByPlaceholder("123456:ABC-DEF...");
-    await telegramInput.fill("123456:ABC-DEF-token");
-    const telegramForm = telegramInput.locator("xpath=ancestor::div[contains(@class, 'space-y-2')][1]");
-    await telegramForm.getByRole("button", { name: "Connect" }).click();
-    await expect.poll(() => JSON.stringify(state.channelAdds)).toContain("telegram");
-
-    await page.getByRole("switch").first().click();
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
+    await page.goto("/remote");
+    await expect(page).toHaveURL(/\/settings\?tab=general$/);
+    await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
+    await expect(page.getByText("Remote Access Disabled")).toHaveCount(0);
+    await expect(page.getByText("Channels", { exact: true })).toHaveCount(0);
     await expectNoAppCrash(page);
   });
 
@@ -234,8 +216,10 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await expect(page.getByText("GitHub")).toBeVisible();
 
     await page.goto("/remote");
-    await expect(page.getByRole("heading", { name: "Remote" })).toBeVisible();
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
+    await expect(page).toHaveURL(/\/settings\?tab=general$/);
+    await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
+    await expect(page.getByText("Remote Access Disabled")).toHaveCount(0);
+    await expect(page.getByText("Channels", { exact: true })).toHaveCount(0);
     await expectNoAppCrash(page);
 
     const onboarding = await page.context().newPage();
@@ -243,9 +227,16 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
       hasCompletedOnboarding: false,
     });
     await onboarding.goto("/c/new");
-    await expect(onboarding.getByRole("heading", { name: "Welcome to 苏小有" })).toBeVisible();
+    await expect(onboarding.getByRole("heading", { name: "Welcome to suyo" })).toBeVisible();
 
-    await onboarding.getByRole("button", { name: "Set Up Provider" }).click();
+    const providerButton = onboarding.getByRole("button", { name: "Configure provider" });
+    await expect(providerButton).toBeDisabled();
+    await onboarding.getByRole("button", { name: "Select workspace folder" }).click();
+    await expect(
+      onboarding.getByRole("button", { name: "/Users/alex/suxiaoyou-demo" }),
+    ).toBeVisible();
+    await expect(providerButton).toBeEnabled();
+    await providerButton.click();
     await expect(onboarding).toHaveURL(/\/settings\?tab=providers$/);
     await expect(onboarding.getByRole("heading", { name: "Providers" })).toBeVisible();
     await expectNoAppCrash(onboarding);

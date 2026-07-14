@@ -17,10 +17,11 @@
  * over cloudflare tunnel returned 404. Never let that happen again.
  */
 
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { argv, env, exit, platform } from "node:process";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   BackendSmokeError,
   resolveStartupTimeoutMs,
@@ -135,7 +136,8 @@ const required = [
   // In particular, SQLAlchemy 2.0.46 ships a py3-none-any wheel on Intel
   // macOS, so a valid PyInstaller bundle has no _internal/sqlalchemy/. The
   // smoke test starts the FastAPI lifespan, which creates the SQLAlchemy
-  // engine and runs create_all/auto-migration before /m can return 200.
+  // engine and runs create_all/auto-migration before /m can return its
+  // expected authentication response.
   {
     kind: "nonempty-dir",
     path: join(internal, "uvicorn"),
@@ -265,7 +267,80 @@ if (env.VERIFY_BUNDLE_SKIP_SMOKE === "1") {
 const binary = join(dist, exeName);
 const port = 17000 + Math.floor(Math.random() * 500);
 
+providerSmokeTest(binary);
+sandboxSmokeTest(binary);
 await smokeTest(binary, port);
+
+function providerSmokeTest(bin) {
+  console.log("[verify-bundle] provider smoke: official Anthropic/Gemini constructors");
+  const report = runJsonCommand(bin, ["--provider-self-test"], 30_000);
+  if (
+    report.status !== "ok" ||
+    JSON.stringify(report.providers) !== JSON.stringify(["anthropic", "google"])
+  ) {
+    fail(`provider smoke returned an invalid report: ${JSON.stringify(report)}`);
+  }
+}
+
+function sandboxSmokeTest(bin) {
+  const workspace = mkdtempSync(join(tmpdir(), "suxiaoyou-sandbox-smoke-"));
+  try {
+    console.log(`[verify-bundle] sandbox smoke: ${bin} --sandbox-self-test ${workspace}`);
+    const report = runJsonCommand(bin, ["--sandbox-self-test", workspace], 120_000);
+    if (platform === "win32" || platform === "darwin") {
+      if (report.status !== "disabled" || report.platform !== platform) {
+        fail(`${platform} sandbox smoke did not fail closed: ${JSON.stringify(report)}`);
+      }
+      return;
+    }
+    for (const field of [
+      "filesystem_isolated",
+      "network_isolated",
+      "environment_sanitized",
+      "descendant_terminated",
+    ]) {
+      if (report[field] !== true) {
+        fail(`sandbox smoke did not prove ${field}: ${JSON.stringify(report)}`);
+      }
+    }
+    if (report.status !== "ok") {
+      fail(`sandbox smoke returned an invalid report: ${JSON.stringify(report)}`);
+    }
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+function runJsonCommand(bin, args, timeout) {
+  const result = spawnSync(bin, args, {
+    encoding: "utf8",
+    timeout,
+    env: { ...env },
+    windowsHide: true,
+  });
+  if (result.error) {
+    fail(`command smoke failed to launch ${args[0]}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail(
+      `command smoke ${args[0]} exited ${result.status ?? result.signal}:\n` +
+        `${result.stderr || result.stdout}`.slice(-4000),
+    );
+  }
+  const lines = String(result.stdout || "")
+    .trim()
+    .split(/\r?\n/)
+    .reverse();
+  for (const line of lines) {
+    try {
+      const report = JSON.parse(line);
+      if (report && typeof report === "object") return report;
+    } catch {
+      // PyInstaller or native dependencies may emit non-JSON diagnostics.
+    }
+  }
+  fail(`command smoke ${args[0]} did not emit a JSON report`);
+}
 
 async function smokeTest(bin, port) {
   let startupTimeoutMs;
@@ -290,6 +365,11 @@ async function smokeTest(bin, port) {
         });
       },
       url: `http://127.0.0.1:${port}/m`,
+      // Remote/mobile shells are intentionally unavailable in v0.9.0-rc.1.
+      // A fully started backend must reject an anonymous /m request; accepting
+      // 200 here would be a security regression. The static m.html and chunks
+      // are verified independently above.
+      isReadyResponse: (response) => response.status === 401,
       startupTimeoutMs,
     });
   } catch (error) {
@@ -303,7 +383,9 @@ async function smokeTest(bin, port) {
     exit(1);
   }
 
-  console.log("[verify-bundle] smoke: /m served successfully — bundle is live");
+  console.log(
+    "[verify-bundle] smoke: backend is live and anonymous /m failed closed with 401",
+  );
 }
 
 function fail(msg) {

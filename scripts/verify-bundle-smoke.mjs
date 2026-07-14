@@ -44,6 +44,7 @@ export function resolveStartupTimeoutMs(rawValue) {
 export async function runBackendSmoke({
   launch,
   url,
+  isReadyResponse = defaultReadyResponse,
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
   shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
   killWaitMs = DEFAULT_KILL_WAIT_MS,
@@ -57,6 +58,9 @@ export async function runBackendSmoke({
   validatePositiveInteger("requestTimeoutMs", requestTimeoutMs);
   if (typeof launch !== "function") throw new TypeError("launch must be a function");
   if (typeof url !== "string" || url.length === 0) throw new TypeError("url must be a string");
+  if (typeof isReadyResponse !== "function") {
+    throw new TypeError("isReadyResponse must be a function");
+  }
 
   const dataDir = mkdtempSync(join(tmpdir(), "suxiaoyou-smoke-"));
   let child;
@@ -129,12 +133,9 @@ export async function runBackendSmoke({
         const response = await fetch(url, {
           signal: AbortSignal.timeout(Math.max(1, Math.min(requestTimeoutMs, remainingMs))),
         });
-        if (response.status === 200) {
-          const body = await response.text();
-          if (body.includes("<html") || body.includes("<!DOCTYPE")) {
-            ready = true;
-            break;
-          }
+        if (await isReadyResponse(response)) {
+          ready = true;
+          break;
         }
       } catch {
         // The process is still within its absolute startup budget.
@@ -197,6 +198,12 @@ export async function runBackendSmoke({
   }
 
   return { ok: true, termination };
+}
+
+async function defaultReadyResponse(response) {
+  if (response.status !== 200) return false;
+  const body = await response.text();
+  return body.includes("<html") || body.includes("<!DOCTYPE");
 }
 
 function earlyExitError({ code, signal }) {

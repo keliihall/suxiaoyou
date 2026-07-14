@@ -5,11 +5,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.agent import AgentRegistry
+from app.agent.permission import (
+    GLOBAL_DEFAULTS,
+    parse_permission_snapshot,
+    serialize_permission_snapshot,
+    tighten_permission_snapshot,
+)
 from app.provider.registry import ProviderRegistry
 from app.schemas.chat import PromptRequest, TaskBatchRequest, TaskBatchTask
 from app.session.manager import create_message, create_part, create_session, get_session
@@ -25,11 +32,24 @@ from app.streaming.events import (
 )
 from app.streaming.manager import GenerationJob
 from app.tool.registry import ToolRegistry
+from app.tool.workspace import WorkspaceBoundaryViolation, validate_agent_workspace_root
 from app.utils.id import generate_ulid
 
 logger = logging.getLogger(__name__)
 
 TaskStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
+
+
+class TaskBatchWorkspaceConflict(ValueError):
+    """Raised when a batch attempts to relocate an existing parent session."""
+
+
+class TaskBatchWorkspaceRequired(ValueError):
+    """Raised when neither the request nor parent provides a workspace."""
+
+
+class TaskBatchWorkspaceInvalid(ValueError):
+    """Raised when the selected workspace crosses the private-data boundary."""
 
 
 @dataclass
@@ -93,6 +113,49 @@ def _format_user_text(body: TaskBatchRequest) -> str:
     return "\n\n".join(lines)
 
 
+def _requested_workspace(body: TaskBatchRequest) -> str | None:
+    if not body.workspace:
+        return None
+    try:
+        return str(validate_agent_workspace_root(Path(body.workspace).expanduser().resolve()))
+    except WorkspaceBoundaryViolation as exc:
+        raise TaskBatchWorkspaceInvalid(str(exc)) from exc
+
+
+def _stored_workspace(session: Any | None) -> str | None:
+    if session is None or not session.directory or session.directory == ".":
+        return None
+    try:
+        return str(validate_agent_workspace_root(session.directory))
+    except WorkspaceBoundaryViolation as exc:
+        raise TaskBatchWorkspaceInvalid(str(exc)) from exc
+
+
+async def resolve_task_batch_workspace(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    session_id: str,
+    body: TaskBatchRequest,
+) -> str:
+    """Resolve the one authoritative workspace before admitting a batch."""
+
+    requested_workspace = _requested_workspace(body)
+    async with session_factory() as db:
+        session = await get_session(db, session_id)
+    parent_workspace = _stored_workspace(session)
+
+    if session is not None and requested_workspace and requested_workspace != parent_workspace:
+        raise TaskBatchWorkspaceConflict(
+            "Task batch workspace conflicts with the parent session workspace"
+        )
+    workspace = parent_workspace or requested_workspace
+    if workspace is None:
+        raise TaskBatchWorkspaceRequired(
+            "Select a workspace before starting a multi-agent task batch"
+        )
+    return workspace
+
+
 def _extract_child_output(child_job: GenerationJob) -> tuple[str, str | None]:
     output_parts: list[str] = []
     error_parts: list[str] = []
@@ -148,16 +211,46 @@ async def _ensure_parent_session_and_user_message(
     session_factory: async_sessionmaker[AsyncSession],
     session_id: str,
     body: TaskBatchRequest,
-) -> None:
+) -> tuple[str | None, list[dict[str, Any]]]:
     async with session_factory() as db:
         async with db.begin():
             session = await get_session(db, session_id)
+            requested_workspace = _requested_workspace(body)
             if session is None:
-                await create_session(
+                if requested_workspace is None:
+                    raise TaskBatchWorkspaceRequired(
+                        "Select a workspace before starting a multi-agent task batch"
+                    )
+                parent_workspace = requested_workspace
+                session = await create_session(
                     db,
                     id=session_id,
-                    directory=body.workspace or ".",
+                    directory=parent_workspace,
                 )
+            else:
+                parent_workspace = _stored_workspace(session)
+                # An existing session's workspace is authoritative. A stale UI
+                # body must not relocate its child agents to another directory.
+                if requested_workspace != parent_workspace and body.workspace:
+                    raise TaskBatchWorkspaceConflict(
+                        "Task batch workspace conflicts with the parent session workspace"
+                    )
+                if parent_workspace is None:
+                    raise TaskBatchWorkspaceRequired(
+                        "Select a workspace before starting a multi-agent task batch"
+                    )
+
+            # The batch payload is not an authority source.  Start from the
+            # last server-computed parent snapshot (or the fail-closed default
+            # Ask policy for a new/legacy session) and accept only explicit
+            # deny rules from the request as a legal tightening.
+            parent_permissions = parse_permission_snapshot(session.permission_snapshot)
+            if parent_permissions is None:
+                parent_permissions = GLOBAL_DEFAULTS.model_copy(deep=True)
+            child_ceiling = tighten_permission_snapshot(
+                parent_permissions,
+                body.permission_rules,
+            )
 
             user_msg = await create_message(
                 db,
@@ -170,6 +263,7 @@ async def _ensure_parent_session_and_user_message(
                 session_id=session_id,
                 data={"type": "text", "text": _format_user_text(body)},
             )
+            return parent_workspace, serialize_permission_snapshot(child_ceiling)["rules"]
 
 
 async def _create_child_sessions(
@@ -181,8 +275,7 @@ async def _create_child_sessions(
 ) -> None:
     async with session_factory() as db:
         async with db.begin():
-            parent = await get_session(db, parent_session_id)
-            directory = workspace or (parent.directory if parent else None) or "."
+            directory = workspace or "."
             for state in states:
                 await create_session(
                     db,
@@ -259,7 +352,7 @@ async def run_task_batch(
     ]
 
     try:
-        await _ensure_parent_session_and_user_message(
+        parent_workspace, child_permission_ceiling = await _ensure_parent_session_and_user_message(
             session_factory=session_factory,
             session_id=job.session_id,
             body=body,
@@ -268,7 +361,7 @@ async def run_task_batch(
             session_factory=session_factory,
             parent_session_id=job.session_id,
             states=states,
-            workspace=body.workspace,
+            workspace=parent_workspace,
         )
 
         job.publish(SSEEvent(TASK_BATCH_START, _snapshot(batch_id, body.mode, states)))
@@ -288,6 +381,7 @@ async def run_task_batch(
                 language=body.language,
             )
             child_job.abort_event = job.abort_event
+            child_job.interactive = False
             child_job._depth = getattr(job, "_depth", 0) + 1
 
             child_request = PromptRequest(
@@ -296,9 +390,12 @@ async def run_task_batch(
                 model=state.model,
                 provider_id=state.provider_id,
                 agent=state.agent,
-                workspace=body.workspace,
+                workspace=parent_workspace,
+                permission_presets=None,
+                permission_rules=child_permission_ceiling,
                 language=body.language,
             )
+            child_request._permission_rules_authoritative = True
 
             try:
                 await run_generation(
@@ -363,6 +460,13 @@ async def run_task_batch(
                 },
             )
         )
+    except (
+        TaskBatchWorkspaceConflict,
+        TaskBatchWorkspaceInvalid,
+        TaskBatchWorkspaceRequired,
+    ) as exc:
+        logger.warning("Task batch workspace rejected for stream %s: %s", job.stream_id, exc)
+        job.publish(SSEEvent(AGENT_ERROR, {"error_message": str(exc)}))
     except Exception:
         logger.exception("Task batch failed for stream %s", job.stream_id)
         job.publish(SSEEvent(AGENT_ERROR, {"error_message": "Task batch failed. Please try again."}))

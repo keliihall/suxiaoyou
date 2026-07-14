@@ -41,6 +41,11 @@ class ToolContext:
     # Deferred-tools discovery state (shared reference with SessionPrompt)
     discovered_tools: set[str] | None = None
 
+    # Immutable snapshot of the parent's effective permission rules.  Task
+    # children append this snapshot after their own agent rules, so a child can
+    # never gain a capability that the parent did not have.
+    permission_rules: tuple[dict[str, Any], ...] = ()
+
     # Callbacks set by the session processor
     _publish_fn: Callable[[str, dict[str, Any]], None] | None = None
     _ask_fn: Callable[[str, list[str]], Awaitable[bool]] | None = None
@@ -63,7 +68,10 @@ class ToolContext:
         """
         if self._ask_fn:
             return await self._ask_fn(permission, patterns or [])
-        return True  # Default: allow
+        # Missing approval plumbing is never permission.  This is especially
+        # important for headless tools and future plugins that call ctx.ask()
+        # directly instead of going through SessionProcessor.
+        return False
 
     @property
     def is_aborted(self) -> bool:

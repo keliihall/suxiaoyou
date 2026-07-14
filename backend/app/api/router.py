@@ -9,7 +9,6 @@ from app.api import artifacts as artifacts_api
 from app.api import pptx as pptx_api
 from app.api import automations as automations_api
 from app.api import workspace_memory as workspace_memory_api
-from app.api import channels as channels_api
 from app.api import ollama as ollama_api
 from app.api import chat as chat_api
 from app.api import session_inputs as session_inputs_api
@@ -23,12 +22,12 @@ from app.api import models as models_api
 from app.api import fts as fts_api
 from app.api import openai_auth as openai_auth_api
 from app.api import plugins as plugins_api
-from app.api import remote as remote_api
 from app.api import rapid_mlx as rapid_mlx_api
 from app.api import sessions as sessions_api
 from app.api import skills as skills_api
 from app.api import tools as tools_api
 from app.api import usage as usage_api
+from app.release_features import MESSAGING_CHANNELS_RELEASED, REMOTE_ACCESS_RELEASED
 
 api_router = APIRouter()
 
@@ -51,9 +50,15 @@ api_router.include_router(mcp_api.router, tags=["mcp"])
 api_router.include_router(connectors_api.router, tags=["connectors"])
 api_router.include_router(google_auth_api.router, tags=["google"])
 api_router.include_router(plugins_api.router, tags=["plugins"])
-api_router.include_router(remote_api.router, tags=["remote"])
+if REMOTE_ACCESS_RELEASED:
+    from app.api import remote as remote_api
+
+    api_router.include_router(remote_api.router, tags=["remote"])
 api_router.include_router(automations_api.router, tags=["automations"])
 api_router.include_router(ollama_api.router, tags=["ollama"])
 api_router.include_router(rapid_mlx_api.router, tags=["rapid-mlx"])
-api_router.include_router(channels_api.router, tags=["channels"])
+if MESSAGING_CHANNELS_RELEASED:
+    from app.api import channels as channels_api
+
+    api_router.include_router(channels_api.router, tags=["channels"])
 api_router.include_router(workspace_memory_api.router, tags=["workspace-memory"])

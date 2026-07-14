@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("mcp")
@@ -9,6 +11,7 @@ pytest.importorskip("mcp")
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.api import google_auth
 from app.connector.registry import ConnectorRegistry
 
 
@@ -163,3 +166,126 @@ class TestLifecycle:
 
         manager.startup.assert_awaited_once()
         reg.sync_tools.assert_called_once()
+
+
+class TestGoogleRuntimeStateMachine:
+    def _make_registry(
+        self,
+        tmp_path: Path,
+        *,
+        enabled: bool = True,
+    ) -> tuple[ConnectorRegistry, MagicMock, MagicMock]:
+        with patch.object(ConnectorRegistry, "_load_catalog", return_value={}):
+            registry = ConnectorRegistry(project_dir=str(tmp_path))
+        registry.register_from_plugin(
+            "test",
+            {
+                "google-workspace": {
+                    "type": "local",
+                    "command": ["google-workspace-worker"],
+                }
+            },
+        )
+        connector = registry.get("google-workspace")
+        assert connector is not None
+        connector.enabled = enabled
+
+        manager = MagicMock()
+        manager.reconnect = AsyncMock(return_value=True)
+        manager.disconnect_auth = AsyncMock(return_value=True)
+        client = MagicMock()
+        client.close = AsyncMock()
+        manager._clients = {"google-workspace": client}
+        registry._mcp_manager = manager
+        registry.sync_tools = MagicMock()  # type: ignore[method-assign]
+        registry._inject_local_credentials = MagicMock()  # type: ignore[method-assign]
+        return registry, manager, client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["enable", "disable", "reconnect"])
+    async def test_all_public_google_runtime_mutations_share_one_lock(
+        self,
+        tmp_path: Path,
+        operation: str,
+    ) -> None:
+        registry, manager, client = self._make_registry(
+            tmp_path,
+            enabled=operation != "enable",
+        )
+        await registry.google_auth_operation_lock.acquire()
+        task = asyncio.create_task(
+            getattr(registry, operation)("google-workspace")
+        )
+        await asyncio.sleep(0)
+
+        assert not task.done()
+        manager.reconnect.assert_not_awaited()
+        client.close.assert_not_awaited()
+
+        registry.google_auth_operation_lock.release()
+        assert await asyncio.wait_for(task, timeout=1) is True
+
+    @pytest.mark.asyncio
+    async def test_google_disconnect_fences_then_deletes_inside_runtime_lock(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        registry, manager, _client = self._make_registry(tmp_path)
+        order: list[str] = []
+        monkeypatch.setattr(
+            google_auth,
+            "fence_google_auth_disconnect",
+            lambda project: order.append(f"fence:{project}"),
+        )
+        monkeypatch.setattr(
+            google_auth,
+            "delete_google_tokens",
+            lambda project: order.append(f"delete:{project}"),
+        )
+
+        async def disconnect_runtime(name: str) -> bool:
+            assert registry.google_auth_operation_lock.locked()
+            order.append(f"runtime:{name}")
+            return True
+
+        manager.disconnect_auth.side_effect = disconnect_runtime
+
+        assert await registry.disconnect("google-workspace") is True
+        assert order == [
+            f"fence:{tmp_path}",
+            "runtime:google-workspace",
+            f"delete:{tmp_path}",
+        ]
+        registry._inject_local_credentials.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_google_disable_fences_pending_callback_before_waiting(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        registry, _manager, _client = self._make_registry(tmp_path)
+        project_dir = str(tmp_path)
+        scope = google_auth._credential_namespace(project_dir)
+        generation = google_auth._auth_generations.get(scope, 0)
+        state = f"disable-pending-{tmp_path.name}"
+        google_auth._pending_states[state] = {
+            "scope": scope,
+            "generation": generation,
+            "project_dir": project_dir,
+            "redirect_uri": "http://localhost/callback",
+        }
+
+        await registry.google_auth_operation_lock.acquire()
+        task = asyncio.create_task(registry.disable("google-workspace"))
+        for _ in range(10):
+            if google_auth._auth_generations.get(scope, 0) != generation:
+                break
+            await asyncio.sleep(0)
+
+        assert not task.done()
+        assert state not in google_auth._pending_states
+        assert google_auth._auth_generations[scope] == generation + 1
+
+        registry.google_auth_operation_lock.release()
+        assert await asyncio.wait_for(task, timeout=1) is True

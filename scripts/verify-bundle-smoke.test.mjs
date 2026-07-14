@@ -65,6 +65,17 @@ test("successful startup is terminated, closed, and cleaned up", async () => {
   await assertProcessGone(run.pid);
 });
 
+test("a protected readiness endpoint can require an explicit response matcher", async () => {
+  const run = await runScenario("unauthorized", {
+    startupTimeoutMs: 2_000,
+    isReadyResponse: (response) => response.status === 401,
+  });
+
+  assert.equal(run.result.ok, true);
+  assert.equal(existsSync(run.dataDir), false);
+  await assertProcessGone(run.pid);
+});
+
 test("natural exit before the deadline reports its code instead of a timeout", async () => {
   const run = await runScenario("natural-exit", { startupTimeoutMs: 1_000 });
 
@@ -156,6 +167,7 @@ async function runScenario(mode, options) {
         return child;
       },
       url: `http://127.0.0.1:${port}/m`,
+      isReadyResponse: options.isReadyResponse,
       startupTimeoutMs: options.startupTimeoutMs,
       shutdownGraceMs: options.shutdownGraceMs ?? 500,
       killWaitMs: 1_000,

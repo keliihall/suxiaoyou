@@ -1,6 +1,7 @@
 """Tests for code_execute written file tracking."""
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -20,11 +21,7 @@ def _make_ctx(workspace: str | None = None) -> ToolContext:
 
 
 @pytest.mark.asyncio
-async def test_tracks_written_files_without_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.chdir(tmp_path)
+async def test_execution_without_workspace_fails_closed(tmp_path: Path):
     tool = CodeExecuteTool()
 
     result = await tool.execute(
@@ -32,11 +29,16 @@ async def test_tracks_written_files_without_workspace(
         _make_ctx(),
     )
 
-    assert result.success
-    assert result.metadata["written_files"] == [str((tmp_path / "deliverable.md").resolve())]
+    assert not result.success
+    assert "selected workspace" in (result.error or "")
+    assert not (tmp_path / "deliverable.md").exists()
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="v0.9 Python execution is enabled only under Linux bubblewrap",
+)
 async def test_tracks_written_files_inside_workspace(tmp_path: Path):
     tool = CodeExecuteTool()
 

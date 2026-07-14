@@ -1,14 +1,5 @@
-"use client";
-
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { redirect } from "next/navigation";
 
 export default function RemotePage() {
-  const router = useRouter();
-
-  useEffect(() => {
-    router.replace("/settings?tab=general");
-  }, [router]);
-
-  return null;
+  redirect("/settings?tab=general");
 }

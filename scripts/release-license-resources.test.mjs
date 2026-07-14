@@ -225,6 +225,10 @@ test("the checked-in static license baseline contains every required text", () =
 
   const baselineReadme = read("release-licenses/README.md");
   assert.match(baselineReadme, /not an automatically generated or exhaustive inventory/i);
+  assert.match(
+    baselineReadme,
+    /Windows release installers bundle CPython 3\.12\.10; macOS and Linux release\s+installers bundle CPython 3\.12\.13/,
+  );
 
   const standalone = "release-licenses/python-runtime/python-build-standalone-20260623";
   assert.deepEqual(
@@ -304,6 +308,14 @@ test("source-availability notices match the locked MPL and CDLA versions", () =>
   assert.match(availability, /github\.com\/tqdm\/tqdm\/tree\/v4\.68\.4/);
   assert.match(availability, /certifi-2025\.8\.3\.tar\.gz/);
   assert.match(availability, /notofonts\/noto-cjk\/releases\/tag\/Sans2\.004/);
+  assert.match(
+    availability,
+    /CPython 3\.12\.10 \(runtime bundled with Windows release installers\):\s+<https:\/\/github\.com\/python\/cpython\/tree\/v3\.12\.10>/,
+  );
+  assert.match(
+    availability,
+    /CPython 3\.12\.13 \(runtime bundled with macOS and Linux release installers\):\s+<https:\/\/github\.com\/python\/cpython\/tree\/v3\.12\.13>/,
+  );
 });
 
 test("runtime license filenames stay synchronized with release tooling", () => {
@@ -322,7 +334,12 @@ test("runtime license filenames stay synchronized with release tooling", () => {
   }
 
   assert.match(read("release-licenses/JAVASCRIPT-LICENSES.txt"), /Packages in production graph: 447/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Locked packages: 86/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Locked packages: 101/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: anthropic 0\.116\.0/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: google-genai 2\.11\.0/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: keyring 25\.7\.0/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: SecretStorage 3\.5\.0/);
+  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: pywin32-ctypes 0\.2\.3/);
   assert.match(read("release-licenses/RUST-LICENSES.html"), /suxiaoyou/i);
 });
 

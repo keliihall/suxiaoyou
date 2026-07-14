@@ -102,8 +102,8 @@ class GenerationJob:
         # Prevents GC from silently cancelling fire-and-forget tasks.
         self.task: asyncio.Task[None] | None = None
 
-        # Interactive mode: True when a client is connected via SSE.
-        # When False (tests, headless), permission "ask" auto-approves.
+        # Interactive mode: True when a client can answer SSE prompts.
+        # Headless/non-interactive permission "ask" requests fail closed.
         self.interactive: bool = False
 
         # Nesting depth for subtask recursion guard

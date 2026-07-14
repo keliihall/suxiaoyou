@@ -98,7 +98,7 @@ def main() -> None:
         "",
         f"Locked packages: {len(expected)}",
         f"Installed packages represented on this build host: {len(installed)}",
-        "Platform-conditional packages are covered by separate versioned files in this directory.",
+        "Pure-Python platform-conditional wheels are represented here; binary-only wheels use separate versioned files.",
         "",
     ]
 

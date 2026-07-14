@@ -37,9 +37,12 @@
 
 ## 安装与使用
 
-> 发布状态：最新候选测试版为 `v0.8.3-rc.2`，提供七个安装包，覆盖 Windows x64、macOS arm64/x64 与 Linux x64/ARM64。在取得 Apple Developer ID
-> 和公证凭据前，macOS 只提供明确标注的 ad-hoc 签名测试包（非 Developer ID
-> 签名、未公证），不作为面向普通用户的正式发布。
+> 发布状态：[`v0.9.0-rc.1`](https://github.com/keliihall/suxiaoyou/releases/tag/v0.9.0-rc.1) 是 `0.9.0` 的候选测试版，提供七个原生安装包，覆盖 Windows x64、macOS arm64/x64 与 Linux x64/ARM64。在取得 Apple Developer ID
+> 和公证凭据前，macOS 只提供明确标注的候选测试包：DMG 本身未签名、未公证，内含的
+> `.app` 仅使用 ad-hoc 临时签名，不作为面向普通用户的正式发布。
+>
+> `v0.9.0-rc.1` 的安全范围中，Bash/Python 命令执行只在安装了 Bubblewrap 的 Linux 开放；
+> macOS 与 Windows 均 fail-closed 禁用，不会退回无隔离执行。
 
 系统要求：macOS 11.0 或更高版本（Apple Silicon 与 Intel 分别提供原生安装包）；Windows x64、Linux x64 与 Linux ARM64 安装包由对应平台的原生 CI runner 构建与验证。
 

@@ -18,6 +18,56 @@ block_cipher = None
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
 wcmatch_datas, wcmatch_binaries, wcmatch_hiddenimports = collect_all('wcmatch')
 croniter_datas, croniter_binaries, croniter_hiddenimports = collect_all('croniter')
+anthropic_datas, anthropic_binaries, anthropic_hiddenimports = collect_all('anthropic')
+google_genai_datas, google_genai_binaries, google_genai_hiddenimports = collect_all('google.genai')
+keyring_datas, keyring_binaries, keyring_hiddenimports = collect_all('keyring')
+
+
+def production_package_only(datas, hiddenimports):
+    """Drop SDK test modules and duplicate Python sources from frozen data.
+
+    ``collect_all`` is useful for generated/dynamic SDK modules, but it also
+    treats every ``.py`` source file as data in addition to compiling it into
+    PYZ. Shipping those duplicates (including google-genai's own test suite)
+    bloats the installer and expands its unaudited executable surface.
+    """
+    filtered_datas = [
+        (source, destination)
+        for source, destination in datas
+        if Path(source).suffix not in {'.py', '.pyc'}
+        and not {'tests', 'testing'}.intersection(Path(source).parts)
+    ]
+    filtered_hiddenimports = [
+        module
+        for module in hiddenimports
+        if not any(
+            part in {'tests', 'testing'}
+            or part.startswith('test_')
+            or part.startswith('_test_')
+            for part in module.split('.')
+        )
+    ]
+    return filtered_datas, filtered_hiddenimports
+
+
+uvicorn_datas, uvicorn_hiddenimports = production_package_only(
+    uvicorn_datas, uvicorn_hiddenimports
+)
+wcmatch_datas, wcmatch_hiddenimports = production_package_only(
+    wcmatch_datas, wcmatch_hiddenimports
+)
+croniter_datas, croniter_hiddenimports = production_package_only(
+    croniter_datas, croniter_hiddenimports
+)
+anthropic_datas, anthropic_hiddenimports = production_package_only(
+    anthropic_datas, anthropic_hiddenimports
+)
+google_genai_datas, google_genai_hiddenimports = production_package_only(
+    google_genai_datas, google_genai_hiddenimports
+)
+keyring_datas, keyring_hiddenimports = production_package_only(
+    keyring_datas, keyring_hiddenimports
+)
 
 # Resolve paths
 backend_dir = os.path.abspath('.')
@@ -117,6 +167,8 @@ hiddenimports = [
 
     # LLM
     'openai',
+    'anthropic',
+    'google.genai',
     'httpx',
     'tiktoken',
     'tiktoken_ext',
@@ -159,6 +211,12 @@ hiddenimports = [
     # Utilities
     'ulid',
     'aiofiles',
+    'keyring',
+    'keyring.backends.macOS',
+    'keyring.backends.Windows',
+    'keyring.backends.SecretService',
+    'keyring.backends.chainer',
+    'keyring.backends.fail',
     'yaml',
     'anyio',
     'anyio._backends',
@@ -206,11 +264,15 @@ hiddenimports = [
     'app.agent.agent',
     'app.agent.permission',
     'app.provider.base',
+    'app.provider.anthropic_provider',
+    'app.provider.gemini_provider',
     'app.provider.openrouter',
     'app.provider.openai_compat',
     'app.provider.registry',
     'app.tool.registry',
     'app.tool.context',
+    'app.tool.sandbox_self_test',
+    'app.tool.sandbox_worker',
     'app.tool.builtin.read',
     'app.tool.builtin.write',
     'app.tool.builtin.edit',
@@ -235,9 +297,32 @@ hiddenimports = [
 a = Analysis(
     ['run.py'],
     pathex=[backend_dir],
-    binaries=uvicorn_binaries + wcmatch_binaries + croniter_binaries,
-    datas=datas + uvicorn_datas + wcmatch_datas + croniter_datas,
-    hiddenimports=hiddenimports + uvicorn_hiddenimports + wcmatch_hiddenimports + croniter_hiddenimports,
+    binaries=(
+        uvicorn_binaries
+        + wcmatch_binaries
+        + croniter_binaries
+        + anthropic_binaries
+        + google_genai_binaries
+        + keyring_binaries
+    ),
+    datas=(
+        datas
+        + uvicorn_datas
+        + wcmatch_datas
+        + croniter_datas
+        + anthropic_datas
+        + google_genai_datas
+        + keyring_datas
+    ),
+    hiddenimports=(
+        hiddenimports
+        + uvicorn_hiddenimports
+        + wcmatch_hiddenimports
+        + croniter_hiddenimports
+        + anthropic_hiddenimports
+        + google_genai_hiddenimports
+        + keyring_hiddenimports
+    ),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

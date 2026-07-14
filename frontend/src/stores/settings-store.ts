@@ -99,9 +99,9 @@ export const useSettingsStore = create<SettingsStore>()(
       selectedProviderId: null,
       selectedAgent: "build",
       safeMode: false,
-      workMode: "auto" as WorkMode,
+      workMode: "ask" as WorkMode,
       reasoningEnabled: true,
-      permissionPresets: { fileChanges: true, runCommands: true },
+      permissionPresets: { fileChanges: false, runCommands: false },
       savedPermissions: [],
       workspaceDirectory: null,
       hasSeenHints: false,
@@ -193,7 +193,14 @@ export const useSettingsStore = create<SettingsStore>()(
         })),
       clearAllPermissionRules: () => set({ savedPermissions: [] }),
       setWorkspaceDirectory: (dir) => set({ workspaceDirectory: dir }),
-      completeOnboarding: () => set({ hasCompletedOnboarding: true }),
+      completeOnboarding: () => {
+        // A workspace is part of the first-run security boundary. Keep the
+        // onboarding gate closed if a stale caller tries to bypass the UI.
+        const workspace = get().workspaceDirectory;
+        const normalizedWorkspace = workspace?.trim();
+        if (!normalizedWorkspace || normalizedWorkspace === ".") return;
+        set({ hasCompletedOnboarding: true });
+      },
       setHasSeenHints: (seen) => set({ hasSeenHints: seen }),
       setLanguage: (lang) => {
         set({ language: lang });
@@ -205,24 +212,61 @@ export const useSettingsStore = create<SettingsStore>()(
     }),
     {
       name: "suxiaoyou-settings",
-      version: 3,
-      migrate: (persistedState) => {
-        if (
-          persistedState &&
-          typeof persistedState === "object" &&
-          "activeProvider" in persistedState
-        ) {
-          if (persistedState.activeProvider === "suxiaoyou") {
-            return { ...persistedState, activeProvider: null } as SettingsStore;
-          }
-          if (persistedState.activeProvider === "local") {
-            return {
-              ...persistedState,
-              activeProvider: "custom",
-            } as SettingsStore;
-          }
+      version: 4,
+      migrate: (persistedState, persistedVersion) => {
+        if (!persistedState || typeof persistedState !== "object") {
+          return persistedState as SettingsStore;
         }
-        return persistedState as SettingsStore;
+
+        const state = { ...persistedState } as Partial<SettingsStore>;
+        const legacyActiveProvider = (
+          persistedState as Record<string, unknown>
+        ).activeProvider;
+        if (legacyActiveProvider === "suxiaoyou") {
+          state.activeProvider = null;
+        }
+        if (legacyActiveProvider === "local") {
+          state.activeProvider = "custom";
+        }
+
+        if (persistedVersion < 4) {
+          const normalizedWorkspace =
+            typeof state.workspaceDirectory === "string"
+              ? state.workspaceDirectory.trim()
+              : "";
+          const hasWorkspace =
+            normalizedWorkspace.length > 0 && normalizedWorkspace !== ".";
+
+          return {
+            ...state,
+            // v0.9 resets the inherited Auto default to the fail-safe Ask
+            // posture. Plan remains read-only; users can explicitly opt back
+            // into Auto after the migration.
+            ...(state.workMode === "plan"
+              ? {
+                  selectedAgent: "plan",
+                  safeMode: true,
+                  permissionPresets: {
+                    fileChanges: false,
+                    runCommands: false,
+                  },
+                }
+              : {
+                  selectedAgent: "build",
+                  safeMode: false,
+                  workMode: "ask" as WorkMode,
+                  permissionPresets: {
+                    fileChanges: false,
+                    runCommands: false,
+                  },
+                }),
+            // Existing installations that never chose a workspace must pass
+            // through the new workspace-first onboarding once.
+            hasCompletedOnboarding:
+              Boolean(state.hasCompletedOnboarding) && hasWorkspace,
+          } as SettingsStore;
+        }
+        return state as SettingsStore;
       },
     },
   ),

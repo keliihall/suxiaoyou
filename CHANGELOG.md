@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.9.0-rc.1 — 2026-07-14
+
+本版本把命令执行、权限、凭据、数据库升级和发布产物收敛到可验证的安全边界。该标签是
+`v0.9.0-rc.1` 候选版；应用与安装包内部版本保持 `0.9.0`。
+
+### 执行与权限边界
+
+- Python 与 Shell 工具在 Linux 改由 Bubblewrap OS 级沙箱托管；Linux DEB/RPM 将
+  `bubblewrap` 声明为安装依赖，缺失时拒绝执行。
+- macOS 与 Windows RC 暂不开放 Bash/Python 命令执行。macOS Seatbelt 能限制资源，但没有
+  可靠、公共且无需额外授权的完整后代进程回收边界；Windows Job Object 能回收进程树但不
+  提供文件系统/网络隔离。因此两端都明确 fail-closed，不退回无隔离执行。
+- 非交互任务遇到 `ask` 权限必须失败；子任务继承父任务的 workspace、权限模式和已批准
+  边界，不能自行扩大路径或执行权限。
+- 新安装默认进入 Ask 模式，首次引导必须先选择工作区；没有有效工作区的旧配置也会重新
+  进入该安全边界。
+
+### Provider、凭据与数据恢复
+
+- Anthropic 与 Google Gemini 改为官方生产 SDK，并加入原生模型目录、消息/工具映射、流式
+  事件回归及最终冻结后端的离线构造 smoke；移除不存在的 `yakagent` 运行时假设。由于当前
+  消息历史还不能保留 signed thinking/thought signature，本候选版不宣称这两个原生适配器
+  支持 reasoning；适配器会忽略遗留的 reasoning 偏好且不向 SDK 发送 thinking 配置。
+- Provider、OAuth、MCP 与渠道凭据迁移为不透明引用，优先存入 macOS Keychain、Windows
+  Credential Manager 或 Linux Secret Service；无可用原生服务时仅使用原子写入的私有
+  `0600` 文件回退。
+- 新增正式 `0005` Alembic 版本边界，以及带 SHA-256 清单、SQLite `quick_check`、原子替换
+  和恢复前安全备份的离线列举/恢复命令；不在正式数据库上原地降级。
+- Remote 与消息 Channels 的高权限 Agent 路径在本候选版由代码级发布开关关闭，旧环境变量
+  不能重新开启其路由、隧道或消费者。
+
+### 构建与发布门禁
+
+- CI 增加 Python、三份 JavaScript 生产依赖图与 Rust 漏洞审计，并执行 production frontend、
+  冻结后端、Rust release build、Playwright 核心场景和真实 Linux DEB 安装事务。
+- 最终后端 bundle smoke 同时验证官方 Anthropic/Gemini SDK 可构造；Linux 产物必须证明
+  沙箱的文件系统、网络、环境变量和后代进程隔离，macOS/Windows 产物必须证明命令执行
+  保持 fail-closed。
+- macOS Intel 继续在原生 Intel runner 重建后端与桌面应用，并对最终 `.app`、DMG、Mach-O
+  架构、最低系统版本、安装后启动/退出和孤儿进程执行门禁；不使用 Apple Silicon 交叉产物
+  代替 Intel 验证。
+
+### 已知限制
+
+- 只有 Linux 在 rc.1 开放命令执行；macOS 与 Windows 均不可用。如果 v0.9.0 的完成定义要求
+  三平台命令能力对齐，则该项尚未成熟：macOS 需同时解决沙箱后代的强制回收，Windows 需补
+  AppContainer/受限文件系统与网络边界。
+- 候选版发布以同一 tag 的七个原生安装包全部通过 runner 验证为前提；仅有工作流配置或本地
+  预检不构成已通过证据。发布页见 [`v0.9.0-rc.1`](https://github.com/keliihall/suxiaoyou/releases/tag/v0.9.0-rc.1)。
+- macOS 没有 Apple Developer ID 与公证凭据时，RC 仍只能发布明确标注的测试包：DMG 本身
+  未签名、未公证，内含的 `.app` 仅使用 ad-hoc 临时签名。
+
 ## v0.8.3 — 2026-07-13
 
 本版本补齐大文件原生操作、PPTX 静态预览与长对话历史定位，并继续保持本地桌面能力的会话与路径授权边界。

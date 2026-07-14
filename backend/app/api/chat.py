@@ -48,7 +48,13 @@ from app.session.idempotency import (
     mark_idempotency_status,
     validate_idempotent_replay,
 )
-from app.session.task_batch import run_task_batch
+from app.session.task_batch import (
+    TaskBatchWorkspaceConflict,
+    TaskBatchWorkspaceInvalid,
+    TaskBatchWorkspaceRequired,
+    resolve_task_batch_workspace,
+    run_task_batch,
+)
 from app.session.utils import (
     compute_usable_context_window,
     get_effective_context_window,
@@ -486,6 +492,27 @@ async def start_task_batch(
     """Start an explicit sequential or parallel multi-agent task batch."""
     body.language = request_language(request)
     session_id = body.session_id or generate_ulid()
+    try:
+        body.workspace = await resolve_task_batch_workspace(
+            session_factory=session_factory,
+            session_id=session_id,
+            body=body,
+        )
+    except TaskBatchWorkspaceRequired as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "workspace_required", "message": str(exc)},
+        ) from exc
+    except TaskBatchWorkspaceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "workspace_conflict", "message": str(exc)},
+        ) from exc
+    except TaskBatchWorkspaceInvalid as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "workspace_invalid", "message": str(exc)},
+        ) from exc
     stream_id = generate_ulid()
 
     job = _create_session_job(sm, stream_id=stream_id, session_id=session_id)
@@ -694,7 +721,8 @@ async def stream_events(
     """SSE endpoint. Supports reconnect via ?last_event_id=N.
 
     Includes heartbeat every 15s to prevent proxy/CDN timeouts (matching OpenCode).
-    Sets job.interactive=True to enable permission ask and question blocking.
+    A job's interactive capability is fixed by its creator. Subscribing to a
+    stream is observational and must never promote a headless automation job.
     """
     # Native EventSource reconnects send Last-Event-ID as an HTTP header rather
     # than as a query param. The local desktop app uses native EventSource for
@@ -724,9 +752,6 @@ async def stream_events(
             _error_stream("Job not found", code="JOB_NOT_FOUND"),
             media_type="text/event-stream",
         )
-
-    # Mark job as interactive — enables permission ask and question tool blocking
-    job.interactive = True
 
     queue = job.subscribe(last_event_id=last_event_id)
 

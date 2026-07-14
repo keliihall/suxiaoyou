@@ -343,7 +343,9 @@ function ConnectorRow({
           </Button>
         )}
 
-        {(connector.status === "needs_auth" || connector.status === "failed") && connector.enabled && (
+        {(connector.status === "needs_auth" || connector.status === "failed") &&
+          connector.enabled &&
+          id !== "google-workspace" && (
           <form
             className="flex items-center gap-1"
             onSubmit={(e) => {

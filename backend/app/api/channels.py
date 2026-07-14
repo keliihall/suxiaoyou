@@ -6,20 +6,29 @@ architecture running directly inside 苏小有 (no external Node.js process).
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.channels.registry import CHINA_READY_CHANNELS
+from app.channels.config import load_channels_config_dict, save_channels_config_dict
+from app.auth.local import require_local_session
+from app.release_features import MESSAGING_CHANNELS_RELEASED
 from app.i18n import localize, request_language
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+def _require_channels_release() -> None:
+    if not MESSAGING_CHANNELS_RELEASED:
+        raise HTTPException(status_code=404, detail="Messaging channels are not available in this release")
+
+
+router = APIRouter(
+    dependencies=[Depends(_require_channels_release), Depends(require_local_session)]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +81,12 @@ def _get_channels_config_path() -> Path:
 
 def _load_config_dict() -> dict:
     """Load raw channels.json config."""
-    path = _get_channels_config_path()
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"channels": {}}
+    return load_channels_config_dict(_get_channels_config_path())
 
 
 def _save_config_dict(data: dict) -> None:
     """Save raw channels.json config."""
-    path = _get_channels_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_channels_config_dict(data, _get_channels_config_path())
 
 
 # ---------------------------------------------------------------------------

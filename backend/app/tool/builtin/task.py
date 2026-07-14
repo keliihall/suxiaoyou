@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from app.tool.base import ToolDefinition, ToolResult
@@ -94,6 +95,12 @@ class TaskTool(ToolDefinition):
                 ),
             )
 
+        if not ctx.workspace:
+            return ToolResult(
+                error="SubAgent requires the parent's selected workspace",
+            )
+        parent_workspace = str(Path(ctx.workspace).resolve())
+
         # Access app-level registries through the _app_state injected by processor
         app_state = getattr(ctx, "_app_state", None)
         if not app_state:
@@ -109,13 +116,22 @@ class TaskTool(ToolDefinition):
             # Try to resume an existing child session
             async with session_factory() as db:
                 existing = await get_session(db, task_id)
-                if existing and existing.parent_id == ctx.session_id:
+                existing_workspace = (
+                    str(Path(existing.directory).resolve())
+                    if existing and existing.directory and existing.directory != "."
+                    else None
+                )
+                if (
+                    existing
+                    and existing.parent_id == ctx.session_id
+                    and existing_workspace == parent_workspace
+                ):
                     child_session_id = task_id
                     resuming = True
                     logger.info("Resuming subtask session %s", task_id)
                 else:
                     logger.warning(
-                        "task_id %s not found or parent mismatch, creating new session",
+                        "task_id %s not found or execution context mismatch; creating new session",
                         task_id,
                     )
                     task_id = None  # Fall through to create new
@@ -128,7 +144,7 @@ class TaskTool(ToolDefinition):
                         db,
                         id=child_session_id,
                         parent_id=ctx.session_id,
-                        directory=".",
+                        directory=parent_workspace,
                         title=description,
                     )
 
@@ -138,6 +154,11 @@ class TaskTool(ToolDefinition):
             session_id=child_session_id,
             language=ctx.language,
         )
+        # The child is headless: it shares cancellation with its parent and
+        # cannot auto-approve an inherited `ask` rule. Explicit parent `allow`
+        # rules continue to work because they are copied into the request.
+        child_job.abort_event = ctx.abort_event
+        child_job.interactive = False
         # Propagate depth for nested recursion guard
         child_job._depth = parent_depth + 1
 
@@ -148,7 +169,10 @@ class TaskTool(ToolDefinition):
             model=getattr(ctx, "_model_id", None),
             agent=agent_name,
             language=ctx.language,
+            workspace=parent_workspace,
+            permission_rules=[dict(rule) for rule in ctx.permission_rules],
         )
+        child_request._permission_rules_authoritative = True
 
         # Publish subtask start to parent stream
         if ctx._publish_fn:
@@ -201,8 +225,14 @@ class TaskTool(ToolDefinition):
                     if len(tool_output) > 2000:
                         tool_output = tool_output[:2000] + "... [truncated]"
                     tool_results.append(f"[{tool_name}] {tool_output}")
-            elif event.event == "error":
-                error_parts.append(event.data.get("message", ""))
+            elif event.event in {"agent-error", "error"}:
+                error_parts.append(
+                    str(
+                        event.data.get("error_message")
+                        or event.data.get("message")
+                        or "error"
+                    )
+                )
 
         output = "".join(output_parts)
 
@@ -214,7 +244,19 @@ class TaskTool(ToolDefinition):
             output += "\n\n".join(recent_results)
 
         if error_parts:
-            output += ctx.tr("\n[错误：", "\n[Errors: ") + "; ".join(error_parts) + "]"
+            return ToolResult(
+                error=ctx.tr("子任务失败：", "Subtask failed: ") + "; ".join(error_parts),
+                metadata={
+                    "task_id": child_session_id,
+                    "session_id": child_session_id,
+                    "parent_id": ctx.session_id,
+                    "agent": agent_name,
+                    "depth": parent_depth + 1,
+                    "resumed": resuming,
+                    "events": len(child_job.events),
+                    "tool_calls": len(tool_results),
+                },
+            )
         if not output.strip():
             output = ctx.tr("（子任务没有产生文本输出）", "(The subtask produced no text output)")
 

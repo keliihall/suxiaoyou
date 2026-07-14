@@ -30,7 +30,7 @@ test("v0.8.0 does not expose unfinished messaging channel setup", () => {
 
 test("v0.8.0 hides remote access until the 1.0 service is ready", () => {
   assert.doesNotMatch(settingsTabs, /id: "remote"/);
-  assert.match(remotePage, /router\.replace\("\/settings\?tab=general"\)/);
+  assert.match(remotePage, /redirect\("\/settings\?tab=general"\)/);
   assert.doesNotMatch(remotePage, /RemoteTabContent/);
   assert.match(remoteConnection, /"__TAURI_INTERNALS__" in window/);
   assert.match(remoteConnection, /if \(isDesktopShell\(\)\) return null/);

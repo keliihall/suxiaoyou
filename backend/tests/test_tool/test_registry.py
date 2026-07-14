@@ -1,5 +1,7 @@
 """Tool registry tests."""
 
+import sys
+
 import pytest
 
 from app.agent.agent import AgentRegistry
@@ -17,10 +19,12 @@ class TestToolRegistry:
 
     def test_all_builtin_tools_registered(self, registry: ToolRegistry):
         tool_ids = {t.id for t in registry.all_tools()}
-        expected = {"read", "write", "edit", "apply_patch", "bash", "code_execute",
+        expected = {"read", "write", "edit", "apply_patch",
                     "glob", "grep", "question", "todo", "task",
                     "web_fetch", "web_search", "invalid",
                     "plan", "submit_plan", "artifact", "present_file", "skill"}
+        if sys.platform.startswith("linux"):
+            expected.update({"bash", "code_execute"})
         assert tool_ids == expected
 
     def test_get_by_id(self, registry: ToolRegistry):
@@ -34,7 +38,7 @@ class TestToolRegistry:
         tool_ids = {t.id for t in tools}
         # Build agent has allow *, ask bash/write/edit — none denied
         assert "read" in tool_ids
-        assert "bash" in tool_ids  # ask != deny
+        assert ("bash" in tool_ids) is sys.platform.startswith("linux")
 
     def test_resolve_for_explore_agent(self, registry: ToolRegistry):
         ar = AgentRegistry()
@@ -66,3 +70,17 @@ class TestToolRegistry:
             assert spec["type"] == "function"
             assert "name" in spec["function"]
             assert "parameters" in spec["function"]
+
+    @pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+    def test_execution_tools_are_not_registered_on_unsupported_platforms(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        platform_name: str,
+    ) -> None:
+        monkeypatch.setattr("app.main.sys.platform", platform_name)
+        registry = ToolRegistry()
+
+        _register_builtin_tools(registry)
+
+        assert registry.get("bash") is None
+        assert registry.get("code_execute") is None

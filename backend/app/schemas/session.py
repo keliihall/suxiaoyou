@@ -24,7 +24,10 @@ class SessionUpdate(BaseModel):
     directory: str | None = None
     is_pinned: bool | None = None
     time_archived: datetime | None = None
-    permission: dict[str, Any] | None = None
+    # Legacy clients may still send null.  Non-null permission state is no
+    # longer publicly writable; effective delegation snapshots are computed
+    # and stored by the server in a separate private column.
+    permission: None = None
 
 
 class SessionResponse(BaseModel):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class PromptRequest(BaseModel):
@@ -19,6 +19,10 @@ class PromptRequest(BaseModel):
     attachments: list[dict[str, Any]] = []
     permission_presets: dict[str, bool] | None = None
     permission_rules: list[dict[str, Any]] | None = None
+    # Internal-only: child agents receive the parent's effective rules as a
+    # ceiling. PrivateAttr prevents external JSON from opting into this merge
+    # mode and bypassing a persisted session denial.
+    _permission_rules_authoritative: bool = PrivateAttr(default=False)
     reasoning: bool | None = None  # Explicitly enable/disable reasoning
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}
@@ -51,6 +55,8 @@ class TaskBatchRequest(BaseModel):
     mode: Literal["sequential", "parallel"] = "parallel"
     tasks: list[TaskBatchTask] = Field(..., min_length=1, max_length=12)
     workspace: str | None = None
+    permission_presets: dict[str, bool] | None = None
+    permission_rules: list[dict[str, Any]] | None = None
     language: Literal["zh", "en"] = Field("zh", exclude=True)
 
 

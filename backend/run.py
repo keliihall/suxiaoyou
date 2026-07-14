@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 _DESKTOP_PARENT_PID_ENV = "SUXIAOYOU_DESKTOP_PARENT_PID"
+_APP_PRIVATE_DIR_ENV = "SUXIAOYOU_PRIVATE_DATA_DIR"
 _PROCESS_GROUP_GRACE_SECONDS = 12.0
 _WINDOWS_BACKEND_JOB_HANDLE = None
 
@@ -360,6 +361,10 @@ def _configure_runtime(args: argparse.Namespace):
         os.makedirs(args.data_dir, exist_ok=True)
         os.chdir(args.data_dir)
 
+    # Command/Python sandboxes use this canonical boundary to reject a broad
+    # workspace that would otherwise contain per-user config and credentials.
+    os.environ[_APP_PRIVATE_DIR_ENV] = str(Path.cwd().resolve())
+
     if args.resource_dir:
         os.environ["SUXIAOYOU_RESOURCE_DIR"] = args.resource_dir
     _configure_bundled_node(args.resource_dir)
@@ -387,7 +392,90 @@ def _configure_runtime(args: argparse.Namespace):
     return Settings(host="127.0.0.1", port=args.port)
 
 
+def _handle_database_recovery(args: argparse.Namespace) -> bool:
+    """Run offline DB recovery without constructing Settings or the app."""
+
+    if not args.list_backups and not args.restore_backup:
+        return False
+    if args.data_dir:
+        os.makedirs(args.data_dir, exist_ok=True)
+        os.chdir(args.data_dir)
+
+    import json
+
+    from app.storage.migrations import (
+        list_database_backups,
+        restore_database_backup,
+    )
+
+    database_url = (
+        args.database_url or "sqlite+aiosqlite:///./data/suxiaoyou.db"
+    )
+    if args.list_backups:
+        payload = {
+            "database_url": database_url,
+            "backups": list_database_backups(database_url),
+        }
+    else:
+        result = restore_database_backup(database_url, args.restore_backup)
+        payload = {
+            "status": "restored",
+            "database_path": str(result.database_path),
+            "restored_backup_path": str(result.restored_backup_path),
+            "restored_revision": result.restored_revision,
+            "safety_backup_path": (
+                str(result.safety_backup_path) if result.safety_backup_path else None
+            ),
+            "safety_backup_metadata_path": (
+                str(result.safety_backup_metadata_path)
+                if result.safety_backup_metadata_path
+                else None
+            ),
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return True
+
+
 def main() -> None:
+    # The frozen backend executable doubles as the isolated Python worker.
+    # Dispatch before server lifecycle setup so arbitrary code can never run in
+    # the long-lived API process or inherit its watchdog/job state.
+    if len(sys.argv) == 3 and sys.argv[1] == "--sandbox-python-worker":
+        from app.tool.sandbox_worker import run_code_file
+
+        raise SystemExit(run_code_file(sys.argv[2]))
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--sandbox-self-test":
+        from app.tool.sandbox_self_test import main as sandbox_self_test
+
+        raise SystemExit(sandbox_self_test(sys.argv[2]))
+
+    if len(sys.argv) == 2 and sys.argv[1] == "--provider-self-test":
+        # Offline constructor/import contract for the final PyInstaller bundle.
+        # No provider API method is called and the fake keys never leave this
+        # process; verify-bundle.mjs requires the JSON marker before shipping.
+        import json
+
+        from anthropic import AsyncAnthropic
+        from google import genai
+
+        from app.provider.factory import create_provider
+
+        anthropic_provider = create_provider("anthropic", "bundle-smoke-key")
+        google_provider = create_provider("google", "bundle-smoke-key")
+        if not isinstance(anthropic_provider._client, AsyncAnthropic):
+            raise RuntimeError("Anthropic provider did not construct the official SDK client")
+        if not isinstance(google_provider._client, genai.Client):
+            raise RuntimeError("Gemini provider did not construct the official SDK client")
+        print(
+            json.dumps(
+                {"status": "ok", "providers": ["anthropic", "google"]},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        raise SystemExit(0)
+
     _install_crash_reporter()
     _configure_windows_process_job()
     _start_desktop_parent_watchdog()
@@ -402,7 +490,29 @@ def main() -> None:
         default=None,
         help="Optional predecessor desktop data directory to import once",
     )
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="File-backed SQLite URL for offline backup recovery",
+    )
+    recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List and checksum-verify database backups without starting the service",
+    )
+    recovery.add_argument(
+        "--restore-backup",
+        type=str,
+        default=None,
+        metavar="MANIFEST_OR_BACKUP",
+        help="Atomically restore a verified backup without starting the service",
+    )
     args = parser.parse_args()
+
+    if _handle_database_recovery(args):
+        return
 
     settings = _configure_runtime(args)
 

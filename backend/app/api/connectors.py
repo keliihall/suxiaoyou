@@ -141,6 +141,11 @@ async def set_connector_token(
     connector = registry.get(connector_id)
     if not connector:
         return {"success": False, "error": f"Connector not found: {connector_id}"}
+    if connector_id == "google-workspace":
+        return {
+            "success": False,
+            "error": "Google Workspace credentials require the direct OAuth flow",
+        }
 
     # Store the token and inject into MCP client
     mgr = registry.mcp_manager
@@ -205,6 +210,11 @@ async def connect_connector(connector_id: str, request: Request) -> dict[str, An
     registry = _get_registry(request)
     if registry is None:
         return {"success": False, "error": "Connector system not available"}
+    if connector_id == "google-workspace":
+        return {
+            "success": False,
+            "error": "Google Workspace credentials require the direct OAuth flow",
+        }
 
     settings = request.app.state.settings
     redirect_uri = loopback_redirect_uri(settings, "/api/connectors/oauth/callback")
@@ -226,6 +236,11 @@ async def auth_callback_api(
     registry = _get_registry(request)
     if registry is None:
         return {"success": False, "error": "Connector system not available"}
+    if connector_id == "google-workspace":
+        return {
+            "success": False,
+            "error": "Google Workspace credentials require the direct OAuth flow",
+        }
     success = await registry.complete_auth(body.state, body.code)
     return {"success": success, "connectors": registry.status()}
 

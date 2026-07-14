@@ -14,7 +14,7 @@ writeFileSync(pidFile, String(process.pid));
 // waits for go so the parent can install its ChildProcess listeners first.
 let start;
 
-if (mode === "success") {
+if (mode === "success" || mode === "unauthorized") {
   let server;
   process.on("SIGTERM", () => {
     if (server?.listening) server.close(() => process.exit(0));
@@ -22,8 +22,13 @@ if (mode === "success") {
   });
   start = () => {
     server = createServer((_request, response) => {
-      response.writeHead(200, { "content-type": "text/html" });
-      response.end("<!DOCTYPE html><html><body>ready</body></html>");
+      if (mode === "unauthorized") {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end('{"detail":"Authentication required"}');
+      } else {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<!DOCTYPE html><html><body>ready</body></html>");
+      }
     });
     server.listen(port, "127.0.0.1");
   };

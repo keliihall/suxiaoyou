@@ -48,6 +48,13 @@ class Session(Base, TimestampMixin):
     # Permission override at session level
     permission: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
 
+    # Server-owned effective rules used only as the hard ceiling for delegated
+    # non-interactive children.  It is intentionally absent from public
+    # create/update/response schemas so request data cannot forge it.
+    permission_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+
     # Lifecycle timestamps
     time_compacting: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

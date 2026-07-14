@@ -76,6 +76,8 @@ class OpenAISubscriptionProvider(BaseProvider):
         self._settings = settings
         self._refresh_lock = asyncio.Lock()
         self._needs_reauth: bool = False
+        self._refresh_generation = 0
+        self._refresh_enabled = True
 
     @property
     def id(self) -> str:
@@ -88,44 +90,107 @@ class OpenAISubscriptionProvider(BaseProvider):
         expires_at_ms: int = 0,
     ) -> None:
         """Hot-swap tokens after a refresh."""
+        # Any network refresh that started with the previous token must not
+        # install its eventual response over this newer state.
+        self._refresh_generation += 1
+        self._refresh_enabled = True
         self._access_token = access_token
         if refresh_token:
             self._refresh_token = refresh_token
         if expires_at_ms:
             self._expires_at_ms = expires_at_ms
 
+    def invalidate_pending_refreshes(self) -> None:
+        """Fence refresh responses that belong to a superseded connection."""
+
+        self._refresh_generation += 1
+        self._refresh_enabled = False
+
+    def resume_refreshes_after_failed_change(self) -> None:
+        """Re-enable this provider after a config transaction rolls back."""
+
+        # Keep the incremented generation: a response obtained while the
+        # connection change was in flight is stale even though the old
+        # connection itself has been restored.
+        self._refresh_enabled = True
+
     async def _do_refresh(self) -> None:
         """Perform the actual token refresh. Must be called under self._refresh_lock."""
         from app.provider.openai_oauth import refresh_access_token
-        from app.api.config import _update_env_file
+        from app.api.config import persist_env_transaction
 
         logger.info("OpenAI subscription token refreshing...")
+        refresh_generation = self._refresh_generation
+        refresh_token_at_start = self._refresh_token
         try:
-            tokens = await refresh_access_token(self._refresh_token)
+            tokens = await refresh_access_token(refresh_token_at_start)
         except Exception as e:
             logger.error("Token refresh failed: %s", e)
             self._needs_reauth = True
             raise
 
-        new_expires_at = int(time.time() * 1000) + tokens.get("expires_in", 3600) * 1000
+        if (
+            not self._refresh_enabled
+            or self._refresh_generation != refresh_generation
+            or self._refresh_token != refresh_token_at_start
+        ):
+            raise RuntimeError(
+                "OpenAI subscription changed while token refresh was in progress"
+            )
 
-        self._access_token = tokens["access_token"]
-        if tokens.get("refresh_token"):
-            self._refresh_token = tokens["refresh_token"]
-        self._expires_at_ms = new_expires_at
-        self._needs_reauth = False
-
-        # Persist updated tokens to .env
-        _update_env_file("SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN", self._access_token)
-        if tokens.get("refresh_token"):
-            _update_env_file("SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN", self._refresh_token)
-        _update_env_file("SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT", str(new_expires_at))
-
-        # Sync runtime settings if available
+        new_access_token = tokens["access_token"]
+        refreshed_refresh_token = tokens.get("refresh_token") or ""
+        new_refresh_token = refreshed_refresh_token or self._refresh_token
+        new_expires_at = (
+            int(time.time() * 1000) + tokens.get("expires_in", 3600) * 1000
+        )
+        previous_provider_state = (
+            self._access_token,
+            self._refresh_token,
+            self._expires_at_ms,
+            self._needs_reauth,
+        )
+        previous_settings_state = None
         if self._settings is not None:
-            self._settings.openai_oauth_access_token = self._access_token
-            self._settings.openai_oauth_refresh_token = self._refresh_token
-            self._settings.openai_oauth_expires_at = new_expires_at
+            previous_settings_state = (
+                self._settings.openai_oauth_access_token,
+                self._settings.openai_oauth_refresh_token,
+                self._settings.openai_oauth_expires_at,
+            )
+
+        def commit_runtime() -> None:
+            self._access_token = new_access_token
+            self._refresh_token = new_refresh_token
+            self._expires_at_ms = new_expires_at
+            self._needs_reauth = False
+            if self._settings is not None:
+                self._settings.openai_oauth_access_token = new_access_token
+                self._settings.openai_oauth_refresh_token = new_refresh_token
+                self._settings.openai_oauth_expires_at = new_expires_at
+
+        def rollback_runtime() -> None:
+            (
+                self._access_token,
+                self._refresh_token,
+                self._expires_at_ms,
+                self._needs_reauth,
+            ) = previous_provider_state
+            if self._settings is not None and previous_settings_state is not None:
+                (
+                    self._settings.openai_oauth_access_token,
+                    self._settings.openai_oauth_refresh_token,
+                    self._settings.openai_oauth_expires_at,
+                ) = previous_settings_state
+
+        env_changes: dict[str, str | None] = {
+            "SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN": new_access_token,
+            "SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT": str(new_expires_at),
+        }
+        if refreshed_refresh_token:
+            env_changes["SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN"] = (
+                refreshed_refresh_token
+            )
+        persist_env_transaction(env_changes, commit_runtime, rollback_runtime)
 
         logger.info("OpenAI subscription token refreshed successfully")
 

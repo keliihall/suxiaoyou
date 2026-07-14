@@ -10,7 +10,7 @@ from app.api import channels
 
 
 @pytest.mark.asyncio
-async def test_login_rejects_every_unreleased_channel_before_manager_lookup(
+async def test_channel_api_is_hard_disabled_before_manager_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The hidden bridge cannot be reached through the public login API."""
@@ -31,5 +31,7 @@ async def test_login_rejects_every_unreleased_channel_before_manager_lookup(
                 "/channels/login",
                 json={"channel": channel_name},
             )
-            assert response.status_code == 400
-            assert response.json() == {"detail": "暂不支持该消息渠道"}
+            assert response.status_code == 404
+            assert response.json() == {
+                "detail": "Messaging channels are not available in this release"
+            }

@@ -8,11 +8,49 @@ from pathlib import Path
 import pytest
 
 from app.tool.workspace import (
+    WorkspaceBoundaryViolation,
     WorkspaceViolation,
     resolve_and_validate,
     resolve_for_write,
     validate_cwd,
+    validate_agent_workspace_root,
 )
+
+
+def test_agent_workspace_rejects_broad_root_containing_private_data(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "app-private"
+    private_root.mkdir()
+
+    with pytest.raises(WorkspaceBoundaryViolation, match="application-private"):
+        validate_agent_workspace_root(tmp_path, private_root=private_root)
+
+
+def test_agent_workspace_allows_exact_generated_managed_workspace(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "app-private"
+    managed = private_root / "managed-workspaces" / "session-1"
+    managed.mkdir(parents=True)
+
+    assert validate_agent_workspace_root(
+        managed,
+        private_root=private_root,
+        allowed_managed_workspace=managed,
+    ) == managed.resolve()
+
+
+def test_agent_workspace_allows_separate_project(tmp_path: Path) -> None:
+    private_root = tmp_path / "app-private"
+    project = tmp_path / "project"
+    private_root.mkdir()
+    project.mkdir()
+
+    assert validate_agent_workspace_root(
+        project,
+        private_root=private_root,
+    ) == project.resolve()
 
 
 class TestResolveAndValidate:

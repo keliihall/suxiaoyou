@@ -157,8 +157,8 @@ class Settings(BaseSettings):
     # this to extend for unusual deployments (e.g. a custom web wrapper).
     extra_allowed_origins: str = ""  # SUXIAOYOU_EXTRA_ALLOWED_ORIGINS
 
-    # --- Messaging Channels (nanobot-based, in-process) ---
-    channels_enabled: bool = True  # SUXIAOYOU_CHANNELS_ENABLED
+    # --- Messaging Channels (unreleased; code-owned release gate also applies) ---
+    channels_enabled: bool = False  # SUXIAOYOU_CHANNELS_ENABLED
     channels_config_path: str = ""  # SUXIAOYOU_CHANNELS_CONFIG_PATH (default: data/channels.json)
 
     # --- Remote Access ---
@@ -166,7 +166,7 @@ class Settings(BaseSettings):
     remote_token_path: str = "data/remote_token.json"
     remote_tunnel_mode: str = "cloudflare"  # "cloudflare" | "manual"
     remote_tunnel_url: str = ""  # Manual tunnel URL (when mode="manual")
-    remote_permission_mode: str = "auto"  # "auto" | "ask" | "deny"
+    remote_permission_mode: str = "deny"  # "auto" | "ask" | "deny"
 
     # --- Local session auth ---
     # Rotated every backend start, written 0600 so another local user on a
@@ -184,6 +184,13 @@ class Settings(BaseSettings):
     # at ``backend/`` and the file needs to land under ``backend/data/``
     # to match what Tauri dev mode reads).
     session_token_path: str = "session_token.json"
+
+    def model_post_init(self, __context: Any) -> None:
+        """Resolve opaque credential references after settings validation."""
+
+        from app.auth.credential_store import resolve_settings_references
+
+        resolve_settings_references(self)
 
 
 @lru_cache

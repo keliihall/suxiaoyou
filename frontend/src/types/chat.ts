@@ -83,6 +83,8 @@ export interface TaskBatchRequest {
   mode: TaskBatchMode;
   tasks: TaskBatchTask[];
   workspace?: string | null;
+  permission_presets?: Record<string, boolean> | null;
+  permission_rules?: Array<{ action: "allow" | "deny"; permission: string; pattern?: string }> | null;
 }
 
 export interface EditAndResendRequest {

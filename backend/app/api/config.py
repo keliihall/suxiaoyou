@@ -5,13 +5,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
+from dotenv import dotenv_values
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.auth.credential_store import (
+    CredentialCleanupTransaction,
+    StagedEnvValue,
+    prepare_stale_secret_cleanup,
+    stage_protected_env_value,
+)
 from app.config import get_custom_endpoints
 from app.dependencies import ProviderRegistryDep, SettingsDep
 from app.provider.catalog import PROVIDER_CATALOG
@@ -34,12 +44,17 @@ from app.schemas.provider import (
     RESERVED_CUSTOM_SLUGS,
 )
 from app.i18n import request_language
+from app.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _custom_endpoints_lock = asyncio.Lock()
+_env_file_lock = threading.RLock()
+_ENV_ASSIGNMENT = re.compile(
+    r"^\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*="
+)
 
 # Persist runtime config in current working directory.
 #
@@ -109,39 +124,247 @@ def _build_custom_endpoint_info(
     )
 
 
-def _update_env_file(key: str, value: str) -> None:
-    """Update or add a key=value pair in the backend .env file.
+def _env_line_matches(line: str, key: str) -> bool:
+    match = _ENV_ASSIGNMENT.match(line)
+    return bool(match and match.group("key") == key)
 
-    Values are single-quoted to prevent python-dotenv from interpreting
-    special characters (``#`` as inline comments, whitespace stripping, etc.).
+
+def _env_entry(key: str, value: str) -> str:
+    # Single quotes prevent python-dotenv from treating ``#`` and whitespace
+    # as syntax. python-dotenv decodes both ``\\`` and ``\'`` inside this form,
+    # so escape backslashes first and apostrophes second. Shell's close-quote /
+    # reopen idiom is not valid dotenv syntax.
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"{key}='{escaped}'"
+
+
+@dataclass
+class _StagedEnvFileUpdate:
+    """One atomic env-file update plus its not-yet-committed credentials."""
+
+    path: Path
+    changes: dict[str, str | None]
+    previous_values: dict[str, str | None]
+    staged_values: dict[str, StagedEnvValue]
+    previous_exists: bool
+    previous_text: str
+    next_text: str
+    should_write: bool
+    cleanup_transaction: CredentialCleanupTransaction | None
+    installed: bool = False
+
+    @classmethod
+    def prepare(
+        cls,
+        path: Path,
+        changes: dict[str, str | None],
+    ) -> _StagedEnvFileUpdate:
+        previous_exists = path.exists()
+        previous_text = path.read_text(encoding="utf-8") if previous_exists else ""
+        previous_values = dict(dotenv_values(path)) if previous_exists else {}
+        staged_values: dict[str, StagedEnvValue] = {}
+        try:
+            for key, value in changes.items():
+                if value is not None:
+                    staged_values[key] = stage_protected_env_value(
+                        key,
+                        value,
+                        previous_value=previous_values.get(key),
+                    )
+        except Exception:
+            for staged in staged_values.values():
+                staged.discard_unreferenced(previous_values.values())
+            raise
+
+        output: list[str] = []
+        handled: set[str] = set()
+        for line in previous_text.splitlines():
+            matching_key = next(
+                (key for key in changes if _env_line_matches(line, key)),
+                None,
+            )
+            if matching_key is None:
+                output.append(line)
+                continue
+            # Collapse duplicate assignments so dotenv cannot select a stale
+            # value later in the file.
+            if matching_key in handled:
+                continue
+            handled.add(matching_key)
+            staged = staged_values.get(matching_key)
+            if staged is not None:
+                output.append(_env_entry(matching_key, staged.value))
+
+        for key, staged in staged_values.items():
+            if key not in handled:
+                output.append(_env_entry(key, staged.value))
+
+        next_text = "\n".join(output) + ("\n" if output else "")
+        should_write = previous_exists or bool(staged_values)
+        previous_changed_values = {
+            key: previous_values.get(key) for key in changes
+        }
+        next_changed_values = {
+            key: (staged_values[key].value if key in staged_values else None)
+            for key in changes
+        }
+        try:
+            cleanup_transaction = prepare_stale_secret_cleanup(
+                previous_changed_values,
+                next_changed_values,
+                evidence_path=path,
+                previous_exists=previous_exists,
+                previous_content=previous_text,
+                next_exists=should_write,
+                next_content=next_text,
+            )
+        except Exception:
+            for staged in staged_values.values():
+                staged.discard_unreferenced(previous_values.values())
+            raise
+        return cls(
+            path=path,
+            changes=dict(changes),
+            previous_values=previous_values,
+            staged_values=staged_values,
+            previous_exists=previous_exists,
+            previous_text=previous_text,
+            next_text=next_text,
+            should_write=should_write,
+            cleanup_transaction=cleanup_transaction,
+        )
+
+    def install(self) -> None:
+        if not self.should_write:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.path, self.next_text, mode=0o600)
+        self.installed = True
+
+    def restore(self) -> None:
+        if not self.installed:
+            return
+        if self.previous_exists:
+            atomic_write_text(self.path, self.previous_text, mode=0o600)
+        else:
+            self.path.unlink(missing_ok=True)
+        self.installed = False
+
+    def discard_created_references(self) -> None:
+        # Inspect what is actually installed.  If a rollback write itself ever
+        # fails, a new reference that remains in config must not be deleted.
+        try:
+            configured = (
+                dict(dotenv_values(self.path)).values()
+                if self.path.exists()
+                else ()
+            )
+            configured_values = tuple(configured)
+        except Exception as exc:
+            logger.error(
+                "Cannot verify env references during credential rollback: %s",
+                exc,
+            )
+            return
+        for staged in self.staged_values.values():
+            staged.discard_unreferenced(configured_values)
+        if self.cleanup_transaction is not None:
+            self.cleanup_transaction.cancel()
+
+    def finalize_credentials(self) -> None:
+        if self.cleanup_transaction is not None:
+            self.cleanup_transaction.commit()
+
+
+def _persist_env_then_commit_runtime(
+    changes: dict[str, str | None],
+    commit_runtime: Callable[[], None],
+    rollback_runtime: Callable[[], None],
+) -> None:
+    """Install config first, then commit runtime state as one transaction.
+
+    No await occurs inside this function, so desktop API tasks cannot observe a
+    half-committed settings/registry state.  New secret references are retained
+    only if the installed config still points at them.
     """
-    lines: list[str] = []
-    found = False
-    # Single-quote the value; escape any embedded single quotes.
-    escaped = value.replace("'", "'\\''")
-    entry = f"{key}='{escaped}'"
 
-    if _ENV_PATH.exists():
-        lines = _ENV_PATH.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
-                lines[i] = entry
-                found = True
-                break
+    with _env_file_lock:
+        staged = _StagedEnvFileUpdate.prepare(_ENV_PATH, changes)
+        try:
+            staged.install()
+        except Exception:
+            staged.discard_created_references()
+            raise
 
-    if not found:
-        lines.append(entry)
+        try:
+            commit_runtime()
+        except Exception as exc:
+            rollback_failures: list[str] = []
+            try:
+                rollback_runtime()
+            except Exception as rollback_exc:
+                rollback_failures.append(f"runtime rollback failed: {rollback_exc}")
+                logger.exception("Runtime config rollback failed")
+            try:
+                staged.restore()
+            except Exception as restore_exc:
+                rollback_failures.append(f"persistent rollback failed: {restore_exc}")
+                logger.exception("Persistent config rollback failed")
+            staged.discard_created_references()
+            if rollback_failures:
+                exc.add_note("; ".join(rollback_failures))
+            raise
 
-    _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Stale references are deleted only after both installed config and
+        # runtime state have committed successfully.
+        staged.finalize_credentials()
+
+
+def _update_env_file(key: str, value: str) -> None:
+    """Atomically add or replace one backend ``.env`` value."""
+
+    _persist_env_then_commit_runtime({key: value}, lambda: None, lambda: None)
 
 
 def _remove_env_key(key: str) -> None:
-    """Remove a key from the backend .env file entirely."""
-    if not _ENV_PATH.exists():
+    """Atomically remove one backend ``.env`` value."""
+
+    _persist_env_then_commit_runtime({key: None}, lambda: None, lambda: None)
+
+
+def _restore_registry_provider(
+    registry: Any,
+    provider_id: str,
+    previous_provider: Any,
+) -> None:
+    """Restore exactly the provider instance visible before a transaction."""
+
+    if registry.get_provider(provider_id) is previous_provider:
         return
-    lines = _ENV_PATH.read_text(encoding="utf-8").splitlines()
-    lines = [l for l in lines if not l.startswith(f"{key}=") and not l.startswith(f"{key} =")]
-    _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if previous_provider is None:
+        registry.unregister(provider_id)
+    else:
+        registry.register(previous_provider)
+
+
+def persist_env_transaction(
+    changes: dict[str, str | None],
+    commit_runtime: Callable[[], None],
+    rollback_runtime: Callable[[], None],
+) -> None:
+    """Commit one multi-key env/runtime update through the shared transaction."""
+
+    _persist_env_then_commit_runtime(changes, commit_runtime, rollback_runtime)
+
+
+def restore_registry_provider(
+    registry: Any,
+    provider_id: str,
+    previous_provider: Any,
+) -> None:
+    """Restore the provider instance captured before a config transaction."""
+
+    _restore_registry_provider(registry, provider_id, previous_provider)
 
 
 class LocalProviderStatus(BaseModel):
@@ -199,7 +422,11 @@ async def get_api_key_status(registry: ProviderRegistryDep) -> ApiKeyStatus:
 
 
 @router.post("/config/api-key", response_model=ApiKeyStatus)
-async def update_api_key(registry: ProviderRegistryDep, body: ApiKeyUpdate) -> ApiKeyStatus:
+async def update_api_key(
+    settings: SettingsDep,
+    registry: ProviderRegistryDep,
+    body: ApiKeyUpdate,
+) -> ApiKeyStatus:
     """Update the OpenRouter API key, validate it, and re-initialize the provider."""
     api_key = body.api_key.strip()
     if not api_key:
@@ -223,18 +450,31 @@ async def update_api_key(registry: ProviderRegistryDep, body: ApiKeyUpdate) -> A
             detail=f"API key validation failed: {e}",
         )
 
-    # Key is valid — replace the provider in the registry
+    # The key is valid.  Install the durable reference before replacing the
+    # live provider; a failed write must leave the working provider untouched.
     new_provider = OpenRouterProvider(api_key)
-    registry.register(new_provider)
+    previous_provider = registry.get_provider("openrouter")
+    previous_api_key = settings.openrouter_api_key
+
+    def commit_runtime() -> None:
+        settings.openrouter_api_key = api_key
+        registry.register(new_provider)
+
+    def rollback_runtime() -> None:
+        settings.openrouter_api_key = previous_api_key
+        _restore_registry_provider(registry, "openrouter", previous_provider)
+
+    _persist_env_then_commit_runtime(
+        {"SUXIAOYOU_OPENROUTER_API_KEY": api_key},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     # Refresh the model index so the frontend picks up the new models
     try:
         await registry.refresh_models()
     except Exception as e:
         logger.warning("Model refresh failed after API key update: %s — will retry on next request", e)
-
-    # Persist to .env so it survives restarts
-    _update_env_file("SUXIAOYOU_OPENROUTER_API_KEY", api_key)
 
     return ApiKeyStatus(
         is_configured=True,
@@ -246,10 +486,22 @@ async def update_api_key(registry: ProviderRegistryDep, body: ApiKeyUpdate) -> A
 @router.delete("/config/api-key", response_model=ApiKeyStatus)
 async def delete_api_key(settings: SettingsDep, registry: ProviderRegistryDep) -> ApiKeyStatus:
     """Delete the stored OpenRouter API key."""
-    settings.openrouter_api_key = ""
-    _remove_env_key("SUXIAOYOU_OPENROUTER_API_KEY")
+    previous_api_key = settings.openrouter_api_key
+    previous_provider = registry.get_provider("openrouter")
 
-    registry.unregister("openrouter")
+    def commit_runtime() -> None:
+        settings.openrouter_api_key = ""
+        registry.unregister("openrouter")
+
+    def rollback_runtime() -> None:
+        settings.openrouter_api_key = previous_api_key
+        _restore_registry_provider(registry, "openrouter", previous_provider)
+
+    _persist_env_then_commit_runtime(
+        {"SUXIAOYOU_OPENROUTER_API_KEY": None},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return ApiKeyStatus(is_configured=False)
 
@@ -306,16 +558,27 @@ async def connect_ollama(
             f"Cannot connect to Ollama at {base_url}: {status.error or 'unknown error'}",
         )
 
-    # Register (replaces any prior Ollama provider)
-    registry.register(test_provider)
+    previous_base_url = settings.ollama_base_url
+    previous_provider = registry.get_provider("ollama")
+
+    def commit_runtime() -> None:
+        settings.ollama_base_url = base_url
+        registry.register(test_provider)
+
+    def rollback_runtime() -> None:
+        settings.ollama_base_url = previous_base_url
+        _restore_registry_provider(registry, "ollama", previous_provider)
+
+    _persist_env_then_commit_runtime(
+        {"SUXIAOYOU_OLLAMA_BASE_URL": base_url},
+        commit_runtime,
+        rollback_runtime,
+    )
+
     try:
         await registry.refresh_models()
     except Exception as e:
         logger.warning("Model refresh failed after Ollama connect: %s", e)
-
-    # Persist to .env and runtime settings
-    _update_env_file("SUXIAOYOU_OLLAMA_BASE_URL", base_url)
-    settings.ollama_base_url = base_url
 
     return OllamaStatus(
         is_configured=True,
@@ -327,10 +590,22 @@ async def connect_ollama(
 @router.delete("/config/ollama", response_model=OllamaStatus)
 async def disconnect_ollama(settings: SettingsDep, registry: ProviderRegistryDep) -> OllamaStatus:
     """Disconnect Ollama: remove provider and clear config."""
-    settings.ollama_base_url = ""
-    _remove_env_key("SUXIAOYOU_OLLAMA_BASE_URL")
+    previous_base_url = settings.ollama_base_url
+    previous_provider = registry.get_provider("ollama")
 
-    registry.unregister("ollama")
+    def commit_runtime() -> None:
+        settings.ollama_base_url = ""
+        registry.unregister("ollama")
+
+    def rollback_runtime() -> None:
+        settings.ollama_base_url = previous_base_url
+        _restore_registry_provider(registry, "ollama", previous_provider)
+
+    _persist_env_then_commit_runtime(
+        {"SUXIAOYOU_OLLAMA_BASE_URL": None},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return OllamaStatus(is_configured=False)
 
@@ -467,10 +742,6 @@ async def set_provider_key(
             raise HTTPException(400, f"{pdef.name} requires a base_url to be set")
         extra_kwargs["base_url"] = base_url
 
-        # Persist base_url
-        setattr(settings, url_setting, base_url)
-        _update_env_file(f"SUXIAOYOU_{url_setting.upper()}", base_url)
-
     # Validate by creating a test provider and listing models
     try:
         test_provider = create_desktop_provider(provider_id, api_key, **extra_kwargs)
@@ -484,9 +755,38 @@ async def set_provider_key(
         logger.warning("API key validation failed for %s: %s", provider_id, e)
         raise HTTPException(400, f"API key validation failed: {e}")
 
-    # Register in the registry (replaces any existing instance)
+    # Install all durable values in one atomic file update before changing
+    # settings or replacing the live provider.
     new_provider = create_desktop_provider(provider_id, api_key, **extra_kwargs)
-    registry.register(new_provider)
+    previous_provider = registry.get_provider(provider_id)
+    previous_api_key = getattr(settings, pdef.settings_key, "")
+    previous_base_url = (
+        getattr(settings, "azure_openai_base_url", "")
+        if pdef.kind == "openai_compat_azure"
+        else None
+    )
+    env_key = f"SUXIAOYOU_{pdef.settings_key.upper()}"
+    env_changes: dict[str, str | None] = {env_key: api_key}
+    if pdef.kind == "openai_compat_azure":
+        env_changes["SUXIAOYOU_AZURE_OPENAI_BASE_URL"] = extra_kwargs["base_url"]
+
+    def commit_runtime() -> None:
+        setattr(settings, pdef.settings_key, api_key)
+        if pdef.kind == "openai_compat_azure":
+            settings.azure_openai_base_url = extra_kwargs["base_url"]
+        registry.register(new_provider)
+
+    def rollback_runtime() -> None:
+        setattr(settings, pdef.settings_key, previous_api_key)
+        if pdef.kind == "openai_compat_azure":
+            settings.azure_openai_base_url = previous_base_url or ""
+        _restore_registry_provider(registry, provider_id, previous_provider)
+
+    _persist_env_then_commit_runtime(
+        env_changes,
+        commit_runtime,
+        rollback_runtime,
+    )
 
     try:
         await registry.refresh_models()
@@ -495,13 +795,6 @@ async def set_provider_key(
             "Model refresh failed after %s key update: %s — will retry on next request",
             provider_id, e,
         )
-
-    # Persist to .env
-    env_key = f"SUXIAOYOU_{pdef.settings_key.upper()}"
-    _update_env_file(env_key, api_key)
-
-    # Update runtime settings
-    setattr(settings, pdef.settings_key, api_key)
 
     return ProviderInfo(
         id=provider_id,
@@ -523,19 +816,35 @@ async def delete_provider_key(
     if not pdef:
         raise HTTPException(404, f"Unknown provider: {provider_id}")
 
-    # Clear runtime settings
-    setattr(settings, pdef.settings_key, "")
-
-    # Remove from .env
     env_key = f"SUXIAOYOU_{pdef.settings_key.upper()}"
-    _remove_env_key(env_key)
-
+    env_changes: dict[str, str | None] = {env_key: None}
+    previous_api_key = getattr(settings, pdef.settings_key, "")
+    previous_base_url = (
+        getattr(settings, "azure_openai_base_url", "")
+        if pdef.kind == "openai_compat_azure"
+        else None
+    )
+    previous_provider = registry.get_provider(provider_id)
     if pdef.kind == "openai_compat_azure":
-        settings.azure_openai_base_url = ""
-        _remove_env_key("SUXIAOYOU_AZURE_OPENAI_BASE_URL")
+        env_changes["SUXIAOYOU_AZURE_OPENAI_BASE_URL"] = None
 
-    # Unregister provider
-    registry.unregister(provider_id)
+    def commit_runtime() -> None:
+        setattr(settings, pdef.settings_key, "")
+        if pdef.kind == "openai_compat_azure":
+            settings.azure_openai_base_url = ""
+        registry.unregister(provider_id)
+
+    def rollback_runtime() -> None:
+        setattr(settings, pdef.settings_key, previous_api_key)
+        if pdef.kind == "openai_compat_azure":
+            settings.azure_openai_base_url = previous_base_url or ""
+        _restore_registry_provider(registry, provider_id, previous_provider)
+
+    _persist_env_then_commit_runtime(
+        env_changes,
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return ProviderInfo(
         id=provider_id,
@@ -557,9 +866,11 @@ async def toggle_provider(
 
     api_key = getattr(settings, pdef.settings_key, "")
     is_currently_disabled = provider_id in disabled
+    previous_disabled = settings.disabled_providers
+    previous_provider = registry.get_provider(provider_id)
+    provider_to_enable = None
 
     if is_currently_disabled:
-        # Enable: remove from disabled list, register provider
         disabled.discard(provider_id)
         if api_key:
             try:
@@ -568,19 +879,41 @@ async def toggle_provider(
                     azure_url = getattr(settings, "azure_openai_base_url", "")
                     if azure_url:
                         extra_kwargs["base_url"] = azure_url
-                provider = create_desktop_provider(provider_id, api_key, **extra_kwargs)
-                registry.register(provider)
-                await registry.refresh_models()
+                provider_to_enable = create_desktop_provider(
+                    provider_id,
+                    api_key,
+                    **extra_kwargs,
+                )
             except Exception as e:
                 logger.warning("Failed to enable provider %s: %s", provider_id, e)
     else:
-        # Disable: add to disabled list, unregister provider
         disabled.add(provider_id)
-        registry.unregister(provider_id)
 
-    # Persist disabled list
-    settings.disabled_providers = ",".join(sorted(disabled))
-    _update_env_file("SUXIAOYOU_DISABLED_PROVIDERS", settings.disabled_providers)
+    next_disabled = ",".join(sorted(disabled))
+
+    def commit_runtime() -> None:
+        settings.disabled_providers = next_disabled
+        if is_currently_disabled:
+            if provider_to_enable is not None:
+                registry.register(provider_to_enable)
+        else:
+            registry.unregister(provider_id)
+
+    def rollback_runtime() -> None:
+        settings.disabled_providers = previous_disabled
+        _restore_registry_provider(registry, provider_id, previous_provider)
+
+    _persist_env_then_commit_runtime(
+        {"SUXIAOYOU_DISABLED_PROVIDERS": next_disabled},
+        commit_runtime,
+        rollback_runtime,
+    )
+
+    if is_currently_disabled and provider_to_enable is not None:
+        try:
+            await registry.refresh_models()
+        except Exception as e:
+            logger.warning("Failed to refresh enabled provider %s: %s", provider_id, e)
 
     # Build response
     provider = registry.get_provider(provider_id)
@@ -654,11 +987,28 @@ async def create_custom_endpoint(
             "headers": headers_payload,
         }
         endpoints.append(new_config)
+        next_custom_endpoints = json.dumps(endpoints)
+        previous_custom_endpoints = settings.custom_endpoints
+        previous_provider = registry.get_provider(endpoint_id)
 
-        settings.custom_endpoints = json.dumps(endpoints)
-        _update_env_file("SUXIAOYOU_CUSTOM_ENDPOINTS", settings.custom_endpoints)
+        def commit_runtime() -> None:
+            settings.custom_endpoints = next_custom_endpoints
+            registry.register(test_provider)
 
-    registry.register(test_provider)
+        def rollback_runtime() -> None:
+            settings.custom_endpoints = previous_custom_endpoints
+            _restore_registry_provider(
+                registry,
+                endpoint_id,
+                previous_provider,
+            )
+
+        _persist_env_then_commit_runtime(
+            {"SUXIAOYOU_CUSTOM_ENDPOINTS": next_custom_endpoints},
+            commit_runtime,
+            rollback_runtime,
+        )
+
     try:
         # Only refresh this provider — the BYOK/Ollama/Rapid-MLX providers
         # don't change when we add a custom endpoint, so the full sweep
@@ -684,10 +1034,27 @@ async def delete_custom_endpoint(
         if not found:
             raise HTTPException(404, "Custom endpoint not found")
 
-        settings.custom_endpoints = json.dumps(endpoints)
-        _update_env_file("SUXIAOYOU_CUSTOM_ENDPOINTS", settings.custom_endpoints)
+        next_custom_endpoints = json.dumps(endpoints)
+        previous_custom_endpoints = settings.custom_endpoints
+        previous_provider = registry.get_provider(endpoint_id)
 
-    registry.unregister(endpoint_id)
+        def commit_runtime() -> None:
+            settings.custom_endpoints = next_custom_endpoints
+            registry.unregister(endpoint_id)
+
+        def rollback_runtime() -> None:
+            settings.custom_endpoints = previous_custom_endpoints
+            _restore_registry_provider(
+                registry,
+                endpoint_id,
+                previous_provider,
+            )
+
+        _persist_env_then_commit_runtime(
+            {"SUXIAOYOU_CUSTOM_ENDPOINTS": next_custom_endpoints},
+            commit_runtime,
+            rollback_runtime,
+        )
 
     return ProviderInfo(
         id=endpoint_id, name=found.get("name", "Custom Endpoint"),
@@ -789,6 +1156,14 @@ async def update_custom_endpoint(
             raise HTTPException(404, "Custom endpoint was deleted during update")
 
         prior = endpoints[found_idx]
+        if prior != found:
+            # Validation ran without the lock so slow network I/O cannot block
+            # every custom-provider operation. Refuse a stale compare-and-swap
+            # instead of overwriting fields committed by a concurrent PATCH.
+            raise HTTPException(
+                409,
+                "Custom endpoint changed during validation; retry the update",
+            )
         updated_config = {
             "id": endpoint_id,
             "slug": prior.get("slug") or endpoint_id[len("custom_"):],
@@ -800,20 +1175,37 @@ async def update_custom_endpoint(
             "headers": headers_payload,
         }
         endpoints[found_idx] = updated_config
+        next_custom_endpoints = json.dumps(endpoints)
+        previous_custom_endpoints = settings.custom_endpoints
+        previous_provider = registry.get_provider(endpoint_id)
 
-        settings.custom_endpoints = json.dumps(endpoints)
-        _update_env_file("SUXIAOYOU_CUSTOM_ENDPOINTS", settings.custom_endpoints)
+        def commit_runtime() -> None:
+            settings.custom_endpoints = next_custom_endpoints
+            if enabled and needs_rebuild and test_provider is not None:
+                registry.register(test_provider)
+            elif not enabled:
+                registry.unregister(endpoint_id)
+
+        def rollback_runtime() -> None:
+            settings.custom_endpoints = previous_custom_endpoints
+            _restore_registry_provider(
+                registry,
+                endpoint_id,
+                previous_provider,
+            )
+
+        _persist_env_then_commit_runtime(
+            {"SUXIAOYOU_CUSTOM_ENDPOINTS": next_custom_endpoints},
+            commit_runtime,
+            rollback_runtime,
+        )
 
     if enabled and needs_rebuild and test_provider is not None:
-        registry.unregister(endpoint_id)
-        registry.register(test_provider)
         try:
             # Single-provider refresh — see create_custom_endpoint above.
             await registry.refresh_provider(endpoint_id)
         except Exception as e:
             logger.warning("Failed to refresh models after updating custom endpoint %s: %s", endpoint_id, e)
-    elif not enabled:
-        registry.unregister(endpoint_id)
 
     return _build_custom_endpoint_info(
         updated_config,
@@ -844,16 +1236,31 @@ async def set_local_provider(
     except Exception as e:
         logger.warning("Local provider validation failed for %s: %s", base_url, e)
         raise HTTPException(400, f"Local endpoint validation failed: {e}")
-    registry.unregister(LOCAL_PROVIDER_ID)
-    registry.register(create_local_provider(base_url))
+    previous_base_url = settings.local_base_url
+    previous_provider = registry.get_provider(LOCAL_PROVIDER_ID)
+
+    def commit_runtime() -> None:
+        settings.local_base_url = base_url
+        registry.register(test_provider)
+
+    def rollback_runtime() -> None:
+        settings.local_base_url = previous_base_url
+        _restore_registry_provider(
+            registry,
+            LOCAL_PROVIDER_ID,
+            previous_provider,
+        )
+
+    _persist_env_then_commit_runtime(
+        {LOCAL_BASE_URL_ENV: base_url},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     try:
         await registry.refresh_models()
     except Exception as e:
         logger.warning("Model refresh failed after local provider registration: %s", e)
-
-    _update_env_file(LOCAL_BASE_URL_ENV, base_url)
-    settings.local_base_url = base_url
 
     return LocalProviderStatus(
         base_url=base_url,
@@ -866,10 +1273,26 @@ async def set_local_provider(
 @router.delete("/config/local", response_model=LocalProviderStatus)
 async def delete_local_provider(settings: SettingsDep, registry: ProviderRegistryDep) -> LocalProviderStatus:
     """Remove the local endpoint configuration."""
-    settings.local_base_url = ""
-    _remove_env_key(LOCAL_BASE_URL_ENV)
+    previous_base_url = settings.local_base_url
+    previous_provider = registry.get_provider(LOCAL_PROVIDER_ID)
 
-    registry.unregister(LOCAL_PROVIDER_ID)
+    def commit_runtime() -> None:
+        settings.local_base_url = ""
+        registry.unregister(LOCAL_PROVIDER_ID)
+
+    def rollback_runtime() -> None:
+        settings.local_base_url = previous_base_url
+        _restore_registry_provider(
+            registry,
+            LOCAL_PROVIDER_ID,
+            previous_provider,
+        )
+
+    _persist_env_then_commit_runtime(
+        {LOCAL_BASE_URL_ENV: None},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     try:
         await registry.refresh_models()

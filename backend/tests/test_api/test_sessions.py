@@ -110,6 +110,22 @@ class TestUpdateSession:
         assert resp.status_code == 200
         assert resp.json()["directory"] == "/new"
 
+    async def test_permission_state_is_not_publicly_writable(self, app_client):
+        create = await app_client.post("/api/sessions", json={})
+        sid = create.json()["id"]
+
+        resp = await app_client.patch(
+            f"/api/sessions/{sid}",
+            json={
+                "permission": [
+                    {"action": "allow", "permission": "bash", "pattern": "*"},
+                ],
+            },
+        )
+
+        assert resp.status_code == 422
+        assert (await app_client.get(f"/api/sessions/{sid}")).json()["permission"] is None
+
 
 class TestDeleteSession:
     async def test_success(self, app_client):

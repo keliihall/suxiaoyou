@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
+from functools import wraps
 from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable
 
@@ -386,10 +388,85 @@ async def _shutdown_runtime(
         raise pending_cancel
 
 
+def _hold_database_lease_for_lifespan(factory):
+    """Keep one app process attached to a file-backed database at a time."""
+
+    @asynccontextmanager
+    @wraps(factory)
+    async def leased_lifespan(app: FastAPI):
+        from app.storage.migrations import database_lease
+
+        settings: Settings = app.state.settings
+        with database_lease(settings.database_url) as lease:
+            app.state.database_lease = lease
+            try:
+                async with factory(app):
+                    yield
+            finally:
+                try:
+                    # Normal shutdown already disposes this after every DB
+                    # consumer. The idempotent fallback also covers startup
+                    # failures after engine creation but before the inner
+                    # lifespan reaches its yield/finally block.
+                    engine = getattr(app.state, "engine", None)
+                    if engine is not None:
+                        await engine.dispose()
+                finally:
+                    # Release only after the final engine handle is closed.
+                    # This closes the check/replace race for every cooperating
+                    # backend and offline recovery process.
+                    delattr(app.state, "database_lease")
+
+    return leased_lifespan
+
+
+@_hold_database_lease_for_lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: startup and shutdown."""
     settings: Settings = app.state.settings
+
+    from app.auth.credential_store import (
+        get_credential_store,
+        migrate_settings_credentials,
+    )
+    from app.auth.legacy_credentials import (
+        migrate_historical_workspace_credentials,
+        migrate_legacy_credential_artifacts,
+    )
+
+    from app.release_features import (
+        MESSAGING_CHANNELS_RELEASED,
+        REMOTE_ACCESS_RELEASED,
+    )
+
+    # Stale per-user configuration from an older build must not reopen either
+    # high-privilege ingress while its code-owned release gate is closed.
+    if not REMOTE_ACCESS_RELEASED:
+        settings.remote_access_enabled = False
+        settings.remote_permission_mode = "deny"
+
+    # Rewrite app-owned plaintext credentials to opaque references before any
+    # provider, connector, or channel sees them. Runtime settings remain
+    # hydrated so existing consumers do not need storage-specific knowledge.
+    migrate_settings_credentials(settings, Path(".env"))
+
+    # Secure v0.8 credential artifacts even while their Remote/Channels
+    # consumers are behind code-owned release gates. Unsupported runtime state
+    # is retained behind a recoverable opaque reference; any migration failure
+    # aborts startup instead of leaving plaintext silently stranded on disk.
+    credential_store = get_credential_store()
+    migrate_legacy_credential_artifacts(
+        data_root=Path.cwd(),
+        # The pre-database pass always covers app-private artifacts and the
+        # historical global ~/.suxiaoyou location. Workspace paths are sourced
+        # from the migrated database below instead of trusting only the current
+        # Settings.project_dir value.
+        project_dir=None,
+        include_global_legacy=True,
+        remote_token_path=settings.remote_token_path,
+        store=credential_store,
+    )
 
     # --- Startup ---
 
@@ -426,7 +503,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # If the user had remote access enabled and configured a manual
     # tunnel URL, seed the set now so mobile requests are accepted on
     # the first request after startup.
-    if settings.remote_access_enabled and settings.remote_tunnel_mode == "manual" and settings.remote_tunnel_url:
+    if REMOTE_ACCESS_RELEASED and settings.remote_access_enabled and settings.remote_tunnel_mode == "manual" and settings.remote_tunnel_url:
         app.state.runtime_allowed_origins.add(settings.remote_tunnel_url.rstrip("/"))
 
     # Database.  File-backed desktop SQLite stores are upgraded in a staging
@@ -438,9 +515,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     migration_result = await asyncio.to_thread(
         upgrade_sqlite_database,
         settings.database_url,
+        lease=app.state.database_lease,
     )
     engine = create_engine(settings)
+    app.state.engine = engine
     session_factory = create_session_factory(engine)
+    app.state.session_factory = session_factory
     set_session_factory(session_factory)
 
     if migration_result is None:
@@ -452,6 +532,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+    # v0.8 Google/MCP tokens were stored inside the workspace selected by each
+    # exclude folderless/private-overlap entries, and inspect only the two
+    # known <workspace>/.suxiaoyou credential files. This remains independent
+    # of connector and messaging feature gates.
+    await migrate_historical_workspace_credentials(
+        session_factory,
+        configured_project_dir=settings.project_dir,
+        private_data_root=Path.cwd(),
+        store=credential_store,
+    )
 
     # A process can exit after an input is durably claimed but before it is
     # safe to say whether its tools ran.  Never auto-replay that ambiguous
@@ -483,9 +574,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Recovered %d in-flight tool call(s) as interrupted",
             interrupted_tools,
         )
-
-    app.state.engine = engine
-    app.state.session_factory = session_factory
 
     # Provider registry
     registry = ProviderRegistry()
@@ -700,7 +788,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Construct the optional tunnel manager locally, but defer its network
     # startup until after the app can answer /livez.
     tunnel_mgr = None
-    if settings.remote_access_enabled and settings.remote_tunnel_mode == "cloudflare":
+    if REMOTE_ACCESS_RELEASED and settings.remote_access_enabled and settings.remote_tunnel_mode == "cloudflare":
         from app.api.remote import get_or_create_tunnel_manager
 
         tunnel_mgr = get_or_create_tunnel_manager(app)
@@ -717,24 +805,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await task_scheduler.start()
     app.state.task_scheduler = task_scheduler
 
-    # Nanobot-based channel system (in-process, no external dependencies)
-    from app.channels.bus.queue import MessageBus
-    from app.channels.config import load_channels_config
-    from app.channels.manager import ChannelManager
-    from app.channels.adapter import AgentAdapter
+    # Messaging channels feed an unattended Agent and are not release-ready.
+    # Do not even construct the consumer/adapter until both the code-owned gate
+    # and the user setting are enabled in a future reviewed release.
+    app.state.message_bus = None
+    app.state.channel_manager = None
+    app.state.agent_adapter = None
+    if MESSAGING_CHANNELS_RELEASED and settings.channels_enabled:
+        from app.channels.bus.queue import MessageBus
+        from app.channels.config import load_channels_config
+        from app.channels.manager import ChannelManager
+        from app.channels.adapter import AgentAdapter
 
-    message_bus = MessageBus()
-    channels_config = load_channels_config(data_dir / "channels.json")
-    channel_manager = ChannelManager(channels_config, message_bus)
-    channel_manager.init_channels()
+        message_bus = MessageBus()
+        channels_config = load_channels_config(data_dir / "channels.json")
+        channel_manager = ChannelManager(channels_config, message_bus)
+        channel_manager.init_channels()
 
-    agent_adapter = AgentAdapter(message_bus, app.state)
-    await agent_adapter.start()
-    await channel_manager.start_all()
+        agent_adapter = AgentAdapter(message_bus, app.state)
+        await agent_adapter.start()
+        await channel_manager.start_all()
 
-    app.state.message_bus = message_bus
-    app.state.channel_manager = channel_manager
-    app.state.agent_adapter = agent_adapter
+        app.state.message_bus = message_bus
+        app.state.channel_manager = channel_manager
+        app.state.agent_adapter = agent_adapter
 
     # Workspace memory queue (async, debounced refresh)
     from app.memory.workspace_memory_queue import (
@@ -834,8 +928,6 @@ def _register_builtin_tools(
     """Register all built-in tools."""
     from app.tool.builtin.apply_patch import ApplyPatchTool
     from app.tool.builtin.artifact import ArtifactTool
-    from app.tool.builtin.bash import BashTool
-    from app.tool.builtin.code_execute import CodeExecuteTool
     from app.tool.builtin.edit import EditTool
     from app.tool.builtin.glob_tool import GlobTool
     from app.tool.builtin.grep import GrepTool
@@ -852,13 +944,22 @@ def _register_builtin_tools(
     from app.tool.builtin.web_search import WebSearchTool
     from app.tool.builtin.write import WriteTool
 
-    for tool_cls in [
+    tool_classes = [
         ReadTool, WriteTool, EditTool, ApplyPatchTool,
-        BashTool, CodeExecuteTool,
         GlobTool, GrepTool, QuestionTool, TodoTool,
         TaskTool, WebFetchTool, WebSearchTool, InvalidTool,
         PlanTool, SubmitPlanTool, ArtifactTool, PresentFileTool,
-    ]:
+    ]
+    if sys.platform.startswith("linux"):
+        # Only bubblewrap provides the complete filesystem/network/PID lifetime
+        # boundary required by command and Python execution in v0.9. Do not
+        # advertise tools that can only fail on macOS or Windows.
+        from app.tool.builtin.bash import BashTool
+        from app.tool.builtin.code_execute import CodeExecuteTool
+
+        tool_classes.extend((BashTool, CodeExecuteTool))
+
+    for tool_cls in tool_classes:
         registry.register(tool_cls())
 
     # SkillTool needs the skill registry injected

@@ -121,13 +121,14 @@ jobs:
       - name: Install validation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev pkg-config libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+          sudo apt-get install -y bubblewrap libcairo2-dev pkg-config libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
           npm ci
           npm --prefix frontend ci --legacy-peer-deps
           npm --prefix desktop-tauri ci
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
           python -m pip install -e ./backend --no-deps
           python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pip-audit==2.10.1
+          cargo install cargo-audit --locked --version 0.22.2
 
       - name: Install Chromium validation runtime
         run: |
@@ -142,10 +143,12 @@ jobs:
           node scripts/release-metadata.mjs "$APP_VERSION"
           node --test scripts/*.test.mjs
 
-      - name: Audit and test frontend production graph
+      - name: Audit and test JavaScript production graphs
         run: |
-          cd frontend
           npm audit --omit=dev
+          npm --prefix frontend audit --omit=dev
+          npm --prefix desktop-tauri audit --omit=dev
+          cd frontend
           npx tsc --noEmit
           npm run lint
           node --test tests/unit/*.test.ts
@@ -167,10 +170,37 @@ jobs:
 
       - name: Validate Rust desktop graph
         run: |
+          set -euo pipefail
+          mkdir -p ../../release-validation
           cargo metadata --locked --format-version 1 >/dev/null
+          AUDIT_STATUS=0
+          cargo audit --file Cargo.lock --json \
+            > ../../release-validation/cargo-audit-report.json \
+            || AUDIT_STATUS=$?
+          node ../../scripts/cargo-audit-summary.mjs \
+            generate \
+            ../../release-validation/cargo-audit-report.json \
+            ../../release-validation/cargo-audit-summary.json
+          node ../../scripts/cargo-audit-summary.mjs \
+            verify ../../release-validation/cargo-audit-summary.json
+          node ../../scripts/cargo-audit-summary.mjs \
+            assert-clean ../../release-validation/cargo-audit-summary.json
+          if (( AUDIT_STATUS != 0 )); then
+            echo "::error::cargo-audit failed with status $AUDIT_STATUS"
+            exit "$AUDIT_STATUS"
+          fi
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
         working-directory: desktop-tauri/src-tauri
+
+      - name: Upload Rust audit summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-audit-summary
+          path: release-validation/cargo-audit-summary.json
+          if-no-files-found: error
+          retention-days: 1
 
   build-windows:
     name: Build Windows x64
@@ -208,10 +238,13 @@ jobs:
       - name: Build backend with locked PyInstaller
         run: |
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0 pytest==9.1.1
+          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pip-audit==2.10.1
           python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py
           cd backend
           python -m PyInstaller suxiaoyou.spec --noconfirm
+
+      - name: Audit Windows backend production dependency graph
+        run: python -m pip_audit --strict --require-hashes -r backend/requirements.txt
 
       - name: Verify backend bundle
         run: node scripts/verify-bundle.mjs backend/dist/suxiaoyou-backend
@@ -909,7 +942,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm cpio file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev xvfb dbus-x11
+          sudo apt-get install -y bubblewrap libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev rpm cpio file patchelf build-essential curl wget libssl-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev xvfb dbus-x11
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -1009,8 +1042,16 @@ jobs:
             echo "::error::DEB runtime dependencies do not include libxdo3: $DEB_DEPENDS"
             exit 1
           }
+          grep -Eq '(^|, )bubblewrap([, (]|$)' <<< "$DEB_DEPENDS" || {
+            echo "::error::DEB runtime dependencies do not include bubblewrap: $DEB_DEPENDS"
+            exit 1
+          }
           grep -qx 'xdotool' <<< "$RPM_REQUIRES" || {
             printf '::error::RPM runtime dependencies do not include xdotool:\n%s\n' "$RPM_REQUIRES"
+            exit 1
+          }
+          grep -qx 'bubblewrap' <<< "$RPM_REQUIRES" || {
+            printf '::error::RPM runtime dependencies do not include bubblewrap:\n%s\n' "$RPM_REQUIRES"
             exit 1
           }
 
@@ -1229,6 +1270,15 @@ jobs:
           require_one "Linux RPM installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.rpm"
           require_one "Linux ARM64 Debian installer for app $APP_VERSION" artifacts/linux-arm64-release "*${APP_VERSION}*.deb"
           require_one "Linux ARM64 RPM installer for app $APP_VERSION" artifacts/linux-arm64-release "*${APP_VERSION}*.rpm"
+          require_one "Rust cargo-audit summary" artifacts/cargo-audit-summary "cargo-audit-summary.json"
+
+      - name: Validate and render Rust audit disclosure
+        run: |
+          set -euo pipefail
+          SUMMARY="artifacts/cargo-audit-summary/cargo-audit-summary.json"
+          node scripts/cargo-audit-summary.mjs verify "$SUMMARY"
+          node scripts/cargo-audit-summary.mjs assert-clean "$SUMMARY"
+          node scripts/cargo-audit-summary.mjs markdown "$SUMMARY" RUST-AUDIT.md
 
       - name: Stage release asset names
         run: |
@@ -1306,6 +1356,7 @@ jobs:
             else
               printf '%s\n\n' '- macOS Apple Silicon 与 Intel：应用仅使用 ad-hoc 临时签名；DMG 未使用 Developer ID 签名、未经过 Apple 公证，也没有 stapled ticket。'
             fi
+            cat RUST-AUDIT.md
             cat CHECKSUMS.md
           } > RELEASE-BODY.md
 

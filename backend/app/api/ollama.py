@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.api.config import persist_env_transaction, restore_registry_provider
 from app.dependencies import ProviderRegistryDep, SettingsDep
 from app.ollama.library import CATEGORIES, get_library as fetch_library
 from app.i18n import localize, request_language
@@ -161,13 +162,22 @@ async def uninstall_ollama(
     mgr = _get_manager(request)
 
     result = await mgr.uninstall(delete_models=delete_models)
+    previous_base_url = settings.ollama_base_url
+    previous_provider = registry.get_provider("ollama")
 
-    # Unregister provider and clear config
-    registry.unregister("ollama")
+    def commit_runtime() -> None:
+        settings.ollama_base_url = ""
+        registry.unregister("ollama")
 
-    from app.api.config import _remove_env_key
-    _remove_env_key("SUXIAOYOU_OLLAMA_BASE_URL")
-    settings.ollama_base_url = ""
+    def rollback_runtime() -> None:
+        settings.ollama_base_url = previous_base_url
+        restore_registry_provider(registry, "ollama", previous_provider)
+
+    persist_env_transaction(
+        {"SUXIAOYOU_OLLAMA_BASE_URL": None},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return {"status": "uninstalled", **result}
 
@@ -325,20 +335,30 @@ async def model_info(request: Request, name: str):
 
 async def _register_ollama_provider(base_url: str) -> None:
     """Register (or re-register) the Ollama provider in the provider registry."""
-    from app.api.config import _update_env_file
     from app.dependencies import get_provider_registry, get_settings
     from app.provider.ollama import OllamaProvider
 
     provider = OllamaProvider(base_url=base_url)
     registry = get_provider_registry()
-    registry.register(provider)
+    settings = get_settings()
+    previous_base_url = settings.ollama_base_url
+    previous_provider = registry.get_provider("ollama")
+
+    def commit_runtime() -> None:
+        settings.ollama_base_url = base_url
+        registry.register(provider)
+
+    def rollback_runtime() -> None:
+        settings.ollama_base_url = previous_base_url
+        restore_registry_provider(registry, "ollama", previous_provider)
+
+    persist_env_transaction(
+        {"SUXIAOYOU_OLLAMA_BASE_URL": base_url},
+        commit_runtime,
+        rollback_runtime,
+    )
 
     try:
         await registry.refresh_models()
     except Exception as e:
         logger.warning("Failed to refresh models after Ollama registration: %s", e)
-
-    # Persist so it auto-starts next time
-    _update_env_file("SUXIAOYOU_OLLAMA_BASE_URL", base_url)
-    settings = get_settings()
-    settings.ollama_base_url = base_url

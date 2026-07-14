@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from app.tool.base import ToolDefinition, ToolResult
@@ -21,6 +23,13 @@ from app.tool.subprocess_compat import (
     decode_subprocess_output,
     find_shell,
     get_subprocess_kwargs,
+)
+from app.tool.sandbox import (
+    SandboxUnavailable,
+    create_sandbox_scratch,
+    prepare_sandbox_launch,
+    validate_execution_platform,
+    validate_workspace_private_boundary,
 )
 from app.tool.workspace import WorkspaceViolation, get_default_output_dir, validate_cwd
 
@@ -219,25 +228,56 @@ class BashTool(ToolDefinition):
         timeout = min(args.get("timeout", default_timeout), max_timeout)
         cwd = args.get("cwd")
 
+        try:
+            if not ctx.workspace:
+                raise SandboxUnavailable("Execution requires a selected workspace")
+            workspace = validate_workspace_private_boundary(ctx.workspace)
+            validate_execution_platform()
+        except SandboxUnavailable as exc:
+            return ToolResult(error=f"Sandbox unavailable: {exc}")
+
         # Workspace restriction: validate/default cwd (defaults to suxiaoyou_written/)
         try:
-            if not cwd and ctx.workspace:
-                cwd = get_default_output_dir(ctx.workspace)
-            cwd = validate_cwd(cwd, ctx.workspace)
+            if not cwd:
+                cwd = get_default_output_dir(str(workspace))
+            cwd = validate_cwd(cwd, str(workspace))
         except WorkspaceViolation as e:
             return ToolResult(error=str(e))
 
         # Ensure cwd exists — suxiaoyou_written/ may not have been created yet
         if cwd:
-            import pathlib
             try:
-                pathlib.Path(cwd).mkdir(parents=True, exist_ok=True)
+                Path(cwd).mkdir(parents=True, exist_ok=True)
             except OSError:
-                # If we can't create it, fall back to workspace or None
-                cwd = ctx.workspace or None
+                return ToolResult(error=f"Cannot create execution directory: {cwd}")
+
+        # A unique scratch directory lives inside the selected workspace so the
+        # OS policy never needs a second writable path.  It also becomes HOME,
+        # TMP and XDG cache for the child and is removed after termination.
+        scratch_dir: str | None = None
+        try:
+            scratch_dir = str(
+                create_sandbox_scratch(
+                    workspace,
+                    prefix=f"bash-{ctx.call_id}-",
+                )
+            )
+        except (OSError, SandboxUnavailable) as exc:
+            return ToolResult(error=f"Sandbox unavailable: {exc}")
 
         extra_kwargs = get_subprocess_kwargs()
         shell_prefix = find_shell()
+
+        try:
+            launch = prepare_sandbox_launch(
+                [*shell_prefix, command],
+                workspace=str(workspace),
+                cwd=cwd,
+                scratch_dir=scratch_dir,
+            )
+        except SandboxUnavailable as exc:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            return ToolResult(error=f"Sandbox unavailable: {exc}")
 
         cancel_requested = threading.Event()
 
@@ -251,37 +291,17 @@ class BashTool(ToolDefinition):
             else:
                 process_kwargs["start_new_session"] = True
 
-            launch_command = command
-            if IS_WINDOWS:
-                # Gate user code on one stdin line.  Popen returns before a
-                # Win32 process can be assigned to our Job Object; without this
-                # gate a very short PowerShell parent could spawn a detached
-                # child and exit in that assignment window.
-                launch_command = (
-                    "[Console]::In.ReadLine() | Out-Null; " + command
-                )
             process = subprocess.Popen(
-                [*shell_prefix, launch_command],
+                launch.argv,
                 shell=False,
-                stdin=subprocess.PIPE if IS_WINDOWS else None,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=cwd,
-                env={**os.environ},
+                cwd=launch.cwd,
+                env=launch.env,
                 **process_kwargs,
             )
-            try:
-                windows_job = _create_windows_process_job(process)
-            finally:
-                if IS_WINDOWS and process.stdin is not None:
-                    try:
-                        process.stdin.write(b"\n")
-                        process.stdin.flush()
-                    finally:
-                        process.stdin.close()
-                        # ``communicate`` otherwise tries to flush the already
-                        # closed stream on some Python versions.
-                        process.stdin = None
+            windows_job = _create_windows_process_job(process)
 
             try:
                 started = time.monotonic()
@@ -332,16 +352,19 @@ class BashTool(ToolDefinition):
             return ToolResult(error="Shell not found")
         except PermissionError:
             return ToolResult(error="Permission denied")
+        finally:
+            if scratch_dir is not None:
+                shutil.rmtree(scratch_dir, ignore_errors=True)
 
         if termination == "timeout":
             return ToolResult(
                 error=f"Command timed out after {timeout}s",
-                metadata={"timeout": True},
+                metadata={"timeout": True, **launch.metadata},
             )
         if termination == "aborted":
             return ToolResult(
                 error="Command aborted by user",
-                metadata={"aborted": True},
+                metadata={"aborted": True, **launch.metadata},
             )
 
         stdout = decode_subprocess_output(stdout_bytes)
@@ -360,6 +383,6 @@ class BashTool(ToolDefinition):
         return ToolResult(
             output=output,
             title=command[:80],
-            metadata={"exit_code": exit_code},
+            metadata={"exit_code": exit_code, **launch.metadata},
             error=f"Command failed with exit code {exit_code}" if exit_code != 0 else None,
         )

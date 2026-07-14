@@ -842,8 +842,6 @@ async def update_session(
         session.time_archived = body.time_archived
     if body.is_pinned is not None:
         session.is_pinned = body.is_pinned
-    if body.permission is not None:
-        session.permission = body.permission
     if preserve_time_updated:
         session.time_updated = original_time_updated
         flag_modified(session, "time_updated")

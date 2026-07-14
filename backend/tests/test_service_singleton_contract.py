@@ -120,37 +120,9 @@ def test_scheduler_output_uses_registered_stream_singleton(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_remote_task_routes_use_registered_stream_singleton(
-    app_client,
-    monkeypatch,
-) -> None:
-    job = GenerationJob(stream_id="stream", session_id="session")
-    manager = SimpleNamespace(
-        _jobs={job.stream_id: job},
-        active_jobs=lambda: [
-            {
-                "stream_id": "stream",
-                "session_id": "session",
-                "needs_input": True,
-            }
-        ],
-    )
-    monkeypatch.setattr(dependencies, "_stream_manager", manager)
-    app_client.app.state.stream_manager = SimpleNamespace(
-        _jobs={},
-        active_jobs=lambda: [],
-    )
-
+async def test_unreleased_remote_task_routes_are_not_registered(app_client) -> None:
     status = await app_client.get("/api/remote/status")
-    assert status.status_code == 200
-    assert status.json()["active_tasks"] == 1
+    assert status.status_code == 404
 
     tasks = await app_client.get("/api/remote/tasks")
-    assert tasks.status_code == 200
-    assert tasks.json() == [
-        {
-            "stream_id": "stream",
-            "session_id": "session",
-            "status": "waiting_permission",
-        }
-    ]
+    assert tasks.status_code == 404

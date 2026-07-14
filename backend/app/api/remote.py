@@ -22,11 +22,22 @@ from app.auth.token import (
     rotate_token,
     save_token,
 )
+from app.auth.local import require_local_session
 from app.dependencies import get_stream_manager
+from app.release_features import REMOTE_ACCESS_RELEASED
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/remote", tags=["remote"])
+def _require_remote_release() -> None:
+    if not REMOTE_ACCESS_RELEASED:
+        raise HTTPException(status_code=404, detail="Remote access is not available in this release")
+
+
+router = APIRouter(
+    prefix="/remote",
+    tags=["remote"],
+    dependencies=[Depends(_require_remote_release), Depends(require_local_session)],
+)
 
 REMOTE_PROVIDER_PRIORITY = (
     "deepseek",
@@ -42,10 +53,8 @@ REMOTE_PROVIDER_PRIORITY = (
 # --- Localhost guard ---
 
 def _localhost_only(request: Request) -> None:
-    """Dependency that rejects non-localhost requests."""
-    client_ip = request.client.host if request.client else "unknown"
-    if client_ip not in ("127.0.0.1", "::1", "localhost"):
-        raise HTTPException(status_code=403, detail="This endpoint is only accessible from localhost")
+    """Backward-compatible alias for the source-aware local dependency."""
+    require_local_session(request)
 
 
 # --- CSRF allowlist helpers ---
@@ -109,7 +118,7 @@ class RemoteStatusResponse(BaseModel):
     token_preview: str | None = None  # First 12 chars
     active_tasks: int = 0
     tunnel_mode: str = "cloudflare"
-    permission_mode: str = "auto"
+    permission_mode: str = "deny"
     active_providers: list[str] = []  # e.g. ["deepseek", "qwen"]
 
 

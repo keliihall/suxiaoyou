@@ -38,10 +38,6 @@ Currently allowed unauthenticated:
   Tauri watchdog; contain no secrets, do not mutate state.
 * ``/favicon.svg``, ``/manifest.json`` — PWA asset serves.
 * ``/_next/*`` — Next.js static bundle (JS/CSS/fonts).
-* ``/m``, ``/m/*`` — mobile PWA HTML shells. The HTML itself is not
-  sensitive; the JS it serves makes authenticated ``/api/*`` calls
-  using the remote tunnel token.
-
 Everything else (``/api/*``, ``/v1/*`` OpenAI-compat, ``/shutdown``,
 root ``/``, anything a future router mounts) requires a valid token.
 
@@ -54,10 +50,8 @@ Two tokens are accepted, checked in constant time:
    ``app.state.session_token``, never leaves the host filesystem
    (Tauri reads the 0600 file and injects ``Authorization`` on every
    request).
-2. **Remote token** — persistent, loaded from
-   ``settings.remote_token_path``, only when
-   ``settings.remote_access_enabled`` is True. Used by the phone
-   companion mode through the tunnel.
+2. **Remote token** — retained in the implementation for future redesign, but
+   rejected while the code-owned release gate is closed.
 
 Rate limiting is preserved for non-loopback clients so a broken or
 hostile tunnel peer cannot brute-force the token.
@@ -72,11 +66,11 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import parse_qs
 
+from app.auth.local import LOCALHOST_IPS
 from app.auth.token import load_token, validate_token
+from app.release_features import REMOTE_ACCESS_RELEASED
 
 logger = logging.getLogger(__name__)
-
-_LOCALHOST_IPS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 # Exact-path allowlist — these routes skip authentication entirely. Keep
 # this set minimal: every entry is a public endpoint and must be audited
@@ -87,14 +81,13 @@ _PUBLIC_PATHS = frozenset({
     "/health",         # Provider status dump, no secrets
     "/favicon.svg",    # PWA asset
     "/manifest.json",  # PWA asset
-    "/m",              # Mobile PWA HTML shell (JS inside calls /api/* authed)
 })
 
 # Prefix allowlist — anything under these prefixes is public. The Next.js
-# static bundle and the mobile PWA's nested HTML shells fall here.
+# static bundle falls here. Mobile PWA shells are authenticated while remote
+# access is unreleased.
 _PUBLIC_PREFIXES: tuple[str, ...] = (
     "/_next/",  # Next.js static bundle (JS/CSS/fonts)
-    "/m/",      # Mobile PWA SPA fallback pages
 )
 
 _RATE_WINDOW = 60  # seconds — not user-tunable
@@ -129,6 +122,15 @@ def _requires_auth(path: str) -> bool:
     return True
 
 
+def _query_token_allowed(scope: dict) -> bool:
+    """Limit URL credentials to the one native EventSource endpoint."""
+
+    return (
+        scope.get("method", "").upper() == "GET"
+        and scope.get("path", "").startswith("/api/chat/stream/")
+    )
+
+
 def _extract_token(scope: dict, headers: dict[bytes, bytes]) -> str:
     """Pull a bearer token from ``Authorization`` or the ``?token=`` query.
 
@@ -142,6 +144,8 @@ def _extract_token(scope: dict, headers: dict[bytes, bytes]) -> str:
     # Fall back to ?token= only if Authorization was absent. Accepting both
     # simultaneously would open a smuggling window if a proxy normalises one
     # but not the other.
+    if not _query_token_allowed(scope):
+        return ""
     qs = scope.get("query_string", b"").decode("latin-1", errors="replace")
     token_list = parse_qs(qs).get("token", [])
     return token_list[0] if token_list else ""
@@ -199,7 +203,7 @@ class AuthMiddleware:
 
         headers = dict(scope.get("headers", []))
         client_ip = self._client_ip(scope, headers)
-        is_local = client_ip in _LOCALHOST_IPS
+        is_local = client_ip in LOCALHOST_IPS
         now = time.monotonic()
 
         # Rate limit non-local peers. Local traffic is the Tauri shell and
@@ -247,7 +251,7 @@ class AuthMiddleware:
         """
         session_ok = validate_token(provided, session_token)
         remote_ok = False
-        if getattr(settings, "remote_access_enabled", False):
+        if REMOTE_ACCESS_RELEASED and getattr(settings, "remote_access_enabled", False):
             remote_path = Path(settings.remote_token_path)
             remote_expected = load_token(remote_path)
             if remote_expected:

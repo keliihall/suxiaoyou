@@ -19,22 +19,25 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     newline: str | None = "\n",
+    mode: int | None = None,
 ) -> None:
     """Atomically replace *path* with *content*.
 
     The caller remains responsible for creating the parent directory.  When an
-    existing regular file is replaced, its permission bits are preserved.  The
+    existing regular file is replaced, its permission bits are preserved unless
+    *mode* explicitly supplies the installed POSIX permission bits.  The
     temporary file is always created on the same filesystem as the target so
     ``os.replace`` cannot degrade into a copy-and-delete operation.
     """
 
     target = Path(path)
     parent = target.parent
-    existing_mode: int | None = None
-    try:
-        existing_mode = stat.S_IMODE(target.stat().st_mode)
-    except FileNotFoundError:
-        pass
+    installed_mode = mode
+    if installed_mode is None:
+        try:
+            installed_mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            pass
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
@@ -45,7 +48,7 @@ def atomic_write_text(
     for _ in range(100):
         candidate = parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
         try:
-            fd = os.open(candidate, flags, 0o666)
+            fd = os.open(candidate, flags, mode if mode is not None else 0o666)
         except FileExistsError:
             continue
         temporary = candidate
@@ -54,9 +57,9 @@ def atomic_write_text(
         raise FileExistsError(f"Could not allocate a temporary file beside {target}")
 
     try:
-        if existing_mode is not None:
+        if installed_mode is not None:
             try:
-                os.fchmod(fd, existing_mode)
+                os.fchmod(fd, installed_mode)
             except (AttributeError, OSError):
                 # Windows ACLs and some virtual filesystems do not expose a
                 # useful POSIX mode through fchmod.  Atomicity does not depend
@@ -71,6 +74,13 @@ def atomic_write_text(
 
         os.replace(temporary, target)
         temporary = None
+        if installed_mode is not None:
+            try:
+                os.chmod(target, installed_mode)
+            except OSError:
+                # Windows ACLs are inherited from the per-user app-data
+                # directory; POSIX filesystems were already set via fchmod.
+                pass
         _fsync_directory(parent)
     finally:
         if fd >= 0:

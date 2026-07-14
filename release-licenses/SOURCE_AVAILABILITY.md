@@ -1,7 +1,7 @@
 # Source availability and provenance
 
 This document tells recipients where to obtain the Source Code Form for
-MPL-2.0 components included in 苏小有 v0.8.3. The exact-version links below
+MPL-2.0 components included in 苏小有 v0.9.0. The exact-version links below
 provide the source without charge. 苏小有 does not intentionally modify the
 listed upstream MPL-covered source files.
 
@@ -73,7 +73,10 @@ The complete data-license agreement is in `CDLA-PERMISSIVE-2.0.txt`.
   <https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-1.0.3.tgz>
   (SHA-256 `b88b4ca58495d01052ea22171f407c58aa4706295a8c90aa3c7298d8104cec30`).
 - Node.js 22.22.0: <https://github.com/nodejs/node/tree/v22.22.0>
-- CPython 3.12.13: <https://github.com/python/cpython/tree/v3.12.13>
+- CPython 3.12.10 (runtime bundled with Windows release installers):
+  <https://github.com/python/cpython/tree/v3.12.10>
+- CPython 3.12.13 (runtime bundled with macOS and Linux release installers):
+  <https://github.com/python/cpython/tree/v3.12.13>
 - Relocatable CPython 3.12.13 macOS runtime archives, metadata, checksums, and
   incorporated-library license files:
   <https://github.com/astral-sh/python-build-standalone/releases/tag/20260623>

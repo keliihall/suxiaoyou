@@ -7,8 +7,10 @@ from app.agent.permission import (
     evaluate,
     merge_rulesets,
     parse_session_permissions,
+    presets_to_ruleset,
 )
 from app.schemas.agent import PermissionRule, Ruleset
+from app.session.prompt import _merge_prompt_permission_layers
 
 
 class TestEvaluate:
@@ -48,6 +50,23 @@ class TestEvaluate:
     def test_no_match_defaults_deny(self):
         rs = Ruleset(rules=[])
         assert evaluate("anything", "*", rs) == "deny"
+
+    def test_global_defaults_ask_for_all_execution_and_file_mutation(self):
+        for permission in ("bash", "code_execute", "write", "edit", "apply_patch"):
+            assert evaluate(permission, "*", GLOBAL_DEFAULTS) == "ask"
+
+
+class TestPermissionPresets:
+    def test_run_commands_allows_shell_and_python(self):
+        rules = merge_rulesets(GLOBAL_DEFAULTS, presets_to_ruleset({"run_commands": True}))
+        assert evaluate("bash", "*", rules) == "allow"
+        assert evaluate("code_execute", "*", rules) == "allow"
+
+    def test_file_changes_allows_every_file_mutator(self):
+        rules = merge_rulesets(GLOBAL_DEFAULTS, presets_to_ruleset({"file_changes": True}))
+        assert evaluate("write", "*", rules) == "allow"
+        assert evaluate("edit", "*", rules) == "allow"
+        assert evaluate("apply_patch", "*", rules) == "allow"
 
     def test_exact_match(self):
         rs = Ruleset(rules=[
@@ -143,6 +162,24 @@ class TestMergeRulesets:
         ])
         merged = merge_rulesets(agent, session)
         assert evaluate("read", ".env", merged) == "allow"
+
+    def test_authoritative_parent_snapshot_blocks_stale_child_session_allow(self):
+        parent_snapshot = Ruleset(rules=[
+            PermissionRule(action="deny", permission="bash"),
+        ])
+        stale_child_session = Ruleset(rules=[
+            PermissionRule(action="allow", permission="bash"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            Ruleset(),
+            Ruleset(),
+            parent_snapshot,
+            stale_child_session,
+            request_is_authoritative=True,
+        )
+
+        assert evaluate("bash", "*", merged) == "deny"
 
 
 class TestDisabledTools:

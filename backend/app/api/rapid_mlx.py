@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.api.config import persist_env_transaction, restore_registry_provider
 from app.dependencies import ProviderRegistryDep, SettingsDep
 from app.rapid_mlx.manager import DEFAULT_PORT
 
@@ -115,19 +116,44 @@ async def start_rapid_mlx(
     except Exception as exc:
         raise HTTPException(400, str(exc))
 
-    from app.api.config import _update_env_file
-    from app.provider.rapid_mlx import normalize_rapid_mlx_model
+    from app.provider.rapid_mlx import RapidMLXProvider, normalize_rapid_mlx_model
 
     model = normalize_rapid_mlx_model(body.model)
-    _update_env_file("SUXIAOYOU_RAPID_MLX_BASE_URL", base_url)
-    _update_env_file("SUXIAOYOU_RAPID_MLX_MODEL", model)
-    settings.rapid_mlx_base_url = base_url
-    settings.rapid_mlx_model = model
-
     data = await mgr.status(
-        configured_base_url=settings.rapid_mlx_base_url,
-        configured_model=settings.rapid_mlx_model,
+        configured_base_url=base_url,
+        configured_model=model,
     )
+    previous_base_url = settings.rapid_mlx_base_url
+    previous_model = settings.rapid_mlx_model
+    previous_provider = registry.get_provider("rapid-mlx")
+    provider = (
+        RapidMLXProvider(base_url=base_url, seed_model=model)
+        if data["running"]
+        else None
+    )
+
+    def commit_runtime() -> None:
+        settings.rapid_mlx_base_url = base_url
+        settings.rapid_mlx_model = model
+        if provider is not None:
+            registry.register(provider)
+        else:
+            registry.unregister("rapid-mlx")
+
+    def rollback_runtime() -> None:
+        settings.rapid_mlx_base_url = previous_base_url
+        settings.rapid_mlx_model = previous_model
+        restore_registry_provider(registry, "rapid-mlx", previous_provider)
+
+    persist_env_transaction(
+        {
+            "SUXIAOYOU_RAPID_MLX_BASE_URL": base_url,
+            "SUXIAOYOU_RAPID_MLX_MODEL": model,
+        },
+        commit_runtime,
+        rollback_runtime,
+    )
+
     if data["running"]:
         await _register_rapid_mlx_provider(base_url, registry, settings)
     return RapidMLXRuntimeStatus(**data)
@@ -147,14 +173,28 @@ async def uninstall_rapid_mlx(
     """
     mgr = _get_manager(request)
     summary = await mgr.uninstall(delete_models=delete_models)
+    previous_base_url = settings.rapid_mlx_base_url
+    previous_model = settings.rapid_mlx_model
+    previous_provider = registry.get_provider("rapid-mlx")
 
-    registry.unregister("rapid-mlx")
+    def commit_runtime() -> None:
+        settings.rapid_mlx_base_url = ""
+        settings.rapid_mlx_model = ""
+        registry.unregister("rapid-mlx")
 
-    from app.api.config import _remove_env_key
-    _remove_env_key("SUXIAOYOU_RAPID_MLX_BASE_URL")
-    _remove_env_key("SUXIAOYOU_RAPID_MLX_MODEL")
-    settings.rapid_mlx_base_url = ""
-    settings.rapid_mlx_model = ""
+    def rollback_runtime() -> None:
+        settings.rapid_mlx_base_url = previous_base_url
+        settings.rapid_mlx_model = previous_model
+        restore_registry_provider(registry, "rapid-mlx", previous_provider)
+
+    persist_env_transaction(
+        {
+            "SUXIAOYOU_RAPID_MLX_BASE_URL": None,
+            "SUXIAOYOU_RAPID_MLX_MODEL": None,
+        },
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return RapidMLXUninstallResponse(**summary)
 
@@ -199,9 +239,10 @@ async def _register_rapid_mlx_provider(
             logger.warning("Failed to refresh existing Rapid-MLX provider: %s", exc)
         return
 
-    registry.register(RapidMLXProvider(base_url=base_url))
+    registry.register(
+        RapidMLXProvider(base_url=base_url, seed_model=settings.rapid_mlx_model)
+    )
     try:
         await registry.refresh_models()
     except Exception as exc:
         logger.warning("Failed to refresh models after Rapid-MLX registration: %s", exc)
-    settings.rapid_mlx_base_url = base_url

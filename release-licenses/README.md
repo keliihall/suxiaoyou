@@ -34,6 +34,9 @@ Included files:
 - `NODEJS-22.22.0-LICENSE.txt` — the complete Node.js 22.22.0 distribution
   license and incorporated-library notices.
 - `CPYTHON-3.12.13-LICENSE.txt` — the CPython 3.12.13 distribution license.
+  Windows release installers bundle CPython 3.12.10; macOS and Linux release
+  installers bundle CPython 3.12.13. `SOURCE_AVAILABILITY.md` records the
+  exact source tag for each platform runtime.
 - `python-runtime/python-build-standalone-20260623/` — exact macOS arm64 and
   x86_64 runtime provenance, checksums, architecture-specific `PYTHON.json`
   metadata, all 19 upstream runtime/incorporated-library license files, and
@@ -59,9 +62,16 @@ text and `SOURCE_AVAILABILITY.md` before producing another installer.
 
 Regenerate the language reports after installing the locked dependencies:
 
+On macOS, install the pure-Python, platform-conditional wheels into the
+temporary notice-generation environment as well. This keeps the checked-in
+report complete for Linux Secret Service and Windows keyring helpers; pywin32
+remains covered by its separate wheel notice file.
+
 ```bash
 node scripts/generate-javascript-licenses.mjs
 node scripts/generate-anthropic-font-licenses.mjs
+python -m pip install --no-deps \
+  colorama==0.4.6 jeepney==0.9.0 pywin32-ctypes==0.2.3 secretstorage==3.5.0
 python backend/scripts/generate_python_licenses.py
 cd desktop-tauri/src-tauri
 cargo about generate --locked --fail about.hbs \

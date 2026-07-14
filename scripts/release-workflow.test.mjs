@@ -58,6 +58,9 @@ const backendRequirements = readFileSync(
   "utf8",
 );
 const backendProject = readFileSync(join(root, "backend/pyproject.toml"), "utf8");
+const backendSpec = readFileSync(join(root, "backend/suxiaoyou.spec"), "utf8");
+const backendEntrypoint = readFileSync(join(root, "backend/run.py"), "utf8");
+const bundleVerifier = readFileSync(join(root, "scripts/verify-bundle.mjs"), "utf8");
 const backendAdHocEntitlements = readFileSync(
   join(root, "desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"),
   "utf8",
@@ -251,10 +254,10 @@ test("preserves package upgrade identities while localizing visible display name
   assert.equal(linuxConfig.bundle.linux.rpm.desktopTemplate, templatePath);
   assert.equal(linuxArmConfig.bundle.linux.deb.desktopTemplate, templatePath);
   assert.equal(linuxArmConfig.bundle.linux.rpm.desktopTemplate, templatePath);
-  assert.deepEqual(linuxConfig.bundle.linux.deb.depends, ["libxdo3"]);
-  assert.deepEqual(linuxConfig.bundle.linux.rpm.depends, ["xdotool"]);
-  assert.deepEqual(linuxArmConfig.bundle.linux.deb.depends, ["libxdo3"]);
-  assert.deepEqual(linuxArmConfig.bundle.linux.rpm.depends, ["xdotool"]);
+  assert.deepEqual(linuxConfig.bundle.linux.deb.depends, ["bubblewrap", "libxdo3"]);
+  assert.deepEqual(linuxConfig.bundle.linux.rpm.depends, ["bubblewrap", "xdotool"]);
+  assert.deepEqual(linuxArmConfig.bundle.linux.deb.depends, ["bubblewrap", "libxdo3"]);
+  assert.deepEqual(linuxArmConfig.bundle.linux.rpm.depends, ["bubblewrap", "xdotool"]);
   assert.match(linuxDesktopTemplate, /^\[Desktop Entry\]$/m);
   assert.match(linuxDesktopTemplate, /^Categories=\{\{categories\}\}$/m);
   assert.match(linuxDesktopTemplate, /^Comment=\{\{comment\}\}$/m);
@@ -578,11 +581,13 @@ test("re-extracts Linux installers and executes their packaged Node toolchain", 
   assert.match(linux, /dpkg-deb -f .* Architecture/);
   assert.match(linux, /DEB_DEPENDS=.*dpkg-deb -f .* Depends/);
   assert.match(linux, /libxdo3\(\[, \(\]\|\$\)/);
+  assert.match(linux, /bubblewrap\(\[, \(\]\|\$\)/);
   assert.match(linux, /RPM_PACKAGE=.*rpm -qp --queryformat '%\{NAME\}'/);
   assert.match(linux, /RPM_VERSION=.*rpm -qp --queryformat '%\{VERSION\}'/);
   assert.match(linux, /RPM_ARCH=.*rpm -qp --queryformat '%\{ARCH\}'/);
   assert.match(linux, /RPM_REQUIRES=.*rpm -qp --requires/);
   assert.match(linux, /xdotool/);
+  assert.match(linux, /grep -qx 'bubblewrap'/);
   assert.match(linux, /EXPECTED_PACKAGE="suxiaoyou"/);
   assert.match(linux, /DEB package is \$DEB_PACKAGE, expected \$EXPECTED_PACKAGE/);
   assert.match(linux, /RPM package is \$RPM_PACKAGE, expected \$EXPECTED_PACKAGE/);
@@ -756,10 +761,19 @@ test("launches every installed desktop, waits for backend ready, and proves clea
 test("Windows native build validates lifecycle primitives before packaging", () => {
   const windows = job("build-windows");
   const buildBackend = step(windows, "Build backend with locked PyInstaller");
+  const auditBackend = step(
+    windows,
+    "Audit Windows backend production dependency graph",
+  );
 
   assert.match(buildBackend, /pytest==9\.1\.1/);
+  assert.match(buildBackend, /pip-audit==2\.10\.1/);
   assert.match(buildBackend, /python -m pytest -q backend\/tests\/test_run\.py/);
   assert.match(buildBackend, /backend\/tests\/test_scripts\/test_download_node\.py/);
+  assert.match(
+    auditBackend,
+    /python -m pip_audit --strict --require-hashes -r backend\/requirements\.txt/,
+  );
 });
 
 test("uses Python 3.12 and full backend smoke on every build host", () => {
@@ -804,10 +818,13 @@ test("validates release metadata, production audits, and tests before building",
     install,
     /python -m pip install pytest==9\.1\.1 pytest-asyncio==1\.4\.0 pip-audit==2\.10\.1/,
   );
+  assert.match(install, /cargo install cargo-audit --locked --version 0\.22\.2/);
   assert.doesNotMatch(install, /backend\[(?:dev|mcp)/);
   assert.match(validate, /node scripts\/release-metadata\.mjs/);
   assert.match(validate, /node --test scripts\/\*\.test\.mjs/);
   assert.match(validate, /npm audit --omit=dev/);
+  assert.match(validate, /npm --prefix frontend audit --omit=dev/);
+  assert.match(validate, /npm --prefix desktop-tauri audit --omit=dev/);
   assert.match(validate, /node --test tests\/unit\/\*\.test\.ts/);
   assert.match(validate, /playwright install --with-deps chromium/);
   assert.match(validate, /npm run test:ui:core/);
@@ -815,6 +832,7 @@ test("validates release metadata, production audits, and tests before building",
   assert.match(backend, /pip-audit -r requirements\.txt/);
   assert.match(backend, /pytest -q/);
   assert.match(validate, /cargo metadata --locked --format-version 1/);
+  assert.match(validate, /cargo audit --file Cargo\.lock/);
   assert.match(validate, /cargo test --locked/);
   assert.match(validate, /cargo clippy --locked --all-targets -- -D warnings/);
 
@@ -833,7 +851,57 @@ test("validates release metadata, production audits, and tests before building",
   }
 });
 
-test("pins the packaged backend graph and excludes unreachable native SDKs", () => {
+test("publishes a dynamically validated cargo-audit category disclosure", () => {
+  const validate = job("validate-release");
+  const rust = step(validate, "Validate Rust desktop graph");
+  assert.match(rust, /cargo audit --file Cargo\.lock --json/);
+  assert.match(
+    rust,
+    /> \.\.\/\.\.\/release-validation\/cargo-audit-report\.json/,
+  );
+  assert.match(
+    rust,
+    /cargo-audit-summary\.mjs[\s\\]*generate[\s\\]*\.\.\/\.\.\/release-validation\/cargo-audit-report\.json[\s\\]*\.\.\/\.\.\/release-validation\/cargo-audit-summary\.json/,
+  );
+  assert.match(
+    rust,
+    /cargo-audit-summary\.mjs[\s\\]*verify \.\.\/\.\.\/release-validation\/cargo-audit-summary\.json/,
+  );
+  assert.match(
+    rust,
+    /cargo-audit-summary\.mjs[\s\\]*assert-clean \.\.\/\.\.\/release-validation\/cargo-audit-summary\.json/,
+  );
+  assert.match(rust, /AUDIT_STATUS=0/);
+  assert.match(rust, /if \(\( AUDIT_STATUS != 0 \)\)/);
+
+  const upload = step(validate, "Upload Rust audit summary");
+  assert.match(upload, /if:\s*always\(\)/);
+  assert.match(upload, /uses: actions\/upload-artifact@/);
+  assert.match(upload, /name:\s*cargo-audit-summary/);
+  assert.match(upload, /path:\s*release-validation\/cargo-audit-summary\.json/);
+  assert.match(upload, /if-no-files-found:\s*error/);
+  assert.match(upload, /retention-days:\s*1/);
+
+  const publish = job("publish");
+  assert.match(publish, /uses: actions\/download-artifact@/);
+  assert.match(publish, /path:\s*artifacts/);
+  const completeness = step(publish, "Verify artifact completeness");
+  assert.match(
+    completeness,
+    /require_one "Rust cargo-audit summary" artifacts\/cargo-audit-summary "cargo-audit-summary\.json"/,
+  );
+  const disclosure = step(publish, "Validate and render Rust audit disclosure");
+  assert.match(disclosure, /cargo-audit-summary\.mjs verify "\$SUMMARY"/);
+  assert.match(disclosure, /cargo-audit-summary\.mjs assert-clean "\$SUMMARY"/);
+  assert.match(
+    disclosure,
+    /cargo-audit-summary\.mjs markdown "\$SUMMARY" RUST-AUDIT\.md/,
+  );
+  assert.match(step(publish, "Record installer trust status"), /cat RUST-AUDIT\.md/);
+  assert.match(step(publish, "Prepare GitHub Release"), /draft:\s*true/);
+});
+
+test("pins the complete packaged backend graph including native providers", () => {
   for (const requirement of [
     "mcp==1.28.1",
     "croniter==6.2.4",
@@ -847,6 +915,10 @@ test("pins the packaged backend graph and excludes unreachable native SDKs", () 
     "lxml==6.1.1",
     "reportlab==4.4.5",
     "cryptography==48.0.1",
+    "anthropic==0.116.0",
+    "google-genai==2.11.0",
+    "keyring==25.7.0",
+    "click==8.4.2",
   ]) {
     assert.match(
       backendRequirements,
@@ -872,6 +944,10 @@ test("pins the packaged backend graph and excludes unreachable native SDKs", () 
     "reportlab>=4.4.0",
     "qrcode[pil]>=8.0",
     "websockets>=14.0",
+    "click>=8.3.3",
+    "anthropic==0.116.0",
+    "google-genai==2.11.0",
+    "keyring==25.7.0",
   ]) {
     assert.match(backendProject, new RegExp(`"${escapeRegExp(requirement)}"`));
   }
@@ -879,8 +955,36 @@ test("pins the packaged backend graph and excludes unreachable native SDKs", () 
     `${backendProject}\n${backendRequirements}`,
     /xhtml2pdf|python-bidi|svglib|pyHanko|pyhanko-certvalidator/i,
   );
-  assert.doesNotMatch(backendProject, /"(?:anthropic|google-genai)[^"\n]*"/);
+  assert.doesNotMatch(backendProject, /yakagent/i);
   assert.doesNotMatch(backendProject, /^mcp\s*=\s*\[/m);
+});
+
+test("final bundle proves native provider and sandbox entrypoints", () => {
+  for (const packageName of ["anthropic", "google.genai", "keyring"]) {
+    assert.match(backendSpec, new RegExp(`collect_all\\('${escapeRegExp(packageName)}'\\)`));
+  }
+  assert.match(backendSpec, /def production_package_only\(datas, hiddenimports\)/);
+  assert.match(backendSpec, /part in \{'tests', 'testing'\}/);
+  assert.match(backendSpec, /part\.startswith\('_test_'\)/);
+  for (const hiddenImport of [
+    "app.provider.anthropic_provider",
+    "app.provider.gemini_provider",
+    "app.tool.sandbox_self_test",
+    "app.tool.sandbox_worker",
+  ]) {
+    assert.match(backendSpec, new RegExp(`'${escapeRegExp(hiddenImport)}'`));
+  }
+  assert.match(backendEntrypoint, /--provider-self-test/);
+  assert.match(backendEntrypoint, /AsyncAnthropic/);
+  assert.match(backendEntrypoint, /genai\.Client/);
+  assert.match(bundleVerifier, /\["--provider-self-test"\]/);
+  assert.match(bundleVerifier, /\["--sandbox-self-test", workspace\]/);
+  assert.match(bundleVerifier, /platform === "win32" \|\| platform === "darwin"/);
+  assert.match(bundleVerifier, /report\.status !== "disabled" \|\| report\.platform !== platform/);
+  assert.match(bundleVerifier, /filesystem_isolated/);
+  assert.match(bundleVerifier, /network_isolated/);
+  assert.match(bundleVerifier, /environment_sanitized/);
+  assert.match(bundleVerifier, /descendant_terminated/);
 });
 
 test("verifies all seven installers before publishing checksums", () => {
@@ -1110,17 +1214,16 @@ test("retries only transient hdiutil Resource busy failures when creating the DM
   assert.ok(createIndex >= 0 && verifyIndex > createIndex);
 });
 
-test("CI runs the frontend unit suite", () => {
+test("CI gates production builds, audits, bundle smoke, and test suites", () => {
   assert.match(ciWorkflow, /node --test tests\/unit\/\*\.test\.ts/);
-  assert.match(ciWorkflow, /release-workflow\.test\.mjs/);
-  assert.match(ciWorkflow, /verify-macos-bundle\.test\.mjs/);
-  assert.match(ciWorkflow, /verify-node-runtime\.test\.mjs/);
-  assert.match(ciWorkflow, /workflow-security\.test\.mjs/);
-  assert.match(ciWorkflow, /bump-version\.test\.mjs/);
-  assert.match(ciWorkflow, /release-manifest\.test\.mjs/);
+  assert.match(ciWorkflow, /node --test scripts\/\*\.test\.mjs/);
   assert.match(ciWorkflow, /release-metadata\.mjs/);
-  assert.match(ciWorkflow, /verify-desktop-lifecycle\.test\.mjs/);
-  assert.match(ciWorkflow, /python -m pip install uv==0\.11\.28/);
+  assert.match(ciWorkflow, /pip-audit==2\.10\.1 uv==0\.11\.28/);
+  assert.match(ciWorkflow, /pip-audit -r requirements\.txt/);
+  assert.match(ciWorkflow, /npm audit --omit=dev/);
+  assert.match(ciWorkflow, /npm --prefix frontend audit --omit=dev/);
+  assert.match(ciWorkflow, /npm --prefix desktop-tauri audit --omit=dev/);
+  assert.match(ciWorkflow, /npm run build:frontend/);
   for (const target of [
     "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
@@ -1136,6 +1239,31 @@ test("CI runs the frontend unit suite", () => {
   );
   assert.match(ciWorkflow, /cargo test --locked/);
   assert.match(ciWorkflow, /cargo clippy --locked --all-targets -- -D warnings/);
+  assert.match(ciWorkflow, /cargo install cargo-audit --locked --version 0\.22\.2/);
+  assert.match(ciWorkflow, /cargo audit --file Cargo\.lock/);
+  assert.match(ciWorkflow, /cargo build --release --locked/);
+
+  const windowsAudit = ciJob("backend-windows-audit");
+  assert.match(windowsAudit, /runs-on:\s*windows-latest/);
+  assert.match(windowsAudit, /python-version:\s*"3\.12\.10"/);
+  assert.match(windowsAudit, /python -m pip install pip-audit==2\.10\.1/);
+  assert.match(
+    step(windowsAudit, "Audit Windows backend production dependency graph"),
+    /python -m pip_audit --strict --require-hashes -r backend\/requirements\.txt/,
+  );
+
+  const packaging = ciJob("packaging-smoke");
+  assert.match(packaging, /python -m PyInstaller suxiaoyou\.spec --noconfirm/);
+  assert.match(packaging, /node scripts\/verify-bundle\.mjs backend\/dist\/suxiaoyou-backend/);
+  assert.match(packaging, /bubblewrap/);
+  assert.match(packaging, /npm exec tauri build -- --config src-tauri\/build\.linux-x64\.json --bundles deb --no-sign/);
+  assert.match(packaging, /dpkg-deb -x/);
+  assert.match(packaging, /node scripts\/verify-node-runtime\.mjs/);
+  assert.match(packaging, /node scripts\/verify-bundle\.mjs "\$\(dirname/);
+  assert.match(packaging, /grep -Eq '\(\^\|, \)bubblewrap/);
+  assert.match(packaging, /sudo dpkg -i "\$DEB"/);
+  assert.match(packaging, /dpkg-query -W/);
+  assert.match(packaging, /sudo dpkg --purge "\$DEB_PACKAGE"/);
   assert.match(ciWorkflow, /playwright install --with-deps chromium/);
   assert.match(ciWorkflow, /npm run test:ui:core/);
 });

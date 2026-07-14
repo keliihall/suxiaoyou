@@ -16,7 +16,7 @@ concurrency:
 jobs:
   backend:
     name: Backend Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: backend
@@ -32,15 +32,18 @@ jobs:
           cache-dependency-path: backend/requirements.txt
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcairo2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap libcairo2-dev pkg-config
 
       - name: Install dependencies
         run: |
           python -m pip install --require-hashes -r requirements.txt
           python -m pip install -e . --no-deps
           python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0
-          python -m pip install uv==0.11.28
+          python -m pip install pip-audit==2.10.1 uv==0.11.28
           python -m pip check
+
+      - name: Audit backend production dependencies
+        run: pip-audit -r requirements.txt
 
       - name: Validate universal backend lock
         run: |
@@ -63,7 +66,27 @@ jobs:
           done
 
       - name: Run tests
-        run: pytest -x --tb=short -q --ignore=tests/test_tool/test_code_execute.py
+        run: pytest -x --tb=short -q
+
+  backend-windows-audit:
+    name: Backend Windows Dependency Audit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          # Match the CPython runtime used by the Windows release bundle so
+          # pip-audit evaluates the actual win32 environment markers.
+          python-version: "3.12.10"
+
+      - name: Install Python dependency auditor
+        run: python -m pip install pip-audit==2.10.1
+
+      - name: Audit Windows backend production dependency graph
+        run: python -m pip_audit --strict --require-hashes -r backend/requirements.txt
 
   frontend:
     name: Frontend Checks
@@ -80,27 +103,33 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
-      - name: Install dependencies
-        run: npm ci --legacy-peer-deps
+      - name: Install locked dependencies
+        working-directory: .
+        run: |
+          npm ci
+          npm --prefix frontend ci --legacy-peer-deps
+
+      - name: Audit JavaScript production dependencies
+        working-directory: .
+        run: |
+          npm audit --omit=dev
+          npm --prefix frontend audit --omit=dev
+          npm --prefix desktop-tauri audit --omit=dev
+
+      - name: Production frontend build
+        working-directory: .
+        run: npm run build:frontend
 
       - name: Sanitizer tests
         run: node --test ../scripts/sanitize-build-brand.test.mjs
 
       - name: Release workflow tests
         working-directory: .
-        run: |
-          node --test \
-            scripts/bump-version.test.mjs \
-            scripts/generate-checksums.test.mjs \
-            scripts/release-manifest.test.mjs \
-            scripts/release-metadata.test.mjs \
-            scripts/release-workflow.test.mjs \
-            scripts/verify-desktop-lifecycle.test.mjs \
-            scripts/verify-macos-bundle.test.mjs \
-            scripts/verify-node-runtime.test.mjs \
-            scripts/workflow-security.test.mjs
+        run: node --test scripts/*.test.mjs
 
       - name: Verify synchronized release metadata
         working-directory: .
@@ -148,11 +177,127 @@ jobs:
             ../../backend/dist/suxiaoyou-backend \
             ../../backend/resources/nodejs
 
+      - name: Install Rust dependency auditor
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit Rust production dependencies
+        run: cargo audit --file Cargo.lock
+
       - name: Run Rust tests
         run: cargo test --locked
 
       - name: Deny Clippy warnings
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Production Rust build
+        run: cargo build --release --locked
+
+  packaging-smoke:
+    name: Production Linux Installer Smoke
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+            desktop-tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-06-30
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install bundle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bubblewrap \
+            libcairo2-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            pkg-config \
+            curl \
+            xz-utils
+          npm ci
+          npm --prefix frontend ci --legacy-peer-deps
+          npm --prefix desktop-tauri ci
+          python -m pip install --require-hashes -r backend/requirements.txt
+          python -m pip install pyinstaller==6.21.0
+
+      - name: Build production frontend
+        run: npm run build:frontend
+
+      - name: Build production backend bundle
+        working-directory: backend
+        run: python -m PyInstaller suxiaoyou.spec --noconfirm
+
+      - name: Verify production backend bundle
+        run: node scripts/verify-bundle.mjs backend/dist/suxiaoyou-backend
+
+      - name: Download and verify packaged Node.js runtime
+        working-directory: backend
+        run: |
+          python scripts/download_node.py
+          node ../scripts/verify-node-runtime.mjs resources/nodejs
+
+      - name: Build production Linux installer
+        working-directory: desktop-tauri
+        run: npm exec tauri build -- --config src-tauri/build.linux-x64.json --bundles deb --no-sign
+
+      - name: Extract, install, and verify Linux package
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
+          [[ ${#debs[@]} -eq 1 ]] || {
+            printf '::error::Expected exactly one DEB installer, found %d\n' "${#debs[@]}"
+            exit 1
+          }
+          DEB="${debs[0]}"
+          DEB_PACKAGE="$(dpkg-deb -f "$DEB" Package)"
+          DEB_VERSION="$(dpkg-deb -f "$DEB" Version)"
+          DEB_DEPENDS="$(dpkg-deb -f "$DEB" Depends)"
+          VERSION="$(node -p "require('./package.json').version")"
+          [[ "$DEB_PACKAGE" == "suxiaoyou" && "$DEB_VERSION" == "$VERSION" ]]
+          grep -Eq '(^|, )bubblewrap([, (]|$)' <<< "$DEB_DEPENDS"
+          grep -Eq '(^|, )libxdo3([, (]|$)' <<< "$DEB_DEPENDS"
+
+          ROOT="$RUNNER_TEMP/suxiaoyou-pr-deb-root"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT"
+          dpkg-deb -x "$DEB" "$ROOT"
+          mapfile -t node_binaries < <(find -L "$ROOT" -type f -path '*/nodejs/bin/node')
+          mapfile -t backend_binaries < <(find -L "$ROOT" -type f -path '*/backend/suxiaoyou-backend')
+          [[ ${#node_binaries[@]} -eq 1 && ${#backend_binaries[@]} -eq 1 ]]
+          node scripts/verify-node-runtime.mjs "$(dirname "$(dirname "${node_binaries[0]}")")"
+          node scripts/verify-bundle.mjs "$(dirname "${backend_binaries[0]}")"
+
+          installed=0
+          cleanup() {
+            if (( installed )); then sudo dpkg --purge "$DEB_PACKAGE" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+          sudo dpkg -i "$DEB"
+          installed=1
+          dpkg-query -W -f='${Status} ${Version}\n' "$DEB_PACKAGE" | grep -F "install ok installed $VERSION"
+          sudo dpkg --purge "$DEB_PACKAGE"
+          installed=0
+          trap - EXIT
 
   playwright:
     name: Chromium UI Regression

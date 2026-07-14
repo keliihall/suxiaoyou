@@ -9,6 +9,7 @@ Wraps McpManager (composition) and adds:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -31,6 +32,11 @@ class ConnectorRegistry:
         self._mcp_manager: McpManager | None = None
         self._tool_registry: Any | None = None  # set via set_tool_registry()
         self._project_dir = project_dir
+        # Direct Google OAuth writes credentials outside McpTokenStore and then
+        # restarts the local MCP process.  Keep its callback/disconnect runtime
+        # transitions ordered on this registry instance so a stale callback
+        # cannot tear down a newer authorization.
+        self._google_auth_operation_lock = asyncio.Lock()
 
         # Persistence paths
         if project_dir:
@@ -257,6 +263,13 @@ class ConnectorRegistry:
 
     async def enable(self, id: str) -> bool:
         """Enable a connector and attempt to connect it."""
+        if id == "google-workspace":
+            async with self._google_auth_operation_lock:
+                self._inject_local_credentials()
+                return await self._enable_unlocked(id)
+        return await self._enable_unlocked(id)
+
+    async def _enable_unlocked(self, id: str) -> bool:
         connector = self._connectors.get(id)
         if not connector or connector.enabled:
             return False
@@ -280,6 +293,18 @@ class ConnectorRegistry:
 
     async def disable(self, id: str) -> bool:
         """Disable a connector and disconnect it."""
+        if id == "google-workspace":
+            from app.api.google_auth import fence_google_auth_disconnect
+
+            # Disabling must also cancel a direct OAuth callback already in
+            # flight; otherwise it could persist tokens and reconnect the
+            # runtime immediately after the user disabled the connector.
+            fence_google_auth_disconnect(self._project_dir)
+            async with self._google_auth_operation_lock:
+                return await self._disable_unlocked(id)
+        return await self._disable_unlocked(id)
+
+    async def _disable_unlocked(self, id: str) -> bool:
         connector = self._connectors.get(id)
         if not connector or not connector.enabled:
             return False
@@ -307,6 +332,11 @@ class ConnectorRegistry:
 
     async def connect(self, id: str, redirect_uri: str) -> dict[str, str] | None:
         """Start OAuth flow for a connector. Returns auth URL info or None."""
+        # Google Workspace uses /api/google/auth-start and a generation-fenced
+        # direct OAuth state machine. Never create a second generic MCP OAuth
+        # flow for the same local runtime.
+        if id == "google-workspace":
+            return None
         if not self._mcp_manager:
             return None
         return await self._mcp_manager.start_auth(id, redirect_uri)
@@ -322,6 +352,24 @@ class ConnectorRegistry:
 
     async def disconnect(self, id: str) -> bool:
         """Revoke OAuth tokens and disconnect."""
+        if id == "google-workspace":
+            from app.api.google_auth import (
+                delete_google_tokens,
+                fence_google_auth_disconnect,
+            )
+
+            # Fence before the first await. Callback commits for this workspace
+            # cannot pass their generation CAS while this operation waits.
+            fence_google_auth_disconnect(self._project_dir)
+            async with self._google_auth_operation_lock:
+                result = await self._disconnect_unlocked(id)
+                if result:
+                    delete_google_tokens(self._project_dir)
+                    self._inject_local_credentials()
+                return result
+        return await self._disconnect_unlocked(id)
+
+    async def _disconnect_unlocked(self, id: str) -> bool:
         if not self._mcp_manager:
             return False
         result = await self._mcp_manager.disconnect_auth(id)
@@ -330,11 +378,32 @@ class ConnectorRegistry:
 
     async def reconnect(self, id: str) -> bool:
         """Reconnect a specific connector."""
+        if id == "google-workspace":
+            async with self._google_auth_operation_lock:
+                self._inject_local_credentials()
+                return await self._reconnect_unlocked(id)
+        return await self._reconnect_unlocked(id)
+
+    async def _reconnect_unlocked(self, id: str) -> bool:
         if not self._mcp_manager:
             return False
         result = await self._mcp_manager.reconnect(id)
         self.sync_tools()
         return result
+
+    async def reconnect_google_runtime_locked(self) -> bool:
+        """Reconnect Google while its direct-OAuth operation lock is held."""
+
+        if not self._google_auth_operation_lock.locked():
+            raise RuntimeError("Google OAuth operation lock is not held")
+        return await self._reconnect_unlocked("google-workspace")
+
+    async def disconnect_google_runtime_locked(self) -> bool:
+        """Close Google runtime only; direct-token cleanup is caller-owned."""
+
+        if not self._google_auth_operation_lock.locked():
+            raise RuntimeError("Google OAuth operation lock is not held")
+        return await self._disconnect_unlocked("google-workspace")
 
     # ------------------------------------------------------------------
     # Tool registry integration
@@ -427,6 +496,12 @@ class ConnectorRegistry:
         """Access the underlying McpManager (for backward compatibility)."""
         return self._mcp_manager
 
+    @property
+    def google_auth_operation_lock(self) -> asyncio.Lock:
+        """Serialize direct Google OAuth runtime transitions."""
+
+        return self._google_auth_operation_lock
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -463,6 +538,8 @@ class ConnectorRegistry:
 
         if tokens and tokens.get("refresh_token"):
             env["GOOGLE_WORKSPACE_REFRESH_TOKEN"] = tokens["refresh_token"]
+        else:
+            env.pop("GOOGLE_WORKSPACE_REFRESH_TOKEN", None)
 
     def _find_by_url(self, url: str) -> ConnectorInfo | None:
         """Find a connector by URL (for dedup)."""

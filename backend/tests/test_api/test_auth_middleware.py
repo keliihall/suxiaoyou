@@ -216,10 +216,8 @@ class TestDenyByDefault:
         assert r.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_mobile_shell_public(self):
-        """Mobile PWA HTML shells are public so an unauthenticated
-        browser can bootstrap the app; the JS inside then authenticates
-        via the remote tunnel token before calling /api/*."""
+    async def test_mobile_shell_requires_auth_while_remote_is_unreleased(self):
+        """The dormant mobile shell must not provide a public tunnel surface."""
         app = _make_app(_settings())
 
         @app.get("/m")
@@ -232,9 +230,9 @@ class TestDenyByDefault:
 
         async with await _client(app) as c:
             r = await c.get("/m")
-            assert r.status_code == 200
+            assert r.status_code == 401
             r = await c.get("/m/settings")
-            assert r.status_code == 200
+            assert r.status_code == 401
 
 
 class TestMandatoryAuth:
@@ -266,9 +264,23 @@ class TestMandatoryAuth:
         """EventSource cannot set headers; we accept ?token= as a fallback
         for SSE streams only."""
         app = _make_app(_settings())
+
+        @app.get("/api/chat/stream/test-stream")
+        async def stream():
+            return {"ok": True}
+
+        async with await _client(app) as c:
+            r = await c.get(
+                f"/api/chat/stream/test-stream?token={_SESSION_TOKEN}"
+            )
+        assert r.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_query_token_is_rejected_outside_eventsource_route(self):
+        app = _make_app(_settings())
         async with await _client(app) as c:
             r = await c.get(f"/api/ping?token={_SESSION_TOKEN}")
-        assert r.status_code == 200
+        assert r.status_code == 401
 
     @pytest.mark.asyncio
     async def test_api_rejects_wrong_token(self):
@@ -316,13 +328,10 @@ class TestShutdownProtected:
 
 
 class TestRemoteToken:
-    """When remote-access mode is on, the persisted remote token is a
-    second accepted credential (in addition to the per-run session
-    token). Rotating the remote token does not invalidate the Tauri
-    shell's session token and vice versa."""
+    """The code-owned RC gate overrides stale remote configuration."""
 
     @pytest.mark.asyncio
-    async def test_remote_token_accepted(self, tmp_path: Path):
+    async def test_remote_token_rejected_even_if_stale_setting_is_enabled(self, tmp_path: Path):
         token_path = tmp_path / "remote_token.json"
         token_path.write_text(json.dumps({"token": _REMOTE_TOKEN}))
         app = _make_app(
@@ -336,8 +345,7 @@ class TestRemoteToken:
                 "/api/ping",
                 headers={"authorization": f"Bearer {_REMOTE_TOKEN}"},
             )
-        assert r.status_code == 200
-        assert r.json()["source"] == "remote"
+        assert r.status_code == 401
 
     @pytest.mark.asyncio
     async def test_session_token_remains_local_on_loopback_with_remote_enabled(
@@ -396,4 +404,3 @@ class TestFailClosed:
                 headers={"authorization": f"Bearer {_SESSION_TOKEN}"},
             )
         assert r.status_code == 503
-

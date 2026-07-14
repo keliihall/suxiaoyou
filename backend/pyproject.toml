@@ -1,6 +1,6 @@
 [project]
 name = "suxiaoyou"
-version = "0.8.3"
+version = "0.9.0"
 description = "Your local AI assistant — private, powerful, personal"
 license = "Apache-2.0"
 requires-python = ">=3.12"
@@ -11,6 +11,8 @@ dependencies = [
     "sse-starlette>=2.2.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
+    # Security floor for Uvicorn's command-line dependency (PYSEC-2026-2132).
+    "click>=8.3.3",
 
     # Database
     "sqlalchemy[asyncio]>=2.0.36",
@@ -19,6 +21,10 @@ dependencies = [
 
     # LLM client
     "openai>=1.60.0",
+    # Native provider adapters are version-pinned because their streaming
+    # event schemas are part of the desktop provider contract.
+    "anthropic==0.116.0",
+    "google-genai==2.11.0",
     "httpx>=0.28.0",
     "websockets>=14.0",
 
@@ -26,6 +32,8 @@ dependencies = [
     "python-ulid>=3.0.0",
     "tiktoken>=0.8.0",
     "aiofiles>=24.1.0",
+    # OS-native credential vaults (Keychain, Credential Manager, Secret Service).
+    "keyring==25.7.0",
     "qrcode[pil]>=8.0",
     "pyyaml>=6.0",
     "mcp==1.28.1",
@@ -56,10 +64,6 @@ dependencies = [
 
 [project.optional-dependencies]
 local = ["litellm>=1.55.0"]
-# Legacy native Anthropic/Gemini adapters are available only when developing
-# against yakAgent. They are not reachable from the packaged provider catalog
-# and are intentionally absent from the desktop release dependency graph.
-yakagent = ["yakagent>=0.1.0"]
 office = [
     "pdfplumber>=0.11.0",
 ]

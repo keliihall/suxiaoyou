@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from app.api.config import _remove_env_key, _update_env_file
+from app.api.config import persist_env_transaction, restore_registry_provider
 from app.dependencies import ProviderRegistryDep, SettingsDep, get_provider_registry, get_settings
 from app.provider.openai_oauth import (
     exchange_code,
@@ -171,23 +171,7 @@ async def _complete_oauth_flow_internal(code: str, state: str) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to extract account ID: {e}")
 
     email = extract_email(id_token) if id_token else ""
-
-    # Persist tokens to .env
-    _update_env_file("SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN", access_token)
-    _update_env_file("SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN", refresh_token)
-    _update_env_file("SUXIAOYOU_OPENAI_OAUTH_ACCOUNT_ID", account_id)
-    _update_env_file("SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT", str(expires_at_ms))
-    _update_env_file("SUXIAOYOU_OPENAI_OAUTH_EMAIL", email)
-
-    # Update runtime settings
     settings = get_settings()
-    settings.openai_oauth_access_token = access_token
-    settings.openai_oauth_refresh_token = refresh_token
-    settings.openai_oauth_account_id = account_id
-    settings.openai_oauth_expires_at = expires_at_ms
-    settings.openai_oauth_email = email
-
-    # Register provider
     registry = get_provider_registry()
     provider = OpenAISubscriptionProvider(
         access_token=access_token,
@@ -196,7 +180,44 @@ async def _complete_oauth_flow_internal(code: str, state: str) -> str:
         expires_at_ms=expires_at_ms,
         settings=settings,
     )
-    registry.register(provider)
+    next_runtime = {
+        "openai_oauth_access_token": access_token,
+        "openai_oauth_refresh_token": refresh_token,
+        "openai_oauth_account_id": account_id,
+        "openai_oauth_expires_at": expires_at_ms,
+        "openai_oauth_email": email,
+    }
+    previous_runtime = {
+        field: getattr(settings, field)
+        for field in next_runtime
+    }
+    previous_provider = registry.get_provider(PROVIDER_ID)
+
+    def commit_runtime() -> None:
+        if isinstance(previous_provider, OpenAISubscriptionProvider):
+            previous_provider.invalidate_pending_refreshes()
+        for field, value in next_runtime.items():
+            setattr(settings, field, value)
+        registry.register(provider)
+
+    def rollback_runtime() -> None:
+        for field, value in previous_runtime.items():
+            setattr(settings, field, value)
+        restore_registry_provider(registry, PROVIDER_ID, previous_provider)
+        if isinstance(previous_provider, OpenAISubscriptionProvider):
+            previous_provider.resume_refreshes_after_failed_change()
+
+    persist_env_transaction(
+        {
+            "SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN": access_token,
+            "SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN": refresh_token,
+            "SUXIAOYOU_OPENAI_OAUTH_ACCOUNT_ID": account_id,
+            "SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT": str(expires_at_ms),
+            "SUXIAOYOU_OPENAI_OAUTH_EMAIL": email,
+        },
+        commit_runtime,
+        rollback_runtime,
+    )
 
     # Refresh model index
     try:
@@ -331,22 +352,44 @@ async def manual_openai_callback(request: Request, body: ManualCallbackRequest):
 @router.delete("/config/openai-subscription", response_model=OpenAISubscriptionStatus)
 async def disconnect_openai_subscription(settings: SettingsDep, registry: ProviderRegistryDep) -> OpenAISubscriptionStatus:
     """Disconnect the OpenAI subscription and remove tokens."""
-    # Clear runtime settings
-    settings.openai_oauth_access_token = ""
-    settings.openai_oauth_refresh_token = ""
-    settings.openai_oauth_account_id = ""
-    settings.openai_oauth_expires_at = 0
-    settings.openai_oauth_email = ""
+    cleared_runtime = {
+        "openai_oauth_access_token": "",
+        "openai_oauth_refresh_token": "",
+        "openai_oauth_account_id": "",
+        "openai_oauth_expires_at": 0,
+        "openai_oauth_email": "",
+    }
+    previous_runtime = {
+        field: getattr(settings, field)
+        for field in cleared_runtime
+    }
+    previous_provider = registry.get_provider(PROVIDER_ID)
 
-    # Remove from .env
-    _remove_env_key("SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN")
-    _remove_env_key("SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN")
-    _remove_env_key("SUXIAOYOU_OPENAI_OAUTH_ACCOUNT_ID")
-    _remove_env_key("SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT")
-    _remove_env_key("SUXIAOYOU_OPENAI_OAUTH_EMAIL")
+    def commit_runtime() -> None:
+        if isinstance(previous_provider, OpenAISubscriptionProvider):
+            previous_provider.invalidate_pending_refreshes()
+        for field, value in cleared_runtime.items():
+            setattr(settings, field, value)
+        registry.unregister(PROVIDER_ID)
 
-    # Unregister provider
-    registry.unregister(PROVIDER_ID)
+    def rollback_runtime() -> None:
+        for field, value in previous_runtime.items():
+            setattr(settings, field, value)
+        restore_registry_provider(registry, PROVIDER_ID, previous_provider)
+        if isinstance(previous_provider, OpenAISubscriptionProvider):
+            previous_provider.resume_refreshes_after_failed_change()
+
+    persist_env_transaction(
+        {
+            "SUXIAOYOU_OPENAI_OAUTH_ACCESS_TOKEN": None,
+            "SUXIAOYOU_OPENAI_OAUTH_REFRESH_TOKEN": None,
+            "SUXIAOYOU_OPENAI_OAUTH_ACCOUNT_ID": None,
+            "SUXIAOYOU_OPENAI_OAUTH_EXPIRES_AT": None,
+            "SUXIAOYOU_OPENAI_OAUTH_EMAIL": None,
+        },
+        commit_runtime,
+        rollback_runtime,
+    )
 
     return OpenAISubscriptionStatus(is_connected=False)
 

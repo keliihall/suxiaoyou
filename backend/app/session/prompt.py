@@ -25,6 +25,7 @@ from app.agent.permission import (
     merge_rulesets,
     parse_session_permissions,
     presets_to_ruleset,
+    serialize_permission_snapshot,
 )
 from app.models.message import Message, Part
 from app.provider.registry import ProviderRegistry
@@ -63,11 +64,41 @@ from app.streaming.events import (
 )
 from app.streaming.manager import GenerationJob
 from app.tool.registry import ToolRegistry
+from app.tool.workspace import validate_agent_workspace_root
 from app.config import get_settings
 
 if TYPE_CHECKING:
-    from app.schemas.agent import AgentInfo
+    from app.schemas.agent import AgentInfo, Ruleset
     from app.session.processor import SessionProcessor
+
+
+def _merge_prompt_permission_layers(
+    agent_permissions: "Ruleset",
+    preset_permissions: "Ruleset",
+    request_permissions: "Ruleset",
+    session_permissions: "Ruleset",
+    *,
+    request_is_authoritative: bool,
+) -> "Ruleset":
+    """Merge permissions while preserving a headless parent's hard ceiling."""
+
+    if request_is_authoritative:
+        # The request contains the parent's complete effective rule snapshot.
+        # Excluding historical child-session rules prevents a previously
+        # remembered allow from widening a resumed non-interactive child.
+        return merge_rulesets(
+            GLOBAL_DEFAULTS,
+            agent_permissions,
+            preset_permissions,
+            request_permissions,
+        )
+    return merge_rulesets(
+        GLOBAL_DEFAULTS,
+        agent_permissions,
+        preset_permissions,
+        request_permissions,
+        session_permissions,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +116,49 @@ def _uses_managed_workspace(
     return existing_directory == "." or (
         existing_directory is None and not requested_workspace
     )
+
+
+async def _preflight_workspace_boundary(
+    session_factory: async_sessionmaker[AsyncSession],
+    session_id: str,
+    requested_workspace: str | None,
+) -> tuple[Any | None, Path | None, str | None]:
+    """Validate persisted/request workspaces and resolve one child exception."""
+
+    async with session_factory() as db:
+        session = await get_session(db, session_id)
+        parent = (
+            await get_session(db, session.parent_id)
+            if session is not None and session.parent_id
+            else None
+        )
+
+    inherited_managed: Path | None = None
+    if (
+        session is not None
+        and parent is not None
+        and parent.directory == "."
+        and session.directory
+        and session.directory != "."
+    ):
+        expected = managed_workspace_for_session(parent.id, create=False)
+        if Path(session.directory).expanduser().resolve() == expected.resolve():
+            inherited_managed = expected.resolve()
+
+    canonical_request = requested_workspace
+    if requested_workspace:
+        canonical_request = str(
+            validate_agent_workspace_root(
+                requested_workspace,
+                allowed_managed_workspace=inherited_managed,
+            )
+        )
+    if session is not None and session.directory and session.directory != ".":
+        validate_agent_workspace_root(
+            session.directory,
+            allowed_managed_workspace=inherited_managed,
+        )
+    return session, inherited_managed, canonical_request
 
 
 def _cfg():
@@ -131,6 +205,7 @@ class SessionPrompt:
         self.directory: str | None = None
         self.workspace: str | None = None
         self.managed_workspace: Path | None = None
+        self.inherited_managed_workspace: Path | None = None
         self.fts_status: dict[str, Any] | None = None
         self.workspace_memory_section: str | None = None
         self.system_prompt_parts: SystemPromptParts | None = None
@@ -216,6 +291,18 @@ class SessionPrompt:
     async def _setup(self) -> None:
         """Resolve agent/model, create session, build system prompt, merge permissions."""
 
+        # Workspace admission is a generation boundary, not merely a sandbox
+        # check. Reject broad/private roots before provider refresh, attachment
+        # handling, indexing, memory, or any file tool can observe them.
+        (
+            _preflight_session,
+            self.inherited_managed_workspace,
+            self.request.workspace,
+        ) = await _preflight_workspace_boundary(
+            self.session_factory,
+            self.job.session_id,
+            self.request.workspace,
+        )
         # --- 1. Resolve agent ---
         self.agent = self.agent_registry.get(self.request.agent) or self.agent_registry.default_agent()
 
@@ -373,6 +460,16 @@ class SessionPrompt:
         if self.managed_workspace is not None:
             self.workspace = str(self.managed_workspace)
 
+        if self.workspace and self.workspace != ".":
+            self.workspace = str(
+                validate_agent_workspace_root(
+                    self.workspace,
+                    allowed_managed_workspace=(
+                        self.managed_workspace or self.inherited_managed_workspace
+                    ),
+                )
+            )
+
         if self.index_manager is not None and self.workspace:
             try:
                 await self.index_manager.ensure_index(self.workspace, self.job.session_id)
@@ -416,16 +513,22 @@ class SessionPrompt:
         # Persisted browser choices arrive as request permissions. Do not read
         # historical Session.permission here; Settings must be the visible source
         # of truth for remembered approvals and denials.
-        self.session_permissions = parse_session_permissions(self.session_permission_data)
+        session_permission_data = (
+            None
+            if self.request._permission_rules_authoritative
+            else self.session_permission_data
+        )
+        self.session_permissions = parse_session_permissions(session_permission_data)
         self.preset_permissions = presets_to_ruleset(self.request.permission_presets)
         self.request_permissions = parse_session_permissions(self.request.permission_rules)
-        self.merged_permissions = merge_rulesets(
-            GLOBAL_DEFAULTS,
+        self.merged_permissions = _merge_prompt_permission_layers(
             self.agent.permissions,
             self.preset_permissions,
             self.request_permissions,
             self.session_permissions,
+            request_is_authoritative=self.request._permission_rules_authoritative,
         )
+        await self._persist_effective_permission_snapshot()
 
         # --- Reconstruct artifact cache from message history ---
         # Allows update/rewrite operations to work across generations.
@@ -988,6 +1091,10 @@ class SessionPrompt:
         from app.session.processor import _delete_empty_assistant_messages
 
         await _delete_empty_assistant_messages(self.session_factory, self.job.session_id)
+        # Agent switches and remembered decisions may have changed the merged
+        # rules since setup.  Keep the parent's durable delegation ceiling in
+        # sync with the rules that actually governed the completed turn.
+        await self._persist_effective_permission_snapshot()
 
         # Persist accumulated cost and tokens on the last assistant message
         if self.assistant_msg_id and (
@@ -1077,14 +1184,24 @@ class SessionPrompt:
 
         Called by SessionProcessor when the plan tool switches agents.
         """
-        self.merged_permissions = merge_rulesets(
-            GLOBAL_DEFAULTS,
+        self.merged_permissions = _merge_prompt_permission_layers(
             self.agent.permissions,
             self.preset_permissions,
             self.request_permissions,
             self.session_permissions,
+            request_is_authoritative=self.request._permission_rules_authoritative,
         )
         self.system_prompt_parts = self._build_system_prompt_parts()
+
+    async def _persist_effective_permission_snapshot(self) -> None:
+        """Persist the server-computed rules used as a child-task ceiling."""
+
+        snapshot = serialize_permission_snapshot(self.merged_permissions)
+        async with self.session_factory() as db:
+            async with db.begin():
+                session = await get_session(db, self.job.session_id)
+                if session is not None:
+                    session.permission_snapshot = snapshot
 
     # ------------------------------------------------------------------
     # Internal: gather impure inputs and call the pure assemble().

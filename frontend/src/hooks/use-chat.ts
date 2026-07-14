@@ -366,11 +366,24 @@ export function useChat(currentSessionId?: string) {
       chatState.beginSending(targetSessionId, optimisticText);
 
       try {
+        const presets = settingsState.permissionPresets;
+        const permissionPresets = {
+          file_changes: presets.fileChanges,
+          run_commands: presets.runCommands,
+        };
+        const hasActivePresets = Object.values(permissionPresets).some(Boolean);
+        const permissionRules = settingsState.savedPermissions.map((rule) => ({
+          action: rule.allow ? "allow" as const : "deny" as const,
+          permission: rule.tool,
+          pattern: "*",
+        }));
         const res = await api.post<PromptResponse>(API.CHAT.TASK_BATCH, {
           session_id: currentSessionId ?? null,
           mode: batch.mode,
           tasks,
           workspace: settingsState.workspaceDirectory,
+          permission_presets: hasActivePresets ? permissionPresets : null,
+          permission_rules: permissionRules.length > 0 ? permissionRules : null,
         });
 
         chatState.startGeneration(res.session_id, res.stream_id);

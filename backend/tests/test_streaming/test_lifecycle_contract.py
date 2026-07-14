@@ -195,6 +195,27 @@ class TestGenerationLifecycleContract:
 
 class TestChatStreamEndpointContract:
     @pytest.mark.asyncio
+    async def test_subscribing_cannot_promote_a_headless_job(self) -> None:
+        from starlette.requests import Request
+
+        from app.api.chat import stream_events
+
+        sm = StreamManager()
+        job = sm.create_job("automation-stream", "automation-session")
+        assert job.interactive is False
+
+        response = await stream_events(
+            Request({"type": "http", "headers": []}),
+            sm,
+            job.stream_id,
+        )
+        iterator = response.body_iterator
+        await anext(iterator)
+        await iterator.aclose()
+
+        assert job.interactive is False
+
+    @pytest.mark.asyncio
     async def test_closed_active_stream_unsubscribes_on_every_reconnect(self) -> None:
         from starlette.requests import Request
 

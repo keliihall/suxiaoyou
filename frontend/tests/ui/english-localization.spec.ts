@@ -48,8 +48,17 @@ test.describe("English localization guard", () => {
     await expect(page.getByRole("heading", { name: "Welcome to suyo" })).toBeVisible();
     await expectNoVisibleCjk(page, "English onboarding");
 
+    const startButton = page.getByRole("button", { name: "Start now" });
+    await expect(startButton).toBeDisabled();
+    await page.getByRole("button", { name: "Select workspace folder" }).click();
+    await expect(
+      page.getByRole("button", { name: "/Users/alex/suxiaoyou-demo" }),
+    ).toBeVisible();
+    await expect(startButton).toBeEnabled();
     await page.getByRole("button", { name: "Start now" }).click();
-    await expect(page.getByRole("heading", { name: /What should suyo help you do\?/i })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What should we do in suxiaoyou-demo?" }),
+    ).toBeVisible();
     await expectNoVisibleCjk(page, "English landing page");
 
     await page.getByRole("link", { name: "Settings", exact: true }).click();
@@ -60,7 +69,7 @@ test.describe("English localization guard", () => {
     await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
     await expect(page.getByRole("button", { name: "English" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Chinese" })).toBeVisible();
-    await expect(page.getByText(/suyo v0\.8\.3/)).toBeVisible();
+    await expect(page.getByText(/suyo v0\.9\.0/)).toBeVisible();
     await expectNoVisibleCjk(page, "English general settings");
 
     await page.getByRole("button", { name: "Chinese", exact: true }).click();

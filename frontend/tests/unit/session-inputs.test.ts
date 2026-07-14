@@ -120,3 +120,15 @@ test("running-task messages default to queue and can be edited, steered, or reor
   assert.match(form, /const canRestore = canCancel/);
   assert.match(hook, /api\.patch<SessionInputResponse>/);
 });
+
+test("explicit task batches pass the current permission snapshot to every child", () => {
+  const hook = readFileSync("src/hooks/use-chat.ts", "utf8");
+  const start = hook.indexOf("const sendTaskBatch = useCallback");
+  const end = hook.indexOf("const queueMessage = useCallback", start);
+  assert.ok(start >= 0 && end > start);
+  const batch = hook.slice(start, end);
+
+  assert.match(batch, /permission_presets: hasActivePresets \? permissionPresets : null/);
+  assert.match(batch, /permission_rules: permissionRules\.length > 0 \? permissionRules : null/);
+  assert.match(batch, /workspace: settingsState\.workspaceDirectory/);
+});

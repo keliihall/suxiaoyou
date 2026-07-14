@@ -1037,7 +1037,35 @@ class SessionProcessor:
             )
             return
 
-        if action == "ask" and job.interactive:
+        if action == "ask":
+            if not job.interactive:
+                error = (
+                    f"Permission approval required for {tool.id}; "
+                    "non-interactive tasks cannot grant permissions"
+                )
+                # Headless callers must observe an explicit terminal failure,
+                # not a successful task whose requested tool was silently
+                # auto-approved or skipped.
+                job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": error}))
+                job.publish(SSEEvent(AGENT_ERROR, {
+                    "error_type": "permission_required",
+                    "error_message": error,
+                    "tool": tool.id,
+                    "call_id": ci,
+                }))
+                self._exec_blocked = True
+                self.finish_reason = "error"
+                await _persist_tool_error(
+                    session_factory,
+                    self._assistant_msg_id,
+                    job.session_id,
+                    tool.id,
+                    ci,
+                    ta,
+                    error,
+                )
+                return
+
             decision = await _ask_permission(
                 job,
                 call_id=ci,
@@ -1088,6 +1116,10 @@ class SessionProcessor:
             index_manager=getattr(sp, "index_manager", None),
             messages=self._llm_messages,
             discovered_tools=sp.discovered_tools,
+            permission_rules=tuple(
+                rule.model_dump(mode="json")
+                for rule in sp.merged_permissions.rules
+            ),
             _publish_fn=lambda et, d: job.publish(SSEEvent(et, d)),
         )
         ctx._app_state = {  # type: ignore[attr-defined]
@@ -1397,11 +1429,11 @@ class SessionProcessor:
             if not self._tool_calls_in_step:
                 self._has_tool_calls = False
 
-        if not (self._has_tool_calls and self._streaming_executor.has_submissions):
-            return None
-
         if self._exec_blocked:
             return "stop"
+
+        if not (self._has_tool_calls and self._streaming_executor.has_submissions):
+            return None
 
         # === Collect results — concurrent tools already running, exclusive run now ===
         exec_results = await self._streaming_executor.collect()
