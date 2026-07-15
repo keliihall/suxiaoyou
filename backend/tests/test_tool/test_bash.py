@@ -405,7 +405,6 @@ async def test_native_desktop_bash_execution_is_available(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_bash_rejects_symlinked_scratch_before_external_write(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     external = tmp_path / "external"
@@ -415,8 +414,6 @@ async def test_bash_rejects_symlinked_scratch_before_external_write(
         external,
         target_is_directory=True,
     )
-    monkeypatch.setattr("app.tool.sandbox.sys.platform", "linux")
-
     result = await BashTool().execute(
         {"command": "echo must-not-run"},
         _make_ctx(workspace),

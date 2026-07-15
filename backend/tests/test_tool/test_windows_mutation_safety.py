@@ -411,7 +411,9 @@ def test_windows_production_file_version_restore_round_trip(
     assert recovery is not None
     assert restored_target == target
     assert target.read_text(encoding="utf-8") == "before"
-    assert sorted(path.name for path in workspace.iterdir()) == ["target.txt"]
+    sidecars = list(workspace.glob(f".{target.name}.*.rollback-backup"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_text(encoding="utf-8") == "after"
 
 
 @WINDOWS_ONLY

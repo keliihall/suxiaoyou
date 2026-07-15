@@ -48,8 +48,9 @@ still hold an open file descriptor and write to that old inode after the atomic
 exchange; unlinking the hidden name would make those later bytes unreachable.
 suyo therefore keeps such objects as explicit recovery sidecars next to the
 target, normally named `.filename.suyo-tx-*` for command transactions or
-`.filename.<id>.rollback.tmp` for guarded version restores. Successful command
-results expose their absolute paths in both `recovery_sidecars` and
+`.filename.<id>.rollback.tmp` (`.rollback-backup` on Windows) for guarded
+version restores. Successful command results expose their absolute paths in
+both `recovery_sidecars` and
 `recovery_files` metadata, conflicts include the paths in the error, and crash
 recovery logs every sidecar it finds. A prepared journal cannot reliably prove
 that a temporary was never published, so startup preserves it conservatively.

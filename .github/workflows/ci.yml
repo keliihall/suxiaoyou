@@ -119,9 +119,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
-          python-version: "3.12.13"
+          version: "0.11.28"
+          enable-cache: false
+
+      - name: Install portable macOS Python 3.12.13
+        run: |
+          set -euo pipefail
+          PYTHON_ENV="$RUNNER_TEMP/suxiaoyou-python"
+          uv venv --python 3.12.13 --managed-python --seed "$PYTHON_ENV"
+          [[ "$("$PYTHON_ENV/bin/python" -c 'import platform; print(platform.machine())')" == "arm64" ]]
+          [[ "$("$PYTHON_ENV/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')" == "3.12.13" ]]
+          echo "$PYTHON_ENV/bin" >> "$GITHUB_PATH"
 
       - name: Install backend test dependencies
         run: |

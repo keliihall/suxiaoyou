@@ -885,6 +885,20 @@ test("uses Python 3.12 and full backend smoke on every build host", () => {
   assert.doesNotMatch(mac, /VERIFY_BUNDLE_SKIP_SMOKE/);
 });
 
+test("CI uses the portable arm64 Python path for macOS execution safety", () => {
+  const mac = ciJob("backend-macos-execution");
+
+  assert.match(mac, /runs-on:\s*macos-14/);
+  assert.match(
+    mac,
+    /astral-sh\/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990/,
+  );
+  assert.match(mac, /version:\s*"0\.11\.28"/);
+  assert.match(mac, /uv venv --python 3\.12\.13 --managed-python --seed/);
+  assert.match(mac, /platform\.machine\(\)/);
+  assert.doesNotMatch(mac, /actions\/setup-python/);
+});
+
 test("runs the frozen Office create-edit-reopen contract on every native target", () => {
   const nativeSteps = [
     ["build-windows", "Verify backend bundle", /VERIFY_BUNDLE_OFFICE_PLATFORM:\s*windows-x64/],

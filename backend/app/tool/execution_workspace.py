@@ -126,7 +126,9 @@ class ExecutionWorkspace:
                 or bool(getattr(os.path, "isjunction", lambda _value: False)(path))
                 or not path.is_dir()
             ):
-                raise SandboxUnavailable("Sandbox scratch path is redirected")
+                raise SandboxUnavailable(
+                    "Sandbox scratch path contains a symlink, junction, or non-directory"
+                )
             path.mkdir(mode=0o700, exist_ok=True)
         scratch = sandbox_root / f"{_safe_prefix(prefix)}{secrets.token_hex(12)}"
         scratch.mkdir(mode=0o700)
@@ -194,7 +196,15 @@ class ExecutionWorkspace:
                 str(self._transaction_root_for_redaction),
                 "<private-execution-transaction>",
             )
-        redacted = _STALE_TRANSACTION_PATH_RE.sub(str(self.workspace), redacted)
+        # ``re.sub`` parses backslashes in a string replacement.  A native
+        # Windows workspace such as ``C:\\Users\\...`` would therefore treat
+        # ``\\U`` as an invalid replacement escape while redacting stale
+        # transaction paths.  A callable replacement is inserted literally on
+        # every platform.
+        redacted = _STALE_TRANSACTION_PATH_RE.sub(
+            lambda _match: str(self.workspace),
+            redacted,
+        )
         redacted = _STALE_SCRATCH_PATH_RE.sub(
             "<temporary-execution-directory>",
             redacted,

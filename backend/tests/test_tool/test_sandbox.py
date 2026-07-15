@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -201,7 +202,16 @@ def test_macos_policy_uses_seatbelt_and_private_stage(
     allow_network: bool,
 ) -> None:
     workspace = tmp_path / "logical workspace"
-    staged = tmp_path / 'private ) " (allow default)' / "stage"
+    # A quote is the strongest Seatbelt source-injection probe, but Windows
+    # cannot create a filename containing one.  Keep the policy-construction
+    # test portable there with a parenthesis-based probe; macOS and Linux still
+    # exercise the quote case.
+    hostile_component = (
+        "private ) (allow default)"
+        if os.name == "nt"
+        else 'private ) " (allow default)'
+    )
+    staged = tmp_path / hostile_component / "stage"
     cwd = workspace / "suxiaoyou_written"
     staged_cwd = staged / "suxiaoyou_written"
     scratch = staged / ".suxiaoyou" / "sandbox" / "call"
@@ -299,6 +309,10 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     assert '(literal (param "LITERAL_READ_0"))' in profile
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX descriptor-relative scratch primitive is not used on Windows",
+)
 def test_scratch_creation_rejects_preexisting_symlink_without_external_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -319,6 +333,10 @@ def test_scratch_creation_rejects_preexisting_symlink_without_external_write(
     assert list(external.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX descriptor-relative scratch primitive is not used on Windows",
+)
 def test_scratch_creation_stays_inside_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

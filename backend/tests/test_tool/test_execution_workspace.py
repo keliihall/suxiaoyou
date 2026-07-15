@@ -71,6 +71,28 @@ def test_windows_direct_workspace_ignores_dependency_and_private_trees(
     assert execution.success_metadata(None)["written_files"] == [str(result)]
 
 
+def test_windows_direct_scratch_rejects_redirected_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    (workspace / ".suxiaoyou").mkdir(parents=True)
+    external.mkdir()
+    (workspace / ".suxiaoyou" / "sandbox").symlink_to(
+        external,
+        target_is_directory=True,
+    )
+    monkeypatch.setattr("app.tool.execution_workspace.sys.platform", "win32")
+    execution = ExecutionWorkspace(workspace, _context(workspace), operation="bash")
+    execution.prepare()
+
+    with pytest.raises(SandboxUnavailable, match="symlink"):
+        execution.create_scratch(prefix="probe-")
+
+    assert list(external.iterdir()) == []
+
+
 def test_persistent_environment_is_stable_per_session_and_isolated_between_sessions(
     tmp_path: Path,
     monkeypatch,
@@ -143,3 +165,21 @@ def test_output_redaction_maps_stage_and_hides_call_scratch(
     assert str(scratch) not in output
     assert "<temporary-execution-directory>/home" in output
     execution.abort()
+
+
+def test_output_redaction_inserts_windows_workspace_path_literally(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    execution = ExecutionWorkspace(workspace, _context(workspace), operation="bash")
+    windows_workspace = Path(r"C:\Users\runneradmin\selected workspace")
+    execution.workspace = windows_workspace
+    stale_workspace = (
+        r"C:\Users\runneradmin\AppData\Local\suxiaoyou\execution-transactions"
+        r"\workspace-key\tx-candidate\workspace"
+    )
+
+    output = execution.redact_output(f"cwd={stale_workspace}\\result.txt")
+
+    assert output == f"cwd={windows_workspace}\\result.txt"

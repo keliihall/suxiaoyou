@@ -51,6 +51,25 @@ def _make_png(path: Path) -> None:
     Image.new("RGB", (16, 12), color=(20, 80, 160)).save(path, format="PNG")
 
 
+def test_flush_file_opens_office_output_for_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "office-output.tmp"
+    output.write_bytes(b"office")
+    opened_modes: list[str] = []
+    real_open = Path.open
+
+    def tracked_open(path: Path, mode: str = "r", *args, **kwargs):
+        opened_modes.append(mode)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    office_module._flush_file(output)
+
+    assert opened_modes == ["r+b"]
+
+
 def _rewrite_archive_without(path: Path, removed_name: str) -> None:
     temporary = path.with_name(f".{path.name}.rewrite")
     with zipfile.ZipFile(path) as source, zipfile.ZipFile(temporary, "w") as destination:

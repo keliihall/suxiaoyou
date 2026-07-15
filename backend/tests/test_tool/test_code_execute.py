@@ -312,7 +312,6 @@ async def test_native_desktop_python_execution_is_available(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_code_rejects_symlinked_scratch_before_code_file_write(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     external = tmp_path / "external"
@@ -322,8 +321,6 @@ async def test_code_rejects_symlinked_scratch_before_code_file_write(
         external,
         target_is_directory=True,
     )
-    monkeypatch.setattr("app.tool.sandbox.sys.platform", "linux")
-
     result = await CodeExecuteTool().execute(
         {"code": "print('must not run')"},
         _make_ctx(workspace),

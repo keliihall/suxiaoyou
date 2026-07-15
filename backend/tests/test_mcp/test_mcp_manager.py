@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -14,9 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.mcp.manager import McpManager
 from app.mcp.local_approval import LocalMcpApprovalStore, local_mcp_launch_spec
-
-
-TEST_EXECUTABLE = str(Path(sys.executable).resolve())
 
 
 def _mock_client(name: str, status: str = "connected", tools: list | None = None):
@@ -56,6 +51,7 @@ class TestStartup:
     async def test_enabled_local_server_waits_for_connection_approval(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -66,7 +62,7 @@ class TestStartup:
                 "local": {
                     "type": "local",
                     "enabled": True,
-                    "command": [TEST_EXECUTABLE, "--startup-side-effect"],
+                    "command": [private_test_executable, "--startup-side-effect"],
                 }
             },
             project_dir=str(tmp_path / "workspace"),
@@ -151,11 +147,12 @@ class TestLocalStartupApproval:
     async def test_exact_approval_is_persisted_before_connection(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
             "enabled": True,
-            "command": [TEST_EXECUTABLE, "--safe"],
+            "command": [private_test_executable, "--safe"],
             "environment": {"MODE": "reviewed"},
         }
         store = LocalMcpApprovalStore(
@@ -201,11 +198,12 @@ class TestLocalStartupApproval:
     async def test_stale_fingerprint_cannot_persist_or_spawn(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
             "enabled": True,
-            "command": [TEST_EXECUTABLE, "--read"],
+            "command": [private_test_executable, "--read"],
         }
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -217,7 +215,7 @@ class TestLocalStartupApproval:
             approval_store=store,
         )
         stale = mgr.local_startup_approval("local")["fingerprint"]
-        config["command"] = [TEST_EXECUTABLE, "--write"]
+        config["command"] = [private_test_executable, "--write"]
 
         with patch("app.mcp.manager.McpClient") as client_type:
             accepted = await mgr.approve_local_startup("local", stale)
@@ -231,6 +229,7 @@ class TestLocalStartupApproval:
     async def test_reconnect_does_not_auto_approve_noninteractive_source(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -241,7 +240,7 @@ class TestLocalStartupApproval:
                 "local": {
                     "type": "local",
                     "enabled": True,
-                    "command": [TEST_EXECUTABLE],
+                    "command": [private_test_executable],
                 }
             },
             project_dir=str(tmp_path / "workspace"),
@@ -261,11 +260,12 @@ class TestLocalStartupApproval:
     async def test_concurrent_approval_and_reconnect_spawn_only_once(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
             "enabled": True,
-            "command": [TEST_EXECUTABLE, "--one-start"],
+            "command": [private_test_executable, "--one-start"],
         }
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -307,11 +307,12 @@ class TestLocalStartupApproval:
     async def test_shutdown_closes_gate_while_approval_connect_is_in_flight(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
             "enabled": True,
-            "command": [TEST_EXECUTABLE, "--shutdown-race"],
+            "command": [private_test_executable, "--shutdown-race"],
         }
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -358,11 +359,12 @@ class TestLocalStartupApproval:
     async def test_failed_connection_is_not_reported_as_approval_success(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
             "enabled": True,
-            "command": [TEST_EXECUTABLE, "--fails"],
+            "command": [private_test_executable, "--fails"],
         }
         store = LocalMcpApprovalStore(
             str(tmp_path / "workspace"),
@@ -392,10 +394,11 @@ class TestLocalStartupApproval:
     def test_environment_change_invalidates_persisted_approval(
         self,
         tmp_path,
+        private_test_executable: str,
     ) -> None:
         config = {
             "type": "local",
-            "command": [TEST_EXECUTABLE],
+            "command": [private_test_executable],
             "environment": {"TOKEN": "first"},
         }
         store = LocalMcpApprovalStore(

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -17,9 +15,6 @@ from app.mcp.local_approval import (
     LocalMcpApprovalRequired,
     local_mcp_launch_spec,
 )
-
-
-TEST_EXECUTABLE = str(Path(sys.executable).resolve())
 
 
 def _approved_client(name: str, config: dict) -> McpClient:
@@ -138,8 +133,14 @@ class TestClose:
 
 class TestConnectStdio:
     @pytest.mark.asyncio
-    async def test_unapproved_launch_never_reaches_stdio_transport(self):
-        c = McpClient("test", {"type": "local", "command": [TEST_EXECUTABLE]})
+    async def test_unapproved_launch_never_reaches_stdio_transport(
+        self,
+        private_test_executable: str,
+    ):
+        c = McpClient(
+            "test",
+            {"type": "local", "command": [private_test_executable]},
+        )
 
         with patch("app.mcp.client.stdio_client") as spawn:
             await c.connect()
@@ -150,8 +151,14 @@ class TestConnectStdio:
         spawn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_direct_stdio_call_is_also_fail_closed(self):
-        c = McpClient("test", {"type": "local", "command": [TEST_EXECUTABLE]})
+    async def test_direct_stdio_call_is_also_fail_closed(
+        self,
+        private_test_executable: str,
+    ):
+        c = McpClient(
+            "test",
+            {"type": "local", "command": [private_test_executable]},
+        )
         c._exit_stack = MagicMock()
 
         with (
@@ -163,10 +170,13 @@ class TestConnectStdio:
         spawn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_approved_exact_launch_reaches_transport_with_snapshot(self):
+    async def test_approved_exact_launch_reaches_transport_with_snapshot(
+        self,
+        private_test_executable: str,
+    ):
         config = {
             "type": "local",
-            "command": [TEST_EXECUTABLE, "--safe"],
+            "command": [private_test_executable, "--safe"],
             "environment": {"MODE": "reviewed"},
         }
         launch = local_mcp_launch_spec(config)
@@ -185,17 +195,23 @@ class TestConnectStdio:
             await c._connect_stdio()
 
         params = spawn.call_args.args[0]
-        assert params.command == TEST_EXECUTABLE
+        assert params.command == private_test_executable
         assert params.args == ["--safe"]
         assert params.env == launch.environment
         assert str(params.cwd) == launch.cwd
         session.initialize.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_launch_change_invalidates_prior_approval_before_spawn(self):
-        config = {"type": "local", "command": [TEST_EXECUTABLE, "--read"]}
+    async def test_launch_change_invalidates_prior_approval_before_spawn(
+        self,
+        private_test_executable: str,
+    ):
+        config = {
+            "type": "local",
+            "command": [private_test_executable, "--read"],
+        }
         c = _approved_client("test", config)
-        config["command"] = [TEST_EXECUTABLE, "--write"]
+        config["command"] = [private_test_executable, "--write"]
 
         with patch("app.mcp.client.stdio_client") as spawn:
             await c.connect()
@@ -214,7 +230,10 @@ class TestConnectStdio:
 
 class TestConnectTimeout:
     @pytest.mark.asyncio
-    async def test_configured_timeout_bounds_connection(self):
+    async def test_configured_timeout_bounds_connection(
+        self,
+        private_test_executable: str,
+    ):
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
@@ -228,7 +247,11 @@ class TestConnectTimeout:
 
         c = _approved_client(
             "slow",
-            {"type": "local", "command": [TEST_EXECUTABLE], "timeout": 0.01},
+            {
+                "type": "local",
+                "command": [private_test_executable],
+                "timeout": 0.01,
+            },
         )
         c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
 
@@ -241,7 +264,10 @@ class TestConnectTimeout:
         assert c._exit_stack is None
 
     @pytest.mark.asyncio
-    async def test_caller_cancellation_cleans_up_and_propagates(self):
+    async def test_caller_cancellation_cleans_up_and_propagates(
+        self,
+        private_test_executable: str,
+    ):
         started = asyncio.Event()
 
         async def never_connects():
@@ -250,7 +276,11 @@ class TestConnectTimeout:
 
         c = _approved_client(
             "slow",
-            {"type": "local", "command": [TEST_EXECUTABLE], "timeout": 60},
+            {
+                "type": "local",
+                "command": [private_test_executable],
+                "timeout": 60,
+            },
         )
         c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
 

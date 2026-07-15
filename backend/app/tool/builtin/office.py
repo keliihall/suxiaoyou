@@ -2640,7 +2640,11 @@ def _is_formula(value: Any) -> bool:
 
 
 def _flush_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows implements os.fsync() with the CRT commit operation, which
+    # rejects a descriptor opened read-only with EBADF.  The Office output is
+    # still our private, writable temporary at this point, so open it for
+    # update before making the durability barrier.
+    with path.open("r+b") as handle:
         os.fsync(handle.fileno())
 
 
