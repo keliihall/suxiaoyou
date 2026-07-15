@@ -233,9 +233,14 @@ async def _run(workspace: Path) -> dict[str, object]:
                 and "Python 3" in system_python_result.output
             )
             if not macos_system_python:
+                details = "\n".join(
+                    value
+                    for value in (system_python_result.error, system_python_result.output)
+                    if value
+                )
                 raise RuntimeError(
                     "macOS /usr/bin/python3 could not read the selected Developer runtime: "
-                    f"{system_python_result.error or system_python_result.output}"
+                    f"{details}"
                 )
 
         if sys.platform == "darwin":

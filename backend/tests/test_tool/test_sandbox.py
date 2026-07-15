@@ -277,10 +277,21 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     logical = tmp_path / "var" / "db" / "xcode_select_link"
     developer = tmp_path / "Applications" / "Xcode.app" / "Contents" / "Developer"
     info_plist = developer.parent / "Info.plist"
+    prerequisite_framework = (
+        developer.parent
+        / "SharedFrameworks"
+        / "DVTSystemPrerequisites.framework"
+    )
+    prerequisite_binary = (
+        prerequisite_framework / "Versions" / "A" / "DVTSystemPrerequisites"
+    )
     workspace.mkdir()
     scratch.mkdir(parents=True)
     developer.mkdir(parents=True)
     info_plist.write_text("xcode metadata", encoding="utf-8")
+    prerequisite_framework.mkdir(parents=True)
+    prerequisite_binary.parent.mkdir(parents=True)
+    prerequisite_binary.write_bytes(b"xcode framework")
     logical.parent.mkdir(parents=True)
     logical.symlink_to(developer, target_is_directory=True)
     monkeypatch.setattr(sandbox.sys, "platform", "darwin")
@@ -320,6 +331,8 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
         if value.startswith("READ_ROOT_")
     }
     assert str(developer.resolve()) in read_root_values
+    assert str(prerequisite_framework.resolve()) in read_root_values
+    assert str(prerequisite_framework.parent) not in read_root_values
     assert str(developer.parent) not in read_root_values
     assert str(developer.parent.parent) not in read_root_values
     assert str(developer.parents[2]) not in read_root_values
@@ -338,6 +351,7 @@ def test_macos_xcode_metadata_requires_full_xcode_layout(
     monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
 
     assert sandbox._selected_xcode_metadata_paths() == []
+    assert sandbox._selected_xcode_runtime_roots() == []
 
 
 def test_macos_xcode_metadata_requires_app_bundle(
@@ -353,6 +367,74 @@ def test_macos_xcode_metadata_requires_app_bundle(
     monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
 
     assert sandbox._selected_xcode_metadata_paths() == []
+    assert sandbox._selected_xcode_runtime_roots() == []
+
+
+def test_macos_xcode_selection_requires_developer_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    developer = tmp_path / "Applications" / "Xcode.app" / "Contents" / "Developer"
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer.parent.mkdir(parents=True)
+    developer.write_text("not a directory", encoding="utf-8")
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+
+    assert sandbox._selected_xcode_contents() is None
+
+
+def test_macos_xcode_runtime_roots_require_canonical_framework_binary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contents = tmp_path / "Applications" / "Xcode.app" / "Contents"
+    developer = contents / "Developer"
+    framework = (
+        contents
+        / "SharedFrameworks"
+        / "DVTSystemPrerequisites.framework"
+    )
+    binary = framework / "Versions" / "A" / "DVTSystemPrerequisites"
+    redirected = tmp_path / "redirected-binary"
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer.mkdir(parents=True)
+    framework.mkdir(parents=True)
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+
+    assert sandbox._selected_xcode_runtime_roots() == []
+
+    redirected.write_bytes(b"outside framework")
+    binary.parent.mkdir(parents=True)
+    binary.symlink_to(redirected)
+    assert sandbox._selected_xcode_runtime_roots() == []
+
+
+def test_macos_xcode_runtime_roots_reject_redirected_framework(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contents = tmp_path / "Applications" / "Xcode.app" / "Contents"
+    developer = contents / "Developer"
+    redirected = tmp_path / "redirected-framework"
+    framework = (
+        contents
+        / "SharedFrameworks"
+        / "DVTSystemPrerequisites.framework"
+    )
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer.mkdir(parents=True)
+    redirected.mkdir()
+    framework.parent.mkdir()
+    framework.symlink_to(redirected, target_is_directory=True)
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+
+    assert sandbox._selected_xcode_runtime_roots() == []
 
 
 @pytest.mark.skipif(

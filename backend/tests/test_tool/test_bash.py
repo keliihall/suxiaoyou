@@ -319,7 +319,9 @@ class TestBashTool:
             _make_ctx(tmp_path),
         )
 
-        assert result.success, result.error or result.output
+        assert result.success, "\n".join(
+            value for value in (result.error, result.output) if value
+        )
         assert "Python 3" in result.output
         assert "couldn't create cache file" not in result.output
         assert "couldn't replace cache file" not in result.output

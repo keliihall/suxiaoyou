@@ -391,6 +391,25 @@ def _existing_logical_paths(paths: Iterable[Path]) -> list[Path]:
     return result
 
 
+def _selected_xcode_contents() -> Path | None:
+    """Resolve a full selected Xcode bundle without trusting lookalike paths."""
+
+    try:
+        developer_root = _MACOS_XCODE_SELECT_LINK.resolve(strict=True)
+    except OSError:
+        return None
+    if (
+        developer_root.name != "Developer"
+        or developer_root.parent.name != "Contents"
+        or not developer_root.is_dir()
+    ):
+        return None
+    xcode_bundle = developer_root.parent.parent
+    if xcode_bundle.suffix.casefold() != ".app" or not xcode_bundle.is_dir():
+        return None
+    return developer_root.parent
+
+
 def _selected_xcode_metadata_paths() -> list[Path]:
     """Return exact metadata files required by Apple's developer-tool shims.
 
@@ -402,20 +421,10 @@ def _selected_xcode_metadata_paths() -> list[Path]:
     bundle (or ``/Applications``) as a recursive Seatbelt read root.
     """
 
-    try:
-        developer_root = _MACOS_XCODE_SELECT_LINK.resolve(strict=True)
-    except OSError:
+    contents = _selected_xcode_contents()
+    if contents is None:
         return []
-    if (
-        developer_root.name != "Developer"
-        or developer_root.parent.name != "Contents"
-    ):
-        return []
-    xcode_bundle = developer_root.parent.parent
-    if xcode_bundle.suffix.casefold() != ".app" or not xcode_bundle.is_dir():
-        return []
-
-    info_plist = developer_root.parent / "Info.plist"
+    info_plist = contents / "Info.plist"
     try:
         # Xcode ships a regular Info.plist. Reject a redirected final component
         # instead of silently widening the trusted read set to its target.
@@ -427,6 +436,35 @@ def _selected_xcode_metadata_paths() -> list[Path]:
     if canonical_info != info_plist:
         return []
     return [canonical_info]
+
+
+def _selected_xcode_runtime_roots() -> list[Path]:
+    """Return only the Xcode framework proven necessary for tool shims.
+
+    On a full Xcode selection, Apple's ``/usr/bin/python3`` shim loads
+    ``DVTSystemPrerequisites.framework`` before entering the Developer runtime.
+    Grant that one signed framework as a recursive read root so dyld can read
+    its binary, bundle metadata, and internal symlinks without exposing sibling
+    frameworks or the enclosing Xcode application.
+    """
+
+    contents = _selected_xcode_contents()
+    if contents is None:
+        return []
+    framework = contents / "SharedFrameworks" / "DVTSystemPrerequisites.framework"
+    try:
+        if framework.is_symlink() or not framework.is_dir():
+            return []
+        canonical_framework = framework.resolve(strict=True)
+        binary = framework / "Versions" / "A" / "DVTSystemPrerequisites"
+        if binary.is_symlink() or not binary.is_file():
+            return []
+        canonical_binary = binary.resolve(strict=True)
+    except OSError:
+        return []
+    if canonical_framework != framework or canonical_binary != binary:
+        return []
+    return [canonical_framework]
 
 
 def _map_workspace_text(
@@ -744,6 +782,7 @@ def prepare_sandbox_launch(
         read_roots = _existing_canonical_paths(
             (
                 *_MACOS_SYSTEM_READ_ROOTS,
+                *_selected_xcode_runtime_roots(),
                 workspace_source_path,
                 *((environment_source_path,) if environment_source_path else ()),
                 *mapped_runtime_paths,
