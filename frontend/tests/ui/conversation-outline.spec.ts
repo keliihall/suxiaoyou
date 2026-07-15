@@ -295,22 +295,45 @@ test.describe("苏小有 conversation outline navigation", () => {
   test("a timed-out target cannot replace the live view when its response arrives late", async ({ page }) => {
     await setup(page);
     let delayFirstPage = true;
+    let releaseFirstPage!: () => void;
+    let markFirstPageCaptured!: () => void;
+    let markFirstPageSettled!: () => void;
+    const firstPageGate = new Promise<void>((resolve) => {
+      releaseFirstPage = resolve;
+    });
+    const firstPageCaptured = new Promise<void>((resolve) => {
+      markFirstPageCaptured = resolve;
+    });
+    const firstPageSettled = new Promise<void>((resolve) => {
+      markFirstPageSettled = resolve;
+    });
     await page.route("**/api/messages/session-long?*", async (route) => {
       const offset = new URL(route.request().url()).searchParams.get("offset");
       if (offset === "0" && delayFirstPage) {
         delayFirstPage = false;
-        await delay(5_200);
+        markFirstPageCaptured();
+        await firstPageGate;
+        await route.fallback().catch(() => {});
+        markFirstPageSettled();
+        return;
       }
       await route.fallback().catch(() => {});
     });
     await page.goto("/c/session-long");
+    await page.clock.install();
 
     const outline = page.getByRole("navigation", { name: "Conversation outline" });
-    await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
-    await expect(page.getByRole("button", { name: "Retry locating turn" })).toBeVisible({
-      timeout: 5_000,
-    });
-    await delay(1_500);
+    await outline.getByRole("button", { name: /Turn 1 of 60:/ }).press("Enter");
+    await firstPageCaptured;
+    await page.clock.fastForward(4_100);
+    try {
+      await expect(
+        page.getByRole("button", { name: "Retry locating turn" }),
+      ).toBeVisible();
+    } finally {
+      releaseFirstPage();
+    }
+    await firstPageSettled;
 
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await expect(
