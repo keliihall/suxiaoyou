@@ -111,6 +111,106 @@ test("rejects lifecycle reports that do not explicitly prove cleanup", () => {
   assert.ok(result.failures.includes("checks.no_orphan_processes must be true"));
 });
 
+test("validates executable paths with evidence-platform semantics", () => {
+  const base = {
+    schema_version: 1,
+    status: "ok",
+    ok: true,
+    source_commit: "a".repeat(40),
+    release_ref: "v1.0.0-rc.7",
+    executable_size: 4096,
+    executable_sha256: "c".repeat(64),
+    started_at: "2026-07-14T00:00:00Z",
+    completed_at: "2026-07-14T00:00:01Z",
+    desktopPid: 4100,
+    backendPid: 4101,
+    backendUrl: "http://127.0.0.1:43123",
+    observedDescendantPids: [4101],
+    exit: { code: 0, signal: null },
+    checks: {
+      backend_ready: true,
+      backend_healthy: true,
+      graceful_exit: true,
+      no_orphan_processes: true,
+      backend_stopped: true,
+    },
+  };
+  const validate = (platform, executablePath) =>
+    validateDesktopLifecycleReport(
+      { ...base, platform, executable_path: executablePath },
+      { expectedPlatform: platform },
+    );
+
+  assert.equal(
+    validate(
+      "win32",
+      "D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop.exe",
+    ).ok,
+    true,
+  );
+  assert.equal(validate("win32", "D:\\a\\COM10\\suxiaoyou-desktop.exe").ok, true);
+  assert.equal(validate("linux", "/opt/suyo/suxiaoyou-desktop").ok, true);
+  assert.equal(validate("darwin", "/Applications/苏小有.app/Contents/MacOS/苏小有").ok, true);
+
+  for (const path of [
+    "suxiaoyou-desktop.exe",
+    "D:suxiaoyou-desktop.exe",
+    "\\suxiaoyou-desktop.exe",
+    "D:\\a\\..\\suxiaoyou-desktop.exe",
+    "D:\\a\\.\\suxiaoyou-desktop.exe",
+    "D:/a\\suxiaoyou-desktop.exe",
+    "D:\\a\\\\suxiaoyou-desktop.exe",
+    "D:\\a\\suxiaoyou-desktop.exe.",
+    "D:\\a\\suxiaoyou-desktop.exe ",
+    "D:\\a\\suxiaoyou-desktop.exe:alternate-stream",
+    "\\\\server\\share\\suxiaoyou-desktop.exe",
+    "\\\\?\\D:\\a\\suxiaoyou-desktop.exe",
+    "\\\\.\\D:\\a\\suxiaoyou-desktop.exe",
+  ]) {
+    assert.deepEqual(validate("win32", path).failures, [
+      "executable_path must be an absolute canonical path",
+    ]);
+  }
+  for (const reservedName of [
+    "CON",
+    "con.txt",
+    "PRN.log",
+    "AUX",
+    "NUL.exe",
+    "CLOCK$",
+    "CLOCK$.txt",
+    "CONIN$",
+    "CONIN$.txt",
+    "CONOUT$",
+    "CONOUT$.txt",
+    ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}.exe`),
+    ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}.exe`),
+    "COM¹.exe",
+    "COM².exe",
+    "COM³.exe",
+    "LPT¹.exe",
+    "LPT².exe",
+    "LPT³.exe",
+  ]) {
+    assert.deepEqual(validate("win32", `D:\\a\\${reservedName}`).failures, [
+      "executable_path must be an absolute canonical path",
+    ]);
+  }
+  for (const path of [
+    "opt/suyo/suxiaoyou-desktop",
+    "/opt/suyo/../suxiaoyou-desktop",
+    "/opt/suyo/./suxiaoyou-desktop",
+    "//opt/suyo/suxiaoyou-desktop",
+    "/opt//suyo/suxiaoyou-desktop",
+    "/opt/suyo/suxiaoyou-desktop/",
+    "/opt/suyo\\suxiaoyou-desktop",
+  ]) {
+    assert.deepEqual(validate("linux", path).failures, [
+      "executable_path must be an absolute canonical path",
+    ]);
+  }
+});
+
 test("hashes the canonical executable and rejects empty files", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "suxiaoyou-desktop-hash-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));

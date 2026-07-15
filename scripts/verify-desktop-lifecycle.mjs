@@ -28,7 +28,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { isMainModule } from "./release-metadata.mjs";
@@ -37,8 +37,52 @@ import { resolveCheckoutCommit } from "./office-contract-evidence.mjs";
 const DEFAULT_STARTUP_TIMEOUT_MS = 120_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 200;
+const WINDOWS_RESERVED_PATH_SEGMENT =
+  /^(?:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/iu;
 
 export const DESKTOP_LIFECYCLE_SCHEMA_VERSION = 1;
+
+function isCanonicalAbsoluteExecutablePath(value, platform) {
+  if (typeof value !== "string" || value.length === 0 || /[\0\r\n]/u.test(value)) {
+    return false;
+  }
+
+  const pathApi =
+    platform === "win32"
+      ? win32
+      : platform === "darwin" || platform === "linux"
+        ? posix
+        : null;
+  if (!pathApi || !pathApi.isAbsolute(value) || pathApi.normalize(value) !== value) {
+    return false;
+  }
+
+  if (platform === "win32") {
+    if (value.includes("/") || value.startsWith("\\\\?\\") || value.startsWith("\\\\.\\")) {
+      return false;
+    }
+    const driveAbsolute = /^[A-Za-z]:\\/u.test(value);
+    if (!driveAbsolute) return false;
+    const pathWithoutRootPrefix = value.slice(2);
+    if (/[<>:"|?*\u0000-\u001f]/u.test(pathWithoutRootPrefix)) return false;
+  } else if (value.includes("\\")) {
+    return false;
+  }
+
+  const parsed = pathApi.parse(value);
+  if (!parsed.base || value.endsWith(pathApi.sep)) return false;
+  const segments = value.slice(parsed.root.length).split(pathApi.sep);
+  return segments.every(
+    (segment) =>
+      segment.length > 0 &&
+      segment !== "." &&
+      segment !== ".." &&
+      (platform !== "win32" ||
+        (!segment.endsWith(".") &&
+          !segment.endsWith(" ") &&
+          !WINDOWS_RESERVED_PATH_SEGMENT.test(segment))),
+  );
+}
 
 export function validateDesktopLifecycleReport(
   value,
@@ -76,10 +120,7 @@ export function validateDesktopLifecycleReport(
       `release_ref is ${releaseRef || "missing"}, expected ${expectedReleaseRef}`,
     );
   }
-  if (
-    typeof report.executable_path !== "string" ||
-    !isAbsolute(report.executable_path)
-  ) {
+  if (!isCanonicalAbsoluteExecutablePath(report.executable_path, report.platform)) {
     failures.push("executable_path must be an absolute canonical path");
   }
   if (!Number.isSafeInteger(report.executable_size) || report.executable_size <= 0) {

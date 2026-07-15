@@ -41,7 +41,10 @@ function lifecycle(platform, seed, releaseTag = TAG, executableSeed = seed) {
     platform,
     source_commit: COMMIT,
     release_ref: releaseTag,
-    executable_path: `/opt/suyo/desktop-${executableSeed}`,
+    executable_path:
+      platform === "win32"
+        ? `D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop-${executableSeed}.exe`
+        : `/opt/suyo/desktop-${executableSeed}`,
     executable_size: 4096 + executableSeed,
     executable_sha256: executableSeed.toString(16).padStart(64, "0"),
     started_at: "2026-07-14T00:00:00Z",
@@ -121,6 +124,24 @@ test("aggregates seven checksum-bound installed lifecycle records", async (t) =>
   assert.ok(result.packages[0].executable_size > 0);
   assert.equal(result.packages[1].artifact_profile, "rc-adhoc");
   assert.equal(result.packages[1].trust_boundary_verified, true);
+});
+
+test("aggregates canonical Windows lifecycle evidence with win32 semantics", async (t) => {
+  const result = await collect(fixture(t));
+  const windows = result.packages.find((item) => item.kind === "windows-x64-nsis");
+  assert.equal(
+    windows.executable_path,
+    "D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop-1.exe",
+  );
+});
+
+test("rejects ambiguous Windows lifecycle paths during aggregation", async (t) => {
+  const paths = fixture(t);
+  const reportPath = join(paths.artifactsRoot, FIXTURES[0][2], FIXTURES[0][3], "result.json");
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+  report.executable_path = "D:/a\\_temp\\suxiaoyou-desktop.exe";
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  await assert.rejects(() => collect(paths), /absolute canonical path/u);
 });
 
 test("CLI writes the same scorecard-ready evidence contract", (t) => {
