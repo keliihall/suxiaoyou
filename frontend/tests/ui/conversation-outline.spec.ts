@@ -297,15 +297,11 @@ test.describe("苏小有 conversation outline navigation", () => {
     let delayFirstPage = true;
     let releaseFirstPage!: () => void;
     let markFirstPageCaptured!: () => void;
-    let markFirstPageSettled!: () => void;
     const firstPageGate = new Promise<void>((resolve) => {
       releaseFirstPage = resolve;
     });
     const firstPageCaptured = new Promise<void>((resolve) => {
       markFirstPageCaptured = resolve;
-    });
-    const firstPageSettled = new Promise<void>((resolve) => {
-      markFirstPageSettled = resolve;
     });
     await page.route("**/api/messages/session-long?*", async (route) => {
       const offset = new URL(route.request().url()).searchParams.get("offset");
@@ -313,16 +309,32 @@ test.describe("苏小有 conversation outline navigation", () => {
         delayFirstPage = false;
         markFirstPageCaptured();
         await firstPageGate;
-        await route.fallback().catch(() => {});
-        markFirstPageSettled();
+        await route.fallback();
         return;
       }
       await route.fallback().catch(() => {});
     });
     await page.goto("/c/session-long");
     await page.clock.install();
+    // Keep a valid native AbortSignal but neutralize transport cancellation so
+    // this test proves the request-generation fence rejects a real late 200.
+    await page.evaluate(() => {
+      const NativeAbortController = window.AbortController;
+      Object.defineProperty(window, "AbortController", {
+        configurable: true,
+        value: class NonCancellingAbortController extends NativeAbortController {
+          override abort() {}
+        },
+      });
+    });
 
     const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const delayedFirstPageResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/api/messages/session-long"
+        && url.searchParams.get("offset") === "0"
+        && response.status() === 200;
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).press("Enter");
     await firstPageCaptured;
     await page.clock.fastForward(4_100);
@@ -333,8 +345,11 @@ test.describe("苏小有 conversation outline navigation", () => {
     } finally {
       releaseFirstPage();
     }
-    await firstPageSettled;
+    const lateResponse = await delayedFirstPageResponse;
+    expect(await lateResponse.finished()).toBeNull();
+    await page.clock.fastForward(1_000);
 
+    await expect(page.getByRole("button", { name: "Retry locating turn" })).toBeVisible();
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await expect(
       page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
