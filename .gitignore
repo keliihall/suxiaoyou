@@ -74,6 +74,7 @@ frontend/playwright-report/
 /backend/dist*/
 /backend/build*/
 /frontend/out/
+/release-validation/
 desktop/release/
 desktop-tauri/src-tauri/target/
 desktop-tauri/src-tauri/gen/schemas/

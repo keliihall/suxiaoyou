@@ -12,16 +12,57 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from app.connector.model import ConnectorInfo
+from app.connector.model import (
+    CONNECTOR_PROVENANCE_CUSTOM,
+    REMOTE_AUTH_OAUTH_BEARER,
+    SUPPORTED_CONNECTOR_PROVENANCE,
+    SUPPORTED_REMOTE_AUTH_MODES,
+    ConnectorInfo,
+)
 from app.mcp.manager import McpManager
+from app.mcp.local_approval import LocalMcpApprovalResult
 from app.mcp.tool_wrapper import McpToolWrapper
 from app.tool.base import ToolDefinition
+from app.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
+
+
+class ConnectorPersistenceError(RuntimeError):
+    """A connector state transition could not be durably persisted."""
+
+
+def _external_runtime_stopped() -> bool:
+    try:
+        from app.security.control import get_security_control
+
+        return get_security_control().emergency_stop
+    except RuntimeError:
+        return False
+
+
+@asynccontextmanager
+async def _external_runtime_transition(*, already_owned: bool = False):
+    """Serialize all starts against the emergency-stop state transition."""
+
+    if already_owned:
+        yield
+        return
+    try:
+        from app.security.control import get_security_control
+
+        control = get_security_control()
+    except RuntimeError:
+        yield
+        return
+    async with control.transition_lock:
+        yield
 
 
 class ConnectorRegistry:
@@ -57,6 +98,8 @@ class ConnectorRegistry:
         self,
         plugin_name: str,
         mcp_servers: dict[str, dict[str, Any]],
+        *,
+        source: str = CONNECTOR_PROVENANCE_CUSTOM,
     ) -> list[str]:
         """Extract unique connectors from a plugin's MCP config.
 
@@ -64,6 +107,14 @@ class ConnectorRegistry:
         Returns the list of connector IDs this plugin references.
         """
         connector_ids: list[str] = []
+        # Only bundled plugins are trusted as built-ins.  Any absent or
+        # malformed provenance is conservatively treated as user supplied.
+        connector_provenance = (
+            source
+            if isinstance(source, str)
+            and source in SUPPORTED_CONNECTOR_PROVENANCE
+            else CONNECTOR_PROVENANCE_CUSTOM
+        )
 
         for raw_key, config in mcp_servers.items():
             if not isinstance(config, dict):
@@ -94,6 +145,26 @@ class ConnectorRegistry:
 
             # Create new connector, enriched with catalog metadata
             catalog_entry = self._catalog.get(connector_id, {})
+            auth_mode = catalog_entry.get("auth_mode", REMOTE_AUTH_OAUTH_BEARER)
+            if auth_mode not in SUPPORTED_REMOTE_AUTH_MODES:
+                # Catalog data ships with the application, but still fail
+                # closed if it is malformed instead of turning it into a
+                # generic header injection mechanism.
+                logger.warning(
+                    "Connector '%s' has unsupported auth mode %r; using OAuth bearer",
+                    connector_id,
+                    auth_mode,
+                )
+                auth_mode = REMOTE_AUTH_OAUTH_BEARER
+
+            allowed_tool_patterns = self._catalog_patterns(
+                catalog_entry,
+                "allowed_tool_patterns",
+            )
+            approval_required_tool_patterns = self._catalog_patterns(
+                catalog_entry,
+                "approval_required_tool_patterns",
+            )
 
             connector = ConnectorInfo(
                 id=connector_id,
@@ -106,7 +177,7 @@ class ConnectorRegistry:
                 ),
                 category=catalog_entry.get("category", "other"),
                 enabled=connector_id in self._persisted_state.get("enabled", []),
-                source="builtin",
+                source=connector_provenance,
                 local_config=(
                     {
                         k: v
@@ -117,6 +188,10 @@ class ConnectorRegistry:
                     else {}
                 ),
                 referenced_by=[plugin_name],
+                auth_mode=auth_mode,
+                credential_url=str(catalog_entry.get("credential_url", "")),
+                allowed_tool_patterns=allowed_tool_patterns,
+                approval_required_tool_patterns=approval_required_tool_patterns,
             )
 
             self._connectors[connector_id] = connector
@@ -144,12 +219,10 @@ class ConnectorRegistry:
             description=description or f"{name} (custom connector)",
             category=category,
             enabled=False,
-            source="custom",
+            source=CONNECTOR_PROVENANCE_CUSTOM,
         )
-        self._connectors[id] = connector
-
-        # Persist custom connector
-        customs = self._persisted_state.setdefault("custom", [])
+        desired = deepcopy(self._persisted_state)
+        customs = desired.setdefault("custom", [])
         customs.append({
             "id": id,
             "name": name,
@@ -157,7 +230,9 @@ class ConnectorRegistry:
             "description": description,
             "category": category,
         })
-        self._persist_state()
+        self._persist_state(desired)
+        self._persisted_state = desired
+        self._connectors[id] = connector
 
         return connector
 
@@ -167,15 +242,17 @@ class ConnectorRegistry:
         if not connector or connector.source != "custom":
             return False
 
+        desired = deepcopy(self._persisted_state)
+        customs = desired.get("custom", [])
+        desired["custom"] = [c for c in customs if c.get("id") != id]
+        desired["enabled"] = [
+            connector_id
+            for connector_id in desired.get("enabled", [])
+            if connector_id != id
+        ]
+        self._persist_state(desired)
+        self._persisted_state = desired
         del self._connectors[id]
-
-        # Remove from persisted custom list
-        customs = self._persisted_state.get("custom", [])
-        self._persisted_state["custom"] = [c for c in customs if c.get("id") != id]
-        self._persisted_state.get("enabled", [])
-        if id in self._persisted_state.get("enabled", []):
-            self._persisted_state["enabled"].remove(id)
-        self._persist_state()
 
         return True
 
@@ -200,11 +277,14 @@ class ConnectorRegistry:
                     description=custom.get("description", ""),
                     category=custom.get("category", "custom"),
                     enabled=cid in self._persisted_state.get("enabled", []),
-                    source="custom",
+                    source=CONNECTOR_PROVENANCE_CUSTOM,
                 )
 
         # Inject credentials into local connectors that need them
-        self._inject_local_credentials()
+        # Preparing the registry is part of the readiness-critical startup
+        # path. Keep protected Google values opaque here; enabled connectors
+        # hydrate them only in the post-yield connection task below.
+        self._inject_local_credentials(resolve_secrets=False)
 
         # Build MCP config dict from all connectors (enabled or not)
         mcp_config: dict[str, Any] = {}
@@ -214,15 +294,28 @@ class ConnectorRegistry:
                     "type": "local",
                     "enabled": connector.enabled,
                     **connector.local_config,
+                    # This server-owned value must follow user/plugin config
+                    # so a local config cannot override its trust boundary.
+                    "connector_provenance": connector.source,
                 }
             else:
                 mcp_config[cid] = {
                     "type": "remote",
                     "url": connector.url,
                     "enabled": connector.enabled,
+                    "auth_mode": connector.auth_mode,
+                    "allowed_tool_patterns": list(connector.allowed_tool_patterns),
+                    "approval_required_tool_patterns": list(
+                        connector.approval_required_tool_patterns
+                    ),
+                    "connector_provenance": connector.source,
                 }
 
-        self._mcp_manager = McpManager(mcp_config, project_dir=self._project_dir)
+        self._mcp_manager = McpManager(
+            mcp_config,
+            project_dir=self._project_dir,
+            start_allowed=lambda: not _external_runtime_stopped(),
+        )
 
         logger.info(
             "ConnectorRegistry prepared: %d connectors (%d enabled)",
@@ -230,14 +323,22 @@ class ConnectorRegistry:
             sum(1 for c in self._connectors.values() if c.enabled),
         )
 
-    async def connect_enabled(self) -> None:
+    async def connect_enabled(self, *, transition_owned: bool = False) -> None:
         """Connect enabled servers, then publish their discovered tools."""
-        if self._mcp_manager is None:
-            self.prepare()
-        if self._mcp_manager is None:  # pragma: no cover - defensive invariant
-            return
-        await self._mcp_manager.startup()
-        self.sync_tools()
+        async with _external_runtime_transition(already_owned=transition_owned):
+            if _external_runtime_stopped():
+                self.sync_tools()
+                return
+            if self._mcp_manager is None:
+                self.prepare()
+            if self._mcp_manager is None:  # pragma: no cover - defensive invariant
+                return
+            await asyncio.to_thread(
+                self._inject_local_credentials,
+                resolve_secrets=True,
+            )
+            await self._mcp_manager.startup()
+            self.sync_tools()
 
     async def startup(self) -> None:
         """Backward-compatible combined prepare/connect lifecycle."""
@@ -265,31 +366,39 @@ class ConnectorRegistry:
         """Enable a connector and attempt to connect it."""
         if id == "google-workspace":
             async with self._google_auth_operation_lock:
-                self._inject_local_credentials()
+                await asyncio.to_thread(self._inject_local_credentials)
                 return await self._enable_unlocked(id)
         return await self._enable_unlocked(id)
 
     async def _enable_unlocked(self, id: str) -> bool:
-        connector = self._connectors.get(id)
-        if not connector or connector.enabled:
-            return False
+        async with _external_runtime_transition():
+            connector = self._connectors.get(id)
+            if not connector or connector.enabled:
+                return False
 
-        connector.enabled = True
-        enabled = self._persisted_state.setdefault("enabled", [])
-        if id not in enabled:
-            enabled.append(id)
-        self._persist_state()
-        logger.info("Connector enabled: %s", id)
+            desired = deepcopy(self._persisted_state)
+            enabled = desired.setdefault("enabled", [])
+            if id not in enabled:
+                enabled.append(id)
+            self._persist_state(desired)
+            self._persisted_state = desired
+            connector.enabled = True
+            logger.info("Connector enabled: %s", id)
+            if self._mcp_manager:
+                config = self._mcp_manager._config.get(id)
+                if isinstance(config, dict):
+                    config["enabled"] = True
 
-        # Actually connect the MCP server
-        if self._mcp_manager:
-            try:
-                await self._mcp_manager.reconnect(id)
-            except Exception as e:
-                logger.warning("Failed to connect '%s' after enable: %s", id, e)
-            self.sync_tools()
+            # Actually connect the MCP server only while the same transition
+            # lock still protects the emergency-stop decision.
+            if self._mcp_manager and not _external_runtime_stopped():
+                try:
+                    await self._mcp_manager.reconnect(id)
+                except Exception as e:
+                    logger.warning("Failed to connect '%s' after enable: %s", id, e)
+                self.sync_tools()
 
-        return True
+            return True
 
     async def disable(self, id: str) -> bool:
         """Disable a connector and disconnect it."""
@@ -309,46 +418,55 @@ class ConnectorRegistry:
         if not connector or not connector.enabled:
             return False
 
+        desired = deepcopy(self._persisted_state)
+        desired["enabled"] = [
+            connector_id
+            for connector_id in desired.get("enabled", [])
+            if connector_id != id
+        ]
+        self._persist_state(desired)
+        self._persisted_state = desired
         connector.enabled = False
-        enabled = self._persisted_state.get("enabled", [])
-        if id in enabled:
-            enabled.remove(id)
-        self._persist_state()
         logger.info("Connector disabled: %s", id)
 
         # Disconnect the MCP server
         if self._mcp_manager:
-            client = self._mcp_manager._clients.get(id)
-            if client:
-                try:
-                    await client.close()
-                    client.status = "disabled"
-                    client.error = None
-                except Exception as e:
-                    logger.warning("Failed to disconnect '%s' after disable: %s", id, e)
+            config = self._mcp_manager._config.get(id)
+            if isinstance(config, dict):
+                config["enabled"] = False
+            try:
+                await self._mcp_manager.disable(id)
+            except Exception as e:
+                logger.warning("Failed to disconnect '%s' after disable: %s", id, e)
             self.sync_tools()
 
         return True
 
     async def connect(self, id: str, redirect_uri: str) -> dict[str, str] | None:
         """Start OAuth flow for a connector. Returns auth URL info or None."""
-        # Google Workspace uses /api/google/auth-start and a generation-fenced
-        # direct OAuth state machine. Never create a second generic MCP OAuth
-        # flow for the same local runtime.
-        if id == "google-workspace":
-            return None
-        if not self._mcp_manager:
-            return None
-        return await self._mcp_manager.start_auth(id, redirect_uri)
+        async with _external_runtime_transition():
+            if _external_runtime_stopped():
+                return None
+            # Google Workspace uses /api/google/auth-start and a generation-fenced
+            # direct OAuth state machine. Never create a second generic MCP OAuth
+            # flow for the same local runtime.
+            if id == "google-workspace":
+                return None
+            if not self._mcp_manager:
+                return None
+            return await self._mcp_manager.start_auth(id, redirect_uri)
 
     async def complete_auth(self, state: str, code: str) -> bool:
         """Complete OAuth flow with auth code."""
-        if not self._mcp_manager:
-            return False
-        result = await self._mcp_manager.complete_auth(state, code)
-        if result:
-            self.sync_tools()
-        return result
+        async with _external_runtime_transition():
+            if _external_runtime_stopped():
+                return False
+            if not self._mcp_manager:
+                return False
+            result = await self._mcp_manager.complete_auth(state, code)
+            if result:
+                self.sync_tools()
+            return result
 
     async def disconnect(self, id: str) -> bool:
         """Revoke OAuth tokens and disconnect."""
@@ -365,7 +483,7 @@ class ConnectorRegistry:
                 result = await self._disconnect_unlocked(id)
                 if result:
                     delete_google_tokens(self._project_dir)
-                    self._inject_local_credentials()
+                    await asyncio.to_thread(self._inject_local_credentials)
                 return result
         return await self._disconnect_unlocked(id)
 
@@ -380,16 +498,49 @@ class ConnectorRegistry:
         """Reconnect a specific connector."""
         if id == "google-workspace":
             async with self._google_auth_operation_lock:
-                self._inject_local_credentials()
+                await asyncio.to_thread(self._inject_local_credentials)
                 return await self._reconnect_unlocked(id)
         return await self._reconnect_unlocked(id)
 
+    async def approve_local_startup(
+        self,
+        id: str,
+        fingerprint: str,
+    ) -> LocalMcpApprovalResult:
+        """Approve one exact local launch and immediately attempt connection."""
+
+        async with _external_runtime_transition():
+            connector = self._connectors.get(id)
+            if (
+                connector is None
+                or connector.type != "local"
+                or not connector.enabled
+                or self._mcp_manager is None
+                or _external_runtime_stopped()
+            ):
+                return LocalMcpApprovalResult(
+                    approval_persisted=False,
+                    connected=False,
+                    status="blocked",
+                    error="Connector is not eligible for local startup approval",
+                )
+            approved = await self._mcp_manager.approve_local_startup(id, fingerprint)
+            self.sync_tools()
+            return approved
+
     async def _reconnect_unlocked(self, id: str) -> bool:
-        if not self._mcp_manager:
-            return False
-        result = await self._mcp_manager.reconnect(id)
-        self.sync_tools()
-        return result
+        async with _external_runtime_transition():
+            connector = self._connectors.get(id)
+            if (
+                _external_runtime_stopped()
+                or connector is None
+                or not connector.enabled
+                or not self._mcp_manager
+            ):
+                return False
+            result = await self._mcp_manager.reconnect(id)
+            self.sync_tools()
+            return result
 
     async def reconnect_google_runtime_locked(self) -> bool:
         """Reconnect Google while its direct-OAuth operation lock is held."""
@@ -472,9 +623,19 @@ class ConnectorRegistry:
             mcp_connected = runtime.get("status") == "connected"
             effective_status = runtime.get("status", "disabled" if not connector.enabled else "disconnected")
 
+            local_approval = None
+            if self._mcp_manager is not None and connector.type == "local":
+                candidate = self._mcp_manager.local_startup_approval(cid)
+                if isinstance(candidate, dict):
+                    local_approval = candidate
+                    if connector.enabled and candidate.get("required"):
+                        effective_status = "needs_approval"
+                        mcp_connected = False
+
             # Google Workspace: MCP server can start without OAuth tokens.
-            # Override status to "needs_auth" if user hasn't completed Google login.
-            if cid == "google-workspace" and mcp_connected:
+            # Run direct OAuth before local-process approval so the one approval
+            # presented after callback covers the exact credential environment.
+            if cid == "google-workspace" and connector.enabled:
                 from app.api.google_auth import load_google_tokens
                 tokens = load_google_tokens(self._project_dir)
                 if not tokens or not tokens.get("refresh_token"):
@@ -487,6 +648,12 @@ class ConnectorRegistry:
                 "status": effective_status,
                 "error": runtime.get("error"),
                 "tools_count": runtime.get("tools", 0),
+                "credential_configured": (
+                    self._mcp_manager.has_stored_token(cid)
+                    if self._mcp_manager and connector.type != "local"
+                    else False
+                ),
+                "local_approval": local_approval,
             }
 
         return result
@@ -506,7 +673,7 @@ class ConnectorRegistry:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _inject_local_credentials(self) -> None:
+    def _inject_local_credentials(self, *, resolve_secrets: bool = True) -> None:
         """Inject stored credentials into local connectors as environment vars.
 
         google-workspace-mcp expects:
@@ -523,6 +690,13 @@ class ConnectorRegistry:
             settings = get_settings()
             client_id = settings.google_client_id
             client_secret = settings.google_client_secret
+            if resolve_secrets:
+                from app.auth.credential_store import resolve_env_value
+
+                client_secret = resolve_env_value(
+                    "SUXIAOYOU_GOOGLE_CLIENT_SECRET",
+                    client_secret,
+                )
         except Exception:
             return
 
@@ -534,7 +708,13 @@ class ConnectorRegistry:
 
         env = gw.local_config.setdefault("environment", {})
         env["GOOGLE_WORKSPACE_CLIENT_ID"] = client_id
-        env["GOOGLE_WORKSPACE_CLIENT_SECRET"] = client_secret
+        if resolve_secrets:
+            env["GOOGLE_WORKSPACE_CLIENT_SECRET"] = client_secret
+        else:
+            # Never hand an opaque reference to a child process as though it
+            # were a usable secret. The shared config dict is populated by the
+            # post-readiness connection path before an enabled connector runs.
+            env.pop("GOOGLE_WORKSPACE_CLIENT_SECRET", None)
 
         if tokens and tokens.get("refresh_token"):
             env["GOOGLE_WORKSPACE_REFRESH_TOKEN"] = tokens["refresh_token"]
@@ -571,6 +751,22 @@ class ConnectorRegistry:
             logger.warning("Cannot read connector catalog: %s", e)
             return {}
 
+    @staticmethod
+    def _catalog_patterns(entry: dict[str, Any], key: str) -> list[str]:
+        """Return a small, validated list of trusted tool-name patterns."""
+
+        raw = entry.get(key, [])
+        if not isinstance(raw, list):
+            return []
+        patterns: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            pattern = item.strip()
+            if pattern and len(pattern) <= 160:
+                patterns.append(pattern)
+        return patterns
+
     def _load_state(self) -> dict[str, Any]:
         """Load persisted user state (enabled set + custom connectors)."""
         if not self._state_path.is_file():
@@ -583,13 +779,18 @@ class ConnectorRegistry:
             logger.warning("Cannot read connector state: %s", e)
         return {"enabled": [], "custom": []}
 
-    def _persist_state(self) -> None:
+    def _persist_state(self, state: dict[str, Any] | None = None) -> None:
         """Save user state to disk."""
+        desired = self._persisted_state if state is None else state
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(
-                json.dumps(self._persisted_state, indent=2),
+            atomic_write_text(
+                self._state_path,
+                json.dumps(desired, indent=2),
                 encoding="utf-8",
             )
-        except OSError as e:
-            logger.warning("Cannot persist connector state: %s", e)
+        except OSError as exc:
+            logger.error("Cannot persist connector state: %s", exc)
+            raise ConnectorPersistenceError(
+                "Connector state could not be saved; no runtime change was applied"
+            ) from exc

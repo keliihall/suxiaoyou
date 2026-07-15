@@ -127,7 +127,14 @@ class AgentAdapter:
         )
 
         stream_id = generate_ulid()
-        job = stream_manager.create_job(stream_id=stream_id, session_id=session_id)
+        job = stream_manager.create_job(
+            stream_id=stream_id,
+            session_id=session_id,
+            invocation_source="channel",
+            # Channel type is stable and non-PII.  Sender/chat identifiers are
+            # deliberately excluded from the security audit taxonomy.
+            invocation_source_id=msg.channel,
+        )
         job.interactive = False  # Auto-approve permissions in headless mode
 
         # Pick the best available model

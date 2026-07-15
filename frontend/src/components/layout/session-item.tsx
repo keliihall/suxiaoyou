@@ -79,6 +79,8 @@ export const SessionItem = memo(function SessionItem({
   const itemRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLParagraphElement>(null);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingContextMenuRenameRef = useRef(false);
+  const renameFrameRef = useRef<number | null>(null);
 
   const rawTitle = session.title || t('newConversation');
   // Clean up ugly channel titles: "Channel: whatsapp:+1234567890" → "+1234567890"
@@ -199,10 +201,40 @@ export const SessionItem = memo(function SessionItem({
     if (!isEditing) onEditStart?.(session.id);
   }, [isEditing, onEditStart, session.id]);
 
+  const handleRenameSelect = useCallback(() => {
+    if (menuOpen) {
+      // A context menu restores focus to its trigger (the whole session row)
+      // as it closes. Entering edit mode during `onSelect` therefore lets that
+      // focus restoration immediately blur and submit the new input. Wait for
+      // the context menu to finish closing; the overflow menu can edit now
+      // because its button trigger is removed in edit mode.
+      pendingContextMenuRenameRef.current = true;
+      return;
+    }
+    onEditStart?.(session.id);
+  }, [menuOpen, onEditStart, session.id]);
+
+  const handleContextMenuCloseAutoFocus = useCallback((event: Event) => {
+    if (pendingContextMenuRenameRef.current) {
+      // Radix normally focuses the context-menu trigger as the menu unmounts.
+      // The trigger is the row containing our rename input, so that default
+      // focus handoff can win the race and blur the input immediately.
+      event.preventDefault();
+      pendingContextMenuRenameRef.current = false;
+      renameFrameRef.current = requestAnimationFrame(() => {
+        renameFrameRef.current = null;
+        onEditStart?.(session.id);
+      });
+    }
+  }, [onEditStart, session.id]);
+
   // Cancel a pending navigation if the row unmounts mid-debounce.
   useEffect(
     () => () => {
       if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+      if (renameFrameRef.current !== null) {
+        cancelAnimationFrame(renameFrameRef.current);
+      }
     },
     [],
   );
@@ -250,7 +282,7 @@ export const SessionItem = memo(function SessionItem({
             ? t('unpin', { defaultValue: 'Unpin' })
             : t('pin', { defaultValue: 'Pin' })}
         </Item>
-        <Item onSelect={() => onEditStart?.(session.id)}>
+        <Item onSelect={handleRenameSelect}>
           {t('rename')}
         </Item>
         <Item onSelect={() => onArchive?.(session.id)}>
@@ -297,12 +329,12 @@ export const SessionItem = memo(function SessionItem({
       deeplink,
       handleCopy,
       handleOpenDirectory,
+      handleRenameSelect,
       hasExplicitDirectory,
       openDirectory,
       openDirectoryLabel,
       onArchive,
       onDelete,
-      onEditStart,
       onExportMarkdown,
       onExportPdf,
       onTogglePin,
@@ -487,7 +519,10 @@ export const SessionItem = memo(function SessionItem({
           )}
         </div>
       </ContextMenuTrigger>
-      <ContextMenuContent className="w-48">
+      <ContextMenuContent
+        className="w-48"
+        onCloseAutoFocus={handleContextMenuCloseAutoFocus}
+      >
         <MenuItems Item={ContextMenuItem} Separator={ContextMenuSeparator} />
       </ContextMenuContent>
     </ContextMenu>

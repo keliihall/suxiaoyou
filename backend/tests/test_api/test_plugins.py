@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from unittest.mock import MagicMock
 
+from app.plugin.manager import PluginPersistenceError
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -65,9 +67,33 @@ class TestEnablePlugin:
         assert resp.status_code == 200
         assert resp.json()["success"] is False
 
+    async def test_persistence_failure_is_not_reported_as_success(
+        self, app_client, _mock_pm
+    ):
+        _mock_pm.enable.side_effect = PluginPersistenceError(
+            "Plugin state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.post("/api/plugins/github/enable")
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]
+
 
 class TestDisablePlugin:
     async def test_success(self, app_client, _mock_pm):
         resp = await app_client.post("/api/plugins/office/disable")
         assert resp.status_code == 200
         assert resp.json()["success"] is True
+
+    async def test_persistence_failure_is_not_reported_as_success(
+        self, app_client, _mock_pm
+    ):
+        _mock_pm.disable.side_effect = PluginPersistenceError(
+            "Plugin state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.post("/api/plugins/office/disable")
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]

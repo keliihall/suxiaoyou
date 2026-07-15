@@ -81,7 +81,7 @@
   "sessionRunning": "进行中",
   "sessionCreatedAt": "创建于 {{time}}",
   "sessionUpdatedAt": "更新于 {{time}}",
-  "poweredBy": "苏小有 v0.9.0",
+  "poweredBy": "苏小有 v1.0.0",
   "sortBy": "排序",
   "name": "名称",
   "price": "价格",

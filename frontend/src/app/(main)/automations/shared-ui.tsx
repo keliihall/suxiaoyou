@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   Check,
   Loader2,
+  ShieldCheck,
   XCircle,
 } from "lucide-react";
 import Link from "next/link";
@@ -22,6 +23,24 @@ import type { TaskRunResponse } from "@/types/automation";
 export const inputClass = "w-full h-8 rounded-md border border-[var(--border-default)] bg-transparent px-3 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--border-focus)]";
 
 const selectClass = "h-8 rounded-md border border-[var(--border-default)] bg-transparent px-2 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--border-focus)] appearance-none cursor-pointer";
+
+export function AutomationReadOnlyNotice({ compact = false }: { compact?: boolean }) {
+  const { t } = useTranslation("automations");
+  return (
+    <div
+      className={`flex items-start gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--surface-secondary)] ${compact ? "p-2" : "p-3"}`}
+      data-testid="automation-read-only-notice"
+    >
+      <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--brand-primary)]" />
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-[var(--text-primary)]">{t("readOnlyTitle")}</p>
+        <p className="mt-0.5 text-ui-2xs leading-relaxed text-[var(--text-secondary)]">
+          {t("readOnlyDescription")}
+        </p>
+      </div>
+    </div>
+  );
+}
 
 /* ------------------------------------------------------------------ */
 /* Dialog overlay                                                      */
@@ -116,19 +135,30 @@ export function RunHistoryPanel({ automationId, t }: { automationId: string; t: 
   return (
     <div className="space-y-1.5 max-h-48 overflow-y-auto">
       {runs.map((run: TaskRunResponse) => (
-        <div key={run.id} className="flex items-center gap-2 text-ui-2xs px-1 py-1.5 rounded hover:bg-[var(--surface-secondary)]/50">
-          <StatusBadge status={run.status} sessionId={run.session_id} t={t} />
-          <TriggeredByBadge triggeredBy={run.triggered_by} t={t} />
-          <span className="text-[var(--text-tertiary)]">
-            {formatDuration(run.started_at, run.finished_at, i18n.language)}
-          </span>
-          <span className="text-[var(--text-tertiary)] ml-auto">
-            {relativeTime(run.started_at, t)}
-          </span>
-          {run.session_id && run.status !== "running" && (
-            <Link href={getChatRoute(run.session_id)} className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)]">
-              <ArrowUpRight className="h-3 w-3" />
-            </Link>
+        <div key={run.id} className="rounded px-1 py-1.5 hover:bg-[var(--surface-secondary)]/50">
+          <div className="flex items-center gap-2 text-ui-2xs">
+            <StatusBadge status={run.status} sessionId={run.session_id} t={t} />
+            <TriggeredByBadge triggeredBy={run.triggered_by} t={t} />
+            <span className="text-[var(--text-tertiary)]">
+              {formatDuration(run.started_at, run.finished_at, i18n.language)}
+            </span>
+            <span className="text-[var(--text-tertiary)] ml-auto">
+              {relativeTime(run.started_at, t)}
+            </span>
+            {run.session_id && run.status !== "running" && (
+              <Link href={getChatRoute(run.session_id)} className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)]">
+                <ArrowUpRight className="h-3 w-3" />
+              </Link>
+            )}
+          </div>
+          {run.error_message && (
+            <p
+              className="mt-1 break-words rounded bg-red-500/5 px-2 py-1 text-ui-3xs leading-relaxed text-red-400"
+              title={run.error_message}
+              data-testid="automation-run-error"
+            >
+              {t("runErrorDetail", { error: run.error_message })}
+            </p>
           )}
         </div>
       ))}

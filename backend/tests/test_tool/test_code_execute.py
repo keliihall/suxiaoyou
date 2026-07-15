@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.schemas.agent import AgentInfo
+from app.storage.file_versions import FileVersionStore
 from app.tool.builtin.code_execute import CodeExecuteTool
 from app.tool.context import ToolContext
 from app.tool.sandbox_self_test import _detached_probe_code
@@ -26,8 +27,8 @@ def _make_ctx(workspace: Path) -> ToolContext:
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="v0.9 Python execution is enabled only under Linux bubblewrap",
+    sys.platform not in {"linux", "darwin"},
+    reason="POSIX sandbox execution contract",
 )
 class TestCodeExecuteExecution:
     @pytest.fixture
@@ -122,6 +123,124 @@ class TestCodeExecuteExecution:
         assert result.output.strip() == "None"
 
     @pytest.mark.asyncio
+    async def test_home_persists_but_physical_stage_and_scratch_are_redacted(
+        self,
+        tool: CodeExecuteTool,
+        tmp_path: Path,
+    ) -> None:
+        ctx = _make_ctx(tmp_path)
+        first = await tool.execute(
+            {
+                "code": (
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "Path.home().joinpath('marker').write_text('kept')\n"
+                    "print(Path.home())\n"
+                    "print(Path.cwd())\n"
+                    "print(os.environ['TMPDIR'])\n"
+                )
+            },
+            ctx,
+        )
+        second = await tool.execute(
+            {
+                "code": (
+                    "from pathlib import Path\n"
+                    "print(Path.home().joinpath('marker').read_text())\n"
+                    "print(Path.home())\n"
+                )
+            },
+            ctx,
+        )
+
+        assert first.success, first.error or first.output
+        assert second.success, second.error or second.output
+        assert "kept" in second.output
+        assert first.output.splitlines()[0] == second.output.splitlines()[-1]
+        assert str(tmp_path) in first.output
+        assert "execution-transactions" not in first.output
+        assert "tx-" not in first.output
+        assert ".suxiaoyou/sandbox/" not in first.output
+        assert "<temporary-execution-directory>" in first.output
+
+    @pytest.mark.asyncio
+    async def test_failure_output_does_not_leak_deleted_physical_paths(
+        self,
+        tool: CodeExecuteTool,
+        tmp_path: Path,
+    ) -> None:
+        result = await tool.execute(
+            {
+                "code": (
+                    "from pathlib import Path\n"
+                    "print(Path.cwd())\n"
+                    "raise RuntimeError('expected failure')\n"
+                )
+            },
+            _make_ctx(tmp_path),
+        )
+
+        assert not result.success
+        assert "expected failure" in result.output
+        assert str(tmp_path) in result.output
+        assert "execution-transactions" not in result.output
+        assert "tx-" not in result.output
+        assert ".suxiaoyou/sandbox/" not in result.output
+
+    @pytest.mark.asyncio
+    async def test_exception_discards_staged_writes(
+        self,
+        tool: CodeExecuteTool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        private = tmp_path / "private"
+        workspace.mkdir()
+        target = workspace / "report.txt"
+        target.write_text("before", encoding="utf-8")
+        monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+        code = (
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('after')\n"
+            "raise RuntimeError('stop')\n"
+        )
+
+        result = await tool.execute({"code": code}, _make_ctx(workspace))
+
+        assert not result.success
+        assert result.metadata["workspace_changes_committed"] is False
+        assert target.read_text(encoding="utf-8") == "before"
+        assert FileVersionStore(workspace).list_versions() == []
+
+    @pytest.mark.asyncio
+    async def test_successful_write_is_versioned_then_committed(
+        self,
+        tool: CodeExecuteTool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        private = tmp_path / "private"
+        workspace.mkdir()
+        target = workspace / "report.txt"
+        target.write_text("before", encoding="utf-8")
+        monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+        code = (
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('after')\n"
+        )
+
+        result = await tool.execute({"code": code}, _make_ctx(workspace))
+
+        assert result.success
+        assert result.metadata["workspace_changes_committed"] is True
+        assert result.metadata["written_files"] == [str(target)]
+        assert target.read_text(encoding="utf-8") == "after"
+        version = FileVersionStore(workspace).list_versions(file_path=target)[0]
+        assert version.operation == "code_execute"
+
+    @pytest.mark.asyncio
     async def test_normal_completion_kills_detached_descendant(
         self,
         tool: CodeExecuteTool,
@@ -136,6 +255,7 @@ class TestCodeExecuteExecution:
                     ready,
                     survived,
                     keep_parent_alive=False,
+                    workspace_root=tmp_path,
                 )
             },
             _make_ctx(tmp_path),
@@ -160,6 +280,7 @@ class TestCodeExecuteExecution:
                     ready,
                     survived,
                     keep_parent_alive=True,
+                    workspace_root=tmp_path,
                 ),
                 "timeout": 1,
             },
@@ -167,24 +288,25 @@ class TestCodeExecuteExecution:
         )
 
         assert result.metadata.get("timeout") is True
-        assert ready.exists()
+        assert not ready.exists()
         await asyncio.sleep(2.25)
         assert not survived.exists()
 
 
 @pytest.mark.skipif(
     sys.platform not in {"darwin", "win32"},
-    reason="macOS/Windows fail-closed contract",
+    reason="native macOS/Windows execution contract",
 )
 @pytest.mark.asyncio
-async def test_unsupported_platform_execution_is_disabled(tmp_path: Path):
+async def test_native_desktop_python_execution_is_available(tmp_path: Path):
     result = await CodeExecuteTool().execute(
-        {"code": "print('must not run')"},
+        {"code": "print('native-python-ok')"},
         _make_ctx(tmp_path),
     )
-    expected = "macOS" if sys.platform == "darwin" else "Windows"
-    assert f"disabled on {expected}" in (result.error or "")
-    assert not (tmp_path / ".suxiaoyou").exists()
+    assert result.success, result.error or result.output
+    assert "native-python-ok" in result.output
+    expected_backend = "macos-seatbelt" if sys.platform == "darwin" else "windows-job-object"
+    assert result.metadata["sandbox"] == expected_backend
 
 
 @pytest.mark.asyncio

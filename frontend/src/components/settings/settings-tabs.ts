@@ -6,6 +6,7 @@ import {
   BarChart3,
   Brain,
   ShieldCheck,
+  LockKeyhole,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -19,6 +20,7 @@ export const SETTINGS_TABS = [
   { id: "general", icon: Settings, labelKey: "tabGeneral" },
   { id: "providers", icon: Cpu, labelKey: "tabProviders" },
   { id: "permissions", icon: ShieldCheck, labelKey: "tabPermissions" },
+  { id: "security", icon: LockKeyhole, labelKey: "tabSecurity" },
   { id: "automations", icon: Timer, labelKey: "tabAutomations" },
   { id: "plugins", icon: Plug, labelKey: "tabPlugins" },
   { id: "usage", icon: BarChart3, labelKey: "tabUsage" },

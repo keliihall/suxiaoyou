@@ -20,6 +20,7 @@ pytestmark = pytest.mark.asyncio
 
 def _task_snapshot(**overrides):
     values = {
+        "task_id": "scheduled-task-1",
         "name": "Loop task",
         "prompt": "Do the work",
         "agent": "build",
@@ -125,4 +126,6 @@ async def test_headless_generation_registers_job_and_maps_agent_error(
     jobs = list(stream_manager._jobs.values())
     assert len(jobs) == 1
     assert jobs[0].session_id == "automation-session"
+    assert jobs[0].invocation_source == "scheduler"
+    assert jobs[0].invocation_source_id == "scheduled-task-1"
     assert jobs[0].completed is True

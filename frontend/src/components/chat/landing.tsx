@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Mail, FileDiff, CalendarDays, Settings,
-  Receipt, FolderOpen, Trash2, Images, Table2,
+  Receipt, FolderOpen, Trash2,
   MessagesSquare,
 } from "lucide-react";
 import Link from "next/link";
@@ -29,8 +29,6 @@ const FEATURED_STARTERS = [
   { icon: Receipt, textKey: "starterOrganizeBills", promptKey: "starterOrganizeBillsPrompt" },
   { icon: FolderOpen, textKey: "starterSummarizeFolder", promptKey: "starterSummarizeFolderPrompt" },
   { icon: Trash2, textKey: "starterCleanupFiles", promptKey: "starterCleanupFilesPrompt" },
-  { icon: Images, textKey: "starterRenamePhotos", promptKey: "starterRenamePhotosPrompt" },
-  { icon: Table2, textKey: "starterExtractPdfTables", promptKey: "starterExtractPdfTablesPrompt" },
 ];
 
 const STARTERS_PER_MOUNT = 3;
@@ -60,6 +58,7 @@ export function Landing({ directoryParam = null }: LandingProps) {
   const { t } = useTranslation('chat');
   const {
     sendMessage,
+    handleGoalCommand,
     sendTaskBatch,
     isGenerating,
     stopGeneration,
@@ -174,6 +173,7 @@ export function Landing({ directoryParam = null }: LandingProps) {
         <ChatForm
           isGenerating={isGenerating}
           onSend={sendMessage}
+          onGoalCommand={handleGoalCommand}
           onSendTaskBatch={sendTaskBatch}
           onStop={stopGeneration}
           directory={globalWorkspace}
@@ -228,6 +228,7 @@ export function Landing({ directoryParam = null }: LandingProps) {
           <ChatForm
             isGenerating={isGenerating}
             onSend={sendMessage}
+            onGoalCommand={handleGoalCommand}
             onSendTaskBatch={sendTaskBatch}
             onStop={stopGeneration}
             directory={globalWorkspace}

@@ -28,6 +28,7 @@ import { apiFetch } from "@/lib/api";
 import { API, IS_DESKTOP } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
 import { downloadBlob } from "@/lib/browser-files";
+import { GoalStatusControl } from "@/components/goal/goal-status-control";
 
 interface ChatHeaderProps {
   sessionId?: string;
@@ -201,6 +202,8 @@ export function ChatHeader({ sessionId, title }: ChatHeaderProps) {
           className="min-w-6 flex-1 self-stretch"
           aria-hidden="true"
         />
+
+        {sessionId && <GoalStatusControl sessionId={sessionId} />}
 
         {/* Remote mode: stream status, or task list button */}
         {remote && streamStatus && (

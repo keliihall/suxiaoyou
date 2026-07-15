@@ -21,6 +21,7 @@
   "input": "Input",
   "output": "Output",
   "reasoning": "Reasoning",
+  "cacheRead": "Cache read",
   "dailyCostTrend": "Daily Cost Trend",
   "modelUsage": "Model Usage",
   "model": "Model",

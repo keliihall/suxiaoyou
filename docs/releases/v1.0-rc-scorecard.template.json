@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "release_tag": "v1.0.0-rc.1",
+  "release_commit": "",
+  "integration_evidence": {
+    "summary_file": "",
+    "summary_sha256": "",
+    "release_tag": "",
+    "release_commit": ""
+  },
+  "packages": [],
+  "office_compatibility": [],
+  "beta_evidence": {
+    "summary_sha256": "",
+    "source_sha256": "",
+    "release_tag": "",
+    "release_commit": ""
+  },
+  "beta": {
+    "controlled_user_count": 0,
+    "started_at": null,
+    "ended_at": null,
+    "workflows": {
+      "file_organization": { "total": 0, "succeeded": 0, "output_tasks": 0, "output_revalidated": 0, "unrecoverable_data_loss": 0 },
+      "office_create_edit": { "total": 0, "succeeded": 0, "output_tasks": 0, "output_revalidated": 0, "unrecoverable_data_loss": 0 },
+      "document_read_analysis": { "total": 0, "succeeded": 0, "output_tasks": 0, "output_revalidated": 0, "unrecoverable_data_loss": 0 },
+      "connector_read": { "total": 0, "succeeded": 0, "output_tasks": 0, "output_revalidated": 0, "unrecoverable_data_loss": 0 },
+      "background_automation": { "total": 0, "succeeded": 0, "output_tasks": 0, "output_revalidated": 0, "unrecoverable_data_loss": 0 }
+    }
+  },
+  "quality": {
+    "open_p0": 0,
+    "open_p1": 0,
+    "backend_full_suite_passed": false,
+    "frontend_full_suite_passed": false,
+    "playwright_core_passed": false,
+    "rust_full_suite_passed": false,
+    "migrations_passed": false,
+    "supply_chain_vulnerabilities_zero": false,
+    "security_boundary_regression_passed": false
+  },
+  "integrations": {
+    "tencent_docs": { "contract_test": "pending", "real_e2e": "pending_credentials" },
+    "image_provider": { "contract_test": "pending", "real_e2e": "pending_credentials" }
+  }
+}

@@ -25,6 +25,7 @@ import { uploadFile, browseFiles, attachByPath, ingestFiles } from "@/lib/upload
 import type { FileSearchResult } from "@/lib/upload";
 import { cn } from "@/lib/utils";
 import { formatElapsedDuration } from "@/lib/duration";
+import { parseGoalCommand, type ParsedGoalCommand } from "@/lib/goal-command";
 import { resolveComposerWorkspace } from "@/lib/session-inputs";
 import type { FileAttachment, SessionInputMode, SessionInputResponse, SessionInputUpdateRequest } from "@/types/chat";
 import { useArtifactStore } from "@/stores/artifact-store";
@@ -42,6 +43,14 @@ interface ChatFormProps {
   isCompacting?: boolean;
   onSend: (text: string, attachments?: FileAttachment[]) => Promise<boolean> | void;
   onQueue?: (text: string, attachments?: FileAttachment[], mode?: SessionInputMode) => Promise<boolean> | void;
+  /**
+   * Dispatch a parsed Goal command. Return `false` when the action was not
+   * accepted; ChatForm then preserves the command draft for retry.
+   */
+  onGoalCommand?: (
+    command: ParsedGoalCommand,
+    attachments?: FileAttachment[],
+  ) => Promise<boolean | void> | boolean | void;
   pendingInputs?: SessionInputResponse[];
   onCancelInput?: (inputId: string) => Promise<boolean> | void;
   onUpdateInput?: (inputId: string, update: SessionInputUpdateRequest) => Promise<boolean> | void;
@@ -243,6 +252,7 @@ export function ChatForm({
   isCompacting = false,
   onSend,
   onQueue,
+  onGoalCommand,
   pendingInputs = [],
   onCancelInput,
   onUpdateInput,
@@ -544,9 +554,74 @@ export function ChatForm({
     if (
       sendingRef.current ||
       (!input.trim() && attachments.length === 0) ||
-      isCompacting ||
-      (isGenerating && !onQueue)
+      isCompacting
     ) return;
+
+    // Goal commands are control-plane input. Parse and dispatch them before
+    // the ordinary send/queue path so their literal text never reaches the
+    // model, even when this ChatForm has not been wired to a Goal API yet.
+    const goalCommand = parseGoalCommand(input);
+    if (goalCommand) {
+      if (!goalCommand.ok) {
+        if (goalCommand.error === "objective_required") {
+          toast.error(t("goalCommandObjectiveRequired"));
+        } else if (goalCommand.error === "objective_too_long") {
+          toast.error(t("goalCommandObjectiveTooLong", {
+            count: goalCommand.objectiveCharacters,
+            limit: goalCommand.maxObjectiveCharacters,
+          }));
+        } else {
+          toast.error(t("goalCommandUnexpectedArgument"));
+        }
+        return;
+      }
+
+      if (!onGoalCommand) {
+        toast.error(t("goalCommandUnavailable"));
+        return;
+      }
+
+      sendingRef.current = true;
+      const submittedText = input;
+      const submittedAttachments = attachments;
+      try {
+        const result = await onGoalCommand(
+          goalCommand,
+          submittedAttachments.length > 0 ? submittedAttachments : undefined,
+        );
+        if (result === false) return;
+
+        // Preserve anything the user typed or attached while the asynchronous
+        // command was running; only clear the exact command payload accepted
+        // by the Goal API.
+        const inputUnchanged = inputRef.current === submittedText;
+        const attachmentsUnchanged = attachmentsRef.current === submittedAttachments;
+        if (inputUnchanged) {
+          setInput("");
+          inputRef.current = "";
+          setMentionActive(false);
+          if (ref.current) {
+            ref.current.style.height = "auto";
+          }
+        }
+        if (attachmentsUnchanged) {
+          setAttachments([]);
+          attachmentsRef.current = [];
+        }
+        if (inputUnchanged && attachmentsUnchanged) {
+          deleteDraft(draftKey);
+        }
+      } catch (error) {
+        console.error("Goal command failed:", error);
+        toast.error(t("goalCommandFailed"));
+      } finally {
+        sendingRef.current = false;
+      }
+      return;
+    }
+
+    if (isGenerating && !onQueue) return;
+
     sendingRef.current = true;
     try {
       const text = input;
@@ -573,7 +648,7 @@ export function ChatForm({
     } finally {
       sendingRef.current = false;
     }
-  }, [input, attachments, isGenerating, isCompacting, onQueue, onSend, ref, draftKey]);
+  }, [input, attachments, isGenerating, isCompacting, onQueue, onSend, onGoalCommand, ref, draftKey, t]);
 
   const handleSendTaskBatch = useCallback(async () => {
     if (!onSendTaskBatch || isGenerating || isCompacting || sendingRef.current) return;
@@ -776,49 +851,53 @@ export function ChatForm({
     <div className={cn("px-4 pb-4", className)}>
       <div className="mx-auto max-w-3xl xl:max-w-4xl">
         {isGenerating && isProgressStalled && (
-          <div
-            className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--text-secondary)]"
-            data-testid="progress-stalled-notice"
-          >
-            <CircleEllipsis className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]" />
-            <span className="min-w-0 flex-1">
-              <span className="font-medium text-[var(--text-primary)]" role="status" aria-live="polite">
-                {t("taskMayBeStalled")}
-              </span>{" "}
-              {stalledDuration && (
-                <span aria-hidden="true">
-                  {t("taskNoProgressFor", { duration: stalledDuration })}{" "}
+          <div className="mb-2 flex">
+            <div
+              className="inline-flex max-w-full items-center gap-1.5 rounded-lg border border-[var(--border-default)] bg-[var(--surface-secondary)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--text-tertiary)]"
+              data-testid="progress-stalled-notice"
+            >
+              <CircleEllipsis className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span className="min-w-0">
+                <span role="status" aria-live="polite">
+                  {t("taskMayBeStalled")}
                 </span>
-              )}
-              {t("taskMayBeStalledHint")}
-            </span>
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              <button
-                type="button"
-                onClick={onStop}
-                className="inline-flex min-h-8 items-center rounded-lg border border-[var(--border-default)] bg-[var(--surface-primary)] px-2.5 font-medium text-[var(--text-primary)] hover:bg-[var(--surface-tertiary)]"
-              >
-                {t("stopAction")}
-              </button>
+                {stalledDuration && (
+                  <span
+                    className="text-[var(--text-quaternary)]"
+                    aria-hidden="true"
+                    data-testid="progress-stalled-duration"
+                  >
+                    {" · "}{t("taskNoProgressFor", { duration: stalledDuration })}
+                  </span>
+                )}
+              </span>
             </div>
           </div>
         )}
         {pendingInputs.length > 0 && (
           <section
-            className="mb-2 overflow-hidden rounded-2xl border border-[var(--border-default)] bg-[var(--surface-secondary)]"
+            className="mb-2 overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-primary)]"
             aria-label={t("pendingInputsTitle")}
             data-testid="pending-inputs"
           >
-            <div className="flex items-center gap-2 border-b border-[var(--border-default)] px-3 py-2">
-              <ListPlus className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
-              <span className="text-xs font-medium text-[var(--text-primary)]">
-                {t("pendingInputsTitle")}
-              </span>
-              <span className="rounded-full bg-[var(--surface-tertiary)] px-1.5 py-0.5 text-[10px] tabular-nums text-[var(--text-secondary)]">
-                {pendingInputs.length}
-              </span>
+            <div className="px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <ListPlus className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]" aria-hidden="true" />
+                <span className="text-xs font-medium text-[var(--text-primary)]">
+                  {t("pendingInputsTitle")}
+                </span>
+                <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">
+                  {pendingInputs.length}
+                </span>
+              </div>
+              <p
+                className="mt-1 pl-[22px] text-[11px] leading-relaxed text-[var(--text-tertiary)]"
+                data-testid="pending-inputs-guidance"
+              >
+                {t(isGenerating ? "pendingInputsRunningHint" : "pendingInputsIdleHint")}
+              </p>
             </div>
-            <ol className="max-h-36 overflow-y-auto py-1">
+            <ol className="max-h-36 divide-y divide-[var(--border-default)] overflow-y-auto border-t border-[var(--border-default)]">
               {pendingInputs.map((item, index) => {
                 const canCancel = item.status === "queued" || item.status === "blocked";
                 const canRestore = canCancel;
@@ -861,7 +940,7 @@ export function ChatForm({
                       setDragOverInputId(null);
                     }}
                     className={cn(
-                      "group flex min-w-0 items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-xs transition-colors",
+                      "group flex min-w-0 items-center gap-2 border-l-2 border-transparent px-3 py-2 text-xs transition-colors hover:bg-[var(--surface-secondary)]",
                       canMove && "cursor-grab active:cursor-grabbing",
                       draggedInputId === item.id && "opacity-50",
                       dragOverInputId === item.id && draggedInputId !== item.id && "border-l-[var(--brand-primary)] bg-[var(--surface-tertiary)]",
@@ -874,7 +953,7 @@ export function ChatForm({
                         aria-hidden="true"
                       />
                     )}
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--surface-tertiary)] text-[10px] tabular-nums text-[var(--text-secondary)]">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center text-[10px] tabular-nums text-[var(--text-tertiary)]">
                       {index + 1}
                     </span>
                     <span

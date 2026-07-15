@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import threading
 from unittest.mock import AsyncMock, patch
 
@@ -17,6 +19,8 @@ from app.main import (
     lifespan,
 )
 from app.config import Settings
+from app.auth import credential_store
+from app.auth.credential_store import CredentialStore
 from app.connector.registry import ConnectorRegistry
 from app.provider.registry import ProviderRegistry
 from app.schemas.provider import ModelCapabilities, ModelInfo
@@ -255,6 +259,83 @@ async def test_real_lifespan_yields_while_network_startup_jobs_are_stuck(tmp_pat
 
     assert mcp_cancelled.is_set()
     assert provider_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_real_lifespan_reaches_ready_without_resolving_protected_credentials(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider and MCP references must stay inert through the lifespan yield."""
+
+    class ExplodingReadBackend:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def get_password(self, _service: str, _username: str) -> str | None:
+            self.reads += 1
+            raise AssertionError("native credential read before application readiness")
+
+        def set_password(self, *_args) -> None:
+            return None
+
+        def delete_password(self, *_args) -> None:
+            return None
+
+    backend = ExplodingReadBackend()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        credential_store,
+        "_discover_native_backend",
+        lambda: backend,
+    )
+    credential_store.get_credential_store.cache_clear()
+
+    project = tmp_path / "workspace"
+    project.mkdir()
+    scope_hash = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:20]
+    mcp_path = tmp_path / "data" / "credentials" / "mcp" / f"{scope_hash}.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(
+        json.dumps(
+            {
+                "slack": {
+                    "access_token": "suxiaoyou-credential://mcp-access",
+                    "refresh_token": "suxiaoyou-credential://mcp-refresh",
+                    "expires_at": 99999999.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    reference = "suxiaoyou-credential://env%3ASUXIAOYOU_DEEPSEEK_API_KEY%3Atest"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'startup-credentials.db'}",
+        project_dir=str(project),
+        session_token_path=str(tmp_path / "session_token.json"),
+        deepseek_api_key=reference,
+        fts_enabled=False,
+        channels_enabled=False,
+    )
+    app = type("App", (), {})()
+    app.state = type("State", (), {"settings": settings})()
+
+    try:
+        async with asyncio.timeout(3):
+            async with lifespan(app):  # type: ignore[arg-type]
+                assert backend.reads == 0
+                provider = app.state.provider_registry.get_provider("deepseek")
+                assert provider is not None
+                assert getattr(provider, "credential_deferred", False) is True
+                # Let post-readiness startup tasks enter once. Automatic model
+                # metadata refresh and connector discovery are still not an
+                # authorization boundary for this provider credential.
+                await asyncio.sleep(0)
+                assert backend.reads == 0
+    finally:
+        credential_store.get_credential_store.cache_clear()
 
 
 @pytest.mark.asyncio

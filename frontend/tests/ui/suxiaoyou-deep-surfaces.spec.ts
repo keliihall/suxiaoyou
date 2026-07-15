@@ -171,6 +171,35 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await expectNoAppCrash(page);
   });
 
+  test("sidebar right-click menu keeps inline rename active until it is submitted", async ({ page }) => {
+    const state = await setupMockedApp(page);
+
+    await page.goto("/c/session-alpha");
+    const alpha = page.getByRole("option", { name: /Quarterly planning notes/i });
+    await expect(alpha).toBeVisible();
+
+    await alpha.click({ button: "right" });
+    await page.getByRole("menuitem", { name: /Rename/i }).click();
+
+    const input = alpha.locator('input[type="text"]');
+    await expect(input).toBeVisible();
+    await expect(input).toBeFocused();
+    await input.fill("Quarterly planning renamed from context menu");
+    // `alpha` is an accessible-name locator. Filling the input changes the
+    // row's accessible name, so pressing through the scoped locator would
+    // re-resolve the old name instead of targeting the still-focused input.
+    await page.keyboard.press("Enter");
+
+    await expect(
+      page.getByRole("option", {
+        name: /Quarterly planning renamed from context menu/i,
+      }),
+    ).toBeVisible();
+    await expect.poll(() => JSON.stringify(state.sessionUpdates)).toContain(
+      "Quarterly planning renamed from context menu",
+    );
+  });
+
   test("workspace workflow: progress, scratchpad, file preview, and artifact side panel work together", async ({ page }) => {
     await setupMockedApp(page);
 

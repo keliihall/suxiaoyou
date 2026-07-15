@@ -6,9 +6,16 @@ license: Apache-2.0
 
 # Word document workflow
 
-Use this skill when the primary input or output is a `.docx` file. Prefer
-`python-docx` for ordinary paragraphs, headings, tables, images, sections,
-headers, and footers.
+Use this skill when the primary input or output is a `.docx` file. The
+built-in `office` tool is the default for its supported declarative operations;
+use `python-docx` only for advanced images, sections, headers, and footers.
+
+For ordinary paragraphs, headings, tables, page breaks, workspace-local
+images, appends, and exact text replacements, use the built-in `office` tool
+first. It is available on macOS, Windows, and Linux, stays inside the selected
+workspace, versions an existing destination, and validates a temporary DOCX
+before atomic installation. Do not write a Python or shell helper for
+operations covered by `office`.
 
 ## Procedure
 

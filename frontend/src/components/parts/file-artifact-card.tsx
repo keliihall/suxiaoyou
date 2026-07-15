@@ -16,9 +16,12 @@ import {
   FileText,
   FolderOpen,
   Globe,
+  History,
   Image,
   Loader2,
+  Music,
   Presentation,
+  Video,
 } from "lucide-react";
 import {
   ContextMenu,
@@ -47,6 +50,8 @@ import { isRemoteMode } from "@/lib/remote-connection";
 import { usePlatform } from "@/hooks/use-platform";
 import { useArtifactStore } from "@/stores/artifact-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
+import { ToolMetadataSummary } from "@/components/parts/tool-metadata-summary";
+import { FileVersionHistoryDialog } from "@/components/parts/file-version-history-dialog";
 import type { ArtifactType } from "@/types/artifact";
 import type { ToolPart } from "@/types/message";
 
@@ -73,6 +78,8 @@ const TYPE_CONFIG: Record<
   html: { icon: Globe, label: "Page · HTML" },
   svg: { icon: Image, label: "Image · SVG" },
   image: { icon: Image, label: "Image" },
+  audio: { icon: Music, label: "Audio" },
+  video: { icon: Video, label: "Video" },
   markdown: { icon: FileText, label: "Document · MD" },
   docx: { icon: FileText, label: "Document · Word" },
   pdf: { icon: FileText, label: "Document · PDF" },
@@ -146,12 +153,15 @@ export function FileArtifactCard({
   const openArtifact = useArtifactStore((s) => s.openArtifact);
   const workspace = useWorkspaceStore((s) => s.activeWorkspacePath);
   const [busyAction, setBusyAction] = useState<FileArtifactActionId | null>(null);
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
 
   const input = (data?.state.input ?? {}) as Record<string, string | undefined>;
-  const metadata = (data?.state.metadata ?? {}) as Record<string, string | undefined>;
-  const filePath = directFilePath || metadata.file_path || input.file_path || "";
+  const metadata = (data?.state.metadata ?? {}) as Record<string, unknown>;
+  const metadataFilePath = typeof metadata.file_path === "string" ? metadata.file_path : undefined;
+  const filePath = directFilePath || metadataFilePath || input.file_path || "";
   const fileName = filePath ? basename(filePath) : "File";
-  const title = directTitle || metadata.title || input.title || titleWithoutExtension(fileName);
+  const metadataTitle = typeof metadata.title === "string" ? metadata.title : undefined;
+  const title = directTitle || metadataTitle || input.title || titleWithoutExtension(fileName);
   const isRunning = data?.state.status === "running" || data?.state.status === "pending";
   const isError = data?.state.status === "error";
   const isInteractive = Boolean(filePath) && !isRunning && !isError;
@@ -325,6 +335,15 @@ export function FileArtifactCard({
             {t("copyFilePath")}
           </Item>
         )}
+        {nativeFileActionsAvailable && (
+          <Item
+            onSelect={() => setVersionHistoryOpen(true)}
+            disabled={!isInteractive || busyAction !== null}
+          >
+            <History />
+            {t("fileVersionHistory")}
+          </Item>
+        )}
         <Separator />
         <Item
           onSelect={() => void handleSaveCopy()}
@@ -348,6 +367,7 @@ export function FileArtifactCard({
       handleSaveCopy,
       isInteractive,
       localDesktop,
+      nativeFileActionsAvailable,
       revealLabel,
       sessionId,
       t,
@@ -402,6 +422,7 @@ export function FileArtifactCard({
               >
                 {typeLabel}
               </span>
+              <ToolMetadataSummary metadata={metadata} className="mt-1" />
             </span>
           </button>
 
@@ -444,6 +465,15 @@ export function FileArtifactCard({
       <ContextMenuContent className="w-56">
         <MenuItems Item={ContextMenuItem} Separator={ContextMenuSeparator} />
       </ContextMenuContent>
+      {nativeFileActionsAvailable && sessionId && filePath && (
+        <FileVersionHistoryDialog
+          open={versionHistoryOpen}
+          onOpenChange={setVersionHistoryOpen}
+          sessionId={sessionId}
+          filePath={filePath}
+          fileName={fileName}
+        />
+      )}
     </ContextMenu>
   );
 }

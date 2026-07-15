@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.skill.registry import SkillRegistry
+from app.skill.registry import SkillPersistenceError, SkillRegistry
 
 
 def _create_skill(base_dir: Path, name: str, desc: str) -> Path:
@@ -118,3 +118,41 @@ class TestSkillRegistry:
         registry.scan(project_dir=str(tmp_path))
 
         assert registry.count == 0
+
+    def test_disabled_state_round_trips(self, tmp_path: Path):
+        registry = SkillRegistry(project_dir=str(tmp_path))
+        assert registry.disable("project-skill") is True
+
+        restored = SkillRegistry(project_dir=str(tmp_path))
+        assert restored.is_disabled("project-skill") is True
+
+    def test_disable_persistence_failure_keeps_skill_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        registry = SkillRegistry(project_dir=str(tmp_path))
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("disk is full")
+
+        monkeypatch.setattr("app.skill.registry.atomic_write_text", fail_write)
+
+        with pytest.raises(SkillPersistenceError, match="could not be saved"):
+            registry.disable("project-skill")
+
+        assert registry.is_disabled("project-skill") is False
+
+    def test_enable_persistence_failure_keeps_skill_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        registry = SkillRegistry(project_dir=str(tmp_path))
+        assert registry.disable("project-skill") is True
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr("app.skill.registry.atomic_write_text", fail_write)
+
+        with pytest.raises(SkillPersistenceError, match="could not be saved"):
+            registry.enable("project-skill")
+
+        assert registry.is_disabled("project-skill") is True

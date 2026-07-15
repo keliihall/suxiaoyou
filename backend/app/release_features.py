@@ -13,10 +13,19 @@ from typing import Final
 
 
 # Remote bearer access currently reaches the same Agent and host tools as the
-# local desktop session.  Keep it unmountable in v0.9.0-rc.1.
+# local desktop session.  Keep it unmountable in the v1.0 release scope.
 REMOTE_ACCESS_RELEASED: Final = False
 
 # Messaging channels still feed an unattended build Agent.  The individual
 # channel modules remain available to developers, but the release server does
 # not mount their management API or start their consumers.
 MESSAGING_CHANNELS_RELEASED: Final = False
+
+# Persistent Goal CRUD, commands, UI, migration, CAS, and recovery contracts
+# have passed the stable local-desktop release suite.
+GOALS_RELEASED: Final = True
+
+# Autonomous continuation is a separate, stricter boundary.  It remains
+# independently gateable, but its budget, permission, input-priority,
+# pause/recovery, and no-progress safeguards are released for local desktop.
+AUTONOMOUS_GOALS_RELEASED: Final = True

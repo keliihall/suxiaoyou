@@ -5,6 +5,8 @@ export type ArtifactType =
   | "html"
   | "svg"
   | "image"
+  | "audio"
+  | "video"
   | "code"
   | "markdown"
   | "mermaid"

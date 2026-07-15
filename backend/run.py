@@ -476,6 +476,20 @@ def main() -> None:
         )
         raise SystemExit(0)
 
+    if len(sys.argv) in {2, 3} and sys.argv[1] == "--office-self-test":
+        # Exercise the exact frozen Office implementation and its bundled
+        # python-docx/openpyxl/python-pptx dependencies without starting the
+        # API server. Release jobs pass their expected native platform ID so a
+        # mislabeled or emulated artifact cannot satisfy compatibility gates.
+        import json
+
+        from app.tool.office_contract import run_office_contract_sync
+
+        expected_platform = sys.argv[2] if len(sys.argv) == 3 else None
+        report = run_office_contract_sync(expected_platform=expected_platform)
+        print(json.dumps(report, ensure_ascii=False, separators=(",", ":")), flush=True)
+        raise SystemExit(0 if report["all_passed"] else 1)
+
     _install_crash_reporter()
     _configure_windows_process_job()
     _start_desktop_parent_watchdog()

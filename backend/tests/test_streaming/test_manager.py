@@ -151,3 +151,54 @@ async def test_complete_delivers_terminal_sentinel_to_full_subscriber() -> None:
     terminal = queue.get_nowait()
     assert desync is not None and desync.event == DESYNC
     assert terminal is None
+def test_generation_job_source_is_server_validated_and_defaults_fail_closed() -> None:
+    unknown = GenerationJob("unknown-stream", "unknown-session")
+    assert unknown.invocation_source == "unknown"
+    assert unknown.invocation_source_id is None
+
+    scheduler = GenerationJob(
+        "scheduler-stream",
+        "scheduler-session",
+        invocation_source="scheduler",
+        invocation_source_id="  task-1  ",
+    )
+    assert scheduler.invocation_source == "scheduler"
+    assert scheduler.invocation_source_id == "task-1"
+    with pytest.raises(AttributeError):
+        scheduler.invocation_source = "desktop"  # type: ignore[misc]
+
+    with pytest.raises(ValueError, match="Unknown invocation source"):
+        GenerationJob(
+            "spoofed-stream",
+            "spoofed-session",
+            invocation_source="desktop-from-request",  # type: ignore[arg-type]
+        )
+
+
+def test_stream_manager_preserves_explicit_root_source() -> None:
+    manager = StreamManager()
+    job = manager.create_job(
+        "source-stream",
+        "source-session",
+        invocation_source="goal",
+        invocation_source_id="goal-1",
+        goal_id="goal-1",
+        goal_run_id="run-1",
+    )
+    assert job.invocation_source == "goal"
+    assert job.invocation_source_id == "goal-1"
+    assert job.goal_id == "goal-1"
+    assert job.goal_run_id == "run-1"
+
+    assert manager.active_jobs() == [
+        {
+            "stream_id": "source-stream",
+            "session_id": "source-session",
+            "goal_id": "goal-1",
+            "goal_run_id": "run-1",
+            "needs_input": False,
+        }
+    ]
+
+    job.set_goal_run_id("run-2")
+    assert job.goal_run_id == "run-2"

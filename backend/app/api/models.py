@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 
 from app.dependencies import ProviderRegistryDep
 from app.provider.registry import ProviderRegistry
@@ -44,9 +44,13 @@ async def list_models(
 
 @router.post("/models/refresh")
 async def refresh_models(
+    request: Request,
     registry: ProviderRegistryDep,
 ) -> dict:
     """Force re-fetch model lists from all providers (also refreshes models.dev)."""
+    control = getattr(request.app.state, "security_control", None)
+    if control is not None and control.emergency_stop:
+        raise HTTPException(status_code=423, detail="Security emergency stop is active")
     # Refresh models.dev catalog first so providers pick up latest data
     from app.provider.models_dev import models_dev
     await models_dev.refresh()

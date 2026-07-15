@@ -14,6 +14,15 @@ import { TodoProgress, type TodoItem } from "@/components/parts/todo-progress";
 import { extractSources } from "@/lib/sources";
 import { cn } from "@/lib/utils";
 import type { ActivityData, ChainItem } from "@/stores/activity-store";
+import {
+  GENERATED_FILE_TOOL_PARTS,
+  VISIBLE_TOOL_PARTS,
+  collectToolFilePaths,
+  fileCardsForTool,
+  hasVisibleMessageOutput,
+  isFileCardToolPart,
+  presentedFilePathsForParts,
+} from "@/lib/message-presentation";
 
 interface MessageContentProps {
   parts: PartData[];
@@ -27,90 +36,6 @@ interface MessageContentProps {
   isAwaitingConfirmation?: boolean;
   /** Stable wall-clock origin for timers across route/component remounts. */
   generationStartedAt?: number | null;
-}
-
-const VISIBLE_TOOL_PARTS = new Set(["artifact", "present_file", "submit_plan"]);
-const FILE_CARD_TOOL_PARTS = new Set(["present_file", "write", "edit", "code_execute"]);
-const GENERATED_FILE_TOOL_PARTS = new Set(["write", "edit", "code_execute"]);
-const FILE_CARD_EXTENSIONS = new Set([
-  ".bmp",
-  ".csv",
-  ".docx",
-  ".gif",
-  ".html",
-  ".htm",
-  ".jpeg",
-  ".jpg",
-  ".md",
-  ".mdx",
-  ".pdf",
-  ".png",
-  ".ppt",
-  ".pptx",
-  ".svg",
-  ".tsv",
-  ".txt",
-  ".webp",
-  ".xls",
-  ".xlsx",
-]);
-const NON_USER_FACING_FILE_HINTS = ["helper", "scratch", "temp", "tmp", "script"];
-
-function isFileCardToolPart(part: PartData): boolean {
-  return part.type === "tool" && FILE_CARD_TOOL_PARTS.has((part as ToolPart).tool);
-}
-
-function fileExtension(filePath: string): string {
-  const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  const fileName = filePath.slice(lastSlash + 1);
-  const dot = fileName.lastIndexOf(".");
-  return dot >= 0 ? fileName.slice(dot).toLowerCase() : "";
-}
-
-function isUserFacingGeneratedFile(filePath: string): boolean {
-  const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  const fileName = filePath.slice(lastSlash + 1).toLowerCase();
-  if (!FILE_CARD_EXTENSIONS.has(fileExtension(filePath))) return false;
-  return !NON_USER_FACING_FILE_HINTS.some((hint) => fileName.includes(hint));
-}
-
-function collectToolFilePaths(part: ToolPart): string[] {
-  const input = part.state.input as Record<string, unknown>;
-  const metadata = (part.state.metadata ?? {}) as Record<string, unknown>;
-
-  if (part.tool === "present_file") {
-    const filePath = metadata.file_path || input.file_path;
-    return typeof filePath === "string" ? [filePath] : [];
-  }
-
-  if ((part.tool === "write" || part.tool === "edit") && typeof metadata.file_path === "string") {
-    return [metadata.file_path];
-  }
-
-  if (part.tool === "code_execute" && Array.isArray(metadata.written_files)) {
-    return metadata.written_files.filter((path): path is string => typeof path === "string");
-  }
-
-  return [];
-}
-
-function fileCardsForTool(part: ToolPart, presentedFilePaths: Set<string>) {
-  const input = part.state.input as Record<string, unknown>;
-  const metadata = (part.state.metadata ?? {}) as Record<string, unknown>;
-  const title =
-    typeof metadata.title === "string"
-      ? metadata.title
-      : typeof input.title === "string"
-        ? input.title
-        : undefined;
-
-  return collectToolFilePaths(part)
-    .filter((filePath) =>
-      part.tool === "present_file"
-        ? !!filePath
-        : isUserFacingGeneratedFile(filePath) && !presentedFilePaths.has(filePath),
-    )
-    .map((filePath) => ({ filePath, title: part.tool === "present_file" ? title : undefined }));
 }
 
 /**
@@ -167,16 +92,10 @@ export function MessageContent({
   const hasTools = toolParts.length > 0;
   const hasActivity = hasReasoning || hasTools;
 
-  const presentedFilePaths = useMemo(() => {
-    const paths = new Set<string>();
-    for (const part of toolParts) {
-      if (part.tool !== "present_file") continue;
-      for (const filePath of collectToolFilePaths(part)) {
-        paths.add(filePath);
-      }
-    }
-    return paths;
-  }, [toolParts]);
+  const presentedFilePaths = useMemo(
+    () => presentedFilePathsForParts(parts),
+    [parts],
+  );
 
   // Only show activity during streaming if there's meaningful content:
   // - At least one reasoning text with non-empty firstLine, OR
@@ -217,17 +136,14 @@ export function MessageContent({
             thinkingDuration,
             isAwaitingConfirmation,
             stepParts,
-            hasVisibleOutput: parts.some((p) =>
-              p.type === "text" ||
-              p.type === "file" ||
-              p.type === "compaction" ||
-              p.type === "subtask" ||
-              (p.type === "tool" && VISIBLE_TOOL_PARTS.has((p as ToolPart).tool)),
+            isTerminal: !isStreaming || stepParts.some(
+              (part) => part.type === "step-finish" && part.reason !== "tool_use",
             ),
+            hasVisibleOutput: hasVisibleMessageOutput(parts),
             chain,
           }
         : null,
-    [hasActivity, reasoningTexts, toolParts, thinkingDuration, isAwaitingConfirmation, stepParts, chain, parts, activityKey],
+    [hasActivity, reasoningTexts, toolParts, thinkingDuration, isAwaitingConfirmation, stepParts, chain, parts, activityKey, isStreaming],
   );
 
   // Content parts: text, subtask, and deliverable tool calls (shown as inline cards)
@@ -244,7 +160,10 @@ export function MessageContent({
             p.type === "tool" &&
             !VISIBLE_TOOL_PARTS.has((p as ToolPart).tool) &&
             !(
-              GENERATED_FILE_TOOL_PARTS.has((p as ToolPart).tool) &&
+              (
+                GENERATED_FILE_TOOL_PARTS.has((p as ToolPart).tool) ||
+                collectToolFilePaths(p as ToolPart).length > 0
+              ) &&
               fileCardsForTool(p as ToolPart, presentedFilePaths).length > 0
             )
           ) &&

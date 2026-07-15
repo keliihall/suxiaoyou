@@ -120,6 +120,8 @@ interface MessageListProps {
   isHistoryWindow?: boolean;
   /** Restore the live latest-page view. */
   onExitHistoryWindow?: () => void;
+  /** Hide the turn rail while the desktop workspace panel is visible. */
+  hideConversationOutline?: boolean;
 }
 
 export function MessageList({
@@ -148,6 +150,7 @@ export function MessageList({
   totalMessageCount = messages.length,
   isHistoryWindow = false,
   onExitHistoryWindow,
+  hideConversationOutline = false,
 }: MessageListProps) {
   const { t } = useTranslation("chat");
   const {
@@ -317,27 +320,43 @@ export function MessageList({
       || !canFetchNewerMessages
       || !hasNextPage
       || isFetchingNextPage
+      || !fetchNextPage
     ) return;
+    const requestNextPage = () => {
+      if (
+        !hasNextPage
+        || isFetchingNextPage
+        || paginationInFlightRef.current
+      ) return;
+      paginationInFlightRef.current = true;
+      void fetchNextPage()
+        .catch(() => {})
+        .finally(() => {
+          paginationInFlightRef.current = false;
+        });
+    };
+    const requestNextPageWhenNearBottom = () => {
+      const distanceFromBottom = container.scrollHeight
+        - container.scrollTop
+        - container.clientHeight;
+      if (distanceFromBottom <= 200) requestNextPage();
+    };
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (
-          entry.isIntersecting
-          && hasNextPage
-          && !isFetchingNextPage
-          && !paginationInFlightRef.current
-        ) {
-          paginationInFlightRef.current = true;
-          void fetchNextPage?.()
-            .catch(() => {})
-            .finally(() => {
-              paginationInFlightRef.current = false;
-            });
-        }
+        if (entry.isIntersecting) requestNextPage();
       },
       { root: container, rootMargin: "0px 0px 200px 0px" },
     );
     observer.observe(sentinel);
-    return () => observer.disconnect();
+    container.addEventListener("scroll", requestNextPageWhenNearBottom, { passive: true });
+    // The user may have reached the bottom before forward paging became
+    // enabled. In that case no new intersection/scroll event is guaranteed.
+    const frame = requestAnimationFrame(requestNextPageWhenNearBottom);
+    return () => {
+      cancelAnimationFrame(frame);
+      container.removeEventListener("scroll", requestNextPageWhenNearBottom);
+      observer.disconnect();
+    };
   }, [
     canFetchNewerMessages,
     fetchNextPage,
@@ -986,6 +1005,7 @@ export function MessageList({
         locatingMessageId={pendingLocateMessageId}
         locateErrorMessageId={locateErrorMessageId}
         contentIsTallEnough={contentIsTallEnough}
+        hidden={hideConversationOutline}
         onSelect={(turn) => { void handleSelectTurn(turn); }}
         onRetry={handleRetryLocate}
       />

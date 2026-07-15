@@ -25,6 +25,9 @@ export interface SkillInfo {
   description: string;
   location: string;
   source: "bundled" | "plugin" | "project";
+  plugin_source: "builtin" | "global" | "project" | null;
+  /** Whether the built-in localization catalog may replace this metadata. */
+  catalog_managed: boolean;
   enabled: boolean;
 }
 

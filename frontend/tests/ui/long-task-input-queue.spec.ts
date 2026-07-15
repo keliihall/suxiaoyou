@@ -210,6 +210,157 @@ test.describe("long-task follow-up queue", () => {
     await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
   });
 
+  test("keeps a stalled hint quiet and separate from queued-message guidance", async ({ page }) => {
+    await page.clock.install();
+    const apiState = await mock苏小有Api(page);
+    await page.route("**/api/chat/active", async (route) => {
+      const slowTaskStarted = apiState.promptBodies.some((body) =>
+        /slow stream/i.test(String((body as Record<string, unknown> | null)?.text ?? "")),
+      );
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(slowTaskStarted
+          ? [{ stream_id: "stream-slow", session_id: "session-new" }]
+          : []),
+      });
+    });
+    await page.route("**/api/chat/stream/stream-slow**", async (route) => {
+      const lastEventId = new URL(route.request().url()).searchParams.get("last_event_id");
+      if (!lastEventId) {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+        body: [
+          "id: 3",
+          "event: heartbeat",
+          'data: {"status":"ok"}',
+          "",
+          "",
+        ].join("\n"),
+      });
+    });
+    const inputs = await installSessionInputApi(page);
+    await startSlowTask(page);
+
+    const composer = page.getByPlaceholder("The task is running — add a follow-up");
+    await composer.fill("Run this after the current task");
+    await page.getByRole("button", { name: "Queue follow-up" }).click();
+    await expect.poll(() => inputs.posts.length).toBe(1);
+
+    const queue = page.getByTestId("pending-inputs");
+    await expect(queue).toBeVisible();
+    await expect(queue.getByTestId("pending-inputs-guidance")).toContainText(
+      "Runs in order after the current task",
+    );
+
+    await page.clock.runFor(65_000);
+
+    const stalled = page.getByTestId("progress-stalled-notice");
+    await expect(stalled).toBeVisible();
+    await expect(stalled).toHaveClass(/rounded-lg/);
+    await expect(stalled).toContainText("Still running with no new progress");
+    await expect(stalled).not.toContainText(/queued|steer/i);
+    await expect(stalled.getByRole("button")).toHaveCount(0);
+    await expect(stalled.getByTestId("progress-stalled-duration")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+    await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(1);
+    await expect(queue).toBeVisible();
+  });
+
+  test("keeps interaction acknowledgements authoritative without blocking queued edits", async ({ page }) => {
+    await page.clock.install();
+    await mock苏小有Api(page, {
+      activeJobs: [
+        {
+          stream_id: "stream-permission",
+          session_id: "session-new",
+          needs_input: true,
+        },
+      ],
+    });
+    await page.route("**/api/chat/stream/stream-permission**", async (route) => {
+      const lastEventId = new URL(route.request().url()).searchParams.get("last_event_id");
+      if (!lastEventId) {
+        await route.fallback();
+        return;
+      }
+      // Reconnect proves transport liveness without replaying the original
+      // permission card or supplying a continuation event.
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+        body: [
+          "id: 3",
+          "event: heartbeat",
+          'data: {"status":"ok"}',
+          "",
+          "",
+        ].join("\n"),
+      });
+    });
+    await installSessionInputApi(page);
+
+    await page.goto("/c/new");
+    await page.getByRole("button", { name: /Auto-edit/i }).click();
+    await page.getByRole("button", { name: /Ask first/i }).click();
+    await page.getByPlaceholder(/Describe the result you want/i).fill(
+      "Trigger permission flow after a long wait",
+    );
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page).toHaveURL(/\/c\/session-new/);
+    await expect(page.getByText("Permission Required")).toBeVisible();
+
+    const composer = page.getByPlaceholder("The task is running — add a follow-up");
+    await composer.fill("Keep this queued while confirmation recovers");
+    await page.getByRole("button", { name: "Queue follow-up" }).click();
+    const queue = page.getByTestId("pending-inputs");
+    await expect(queue).toContainText("Keep this queued while confirmation recovers");
+
+    // Waiting for a user decision is not a stalled task, even after the normal
+    // no-progress threshold has elapsed.
+    await page.clock.runFor(65_000);
+    await expect(page.getByTestId("progress-stalled-notice")).toHaveCount(0);
+
+    const respond = page.waitForResponse(
+      (response) => response.url().includes("/api/chat/respond") && response.status() === 200,
+    );
+    await page.getByRole("button", { name: /Allow/i }).click();
+    await respond;
+    await expect(page.getByText("Confirmed", { exact: true })).toBeVisible();
+
+    // The pre-confirmation progress timestamp is now old. If continuation SSE
+    // is delayed, the acknowledgement remains the one truthful status instead
+    // of being joined by the generic stalled notice.
+    await page.clock.runFor(6_000);
+    await expect(page.getByTestId("progress-stalled-notice")).toHaveCount(0);
+
+    // Exercise the bounded recovery terminal state too: one Stop affordance,
+    // no duplicate stalled status, and queued messages remain editable.
+    await page.clock.runFor(17_000);
+    await expect(
+      page.getByText("Confirmation was submitted, but continuation status is unavailable."),
+    ).toBeVisible();
+    await expect(page.getByTestId("progress-stalled-notice")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(1);
+
+    await page.getByRole("button", { name: "More actions for queued message 1" }).click();
+    await page.getByRole("menuitem", { name: "Edit" }).click();
+    await expect(composer).toHaveValue("Keep this queued while confirmation recovers");
+    await expect(queue).toHaveCount(0);
+  });
+
   test("restores pending inputs with GET after remount/reconnect", async ({ page }) => {
     await mock苏小有Api(page);
     const inputs = await installSessionInputApi(page, [

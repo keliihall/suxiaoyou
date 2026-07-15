@@ -151,6 +151,12 @@ test("permission, question and plan keep their cards through acknowledgement", (
     chatView,
     /pendingPlanReview\.responseState === "recovery_needed"[\s\S]*<ChatForm/,
   );
+  assert.doesNotMatch(chatView, /<PermissionDialog[\s\S]{0,300}onStop=/);
+  assert.doesNotMatch(chatView, /<QuestionPrompt[\s\S]{0,300}onStop=/);
+  assert.match(
+    chatView,
+    /onStop=\{pendingPlanReview\.responseState === "recovery_needed"[\s\S]{0,120}\? undefined/,
+  );
 });
 
 test("acknowledgement labels are localized", () => {

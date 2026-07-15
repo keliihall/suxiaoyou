@@ -7,6 +7,7 @@ import test from "node:test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(root, ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+const macSignScript = readFileSync(join(root, "scripts/sign-macos-app.sh"), "utf8");
 const tauriConfig = JSON.parse(
   readFileSync(join(root, "desktop-tauri/src-tauri/tauri.conf.json"), "utf8"),
 );
@@ -197,7 +198,7 @@ test("manual releases select one target while tags keep both native macOS builds
   );
 });
 
-test("installer artifacts expire after one day and lifecycle diagnostics after seven", () => {
+test("installer artifacts expire after one day and lifecycle evidence spans the Beta window", () => {
   const jobs = [
     [
       "build-windows",
@@ -227,7 +228,7 @@ test("installer artifacts expire after one day and lifecycle diagnostics after s
     const diagnostics = step(build, diagnosticsStep);
     assert.match(diagnostics, /if:\s*always\(\)/);
     assert.match(diagnostics, /if-no-files-found:\s*ignore/);
-    assert.match(diagnostics, /retention-days:\s*7/);
+    assert.match(diagnostics, /retention-days:\s*30/);
     assert.match(diagnostics, new RegExp(escapeRegExp(diagnosticPath)));
     assert.equal(diagnosticPaths.has(diagnosticPath), false, diagnosticPath);
     diagnosticPaths.add(diagnosticPath);
@@ -429,6 +430,62 @@ test("separates app version from stable and RC release identities", () => {
   assert.doesNotMatch(metadata, /GITHUB_REF_NAME#v/);
 });
 
+test("RC captures contracts while stable tags fail closed on both real integrations", () => {
+  const validate = job("validate-release");
+  const capture = step(validate, "Capture v1 integration contract evidence");
+  assert.match(capture, /startsWith\(github\.ref, 'refs\/tags\/v1\.0\.0'\)/);
+  assert.match(capture, /v1-real-integration-gates\.mjs contract/);
+  assert.match(capture, /--require-evidence-eligible true/);
+  assert.match(capture, /\$RUNNER_TEMP\/v1-integration-evidence/);
+
+  const credentials = step(validate, "Require real integration credentials for stable tag");
+  assert.match(credentials, /is_stable == 'true'/);
+  for (const name of [
+    "TENCENT_DOCS_E2E_TOKEN",
+    "TENCENT_DOCS_E2E_TEST_DOCUMENT_ID",
+    "TENCENT_DOCS_E2E_BASELINE_TEXT",
+    "TENCENT_DOCS_E2E_READ_ARGS_JSON",
+    "TENCENT_DOCS_E2E_WRITE_TOOL",
+    "TENCENT_DOCS_E2E_WRITE_ARGS_JSON",
+    "TENCENT_DOCS_E2E_RESTORE_TOOL",
+    "TENCENT_DOCS_E2E_RESTORE_ARGS_JSON",
+    "SILICONFLOW_IMAGE_E2E_API_KEY",
+    "SILICONFLOW_IMAGE_E2E_MAX_COST_CNY",
+  ]) {
+    assert.match(credentials, new RegExp(`${name}:\\s*\\$\\{\\{ secrets\\.${name} \\}\\}`));
+    assert.match(credentials, new RegExp(`\\b${name}\\b`));
+  }
+  assert.match(credentials, /missing/);
+  assert.match(credentials, /exit 1/);
+
+  const live = step(validate, "Capture stable real integration evidence");
+  assert.match(live, /is_stable == 'true'/);
+  assert.match(live, /I_UNDERSTAND_THIS_MODIFIES_A_DEDICATED_TEST_DOCUMENT/);
+  assert.match(live, /I_UNDERSTAND_THIS_MAY_USE_PROVIDER_QUOTA_OR_INCUR_COST/);
+  assert.match(live, /SILICONFLOW_IMAGE_E2E_MAX_REQUESTS:\s*"1"/);
+  assert.match(live, /live tencent-real-write/);
+  assert.match(live, /live siliconflow-image-real/);
+
+  const upload = step(validate, "Upload v1 integration evidence");
+  assert.match(upload, /if:\s*always\(\)/);
+  assert.match(upload, /v1-integration-evidence-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(upload, /runner\.temp.*v1-integration-evidence/);
+  assert.match(upload, /retention-days:\s*30/);
+  assert.match(upload, /if-no-files-found:\s*error/);
+
+  const publish = job("publish");
+  const verify = step(publish, "Verify and summarize v1 integration evidence");
+  assert.match(verify, /INTEGRATION_MODE="rc"/);
+  assert.match(verify, /INTEGRATION_MODE="ga"/);
+  assert.doesNotMatch(verify, /INTEGRATION_MODE="contract"/);
+  assert.match(verify, /v1-real-integration-gates\.mjs verify/);
+  assert.match(verify, /v1-real-integration-gates\.mjs summarize/);
+  assert.match(verify, /--release-tag "\$GITHUB_REF_NAME"/);
+  assert.match(verify, /--commit "\$RELEASE_COMMIT"/);
+  assert.match(verify, /--output INTEGRATION-CONTRACTS\.json/);
+  assert.match(step(publish, "Prepare GitHub Release"), /INTEGRATION-CONTRACTS\.json/);
+});
+
 test("publishes a manual-download manifest without updater artifacts or keys", () => {
   assert.doesNotMatch(
     workflow,
@@ -438,7 +495,7 @@ test("publishes a manual-download manifest without updater artifacts or keys", (
   assert.match(workflow, /manual-download/);
   assert.match(workflow, /generate-release-manifest\.mjs/);
   assert.match(workflow, /verify-release-manifest\.mjs/);
-  assert.match(workflow, /git rev-parse "\$GITHUB_SHA\^\{commit\}"/);
+  assert.match(workflow, /git rev-parse 'HEAD\^\{commit\}'/);
 });
 
 test("uses locked desktop tooling and sanitized frontend output on every platform", () => {
@@ -758,6 +815,25 @@ test("launches every installed desktop, waits for backend ready, and proves clea
   }
 });
 
+test("aggregates checksum-bound lifecycle reports into scorecard package records", () => {
+  const publish = job("publish");
+  const generate = step(publish, "Generate scorecard-ready native package evidence");
+  assert.match(generate, /git rev-parse 'HEAD\^\{commit\}'/);
+  assert.match(generate, /native-package-evidence\.mjs/);
+  assert.match(generate, /release-assets/);
+  assert.match(generate, /artifacts/);
+  assert.match(generate, /CHECKSUMS\.md/);
+  assert.match(generate, /"\$GITHUB_REF_NAME"/);
+  assert.match(generate, /"\$RELEASE_CHANNEL"/);
+  assert.match(generate, /PACKAGE-LIFECYCLE\.json/);
+
+  const upload = step(publish, "Retain native package evidence for RC scorecard");
+  assert.match(upload, /v1-native-package-evidence-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(upload, /path:\s*PACKAGE-LIFECYCLE\.json/);
+  assert.match(upload, /if-no-files-found:\s*error/);
+  assert.match(upload, /retention-days:\s*30/);
+});
+
 test("Windows native build validates lifecycle primitives before packaging", () => {
   const windows = job("build-windows");
   const buildBackend = step(windows, "Build backend with locked PyInstaller");
@@ -767,9 +843,14 @@ test("Windows native build validates lifecycle primitives before packaging", () 
   );
 
   assert.match(buildBackend, /pytest==9\.1\.1/);
+  assert.match(buildBackend, /pytest-asyncio==1\.4\.0/);
   assert.match(buildBackend, /pip-audit==2\.10\.1/);
   assert.match(buildBackend, /python -m pytest -q backend\/tests\/test_run\.py/);
   assert.match(buildBackend, /backend\/tests\/test_scripts\/test_download_node\.py/);
+  assert.match(
+    buildBackend,
+    /backend\/tests\/test_tool\/test_windows_mutation_safety\.py/,
+  );
   assert.match(
     auditBackend,
     /python -m pip_audit --strict --require-hashes -r backend\/requirements\.txt/,
@@ -802,6 +883,65 @@ test("uses Python 3.12 and full backend smoke on every build host", () => {
   assert.match(mac, /node scripts\/verify-bundle\.mjs/);
   assert.doesNotMatch(mac, /actions\/setup-python/);
   assert.doesNotMatch(mac, /VERIFY_BUNDLE_SKIP_SMOKE/);
+});
+
+test("runs the frozen Office create-edit-reopen contract on every native target", () => {
+  const nativeSteps = [
+    ["build-windows", "Verify backend bundle", /VERIFY_BUNDLE_OFFICE_PLATFORM:\s*windows-x64/],
+    [
+      "build-macos",
+      "Verify backend bundle with full smoke",
+      /VERIFY_BUNDLE_OFFICE_PLATFORM:[^\n]*macos-arm64[^\n]*macos-x64/,
+    ],
+    [
+      "build-linux",
+      "Verify backend bundle",
+      /VERIFY_BUNDLE_OFFICE_PLATFORM:\s*\$\{\{ matrix\.target \}\}/,
+    ],
+  ];
+  for (const [jobName, stepName, platformPattern] of nativeSteps) {
+    const verification = step(job(jobName), stepName);
+    assert.match(verification, platformPattern);
+    assert.match(verification, /node scripts\/verify-bundle\.mjs/);
+  }
+
+  assert.match(bundleVerifier, /--office-self-test/);
+  assert.match(bundleVerifier, /resolveCheckoutCommit\(\)/);
+  assert.match(bundleVerifier, /SUXIAOYOU_RELEASE_COMMIT:\s*expectedCommit/);
+  assert.match(bundleVerifier, /validateOfficeContractReport/);
+  assert.match(bundleVerifier, /requireFrozen:\s*true/);
+
+  const publish = job("publish");
+  const officeEvidence = step(publish, "Verify native Office compatibility evidence");
+  assert.match(officeEvidence, /office-contract-evidence\.mjs/);
+  assert.match(officeEvidence, /aggregate/);
+  assert.match(officeEvidence, /git rev-parse 'HEAD\^\{commit\}'/);
+  assert.match(officeEvidence, /"\$GITHUB_REF_NAME"/);
+  assert.match(officeEvidence, /OFFICE-COMPATIBILITY\.json/);
+  const release = step(publish, "Prepare GitHub Release");
+  assert.match(release, /files:[\s\S]*OFFICE-COMPATIBILITY\.json/);
+
+  const packagedSteps = [
+    ["build-windows", "Install NSIS package and verify packaged Node.js toolchain", /windows-x64/],
+    [
+      "build-macos",
+      "Verify final DMG contents",
+      /macos-arm64[^\n]*macos-x64/,
+    ],
+    [
+      "build-linux",
+      "Verify Linux installers and packaged Node.js toolchain",
+      /\$\{\{ matrix\.target \}\}/,
+    ],
+  ];
+  for (const [jobName, stepName, platformPattern] of packagedSteps) {
+    const verification = step(job(jobName), stepName);
+    assert.match(verification, /VERIFY_BUNDLE_OFFICE_PLATFORM:/);
+    assert.match(verification, platformPattern);
+    assert.match(verification, /VERIFY_BUNDLE_OFFICE_REPORT:/);
+    assert.match(verification, /office-contract\.json/);
+    assert.match(verification, /verify-bundle\.mjs|verify-macos-bundle\.mjs/);
+  }
 });
 
 test("validates release metadata, production audits, and tests before building", () => {
@@ -979,15 +1119,17 @@ test("final bundle proves native provider and sandbox entrypoints", () => {
   assert.match(backendEntrypoint, /genai\.Client/);
   assert.match(bundleVerifier, /\["--provider-self-test"\]/);
   assert.match(bundleVerifier, /\["--sandbox-self-test", workspace\]/);
-  assert.match(bundleVerifier, /platform === "win32" \|\| platform === "darwin"/);
-  assert.match(bundleVerifier, /report\.status !== "disabled" \|\| report\.platform !== platform/);
+  assert.match(bundleVerifier, /report\.status !== "ok" \|\| report\.platform !== platform/);
+  assert.match(bundleVerifier, /windows-job-object/);
+  assert.match(bundleVerifier, /direct-approved/);
   assert.match(bundleVerifier, /filesystem_isolated/);
   assert.match(bundleVerifier, /network_isolated/);
   assert.match(bundleVerifier, /environment_sanitized/);
   assert.match(bundleVerifier, /descendant_terminated/);
+  assert.match(bundleVerifier, /process_tree_reaped/);
 });
 
-test("verifies all seven installers before publishing checksums", () => {
+test("verifies seven installers and publishes exactly eleven release assets", () => {
   const publish = job("publish");
   const completenessIndex = publish.indexOf("Verify artifact completeness");
   const checksumIndex = publish.indexOf("Generate SHA-256 checksums");
@@ -1027,7 +1169,21 @@ test("verifies all seven installers before publishing checksums", () => {
   assert.match(release, /body_path:\s*RELEASE-BODY\.md/);
   assert.match(release, /files:[\s\S]*CHECKSUMS\.md/);
   assert.match(release, /files:[\s\S]*release-manifest\.json/);
+  assert.match(release, /files:[\s\S]*OFFICE-COMPATIBILITY\.json/);
+  assert.match(release, /files:[\s\S]*INTEGRATION-CONTRACTS\.json/);
   assert.match(release, /files:[\s\S]*release-assets\/\*/);
+  const filesBlock = release.match(/files:\s*\|\n((?:\s{12}\S[^\n]*\n?)+)/)?.[1];
+  assert.ok(filesBlock, "release files block is missing");
+  assert.deepEqual(
+    filesBlock.trim().split(/\r?\n/u).map((line) => line.trim()),
+    [
+      "release-assets/*",
+      "CHECKSUMS.md",
+      "release-manifest.json",
+      "OFFICE-COMPATIBILITY.json",
+      "INTEGRATION-CONTRACTS.json",
+    ],
+  );
 
   const trust = step(publish, "Record installer trust status");
   assert.match(trust, /Developer ID/);
@@ -1039,6 +1195,7 @@ test("verifies all seven installers before publishing checksums", () => {
   assert.match(trust, /先卸载候选版，或显式执行覆盖安装/);
   assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
   assert.match(trust, /Linux x64\/ARM64 DEB\/RPM[^\n]*未配置仓库签名/);
+  assert.match(trust, /十一个资产/);
   assert.match(trust, /release-manifest\.json[^\n]*手动下载/);
   assert.match(trust, /cat CHECKSUMS\.md/);
 });
@@ -1059,6 +1216,7 @@ test("keeps stable Apple trust fail-closed while RC stays explicitly ad-hoc", ()
   assert.match(signApp, /if \[\[ "\$IS_STABLE_RELEASE" == "true" \]\]/);
   assert.match(signApp, /SIGNING_IDENTITY="\$DEVELOPER_IDENTITY"/);
   assert.match(signApp, /SIGNING_IDENTITY="-"/);
+  assert.match(signApp, /scripts\/sign-macos-app\.sh "\$APP_PATH" "\$SIGNING_IDENTITY"/);
   assert.match(signApp, /grep -Fxq "Signature=adhoc"/);
   assert.match(signApp, /grep -Fxq "Authority=\$SIGNING_IDENTITY"/);
   assert.match(rcBoundary, /is_stable == 'false'/);
@@ -1092,17 +1250,20 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.match(mac, /security find-identity/);
   assert.match(mac, /\^Developer ID Application:/);
   assert.doesNotMatch(mac, /wangzhang wu|46KF5Z549N/);
-  assert.match(mac, /com\.apple\.security\.cs\.allow-jit/);
-  assert.match(mac, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
+  assert.match(macSignScript, /com\.apple\.security\.cs\.allow-jit/);
+  assert.match(macSignScript, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
   for (const entitlement of [
     "com.apple.security.get-task-allow",
     "com.apple.security.cs.allow-dyld-environment-variables",
     "com.apple.security.cs.disable-executable-page-protection",
     "com.apple.security.cs.disable-library-validation",
   ]) {
-    assert.match(mac, new RegExp(`${escapeRegExp(entitlement)}[\\s\\S]*grep -q`));
+    assert.match(
+      macSignScript,
+      new RegExp(`${escapeRegExp(entitlement)}[\\s\\S]*grep -q`),
+    );
   }
-  assert.match(mac, /desktop-tauri\/src-tauri\/entitlements\.node\.plist/);
+  assert.match(macSignScript, /desktop-tauri\/src-tauri\/entitlements\.node\.plist/);
   assert.match(
     backendAdHocEntitlements,
     /<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\/>/,
@@ -1129,29 +1290,33 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   ]) {
     assert.doesNotMatch(nodeEntitlements, new RegExp(escapeRegExp(entitlement)));
   }
-  assert.doesNotMatch(mac, /codesign -d --entitlements :-/);
-  assert.doesNotMatch(mac, /plutil -(?:extract|remove) com\.apple\.security/);
-  assert.doesNotMatch(mac, /codesign --force[^\n]*--deep/);
+  assert.doesNotMatch(macSignScript, /codesign -d --entitlements :-/);
+  assert.doesNotMatch(macSignScript, /plutil -(?:extract|remove) com\.apple\.security/);
+  assert.doesNotMatch(macSignScript, /codesign --force[^\n]*--deep/);
   assert.match(
-    signStep,
+    macSignScript,
     /BACKEND_BINARY="\$APP_PATH\/Contents\/Resources\/backend\/suxiaoyou-backend"/,
   );
   assert.match(
-    signStep,
-    /BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri\/src-tauri\/entitlements\.backend-adhoc\.plist"/,
+    macSignScript,
+    /BACKEND_ADHOC_ENTITLEMENTS="\$REPOSITORY_ROOT\/desktop-tauri\/src-tauri\/entitlements\.backend-adhoc\.plist"/,
   );
   assert.match(
-    signStep,
-    /elif \[\[ "\$SIGNING_IDENTITY" == "-" && "\$candidate" == "\$BACKEND_BINARY" \]\]; then\s+codesign "\$\{SIGN_ARGS\[@\]\}" --entitlements "\$BACKEND_ADHOC_ENTITLEMENTS" "\$candidate"/,
+    macSignScript,
+    /elif \[\[ "\$candidate" == "\$BACKEND_BINARY" \]\]; then\s+if \[\[ "\$SIGNING_IDENTITY" == "-" \]\]; then\s+codesign "\$\{SIGN_ARGS\[@\]\}" --identifier "\$BACKEND_IDENTIFIER"[\s\S]*--entitlements "\$BACKEND_ADHOC_ENTITLEMENTS" "\$candidate"\s+else\s+codesign "\$\{SIGN_ARGS\[@\]\}" --identifier "\$BACKEND_IDENTIFIER" "\$candidate"/,
   );
   assert.equal(
-    (signStep.match(/--entitlements "\$BACKEND_ADHOC_ENTITLEMENTS"/g) ?? []).length,
+    (macSignScript.match(/--entitlements "\$BACKEND_ADHOC_ENTITLEMENTS"/g) ?? []).length,
     1,
     "backend library-validation entitlement must only be applied by the ad-hoc branch",
   );
   assert.match(
-    signStep,
+    macSignScript,
     /if \[\[ "\$SIGNING_IDENTITY" == "-" \]\]; then[\s\S]*grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*elif grep -q "com\.apple\.security\.cs\.disable-library-validation"[\s\S]*Developer ID backend must not disable library validation/,
+  );
+  assert.match(
+    macSignScript,
+    /codesign -dv --verbose=4 "\$BACKEND_BINARY" > "\$BACKEND_SIGNATURE_DETAILS" 2>&1\s+grep -Fxq "Identifier=\$BACKEND_IDENTIFIER" "\$BACKEND_SIGNATURE_DETAILS"/,
   );
   assert.match(verifySignedStep, /verify-macos-bundle\.mjs[^\n]*--verify-signature/);
   assert.doesNotMatch(verifySignedStep, /--skip-backend-smoke|VERIFY_BUNDLE_SKIP_SMOKE/);
@@ -1171,9 +1336,9 @@ test("repairs then signs inside-out and notarizes the final DMG", () => {
   assert.match(mac, /notarytool submit "\$DMG_PATH"/);
   assert.match(mac, /stapler staple "\$DMG_PATH"/);
   assert.match(mac, /stapler validate "\$DMG_PATH"/);
-  assert.match(mac, /codesign --verify --deep --strict/);
+  assert.match(macSignScript, /codesign --verify --deep --strict/);
   assert.match(mac, /SIGNING_IDENTITY="-"/);
-  assert.match(mac, /SIGN_ARGS=\(--force --options runtime --sign -\)/);
+  assert.match(macSignScript, /SIGN_ARGS=\(--force --options runtime --sign -\)/);
   assert.match(mac, /--verify-signature/);
   assert.match(mac, /spctl --assess/);
   assert.match(mac, /hdiutil verify/);

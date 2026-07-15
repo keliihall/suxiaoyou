@@ -61,9 +61,15 @@ class WebSearchTool(ToolDefinition):
         settings = get_settings()
 
         if settings.proxy_url and settings.proxy_token:
+            from app.auth.credential_store import resolve_env_value
+
+            proxy_token = resolve_env_value(
+                "SUXIAOYOU_PROXY_TOKEN",
+                settings.proxy_token,
+            )
             return await self._search_proxy(
                 query, max_results,
-                settings.proxy_url, settings.proxy_token,
+                settings.proxy_url, proxy_token,
                 ctx,
             )
         return await self._search_ddg(query, max_results, ctx)

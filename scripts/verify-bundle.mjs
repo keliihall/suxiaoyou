@@ -17,8 +17,17 @@
  * over cloudflare tunnel returned 404. Never let that happen again.
  */
 
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { argv, env, exit, platform } from "node:process";
 import { spawn, spawnSync } from "node:child_process";
@@ -27,6 +36,10 @@ import {
   resolveStartupTimeoutMs,
   runBackendSmoke,
 } from "./verify-bundle-smoke.mjs";
+import {
+  resolveCheckoutCommit,
+  validateOfficeContractReport,
+} from "./office-contract-evidence.mjs";
 
 const distArg = argv[2] ?? "backend/dist/suxiaoyou-backend";
 const dist = resolve(distArg);
@@ -268,6 +281,7 @@ const binary = join(dist, exeName);
 const port = 17000 + Math.floor(Math.random() * 500);
 
 providerSmokeTest(binary);
+officeSmokeTest(binary);
 sandboxSmokeTest(binary);
 await smokeTest(binary, port);
 
@@ -282,40 +296,86 @@ function providerSmokeTest(bin) {
   }
 }
 
+function officeSmokeTest(bin) {
+  const expectedPlatform = String(env.VERIFY_BUNDLE_OFFICE_PLATFORM ?? "").trim();
+  const expectedCommit = resolveCheckoutCommit();
+  const args = ["--office-self-test"];
+  if (expectedPlatform) args.push(expectedPlatform);
+  console.log(
+    `[verify-bundle] Office smoke: restricted create/edit/reopen${
+      expectedPlatform ? ` on ${expectedPlatform}` : ""
+    }`,
+  );
+  const report = runJsonCommand(bin, args, 120_000, {
+    SUXIAOYOU_RELEASE_COMMIT: expectedCommit,
+  });
+  const validation = validateOfficeContractReport(report, {
+    expectedPlatform: expectedPlatform || undefined,
+    expectedCommit,
+    expectedReleaseRef: env.GITHUB_REF_NAME || undefined,
+    requireFrozen: true,
+  });
+  if (!validation.ok) {
+    fail(`Office smoke returned invalid evidence:\n- ${validation.failures.join("\n- ")}`);
+  }
+
+  const outputPath = String(env.VERIFY_BUNDLE_OFFICE_REPORT ?? "").trim();
+  if (outputPath) {
+    const destination = resolve(outputPath);
+    mkdirSync(dirname(destination), { recursive: true });
+    const temporary = `${destination}.tmp-${process.pid}`;
+    writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(temporary, destination);
+    console.log(`[verify-bundle] Office evidence: ${destination}`);
+  }
+}
+
 function sandboxSmokeTest(bin) {
   const workspace = mkdtempSync(join(tmpdir(), "suxiaoyou-sandbox-smoke-"));
   try {
     console.log(`[verify-bundle] sandbox smoke: ${bin} --sandbox-self-test ${workspace}`);
     const report = runJsonCommand(bin, ["--sandbox-self-test", workspace], 120_000);
-    if (platform === "win32" || platform === "darwin") {
-      if (report.status !== "disabled" || report.platform !== platform) {
-        fail(`${platform} sandbox smoke did not fail closed: ${JSON.stringify(report)}`);
-      }
-      return;
+    if (report.status !== "ok" || report.platform !== platform) {
+      fail(`sandbox smoke did not execute on ${platform}: ${JSON.stringify(report)}`);
     }
     for (const field of [
-      "filesystem_isolated",
-      "network_isolated",
       "environment_sanitized",
       "descendant_terminated",
+      "process_tree_reaped",
     ]) {
       if (report[field] !== true) {
         fail(`sandbox smoke did not prove ${field}: ${JSON.stringify(report)}`);
       }
     }
-    if (report.status !== "ok") {
-      fail(`sandbox smoke returned an invalid report: ${JSON.stringify(report)}`);
+    if (platform === "win32") {
+      if (
+        report.sandbox !== "windows-job-object" ||
+        report.workspace_execution !== "direct-approved" ||
+        report.filesystem_isolated !== false ||
+        report.network_isolated !== false
+      ) {
+        fail(`Windows execution contract was misreported: ${JSON.stringify(report)}`);
+      }
+    } else {
+      for (const field of ["filesystem_isolated", "network_isolated"]) {
+        if (report[field] !== true) {
+          fail(`sandbox smoke did not prove ${field}: ${JSON.stringify(report)}`);
+        }
+      }
     }
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
 }
 
-function runJsonCommand(bin, args, timeout) {
+function runJsonCommand(bin, args, timeout, extraEnvironment = {}) {
   const result = spawnSync(bin, args, {
     encoding: "utf8",
     timeout,
-    env: { ...env },
+    env: { ...env, ...extraEnvironment },
     windowsHide: true,
   });
   if (result.error) {
@@ -365,7 +425,7 @@ async function smokeTest(bin, port) {
         });
       },
       url: `http://127.0.0.1:${port}/m`,
-      // Remote/mobile shells are intentionally unavailable in v0.9.0-rc.1.
+      // Remote/mobile shells are intentionally unavailable in the v1.0 scope.
       // A fully started backend must reject an anonymous /m request; accepting
       // 200 here would be a security regression. The static m.html and chunks
       // are verified independently above.

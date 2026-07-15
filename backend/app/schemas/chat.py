@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr
 
+from app.schemas.agent import Ruleset
+
 
 class PromptRequest(BaseModel):
     """Start a new generation."""
@@ -23,6 +25,15 @@ class PromptRequest(BaseModel):
     # ceiling. PrivateAttr prevents external JSON from opting into this merge
     # mode and bypassing a persisted session denial.
     _permission_rules_authoritative: bool = PrivateAttr(default=False)
+    # Goal continuations carry a server-created compound ceiling here.  A
+    # plain list cannot faithfully encode the intersection of two ordered
+    # glob policies, and PrivateAttr prevents external request JSON from
+    # supplying a forged ceiling.
+    _trusted_permission_ruleset: Ruleset | None = PrivateAttr(default=None)
+    _enforce_current_permission_ceiling: bool = PrivateAttr(default=False)
+    _goal_permission_baseline: tuple[Ruleset, Ruleset] | None = PrivateAttr(
+        default=None
+    )
     reasoning: bool | None = None  # Explicitly enable/disable reasoning
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}

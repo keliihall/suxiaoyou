@@ -136,6 +136,8 @@ def test_new_database_is_initialized_at_v080_head(tmp_path: Path) -> None:
         "workspace_memory",
         "session_input",
         "idempotency_record",
+        "session_goal",
+        "goal_run",
         "alembic_version",
     } <= _table_names(database)
 
@@ -200,7 +202,7 @@ def test_existing_database_closes_all_handles_before_windows_replace(
 
     token = "windows-existing-handle-order"
     staging = database.with_name(f".{database.name}.{token}.migrating")
-    backup = database.with_name(f"{database.name}.pre-v0.9.0-{token}.bak")
+    backup = database.with_name(f"{database.name}.pre-v1.0.0-{token}.bak")
     real_connect = migrations.sqlite3.connect
     tracked: list[tuple[Path, sqlite3.Connection]] = []
 
@@ -511,7 +513,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     _materialize_v073_database(database)
 
     first = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
-    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v0.9.0-*.bak"))
+    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v1.0.0-*.bak"))
     second = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
 
     assert first is not None and first.upgraded is True
@@ -520,7 +522,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     assert second.created is False
     assert second.previous_revision == V080_HEAD_REVISION
     assert second.backup_path is None
-    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v0.9.0-*.bak")) == backups_after_first
+    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v1.0.0-*.bak")) == backups_after_first
     assert len(backups_after_first) == 1
     assert _revision(database) == V080_HEAD_REVISION
     with sqlite3.connect(database) as connection:
@@ -653,6 +655,67 @@ def test_v083_database_advances_to_formal_v090_boundary(tmp_path: Path) -> None:
     assert _revision(database) == CURRENT_HEAD_REVISION
 
 
+def test_v100_audit_database_adds_nullable_invocation_provenance(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "v100-audit.db"
+    engine = migrations.create_sync_engine(f"sqlite:///{database}")
+    try:
+        with engine.begin() as connection:
+            config = migrations._alembic_config(connection)
+            try:
+                migrations.command.upgrade(
+                    config,
+                    migrations.V100_SECURITY_AUDIT_REVISION,
+                )
+            finally:
+                config.attributes.pop("connection", None)
+            connection.exec_driver_sql(
+                """
+                INSERT INTO security_audit_event (
+                    id, source_kind, source_id, capability, action,
+                    decision, outcome, details
+                ) VALUES (
+                    'legacy-audit', 'builtin', 'suyo', 'filesystem_read',
+                    'read', 'allow', 'success', '{}'
+                )
+                """
+            )
+    finally:
+        engine.dispose()
+
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+
+    assert result is not None
+    assert result.previous_revision == migrations.V100_SECURITY_AUDIT_REVISION
+    assert result.current_revision == CURRENT_HEAD_REVISION
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(security_audit_event)"
+            )
+        }
+        legacy = connection.execute(
+            """
+            SELECT invocation_source_kind, invocation_source_id
+            FROM security_audit_event WHERE id = 'legacy-audit'
+            """
+        ).fetchone()
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(security_audit_event)"
+            )
+        }
+    assert {
+        "invocation_source_kind",
+        "invocation_source_id",
+    } <= columns
+    assert legacy == (None, None)
+    assert "ix_security_audit_invocation_source" in indexes
+
+
 def test_future_revision_is_rejected_without_backup_or_mutation(tmp_path: Path) -> None:
     database = tmp_path / "future.db"
     upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
@@ -675,7 +738,7 @@ def test_upgrade_backup_has_checksum_manifest_and_is_listed(tmp_path: Path) -> N
     assert result is not None and result.backup_path is not None
     assert result.backup_metadata_path is not None
     manifest = json.loads(result.backup_metadata_path.read_text(encoding="utf-8"))
-    assert manifest["app_version"] == "0.9.0"
+    assert manifest["app_version"] == "1.0.0"
     assert manifest["database_name"] == database.name
     assert manifest["database_path"] == str(database.resolve())
     assert manifest["backup_file"] == result.backup_path.name

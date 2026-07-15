@@ -140,6 +140,7 @@ async def claim_next_generation_input(
     session_id: str,
     *,
     target_stream_id: str,
+    include_stale_steer: bool = False,
 ) -> SessionInput | None:
     """Claim the next runnable follow-up for a generation stream.
 
@@ -154,12 +155,16 @@ async def claim_next_generation_input(
             .where(
                 SessionInput.session_id == session_id,
                 SessionInput.status == "queued",
-                or_(
-                    SessionInput.mode == "queue",
-                    and_(
-                        SessionInput.mode == "steer",
-                        SessionInput.target_stream_id == target_stream_id,
-                    ),
+                (
+                    SessionInput.mode.in_(("queue", "steer"))
+                    if include_stale_steer
+                    else or_(
+                        SessionInput.mode == "queue",
+                        and_(
+                            SessionInput.mode == "steer",
+                            SessionInput.target_stream_id == target_stream_id,
+                        ),
+                    )
                 ),
             )
             .order_by(SessionInput.position.asc(), SessionInput.time_created.asc())
@@ -203,6 +208,31 @@ async def finish_session_input(
         item.time_applied = datetime.now(timezone.utc)
     await db.flush()
     return item
+
+
+async def requeue_unstarted_session_input(
+    db: AsyncSession,
+    item_id: str,
+) -> SessionInput | None:
+    """Return an applying input to the queue when its run never started."""
+
+    result = await db.execute(
+        update(SessionInput)
+        .where(
+            SessionInput.id == item_id,
+            SessionInput.status == "applying",
+        )
+        .values(
+            status="queued",
+            time_applied=None,
+            applied_stream_id=None,
+            error_message=None,
+        )
+    )
+    if result.rowcount != 1:
+        return await db.get(SessionInput, item_id)
+    await db.flush()
+    return await db.get(SessionInput, item_id)
 
 
 async def cancel_session_input(
@@ -293,6 +323,7 @@ async def block_unstarted_inputs_for_stream(
     session_id: str,
     stream_id: str,
     error_message: str,
+    include_stale_steer: bool = False,
 ) -> int:
     """Make follow-ups terminal when their owning generation never starts."""
 
@@ -301,12 +332,16 @@ async def block_unstarted_inputs_for_stream(
         .where(
             SessionInput.session_id == session_id,
             SessionInput.status == "queued",
-            or_(
-                SessionInput.mode == "queue",
-                and_(
-                    SessionInput.mode == "steer",
-                    SessionInput.target_stream_id == stream_id,
-                ),
+            (
+                SessionInput.mode.in_(("queue", "steer"))
+                if include_stale_steer
+                else or_(
+                    SessionInput.mode == "queue",
+                    and_(
+                        SessionInput.mode == "steer",
+                        SessionInput.target_stream_id == stream_id,
+                    ),
+                )
             ),
         )
         .values(

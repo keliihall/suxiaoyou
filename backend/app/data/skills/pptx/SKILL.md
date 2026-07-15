@@ -6,8 +6,17 @@ license: Apache-2.0
 
 # PowerPoint workflow
 
-Use `python-pptx` for ordinary slide creation and edits. Start from a user
+Use the built-in `office` tool for its supported declarative operations. Use
+`python-pptx` for advanced slide creation and edits, and start from a user
 template whenever brand fidelity matters.
+
+For title/bullet slides, text boxes, tables, workspace-local images, slide
+appends, and exact text replacements, use the built-in `office` tool first. It
+is available on macOS, Windows, and Linux, stays inside the selected workspace,
+versions an existing destination, and validates a temporary PPTX before atomic
+installation. The restricted tool does not accept external templates; use the
+advanced workflow only when the requested fidelity cannot be expressed by its
+declarative schema.
 
 ## Procedure
 

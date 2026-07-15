@@ -16,9 +16,11 @@ import test from "node:test";
 import {
   buildIsolatedEnvironment,
   descendantProcessIds,
+  hashStableExecutable,
   parsePosixProcessTable,
   resolveDesktopExecutable,
   validateReadyMarker,
+  validateDesktopLifecycleReport,
   verifyDesktopLifecycle,
 } from "./verify-desktop-lifecycle.mjs";
 
@@ -72,6 +74,56 @@ test("collects the complete descendant tree without unrelated processes", () => 
   20 1 S unrelated
   `);
   assert.deepEqual(descendantProcessIds(processes, 10), [11, 13, 12]);
+});
+
+test("rejects lifecycle reports that do not explicitly prove cleanup", () => {
+  const report = {
+    schema_version: 1,
+    status: "ok",
+    ok: true,
+    platform: "linux",
+    source_commit: "a".repeat(40),
+    release_ref: "v1.0.0-rc.7",
+    executable_path: "/tmp/suyo-desktop",
+    executable_size: 4096,
+    executable_sha256: "c".repeat(64),
+    started_at: "2026-07-14T00:00:00Z",
+    completed_at: "2026-07-14T00:00:01Z",
+    desktopPid: 4100,
+    backendPid: 4101,
+    backendUrl: "http://127.0.0.1:43123",
+    observedDescendantPids: [4101],
+    exit: { code: 0, signal: null },
+    checks: {
+      backend_ready: true,
+      backend_healthy: true,
+      graceful_exit: true,
+      no_orphan_processes: false,
+      backend_stopped: true,
+    },
+  };
+  const result = validateDesktopLifecycleReport(report, {
+    expectedPlatform: "linux",
+    expectedCommit: "a".repeat(40),
+    expectedReleaseRef: "v1.0.0-rc.7",
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.failures.includes("checks.no_orphan_processes must be true"));
+});
+
+test("hashes the canonical executable and rejects empty files", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "suxiaoyou-desktop-hash-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const executable = join(directory, "desktop");
+  writeFileSync(executable, "packaged desktop bytes\n");
+  const evidence = hashStableExecutable(executable);
+  assert.equal(evidence.path, realpathSync(executable));
+  assert.equal(evidence.size, Buffer.byteLength("packaged desktop bytes\n"));
+  assert.match(evidence.sha256, /^[0-9a-f]{64}$/u);
+
+  const empty = join(directory, "empty");
+  writeFileSync(empty, "");
+  assert.throws(() => hashStableExecutable(empty), /non-empty regular file/u);
 });
 
 test(
@@ -154,10 +206,29 @@ const poll = setInterval(() => {
     );
     chmodSync(executable, 0o755);
 
-    const result = await verifyDesktopLifecycle({ executable, workDirectory });
+    const result = await verifyDesktopLifecycle({
+      executable,
+      workDirectory,
+      sourceCommit: "a".repeat(40),
+      releaseRef: "v1.0.0-rc.7",
+    });
     assert.equal(result.ok, true);
+    assert.equal(result.status, "ok");
+    assert.equal(result.schema_version, 1);
+    assert.equal(result.executable_path, realpathSync(executable));
+    assert.ok(result.executable_size > 0);
+    assert.match(result.executable_sha256, /^[0-9a-f]{64}$/u);
     assert.equal(result.backendUrl, `http://127.0.0.1:${port}`);
     assert.ok(result.observedDescendantPids.includes(result.backendPid));
+    assert.equal(result.checks.no_orphan_processes, true);
+    assert.equal(
+      validateDesktopLifecycleReport(result, {
+        expectedPlatform: process.platform,
+        expectedCommit: "a".repeat(40),
+        expectedReleaseRef: "v1.0.0-rc.7",
+      }).ok,
+      true,
+    );
   },
 );
 

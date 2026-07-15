@@ -15,6 +15,7 @@ from app.api import session_inputs as session_inputs_api
 from app.api import config as config_api
 from app.api import connectors as connectors_api
 from app.api import files as files_api
+from app.api import file_versions as file_versions_api
 from app.api import google_auth as google_auth_api
 from app.api import mcp as mcp_api
 from app.api import messages as messages_api
@@ -23,11 +24,16 @@ from app.api import fts as fts_api
 from app.api import openai_auth as openai_auth_api
 from app.api import plugins as plugins_api
 from app.api import rapid_mlx as rapid_mlx_api
+from app.api import security as security_api
 from app.api import sessions as sessions_api
 from app.api import skills as skills_api
 from app.api import tools as tools_api
 from app.api import usage as usage_api
-from app.release_features import MESSAGING_CHANNELS_RELEASED, REMOTE_ACCESS_RELEASED
+from app.release_features import (
+    GOALS_RELEASED,
+    MESSAGING_CHANNELS_RELEASED,
+    REMOTE_ACCESS_RELEASED,
+)
 
 api_router = APIRouter()
 
@@ -38,8 +44,13 @@ api_router.include_router(agents_api.router, tags=["agents"])
 api_router.include_router(tools_api.router, tags=["tools"])
 api_router.include_router(skills_api.router, tags=["skills"])
 api_router.include_router(sessions_api.router, tags=["sessions"])
+if GOALS_RELEASED:
+    from app.api import goals as goals_api
+
+    api_router.include_router(goals_api.router, tags=["goals"])
 api_router.include_router(messages_api.router, tags=["messages"])
 api_router.include_router(files_api.router, tags=["files"])
+api_router.include_router(file_versions_api.router, tags=["file-versions"])
 api_router.include_router(artifacts_api.router, tags=["artifacts"])
 api_router.include_router(pptx_api.router, tags=["files"])
 api_router.include_router(usage_api.router, tags=["usage"])
@@ -57,6 +68,7 @@ if REMOTE_ACCESS_RELEASED:
 api_router.include_router(automations_api.router, tags=["automations"])
 api_router.include_router(ollama_api.router, tags=["ollama"])
 api_router.include_router(rapid_mlx_api.router, tags=["rapid-mlx"])
+api_router.include_router(security_api.router, tags=["security"])
 if MESSAGING_CHANNELS_RELEASED:
     from app.api import channels as channels_api
 

@@ -9,11 +9,22 @@ Supports two calling modes:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
+from app.storage.file_versions import FileVersionStore
 from app.tool.base import ToolDefinition, ToolResult
 from app.tool.context import ToolContext
+from app.tool.file_metadata import (
+    UnsupportedFileMetadataError,
+    ensure_mutation_metadata_supported,
+)
+from app.tool.file_versioning import version_metadata
 from app.tool.workspace import WorkspaceViolation, resolve_for_write
+from app.tool.workspace_transaction import (
+    WorkspaceMutationError,
+    WorkspaceMutationTransaction,
+)
 from app.utils.atomic_write import atomic_write_text
 from app.utils.diff import generate_unified_diff
 
@@ -110,20 +121,41 @@ class EditTool(ToolDefinition):
             if not edits:
                 return ToolResult(error="No edits provided")
 
+        if not ctx.workspace:
+            return ToolResult(
+                error=ctx.tr(
+                    "编辑文件需要先选择工作区",
+                    "Editing a file requires an active workspace",
+                )
+            )
+
         # Workspace restriction
         try:
             file_path = resolve_for_write(file_path, ctx.workspace)
         except WorkspaceViolation as e:
             return ToolResult(error=str(e))
 
-        if not os.path.exists(file_path):
-            return ToolResult(error=f"File not found: {file_path}")
-
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                original = f.read()
+            ensure_mutation_metadata_supported(file_path)
+            transaction = WorkspaceMutationTransaction(
+                ctx.workspace or "",
+                ctx,
+                operation="edit",
+            )
+            transaction.prepare_paths([file_path])
+            staged_path = transaction.staged_path(file_path)
+            if not staged_path.exists() or staged_path.is_dir():
+                transaction.abort()
+                return ToolResult(error=f"File not found: {file_path}")
+            original = staged_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
+            transaction.abort()
             return ToolResult(error=f"Cannot edit binary file: {file_path}")
+        except (OSError, UnsupportedFileMetadataError, WorkspaceMutationError) as exc:
+            transaction = locals().get("transaction")
+            if isinstance(transaction, WorkspaceMutationTransaction):
+                transaction.abort()
+            return ToolResult(error=str(exc))
 
         # Apply edits sequentially, validating each before proceeding
         content = original
@@ -136,6 +168,7 @@ class EditTool(ToolDefinition):
             prefix = f"Edit {i}: " if len(edits) > 1 else ""
 
             if old_string == new_string:
+                transaction.abort()
                 return ToolResult(
                     error=f"{prefix}old_string and new_string are identical"
                 )
@@ -146,11 +179,13 @@ class EditTool(ToolDefinition):
                     " (may have been modified by a previous edit in this batch)"
                     if i > 1 else ""
                 )
+                transaction.abort()
                 return ToolResult(
                     error=f"{prefix}old_string not found in {file_path}{suffix}"
                 )
 
             if count > 1 and not replace_all:
+                transaction.abort()
                 return ToolResult(
                     error=f"{prefix}old_string found {count} times in {file_path}. "
                     "Provide more context to make it unique, or use replace_all=true."
@@ -163,9 +198,20 @@ class EditTool(ToolDefinition):
                 content = content.replace(old_string, new_string, 1)
                 total_replacements += 1
 
-        # All edits validated and applied — install the complete replacement in
-        # one rename so a disk/write failure cannot truncate the original.
-        atomic_write_text(file_path, content)
+        try:
+            atomic_write_text(staged_path, content)
+            ensure_mutation_metadata_supported(file_path)
+            commit = transaction.commit()
+            version_ids = set(commit.previous_version_ids)
+            previous_versions = [
+                version
+                for version in FileVersionStore(Path(ctx.workspace or "")).list_versions()
+                if version.id in version_ids
+            ]
+            previous_version = previous_versions[0] if previous_versions else None
+        except (OSError, UnsupportedFileMetadataError, WorkspaceMutationError) as exc:
+            transaction.abort()
+            return ToolResult(error=str(exc))
 
         diff = generate_unified_diff(original, content, file_path)
 
@@ -183,5 +229,11 @@ class EditTool(ToolDefinition):
         return ToolResult(
             output=diff,
             title=title,
-            metadata={"edits": len(edits), "replacements": total_replacements, "file_path": file_path},
+            metadata={
+                "edits": len(edits),
+                "replacements": total_replacements,
+                "file_path": file_path,
+                **commit.metadata,
+                **version_metadata(previous_version),
+            },
         )

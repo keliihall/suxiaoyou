@@ -31,24 +31,25 @@ DEFAULT_STOP_MARKER = "[LOOP_DONE]"
 # Built-in loop presets — prompt templates for common iterative workflows
 LOOP_PRESETS: dict[str, str] = {
     "email-batch": (
-        "Check the next unprocessed email in the inbox. "
-        "Draft a reply, archive, or create a follow-up todo as appropriate. "
-        "If all emails are processed, output [LOOP_DONE]."
+        "Check the next unreviewed email in the inbox. "
+        "Draft a reply and report suggested archive or follow-up actions without "
+        "changing the mailbox or creating tasks. "
+        "If all emails are reviewed, output [LOOP_DONE]."
     ),
     "doc-review": (
         "Read the next section of the document. Check logic, grammar, "
-        "and formatting. Suggest edits or fix directly. "
+        "and formatting. Suggest edits without modifying the document. "
         "If all sections are reviewed, output [LOOP_DONE]."
     ),
     "data-cleanup": (
-        "Check the next batch of records. Fix inconsistent formatting, "
-        "remove duplicates, fill missing fields. "
-        "If all data is cleaned, output [LOOP_DONE]."
+        "Check the next batch of records. Report proposed formatting fixes, "
+        "duplicates, and missing required fields without changing the data. "
+        "If all data is reviewed, output [LOOP_DONE]."
     ),
     "todo-list": (
-        "Check the todo list, pick the next pending task, complete it, "
-        "and mark it done. "
-        "If all tasks are completed, output [LOOP_DONE]."
+        "Check the todo list and recommend the next pending task and completion "
+        "steps without changing task state. "
+        "If all tasks are reviewed, output [LOOP_DONE]."
     ),
 }
 
@@ -81,6 +82,7 @@ async def execute_scheduled_task(
                 return None
             # Snapshot task fields while inside the session
             task_snapshot = {
+                "task_id": task_id,
                 "name": task.name,
                 "prompt": task.prompt,
                 "agent": task.agent,
@@ -328,7 +330,12 @@ async def _run_session(
     # used by chat. This makes shutdown/abort and remote task visibility work
     # consistently and keeps output extraction independent from FastAPI state.
     stream_manager = get_stream_manager()
-    job = stream_manager.create_job(stream_id=stream_id, session_id=session_id)
+    job = stream_manager.create_job(
+        stream_id=stream_id,
+        session_id=session_id,
+        invocation_source="scheduler",
+        invocation_source_id=str(task_snapshot["task_id"]),
+    )
     job.task = asyncio.current_task()
 
     request = PromptRequest(

@@ -6,14 +6,15 @@ import pytest
 
 pytest.importorskip("mcp")
 
+import hashlib
 import json
 import os
 import stat
 from pathlib import Path
 
+from app.auth.credential_store import CredentialStore, CredentialStoreError
 from app.mcp.oauth import AuthServerMeta, TokenSet
 from app.mcp.token_store import McpTokenStore
-from app.auth.credential_store import CredentialStore, CredentialStoreError
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +41,78 @@ def _make_auth_meta() -> AuthServerMeta:
 
 
 class TestMcpTokenStore:
+    def test_default_store_reuses_process_credential_store(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        shared = CredentialStore(
+            fallback_path=tmp_path / "shared-fallback.json",
+            native_backend=None,
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "app.mcp.token_store.get_credential_store",
+            lambda: shared,
+        )
+
+        store = McpTokenStore(project_dir=str(tmp_path / "workspace"))
+
+        assert store._credential_store is shared
+
+    def test_protected_tokens_are_not_resolved_during_store_startup(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class ExplodingReadBackend:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def get_password(self, _service: str, _username: str) -> str | None:
+                self.reads += 1
+                raise AssertionError("native credential read before connector use")
+
+            def set_password(self, *_args) -> None:
+                return None
+
+            def delete_password(self, *_args) -> None:
+                return None
+
+        backend = ExplodingReadBackend()
+        storage_root = tmp_path / "private"
+        credential_backend = CredentialStore(
+            fallback_path=storage_root / "fallback.json",
+            native_backend=backend,
+        )
+        scope = str(tmp_path.resolve())
+        scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:20]
+        token_path = storage_root / "mcp" / f"{scope_hash}.json"
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text(
+            json.dumps(
+                {
+                    "slack": {
+                        "access_token": "suxiaoyou-credential://mcp-access",
+                        "refresh_token": "suxiaoyou-credential://mcp-refresh",
+                        "expires_at": 99999999.0,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        store = McpTokenStore(
+            project_dir=str(tmp_path),
+            storage_root=storage_root,
+            credential_store=credential_backend,
+        )
+
+        assert store.has_token("slack") is True
+        assert backend.reads == 0
+        with pytest.raises(CredentialStoreError, match="cannot be resolved"):
+            store.get("slack")
+        assert backend.reads == 1
+
     def test_save_and_get_round_trip(self, tmp_path: Path):
         store = McpTokenStore(project_dir=str(tmp_path), storage_root=tmp_path / "private")
         tokens = _make_tokens()

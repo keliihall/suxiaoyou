@@ -21,6 +21,7 @@
   "input": "输入",
   "output": "输出",
   "reasoning": "推理",
+  "cacheRead": "缓存读取",
   "dailyCostTrend": "每日成本趋势",
   "modelUsage": "模型用量",
   "model": "模型",

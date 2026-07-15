@@ -18,12 +18,12 @@
     },
     "ms365": {
       "type": "local",
-      "command": ["npx", "-y", "@softeria/ms-365-mcp-server"],
+      "command": ["npx", "-y", "@softeria/ms-365-mcp-server@0.131.1"],
       "enabled": false
     },
     "google-workspace": {
       "type": "local",
-      "command": ["uvx", "--from", "google-workspace-mcp", "google-workspace-worker"],
+      "command": ["uvx", "--from", "google-workspace-mcp==2.0.8", "google-workspace-worker"],
       "enabled": false
     }
   }

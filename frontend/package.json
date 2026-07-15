@@ -1,6 +1,6 @@
 {
   "name": "suxiaoyou-frontend",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
@@ -13,7 +13,7 @@
     "test:ui": "node scripts/playwright-env.mjs test",
     "test:ui:headed": "node scripts/playwright-env.mjs test --headed",
     "test:ui:headless": "node scripts/playwright-env.mjs --headless test",
-    "test:ui:core": "node scripts/playwright-env.mjs --headless test --project=chromium tests/ui/english-localization.spec.ts tests/ui/v0.8-ux-quickwins.spec.ts tests/ui/long-task-input-queue.spec.ts tests/ui/file-artifact-actions.spec.ts tests/ui/settings-return-navigation.spec.ts tests/ui/suxiaoyou-office-errors.spec.ts tests/ui/conversation-outline.spec.ts && node scripts/playwright-env.mjs --headless test --project=chromium tests/ui/suxiaoyou-preflight.spec.ts --grep \"desktop chat path: landing|desktop interactive path: permission request|desktop interactive path: agent question|desktop interactive path: plan review\"",
+    "test:ui:core": "node scripts/playwright-env.mjs --headless test --project=chromium tests/ui/english-localization.spec.ts tests/ui/v0.8-ux-quickwins.spec.ts tests/ui/long-task-input-queue.spec.ts tests/ui/file-artifact-actions.spec.ts tests/ui/settings-return-navigation.spec.ts tests/ui/suxiaoyou-office-errors.spec.ts tests/ui/conversation-outline.spec.ts tests/ui/goal-mode.spec.ts && node scripts/playwright-env.mjs --headless test --project=chromium tests/ui/suxiaoyou-preflight.spec.ts --grep \"desktop chat path: landing|desktop interactive path: permission request|desktop interactive path: agent question|desktop interactive path: plan review\" && node scripts/playwright-env.mjs --headless test --project=chromium tests/ui/suxiaoyou-deep-surfaces.spec.ts --grep \"sidebar right-click menu keeps inline rename active until it is submitted\"",
     "preflight:ui": "node scripts/playwright-env.mjs test --project=chromium"
   },
   "dependencies": {

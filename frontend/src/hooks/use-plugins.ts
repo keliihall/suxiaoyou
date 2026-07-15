@@ -1,7 +1,9 @@
 "use client";
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+import { api, apiErrorMessage } from "@/lib/api";
 import { API, queryKeys } from "@/lib/constants";
 import type {
   PluginsStatusResponse,
@@ -39,27 +41,49 @@ export function useSkills() {
 
 export function usePluginToggle() {
   const queryClient = useQueryClient();
+  const { t } = useTranslation("plugins");
   return useMutation({
-    mutationFn: ({ name, enable }: { name: string; enable: boolean }) =>
-      api.post<{ success: boolean; plugins: PluginsStatusResponse["plugins"] }>(
+    mutationFn: async ({ name, enable }: { name: string; enable: boolean }) => {
+      const result = await api.post<{
+        success: boolean;
+        error?: string;
+        plugins: PluginsStatusResponse["plugins"];
+      }>(
         enable ? API.PLUGINS.ENABLE(name) : API.PLUGINS.DISABLE(name),
-      ),
+      );
+      if (!result.success) throw new Error(result.error || t("pluginToggleFailed"));
+      return result;
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.plugins.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.skills });
+    },
+    onError: (error) => {
+      toast.error(apiErrorMessage(error, t("pluginToggleFailed")));
     },
   });
 }
 
 export function useSkillToggle() {
   const queryClient = useQueryClient();
+  const { t } = useTranslation("plugins");
   return useMutation({
-    mutationFn: ({ name, enable }: { name: string; enable: boolean }) =>
-      api.post<{ success: boolean; skills: SkillInfo[] }>(
+    mutationFn: async ({ name, enable }: { name: string; enable: boolean }) => {
+      const result = await api.post<{
+        success: boolean;
+        error?: string;
+        skills: SkillInfo[];
+      }>(
         enable ? API.SKILLS.ENABLE(name) : API.SKILLS.DISABLE(name),
-      ),
+      );
+      if (!result.success) throw new Error(result.error || t("skillToggleFailed"));
+      return result;
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.skills });
+    },
+    onError: (error) => {
+      toast.error(apiErrorMessage(error, t("skillToggleFailed")));
     },
   });
 }

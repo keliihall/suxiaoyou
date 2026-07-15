@@ -9,6 +9,7 @@ import { PERMISSION_TIMEOUT } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
 import { canSubmitInteraction } from "@/lib/interaction-response";
 import { InteractionAcknowledgement } from "./interaction-acknowledgement";
+import { ToolMetadataSummary } from "@/components/parts/tool-metadata-summary";
 import type { PermissionRequest } from "@/types/streaming";
 
 interface PermissionDialogProps {
@@ -37,6 +38,16 @@ const TOOL_EXPLANATIONS: Record<string, {
     action: "Edit an existing file",
     impact: "Existing content may be replaced",
     safeguard: "Allow only for files you intend to update now",
+  },
+  office: {
+    action: "Create or edit a DOCX, XLSX, or PPTX file in your workspace",
+    impact: "An existing Office file may be atomically replaced after validation",
+    safeguard: "Review the target path and requested declarative changes",
+  },
+  image_generate: {
+    action: "Generate one image through an external provider and save it in the workspace",
+    impact: "The prompt leaves this device and provider pricing or promotions may change",
+    safeguard: "This approval authorizes one generation only; the provider bill is authoritative",
   },
   bash: {
     action: "Run a shell command",
@@ -137,6 +148,30 @@ function PermissionDetails({
   );
 }
 
+function ImageGenerationCostNotice({ permission }: { permission: PermissionRequest }) {
+  const { t } = useTranslation("chat");
+  if ((permission.tool || permission.permission) !== "image_generate") return null;
+
+  return (
+    <div
+      role="alert"
+      data-testid="image-generation-cost-risk"
+      className="rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 p-3 space-y-2"
+    >
+      <p className="text-xs font-semibold text-[var(--text-primary)]">
+        {t("imageGenerationCostRiskTitle")}
+      </p>
+      <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+        {t("imageGenerationCostRisk")}
+      </p>
+      <ToolMetadataSummary metadata={permission.metadata} />
+      <p className="text-[11px] text-[var(--text-tertiary)]">
+        {t("imageGenerationApprovalPerCall")}
+      </p>
+    </div>
+  );
+}
+
 /** Send a browser notification if tab is not focused. */
 function notifyIfHidden(title: string, body: string) {
   if (typeof document === "undefined" || document.visibilityState !== "hidden") return;
@@ -171,6 +206,13 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
   const respondRef = useRef<(allow: boolean) => void>(undefined);
   const displayTool = permission.tool || permission.permission || "this action";
   const details = getToolExplanation(permission.tool || permission.permission);
+  const isImageGeneration = (permission.tool || permission.permission) === "image_generate";
+  const requiresPerCallApproval =
+    permission.metadata?.approval_mode === "per_call" || isImageGeneration;
+  const rememberedPattern = permission.patterns.find(
+    (pattern) => typeof pattern === "string" && Boolean(pattern.trim()),
+  );
+  const canRememberChoice = !requiresPerCallApproval && Boolean(rememberedPattern);
   const isMobile = isRemoteMode();
   const responseState = permission.responseState ?? "idle";
 
@@ -180,12 +222,13 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
     if (submitting || !canSubmitInteraction(permission.responseState)) return;
     setSubmitting(true);
     try {
-      await onRespond(allow, rememberChoice);
+      await onRespond(allow, canRememberChoice && rememberChoice);
     } finally {
       setSubmitting(false);
     }
   }, [
     onRespond,
+    canRememberChoice,
     permission.responseState,
     rememberChoice,
     submitting,
@@ -224,6 +267,7 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
 
   useEffect(() => {
     setSubmitting(false);
+    setRememberChoice(false);
     hasDeniedRef.current = false;
   }, [permission.callId]);
 
@@ -320,6 +364,8 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
               <PermissionDetails permission={permission} compact />
             )}
 
+            {!expired && <ImageGenerationCostNotice permission={permission} />}
+
             {!expired && (
               <>
                 {/* Countdown progress bar */}
@@ -332,19 +378,24 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
                   />
                 </div>
 
-                <div className="flex items-center gap-2 py-2 border-t border-[var(--border-default)]">
-                  <Switch
-                    checked={rememberChoice}
-                    onCheckedChange={setRememberChoice}
-                    id="remember-choice-mobile"
-                  />
-                  <label
-                    htmlFor="remember-choice-mobile"
-                    className="text-sm text-[var(--text-secondary)] cursor-pointer select-none"
-                  >
-                    Remember for <span className="font-medium text-[var(--text-primary)]">{displayTool}</span>
-                  </label>
-                </div>
+                {canRememberChoice && (
+                  <div className="flex items-center gap-2 py-2 border-t border-[var(--border-default)]">
+                    <Switch
+                      checked={rememberChoice}
+                      onCheckedChange={setRememberChoice}
+                      id="remember-choice-mobile"
+                    />
+                    <label
+                      htmlFor="remember-choice-mobile"
+                      title={rememberedPattern}
+                      className="min-w-0 break-all text-sm text-[var(--text-secondary)] cursor-pointer select-none"
+                    >
+                      {t("permissionRememberExactScope", {
+                        pattern: rememberedPattern,
+                      })}
+                    </label>
+                  </div>
+                )}
                 <div className="flex items-center gap-3">
                   <button
                     type="button"
@@ -413,6 +464,8 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
 
               {!expired && <PermissionDetails permission={permission} />}
 
+              {!expired && <ImageGenerationCostNotice permission={permission} />}
+
               {!expired && (
                 <>
                   {/* Countdown progress bar */}
@@ -425,19 +478,24 @@ export function PermissionDialog({ permission, onRespond, onRecover, onStop }: P
                     />
                   </div>
 
-                  <div className="flex items-center gap-2 py-2 border-t border-[var(--border-default)]">
-                    <Switch
-                      checked={rememberChoice}
-                      onCheckedChange={setRememberChoice}
-                      id="remember-choice"
-                    />
-                    <label
-                      htmlFor="remember-choice"
-                      className="text-xs text-[var(--text-secondary)] cursor-pointer select-none"
-                    >
-                      Remember this choice for <span className="font-medium text-[var(--text-primary)]">{displayTool}</span>
-                    </label>
-                  </div>
+                  {canRememberChoice && (
+                    <div className="flex items-center gap-2 py-2 border-t border-[var(--border-default)]">
+                      <Switch
+                        checked={rememberChoice}
+                        onCheckedChange={setRememberChoice}
+                        id="remember-choice"
+                      />
+                      <label
+                        htmlFor="remember-choice"
+                        title={rememberedPattern}
+                        className="min-w-0 break-all text-xs text-[var(--text-secondary)] cursor-pointer select-none"
+                      >
+                        {t("permissionRememberExactScope", {
+                          pattern: rememberedPattern,
+                        })}
+                      </label>
+                    </div>
+                  )}
                   <div className="flex items-center gap-2">
                     <Button
                       type="button"

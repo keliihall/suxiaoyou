@@ -1,4 +1,9 @@
 import type { Page, Request, Route } from "@playwright/test";
+import type {
+  GoalRun,
+  GoalTokenUsage,
+  SessionGoal,
+} from "../../../src/types/goal";
 
 interface MockPart {
   id: string;
@@ -47,6 +52,11 @@ export interface 苏小有MockState {
   editBodies: unknown[];
   chatResponses: unknown[];
   abortRequests: unknown[];
+  goalStarts: unknown[];
+  goalUpdates: unknown[];
+  goalPauses: unknown[];
+  goalResumes: unknown[];
+  goalClears: string[];
   automationCreates: unknown[];
   automationUpdates: unknown[];
   automationDeletes: string[];
@@ -103,11 +113,21 @@ export interface 苏小有MockOptions {
   remoteProviderInfoStatus?: number | number[];
   connectorErrors?: ConnectorErrorMock[];
   activeJobs?: ActiveJobMock[];
+  /** Opt in to the local desktop Goal release gates and deterministic Goal API. */
+  goalsReleased?: boolean;
 }
 
 export interface 苏小有SeedOptions {
   hasCompletedOnboarding?: boolean;
-  savedPermissions?: Array<{ tool: string; allow: boolean; timestamp: number }>;
+  savedPermissions?: Array<{
+    tool: string;
+    allow: boolean;
+    pattern: string;
+    workspace: string | null;
+    sessionId: string | null;
+    source: "desktop";
+    timestamp: number;
+  }>;
   force?: boolean;
 }
 
@@ -1199,7 +1219,7 @@ function seededSettings(options: 苏小有SeedOptions = {}) {
       language: "en",
       activeProvider: "byok",
     },
-    version: 4,
+    version: 5,
   };
 }
 
@@ -1514,6 +1534,138 @@ function sseEvent(id: number, event: string, data: Record<string, unknown>) {
   ].join("\n");
 }
 
+function goalUpdatedAt(revision: number): string {
+  return `2026-04-26T12:00:${String(Math.min(revision, 59)).padStart(2, "0")}.000Z`;
+}
+
+function createdGoal(
+  sessionId: string,
+  objective: string,
+  streamId: string | null,
+): SessionGoal {
+  const revision = streamId ? 2 : 1;
+  return {
+    id: `goal-${sessionId}`,
+    session_id: sessionId,
+    objective,
+    definition_of_done: null,
+    status: "active",
+    run_state: streamId ? "reserved" : "idle",
+    revision,
+    token_budget: 250_000,
+    tokens_used: 37_614,
+    cost_budget_microusd: null,
+    cost_used_microusd: 0,
+    time_budget_seconds: null,
+    time_used_seconds: 0,
+    max_continuations: null,
+    continuation_count: 0,
+    no_progress_count: 0,
+    blocker_streak: 0,
+    consecutive_error_count: 0,
+    blocker_code: null,
+    blocker_message: null,
+    needs_review: false,
+    next_retry_at: null,
+    completion_summary: null,
+    completion_evidence: null,
+    model_id: "openrouter/anthropic/claude-sonnet-4.5",
+    provider_id: "openrouter",
+    agent: "build",
+    reasoning: true,
+    language: "en",
+    last_run_id: streamId ? `run-${streamId}` : null,
+    last_stream_id: streamId,
+    time_started: streamId ? now : null,
+    time_completed: null,
+    time_created: now,
+    time_updated: goalUpdatedAt(revision),
+  };
+}
+
+function reviseGoal(
+  goal: SessionGoal,
+  update: Partial<SessionGoal>,
+): SessionGoal {
+  const revision = goal.revision + 1;
+  return {
+    ...goal,
+    ...update,
+    revision,
+    time_updated: goalUpdatedAt(revision),
+  };
+}
+
+function goalTokenUsage(goal: SessionGoal): GoalTokenUsage {
+  if (goal.tokens_used === 37_614) {
+    return {
+      input: 1_635,
+      output: 175,
+      reasoning: 117,
+      cache_read: 35_687,
+      unattributed: 0,
+      total_tokens: 37_614,
+      source_count: 4,
+    };
+  }
+  return {
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cache_read: 0,
+    unattributed: goal.tokens_used,
+    total_tokens: goal.tokens_used,
+    source_count: 0,
+  };
+}
+
+function createdGoalRun(
+  goal: SessionGoal,
+  streamId: string,
+  trigger: GoalRun["trigger"],
+  ordinal: number,
+): GoalRun {
+  return {
+    id: `run-${streamId}`,
+    goal_id: goal.id,
+    ordinal,
+    goal_revision: goal.revision,
+    idempotency_key: `mock-${streamId}`,
+    stream_id: streamId,
+    trigger,
+    status: goal.run_state === "reserved" ? "reserved" : "running",
+    tokens_used: 0,
+    cost_used_microusd: 0,
+    active_seconds: 0,
+    progress_summary: null,
+    stop_reason: null,
+    error_code: null,
+    lease_owner: "playwright",
+    lease_expires_at: "2026-04-26T12:05:00.000Z",
+    side_effects_started: false,
+    time_started: now,
+    time_finished: null,
+    time_created: now,
+    time_updated: now,
+  };
+}
+
+function goalTerminalStreamBody(goal: SessionGoal, finishReason: string) {
+  return [
+    sseEvent(1, "goal-run-finished", {
+      session_id: goal.session_id,
+      goal_id: goal.id,
+      goal,
+    }),
+    sseEvent(2, "done", {
+      session_id: goal.session_id,
+      goal_id: goal.id,
+      finish_reason: finishReason,
+    }),
+    "",
+  ].join("\n");
+}
+
 function sseStreamBody(streamId: string) {
   if (streamId.startsWith("stream-natural-")) {
     const kind = streamId.slice("stream-natural-".length) as NaturalOfficeKind;
@@ -1715,6 +1867,11 @@ export async function mock苏小有Api(
     editBodies: [],
     chatResponses: [],
     abortRequests: [],
+    goalStarts: [],
+    goalUpdates: [],
+    goalPauses: [],
+    goalResumes: [],
+    goalClears: [],
     automationCreates: [],
     automationUpdates: [],
     automationDeletes: [],
@@ -1759,7 +1916,26 @@ export async function mock苏小有Api(
       run_count: 2,
     }),
   ];
+  const goalsBySession = new Map<string, SessionGoal>();
+  const goalStreamSessions = new Map<string, string>();
+  const releasedGoalStreams = new Set<string>();
+  const goalStreamResolvers = new Map<string, () => void>();
+  let goalRunOrdinal = 0;
   let remoteProviderInfoCalls = 0;
+
+  const releaseGoalStream = (streamId: string | null) => {
+    if (!streamId) return;
+    releasedGoalStreams.add(streamId);
+    goalStreamResolvers.get(streamId)?.();
+    goalStreamResolvers.delete(streamId);
+  };
+
+  const waitForGoalStreamRelease = async (streamId: string) => {
+    if (releasedGoalStreams.has(streamId)) return;
+    await new Promise<void>((resolve) => {
+      goalStreamResolvers.set(streamId, resolve);
+    });
+  };
 
   const findAutomation = (id: string) =>
     automationList.find((a) => a.id === id);
@@ -1793,6 +1969,29 @@ export async function mock苏小有Api(
       const streamId = decodeURIComponent(
         path.split("/").pop() ?? "stream-ui-1",
       );
+      const goalSessionId = goalStreamSessions.get(streamId);
+      if (goalSessionId) {
+        await waitForGoalStreamRelease(streamId);
+        const goal = goalsBySession.get(goalSessionId);
+        if (!goal) {
+          return route.fulfill({
+            status: 410,
+            contentType: "application/json",
+            body: JSON.stringify({ detail: "Goal was cleared" }),
+          });
+        }
+        return route.fulfill({
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          },
+          body: goalTerminalStreamBody(
+            cloneJson(goal),
+            goal.status === "paused" ? "interrupted" : "stop",
+          ),
+        });
+      }
       return route.fulfill({
         status: 200,
         headers: {
@@ -1819,11 +2018,49 @@ export async function mock苏小有Api(
       return fulfillJson(route, { status: "ok" });
     }
     if (path === "/api/models") return fulfillJson(route, models);
+    if (path === "/api/security/overview") {
+      return fulfillJson(route, {
+        state: {
+          emergency_stop: false,
+          disabled_tools: [],
+          updated_at: null,
+          degraded_reason: null,
+        },
+        warnings: [],
+        tools: [],
+        connectors: [],
+        providers: [],
+        automations: { enabled_count: 0, runtime_running: false },
+        goal_limits: {
+          default_token_budget: null,
+          max_token_budget: null,
+        },
+        release_gates: {
+          remote_access: false,
+          messaging_channels: false,
+          goals: options.goalsReleased === true,
+          autonomous_goals: options.goalsReleased === true,
+        },
+      });
+    }
     if (path === "/api/agents")
       return fulfillJson(route, [{ name: "build" }, { name: "plan" }]);
     if (path === "/api/tools") return fulfillJson(route, []);
-    if (path === "/api/chat/active")
-      return fulfillJson(route, options.activeJobs ?? []);
+    if (path === "/api/chat/active") {
+      if (options.activeJobs) return fulfillJson(route, options.activeJobs);
+      const goalJobs = [...goalsBySession.values()]
+        .filter((goal) => (
+          goal.run_state === "reserved" || goal.run_state === "running"
+        ) && goal.last_stream_id)
+        .map((goal) => ({
+          stream_id: goal.last_stream_id,
+          session_id: goal.session_id,
+          needs_input: false,
+          goal_id: goal.id,
+          goal_run_id: goal.last_run_id,
+        }));
+      return fulfillJson(route, goalJobs);
+    }
     if (path === "/api/config/api-key") {
       return fulfillJson(route, {
         is_configured: true,
@@ -2056,6 +2293,127 @@ export async function mock苏小有Api(
     }
     if (path === "/api/sessions" && method === "POST")
       return fulfillJson(route, createdSession);
+
+    const sessionGoalUsageMatch = path.match(
+      /^\/api\/sessions\/([^/]+)\/goal\/usage$/,
+    );
+    if (sessionGoalUsageMatch && method === "GET") {
+      const sessionId = decodeURIComponent(sessionGoalUsageMatch[1]);
+      const current = goalsBySession.get(sessionId);
+      if (current) return fulfillJson(route, goalTokenUsage(current));
+      return route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Goal not found" }),
+      });
+    }
+
+    const sessionGoalControlMatch = path.match(
+      /^\/api\/sessions\/([^/]+)\/goal\/(pause|resume)$/,
+    );
+    if (sessionGoalControlMatch) {
+      const sessionId = decodeURIComponent(sessionGoalControlMatch[1]);
+      const action = sessionGoalControlMatch[2];
+      const body = (requestJson(request) ?? {}) as Record<string, unknown>;
+      const current = goalsBySession.get(sessionId);
+      if (!current) {
+        return route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "Goal not found" }),
+        });
+      }
+
+      if (action === "pause" && method === "POST") {
+        state.goalPauses.push({ session_id: sessionId, ...body });
+        const paused = reviseGoal(current, {
+          status: "paused",
+          run_state: "idle",
+          blocker_code: "user_pause",
+          blocker_message: null,
+        });
+        goalsBySession.set(sessionId, paused);
+        releaseGoalStream(current.last_stream_id);
+        return fulfillJson(route, cloneJson(paused));
+      }
+
+      if (action === "resume" && method === "POST") {
+        state.goalResumes.push({ session_id: sessionId, ...body });
+        const streamId = `stream-goal-resume-${state.goalResumes.length}`;
+        const active = reviseGoal(current, {
+          status: "active",
+          run_state: "idle",
+          blocker_code: null,
+          blocker_message: null,
+        });
+        const resumed = reviseGoal(active, {
+          run_state: "reserved",
+          last_stream_id: streamId,
+          last_run_id: `run-${streamId}`,
+          time_started: now,
+        });
+        goalsBySession.set(sessionId, resumed);
+        goalStreamSessions.set(streamId, sessionId);
+        goalRunOrdinal += 1;
+        return fulfillJson(route, {
+          stream_id: streamId,
+          session_id: sessionId,
+          goal: cloneJson(resumed),
+          run: createdGoalRun(resumed, streamId, "resume", goalRunOrdinal),
+        });
+      }
+    }
+
+    const sessionGoalMatch = path.match(/^\/api\/sessions\/([^/]+)\/goal$/);
+    if (sessionGoalMatch) {
+      const sessionId = decodeURIComponent(sessionGoalMatch[1]);
+      const current = goalsBySession.get(sessionId) ?? null;
+
+      if (method === "GET") return fulfillJson(route, cloneJson(current));
+
+      if (method === "POST") {
+        const body = (requestJson(request) ?? {}) as Record<string, unknown>;
+        const objective = String(body.objective ?? "Mock persistent goal");
+        const goal = createdGoal(sessionId, objective, null);
+        goalsBySession.set(sessionId, goal);
+        state.goalStarts.push({ session_id: sessionId, ...body });
+        return route.fulfill({
+          status: 201,
+          contentType: "application/json",
+          body: JSON.stringify(cloneJson(goal)),
+        });
+      }
+
+      if (method === "PATCH" && current) {
+        const body = (requestJson(request) ?? {}) as Record<string, unknown>;
+        const update: Partial<SessionGoal> = {};
+        if (typeof body.objective === "string") update.objective = body.objective;
+        if (typeof body.definition_of_done === "string" || body.definition_of_done === null) {
+          update.definition_of_done = body.definition_of_done;
+        }
+        if (typeof body.token_budget === "number" || body.token_budget === null) {
+          update.token_budget = body.token_budget;
+        }
+        state.goalUpdates.push({ session_id: sessionId, ...body });
+        const revised = reviseGoal(current, update);
+        goalsBySession.set(sessionId, revised);
+        return fulfillJson(route, cloneJson(revised));
+      }
+
+      if (method === "DELETE" && current) {
+        state.goalClears.push(sessionId);
+        goalsBySession.delete(sessionId);
+        releaseGoalStream(current.last_stream_id);
+        return route.fulfill({ status: 204 });
+      }
+
+      return route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Goal not found" }),
+      });
+    }
+
     const sessionExportMatch = path.match(
       /^\/api\/sessions\/([^/]+)\/export-(pdf|md)$/,
     );
@@ -2186,6 +2544,32 @@ export async function mock苏小有Api(
             : "session-compact",
       });
     }
+    if (path === "/api/chat/goal" && method === "POST") {
+      const body = (requestJson(request) ?? {}) as Record<string, unknown>;
+      const sessionId = typeof body.session_id === "string"
+        ? body.session_id
+        : createdSession.id;
+      const streamId = `stream-goal-initial-${state.goalStarts.length + 1}`;
+      const goal = createdGoal(
+        sessionId,
+        String(body.objective ?? "Mock persistent goal"),
+        streamId,
+      );
+      state.goalStarts.push(body);
+      goalsBySession.set(sessionId, goal);
+      goalStreamSessions.set(streamId, sessionId);
+      goalRunOrdinal += 1;
+      return route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          stream_id: streamId,
+          session_id: sessionId,
+          goal: cloneJson(goal),
+          run: createdGoalRun(goal, streamId, "initial", goalRunOrdinal),
+        }),
+      });
+    }
     if (path === "/api/chat/prompt" && method === "POST") {
       const body = requestJson(request) as Record<string, unknown> | null;
       const text = String(body?.text ?? "");
@@ -2268,6 +2652,7 @@ export async function mock苏小有Api(
         "vendor-terms-summary.pdf",
         "dragged-note.md",
         "folderless-notes.txt",
+        "goal-context.txt",
       ];
       const filename =
         knownUploadNames.find((name) =>

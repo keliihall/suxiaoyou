@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from app.tool.base import ToolDefinition, ToolResult
@@ -64,11 +65,51 @@ async def _execute_single(info: ToolCallInfo) -> ToolExecutionResult:
             call_id=info.call_id, tool_args=info.tool_args,
             error=asyncio.CancelledError("Aborted"),
         )
+    tool_task: asyncio.Task[ToolResult] | None = None
     try:
-        result = await asyncio.wait_for(
-            info.tool(info.tool_args, info.ctx),
-            timeout=info.timeout,
-        )
+        job = getattr(info.ctx, "_job", None)
+        if job is not None and getattr(job, "goal_id", None) is not None:
+            async with job.execution_admission_lock:
+                if not job.execution_admission_open:
+                    return ToolExecutionResult(
+                        index=info.index,
+                        tool_name=info.tool_name,
+                        call_id=info.call_id,
+                        tool_args=info.tool_args,
+                        error=RuntimeError("Execution stopped at a safe boundary"),
+                    )
+                allowed, reason = await info.ctx.execution_allowed()
+                if not allowed:
+                    return ToolExecutionResult(
+                        index=info.index,
+                        tool_name=info.tool_name,
+                        call_id=info.call_id,
+                        tool_args=info.tool_args,
+                        error=RuntimeError(reason or "Execution stopped at a safe boundary"),
+                    )
+                tool_task = asyncio.create_task(
+                    info.tool(info.tool_args, info.ctx),
+                    name=f"admitted-tool-{info.tool_name}-{info.call_id[:8]}",
+                )
+                # Let the admitted coroutine enter the tool while the control
+                # lock is held. A pause then linearizes after an already-started
+                # tool, never between its final gate and its first instruction.
+                await asyncio.sleep(0)
+        else:
+            allowed, reason = await info.ctx.execution_allowed()
+            if not allowed:
+                return ToolExecutionResult(
+                    index=info.index,
+                    tool_name=info.tool_name,
+                    call_id=info.call_id,
+                    tool_args=info.tool_args,
+                    error=RuntimeError(reason or "Execution stopped at a safe boundary"),
+                )
+            tool_task = asyncio.create_task(
+                info.tool(info.tool_args, info.ctx),
+                name=f"tool-body-{info.tool_name}-{info.call_id[:8]}",
+            )
+        result = await asyncio.wait_for(tool_task, timeout=info.timeout)
         return ToolExecutionResult(
             index=info.index, tool_name=info.tool_name,
             call_id=info.call_id, tool_args=info.tool_args,
@@ -86,6 +127,10 @@ async def _execute_single(info: ToolCallInfo) -> ToolExecutionResult:
             call_id=info.call_id, tool_args=info.tool_args,
             error=e,
         )
+    finally:
+        if tool_task is not None and not tool_task.done():
+            tool_task.cancel()
+            await asyncio.gather(tool_task, return_exceptions=True)
 
 
 class StreamingToolExecutor:
@@ -101,10 +146,17 @@ class StreamingToolExecutor:
         results = await executor.collect()
     """
 
-    def __init__(self, abort_event: asyncio.Event) -> None:
+    def __init__(
+        self,
+        abort_event: asyncio.Event,
+        *,
+        task_tracker: Callable[[asyncio.Task[Any]], None] | None = None,
+    ) -> None:
         self._abort = abort_event
+        self._task_tracker = task_tracker
         self._concurrent_tasks: list[tuple[ToolCallInfo, asyncio.Task]] = []
         self._exclusive_queue: list[ToolCallInfo] = []
+        self._active_tasks: set[asyncio.Task[ToolExecutionResult]] = set()
         self._results: dict[int, ToolExecutionResult] = {}
         self._submission_order: list[int] = []
         # Sibling abort: set when a bash tool errors, cancels other concurrent tasks
@@ -120,10 +172,7 @@ class StreamingToolExecutor:
         self._submission_order.append(info.index)
 
         if info.tool.is_concurrency_safe:
-            task = asyncio.create_task(
-                _execute_single(info),
-                name=f"tool-{info.tool_name}-{info.call_id[:8]}",
-            )
+            task = self._start_task(info)
             self._concurrent_tasks.append((info, task))
             logger.info(
                 "Started concurrent tool %s (call_id=%s) during streaming",
@@ -205,8 +254,18 @@ class StreamingToolExecutor:
                 )
                 continue
 
-            result = await _execute_single(info)
-            self._results[result.index] = result
+            task = self._start_task(info)
+            try:
+                result = await task
+                self._results[result.index] = result
+            except asyncio.CancelledError:
+                self._results[info.index] = ToolExecutionResult(
+                    index=info.index,
+                    tool_name=info.tool_name,
+                    call_id=info.call_id,
+                    tool_args=info.tool_args,
+                    error=asyncio.CancelledError("Aborted"),
+                )
 
         # 3. Return in submission order
         return [
@@ -225,9 +284,22 @@ class StreamingToolExecutor:
                     info.tool_name, info.call_id[:8],
                 )
 
+    def _start_task(self, info: ToolCallInfo) -> asyncio.Task[ToolExecutionResult]:
+        task = asyncio.create_task(
+            _execute_single(info),
+            name=f"tool-{info.tool_name}-{info.call_id[:8]}",
+        )
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
+        if self._task_tracker is not None:
+            self._task_tracker(task)
+        if self._abort.is_set() and not task.done():
+            task.cancel()
+        return task
+
     def cancel_all(self) -> None:
-        """Cancel all pending concurrent tasks."""
-        for _, task in self._concurrent_tasks:
+        """Cancel every running concurrent or exclusive tool task."""
+        for task in list(self._active_tasks):
             if not task.done():
                 task.cancel()
 

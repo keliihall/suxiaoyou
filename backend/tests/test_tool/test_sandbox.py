@@ -46,6 +46,60 @@ def test_linux_policy_uses_minimal_root_and_read_only_parent_dirs(tmp_path, monk
     ]
 
 
+def test_linux_policy_mounts_private_stage_at_logical_workspace_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    staged = tmp_path / "private" / "stage"
+    scratch = staged / ".suxiaoyou" / "sandbox" / "call"
+    cwd = workspace / "suxiaoyou_written"
+    workspace.mkdir()
+    scratch.mkdir(parents=True)
+    (staged / "suxiaoyou_written").mkdir()
+    environment = (
+        workspace / ".suxiaoyou" / "execution-environments" / "session-key"
+    )
+    (environment / "home").mkdir(parents=True)
+    (environment / "cache").mkdir()
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(
+        sandbox.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else f"/usr/bin/{name}",
+    )
+
+    launch = sandbox.prepare_sandbox_launch(
+        ["/bin/bash", "-c", "pwd"],
+        workspace=str(workspace),
+        workspace_source=staged,
+        cwd=str(cwd),
+        scratch_dir=scratch,
+        persistent_environment=environment,
+    )
+
+    bind_index = launch.argv.index("--bind")
+    assert launch.argv[bind_index + 1:bind_index + 3] == [
+        str(staged.resolve()),
+        str(workspace.resolve()),
+    ]
+    chdir_index = launch.argv.index("--chdir")
+    assert launch.argv[chdir_index + 1] == str(cwd)
+    home_index = launch.argv.index("HOME")
+    assert launch.argv[home_index + 1] == str(environment / "home")
+    assert str(staged) not in launch.argv[home_index + 1]
+    environment_bind = [
+        index
+        for index, value in enumerate(launch.argv)
+        if value == "--bind" and launch.argv[index + 1] == str(environment)
+    ]
+    assert len(environment_bind) == 1
+    assert launch.argv[environment_bind[0] + 2] == str(environment)
+    assert launch.metadata["execution_environment_scope"] == "session"
+    assert launch.metadata["home_persistent"] is True
+    assert launch.cwd == str(workspace)
+
+
 def test_linux_without_bubblewrap_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.shutil, "which", lambda _name: None)
@@ -61,22 +115,75 @@ def test_linux_without_bubblewrap_fails_closed(tmp_path, monkeypatch):
         )
 
 
-def test_windows_fails_closed_instead_of_using_job_as_a_sandbox(tmp_path, monkeypatch):
+def test_linux_policy_can_share_only_the_network_namespace(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = workspace / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(
+        sandbox.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else f"/usr/bin/{name}",
+    )
+
+    launch = sandbox.prepare_sandbox_launch(
+        ["/bin/sh", "-c", "curl https://example.com"],
+        workspace=str(workspace),
+        cwd=str(workspace),
+        scratch_dir=scratch,
+        allow_network=True,
+    )
+
+    assert "--unshare-all" in launch.argv
+    assert "--share-net" in launch.argv
+    assert "--die-with-parent" in launch.argv
+    assert launch.filesystem_isolated is True
+    assert launch.network_isolated is False
+
+
+def test_windows_uses_sanitized_workspace_launch_and_reports_native_access(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(sandbox.sys, "platform", "win32")
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "output"
+    scratch = workspace / ".suxiaoyou" / "sandbox" / "call"
+    cwd.mkdir(parents=True)
+    scratch.mkdir(parents=True)
+    environment = (
+        workspace / ".suxiaoyou" / "execution-environments" / "session-key"
+    )
+    environment.mkdir(parents=True)
 
-    with pytest.raises(sandbox.SandboxUnavailable, match="AppContainer"):
-        sandbox.prepare_sandbox_launch(
-            ["powershell.exe", "-Command", "Write-Output unsafe"],
-            workspace=str(tmp_path),
-            cwd=str(tmp_path),
-            scratch_dir=tmp_path / "scratch",
-        )
+    launch = sandbox.prepare_sandbox_launch(
+        [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-Command",
+            "Write-Output ok",
+        ],
+        workspace=str(workspace),
+        cwd=str(cwd),
+        scratch_dir=scratch,
+        persistent_environment=environment,
+        allow_network=True,
+    )
+
+    assert launch.backend == "windows-job-object"
+    assert launch.cwd == str(cwd)
+    assert launch.env["HOME"] == str(environment / "home")
+    assert str(environment / "home" / ".local" / "Scripts") in launch.env["PATH"]
+    assert launch.env["SUXIAOYOU_WORKSPACE"] == str(workspace)
+    assert launch.filesystem_isolated is False
+    assert launch.network_isolated is False
+    assert launch.metadata["process_tree_isolated"] is True
 
 
-def test_macos_fails_closed_without_a_detached_process_owner(tmp_path, monkeypatch):
+def test_macos_without_seatbelt_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _name: None)
 
-    with pytest.raises(sandbox.SandboxUnavailable, match="detached-process"):
+    with pytest.raises(sandbox.SandboxUnavailable, match="sandbox-exec"):
         sandbox.prepare_sandbox_launch(
             ["/bin/sh", "-c", "true"],
             workspace=str(tmp_path),
@@ -85,6 +192,111 @@ def test_macos_fails_closed_without_a_detached_process_owner(tmp_path, monkeypat
         )
 
     assert not (tmp_path / "scratch").exists()
+
+
+@pytest.mark.parametrize("allow_network", [False, True])
+def test_macos_policy_uses_seatbelt_and_private_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_network: bool,
+) -> None:
+    workspace = tmp_path / "logical workspace"
+    staged = tmp_path / 'private ) " (allow default)' / "stage"
+    cwd = workspace / "suxiaoyou_written"
+    staged_cwd = staged / "suxiaoyou_written"
+    scratch = staged / ".suxiaoyou" / "sandbox" / "call"
+    workspace.mkdir()
+    staged_cwd.mkdir(parents=True)
+    scratch.mkdir(parents=True)
+    environment = (
+        workspace / ".suxiaoyou" / "execution-environments" / "session-key"
+    )
+    environment.mkdir(parents=True)
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        sandbox.shutil,
+        "which",
+        lambda name: "/usr/bin/sandbox-exec"
+        if name == "sandbox-exec"
+        else (name if Path(name).is_absolute() else f"/usr/bin/{name}"),
+    )
+
+    logical_output = workspace / "suxiaoyou_written" / "result.txt"
+    launch = sandbox.prepare_sandbox_launch(
+        ["/bin/sh", "-c", f"printf ok > {logical_output}"],
+        workspace=str(workspace),
+        workspace_source=staged,
+        cwd=str(cwd),
+        scratch_dir=scratch,
+        persistent_environment=environment,
+        allow_network=allow_network,
+    )
+
+    profile = launch.argv[launch.argv.index("-p") + 1]
+    command = launch.argv[-1]
+    assert launch.argv[0] == "/usr/bin/sandbox-exec"
+    assert "SYS_setsid" in profile
+    assert "SYS_setpgid" in profile
+    assert '(subpath (param "WORKSPACE"))' in profile
+    assert '(subpath (param "ENVIRONMENT"))' in profile
+    # User-controlled paths are values of distinct ``-D`` argv entries, never
+    # interpolated into the Seatbelt source where quotes/parentheses are syntax.
+    assert str(staged.resolve()) not in profile
+    assert f"WORKSPACE={staged.resolve()}" in launch.argv
+    assert ("(system-network)" in profile) is allow_network
+    assert ("(remote ip)" in profile) is allow_network
+    assert str(staged / "suxiaoyou_written" / "result.txt") in command
+    assert str(workspace) not in command
+    assert launch.cwd == str(staged_cwd)
+    assert launch.env["HOME"] == str(environment / "home")
+    assert f"ENVIRONMENT={environment.resolve()}" in launch.argv
+    assert str(environment / "home" / ".local" / "bin") in launch.env["PATH"]
+    assert launch.env["SUXIAOYOU_WORKSPACE"] == str(staged)
+    assert launch.backend == "macos-seatbelt"
+    assert launch.filesystem_isolated is True
+    assert launch.network_isolated is (not allow_network)
+
+
+def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    staged = tmp_path / "private" / "stage"
+    scratch = staged / ".suxiaoyou" / "sandbox" / "call"
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer = tmp_path / "Applications" / "Xcode.app" / "Contents" / "Developer"
+    workspace.mkdir()
+    scratch.mkdir(parents=True)
+    developer.mkdir(parents=True)
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer, target_is_directory=True)
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox, "_MACOS_SYSTEM_READ_ROOTS", (logical,))
+    monkeypatch.setattr(sandbox, "_MACOS_LOGICAL_READ_PATHS", (logical,))
+    monkeypatch.setattr(
+        sandbox.shutil,
+        "which",
+        lambda name: "/usr/bin/sandbox-exec"
+        if name == "sandbox-exec"
+        else (name if Path(name).is_absolute() else f"/usr/bin/{name}"),
+    )
+
+    launch = sandbox.prepare_sandbox_launch(
+        ["/usr/bin/python3", "--version"],
+        workspace=str(workspace),
+        workspace_source=staged,
+        cwd=str(workspace),
+        scratch_dir=scratch,
+    )
+
+    profile = launch.argv[launch.argv.index("-p") + 1]
+    assert any(value == f"LITERAL_READ_0={logical.absolute()}" for value in launch.argv)
+    assert any(
+        value.startswith("READ_ROOT_") and value.endswith(f"={developer.resolve()}")
+        for value in launch.argv
+    )
+    assert '(literal (param "LITERAL_READ_0"))' in profile
 
 
 def test_scratch_creation_rejects_preexisting_symlink_without_external_write(

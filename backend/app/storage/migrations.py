@@ -38,7 +38,12 @@ V073_BASELINE_REVISION: Final = "0001_v073_baseline"
 V080_SESSION_INPUT_REVISION: Final = "0002_v080_session_input"
 V080_IDEMPOTENCY_REVISION: Final = "0003_v080_idempotency_record"
 V083_SESSION_INPUT_LANGUAGE_REVISION: Final = "0004_v083_session_input_language"
-CURRENT_HEAD_REVISION: Final = "0005_v090_release_boundary"
+V090_RELEASE_BOUNDARY_REVISION: Final = "0005_v090_release_boundary"
+V100_SECURITY_AUDIT_REVISION: Final = "0006_v100_security_audit"
+V100_INVOCATION_SOURCE_REVISION: Final = "0007_v100_invocation_source"
+V100_SESSION_GOAL_REVISION: Final = "0008_v100_session_goal"
+V100_GOAL_USAGE_LEDGER_REVISION: Final = "0009_v100_goal_usage_ledger"
+CURRENT_HEAD_REVISION: Final = V100_GOAL_USAGE_LEDGER_REVISION
 # Backward-compatible import for older callers/tests. New code must use the
 # release-neutral CURRENT_HEAD_REVISION name.
 V080_HEAD_REVISION: Final = CURRENT_HEAD_REVISION
@@ -48,11 +53,15 @@ SUPPORTED_REVISIONS: Final[frozenset[str]] = frozenset(
         V080_SESSION_INPUT_REVISION,
         V080_IDEMPOTENCY_REVISION,
         V083_SESSION_INPUT_LANGUAGE_REVISION,
+        V090_RELEASE_BOUNDARY_REVISION,
+        V100_SECURITY_AUDIT_REVISION,
+        V100_INVOCATION_SOURCE_REVISION,
+        V100_SESSION_GOAL_REVISION,
         CURRENT_HEAD_REVISION,
     }
 )
 BACKUP_MANIFEST_VERSION: Final = 1
-BACKUP_APP_VERSION: Final = "0.9.0"
+BACKUP_APP_VERSION: Final = "1.0.0"
 
 # This is the schema shipped by v0.7.3.  It is deliberately independent from
 # current ORM metadata: using the current models here would silently bless an
@@ -965,7 +974,7 @@ def _upgrade_existing_database(
 ) -> MigrationResult:
     token = _migration_token()
     backup_path = database_path.with_name(
-        f"{database_path.name}.pre-v0.9.0-{token}.bak"
+        f"{database_path.name}.pre-v1.0.0-{token}.bak"
     )
     backup_metadata_path: Path | None = None
     staging_path = database_path.with_name(f".{database_path.name}.{token}.migrating")

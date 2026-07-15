@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 from app.api import google_auth
 from app.auth import credential_store
 from app.auth.credential_store import CredentialStore
+from app.connector.registry import ConnectorPersistenceError
+from app.mcp.local_approval import LocalMcpApprovalResult
 
 pytestmark = pytest.mark.asyncio
 
@@ -25,6 +27,9 @@ def _mock_cr(app_client):
     cr.enable = AsyncMock(return_value=True)
     cr.disable = AsyncMock(return_value=True)
     cr.reconnect = AsyncMock(return_value=True)
+    cr.approve_local_startup = AsyncMock(
+        return_value=LocalMcpApprovalResult(True, True, "connected")
+    )
     cr.connect = AsyncMock(return_value={"auth_url": "https://ex.com/auth", "state": "abc"})
     cr.complete_auth = AsyncMock(return_value=True)
     cr.disconnect = AsyncMock(return_value=True)
@@ -80,6 +85,19 @@ class TestAddCustom:
         })
         assert resp.status_code == 200
         assert resp.json()["success"] is False
+        assert resp.json()["error_code"] == "connector_invalid"
+
+    async def test_persistence_failure_is_explicit(self, app_client, _mock_cr):
+        _mock_cr.register_custom.side_effect = ConnectorPersistenceError(
+            "Connector state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.post("/api/connectors", json={
+            "id": "c1", "name": "Custom", "url": "https://ex.com",
+        })
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]
 
 
 class TestRemoveCustom:
@@ -93,6 +111,17 @@ class TestRemoveCustom:
         resp = await app_client.delete("/api/connectors/builtin")
         assert resp.status_code == 200
         assert resp.json()["success"] is False
+        assert resp.json()["error_code"] == "connector_not_custom"
+
+    async def test_persistence_failure_is_explicit(self, app_client, _mock_cr):
+        _mock_cr.remove_custom.side_effect = ConnectorPersistenceError(
+            "Connector state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.delete("/api/connectors/c1")
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]
 
 
 class TestEnableDisable:
@@ -106,6 +135,159 @@ class TestEnableDisable:
         assert resp.status_code == 200
         assert resp.json()["success"] is True
 
+    async def test_enable_persistence_failure_is_explicit(
+        self, app_client, _mock_cr
+    ):
+        _mock_cr.enable.side_effect = ConnectorPersistenceError(
+            "Connector state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.post("/api/connectors/github/enable")
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]
+
+    async def test_disable_persistence_failure_is_explicit(
+        self, app_client, _mock_cr
+    ):
+        _mock_cr.disable.side_effect = ConnectorPersistenceError(
+            "Connector state could not be saved; no runtime change was applied"
+        )
+
+        resp = await app_client.post("/api/connectors/slack/disable")
+
+        assert resp.status_code == 500
+        assert "could not be saved" in resp.json()["detail"]
+
+
+class TestLocalStartupApproval:
+    _FINGERPRINT = "sha256:" + "a" * 64
+
+    async def test_local_desktop_can_approve_current_exact_fingerprint(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(type="local", enabled=True)
+        _mock_cr.mcp_manager.local_startup_approval.return_value = {
+            "fingerprint": self._FINGERPRINT,
+            "command": ["server", "--reviewed"],
+            "cwd": "/private/app-data",
+            "environment_keys": ["PATH", "TOKEN"],
+            "required": True,
+            "approved": False,
+            "error": None,
+        }
+
+        response = await app_client.post(
+            "/api/connectors/local/approve-local-startup",
+            json={"fingerprint": self._FINGERPRINT, "confirmed": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.json()["approval_persisted"] is True
+        assert response.json()["connection_status"] == "connected"
+        _mock_cr.approve_local_startup.assert_awaited_once_with(
+            "local",
+            self._FINGERPRINT,
+        )
+
+    async def test_persisted_approval_with_failed_connect_is_error_not_success(
+        self,
+        app_client,
+        _mock_cr,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(type="local", enabled=True)
+        _mock_cr.mcp_manager.local_startup_approval.return_value = {
+            "fingerprint": self._FINGERPRINT,
+            "command": ["server"],
+            "cwd": "/private/app-data",
+            "environment_keys": ["PATH"],
+            "required": True,
+            "approved": False,
+        }
+        _mock_cr.approve_local_startup.return_value = LocalMcpApprovalResult(
+            approval_persisted=True,
+            connected=False,
+            status="failed",
+            error="connection failed",
+        )
+        audit = AsyncMock()
+        monkeypatch.setattr("app.api.connectors.record_security_event", audit)
+
+        response = await app_client.post(
+            "/api/connectors/local/approve-local-startup",
+            json={"fingerprint": self._FINGERPRINT, "confirmed": True},
+        )
+
+        body = response.json()
+        assert body["success"] is False
+        assert body["approval_persisted"] is True
+        assert body["connection_status"] == "failed"
+        assert body["error"] == "connection failed"
+        assert body["error_code"] == "local_approval_connect_failed"
+        assert audit.await_args_list[-1].kwargs["outcome"] == "error"
+
+    async def test_stale_fingerprint_cannot_reach_manager(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(type="local", enabled=True)
+        _mock_cr.mcp_manager.local_startup_approval.return_value = {
+            "fingerprint": "sha256:" + "b" * 64,
+        }
+
+        response = await app_client.post(
+            "/api/connectors/local/approve-local-startup",
+            json={"fingerprint": self._FINGERPRINT, "confirmed": True},
+        )
+
+        assert response.json()["success"] is False
+        assert "changed" in response.json()["error"]
+        assert response.json()["error_code"] == "local_command_changed"
+        _mock_cr.approve_local_startup.assert_not_awaited()
+
+    async def test_confirmation_is_mandatory(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(type="local", enabled=True)
+
+        response = await app_client.post(
+            "/api/connectors/local/approve-local-startup",
+            json={"fingerprint": self._FINGERPRINT, "confirmed": False},
+        )
+
+        assert response.json() == {
+            "success": False,
+            "error_code": "explicit_confirmation_required",
+            "error": "Explicit confirmation is required",
+        }
+        _mock_cr.approve_local_startup.assert_not_awaited()
+
+    async def test_remote_connector_is_not_affected_by_local_approval_contract(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(type="remote", enabled=True)
+
+        response = await app_client.post(
+            "/api/connectors/slack/approve-local-startup",
+            json={"fingerprint": self._FINGERPRINT, "confirmed": True},
+        )
+
+        assert response.json()["success"] is False
+        assert "Remote connectors" in response.json()["error"]
+        assert (
+            response.json()["error_code"]
+            == "connector_local_approval_not_required"
+        )
+        _mock_cr.approve_local_startup.assert_not_awaited()
 
 class TestOAuthCallback:
     async def test_callback(self, app_client, _mock_cr):
@@ -148,6 +330,9 @@ class TestGoogleGenericEntrypoints:
         assert token.json()["success"] is False
         assert connect.json()["success"] is False
         assert callback.json()["success"] is False
+        assert token.json()["error_code"] == "google_oauth_required"
+        assert connect.json()["error_code"] == "google_oauth_required"
+        assert callback.json()["error_code"] == "google_oauth_required"
         _mock_cr.mcp_manager._token_store.save.assert_not_called()
         _mock_cr.connect.assert_not_awaited()
         _mock_cr.complete_auth.assert_not_awaited()
@@ -175,6 +360,68 @@ class TestGoogleGenericEntrypoints:
         assert disconnect.json()["success"] is False
         manager.reconnect.assert_not_awaited()
         manager.disconnect_auth.assert_not_awaited()
+
+
+class TestPersonalTokenConnector:
+    async def test_raw_token_is_stored_by_manager_and_enables_connector(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        connector = MagicMock(enabled=False, auth_mode="raw_authorization")
+        _mock_cr.get.return_value = connector
+        _mock_cr.mcp_manager.set_static_token.return_value = True
+
+        response = await app_client.post(
+            "/api/connectors/tencent-docs/token",
+            json={"token": "personal-token-value"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert "personal-token-value" not in response.text
+        _mock_cr.mcp_manager.set_static_token.assert_called_once_with(
+            "tencent-docs",
+            "personal-token-value",
+        )
+        _mock_cr.enable.assert_awaited_once_with("tencent-docs")
+
+    async def test_control_char_token_is_rejected_without_storage(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        response = await app_client.post(
+            "/api/connectors/tencent-docs/token",
+            json={"token": "personal-token\nheader-injection"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": False,
+            "error_code": "invalid_connector_token",
+            "error": "Invalid connector token",
+        }
+        _mock_cr.mcp_manager.set_static_token.assert_not_called()
+
+    async def test_raw_token_connector_never_starts_oauth(
+        self,
+        app_client,
+        _mock_cr,
+    ) -> None:
+        _mock_cr.get.return_value = MagicMock(
+            enabled=True,
+            auth_mode="raw_authorization",
+        )
+
+        response = await app_client.post(
+            "/api/connectors/tencent-docs/connect",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is False
+        assert "personal token" in response.json()["error"]
+        _mock_cr.connect.assert_not_awaited()
 
 
 class TestDisconnect:

@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from app.utils.windows_guarded_file import validate_windows_declared_path
+
 
 APP_PRIVATE_DIR_ENV = "SUXIAOYOU_PRIVATE_DATA_DIR"
 
@@ -92,6 +94,12 @@ def resolve_and_validate(file_path: str, workspace: str | None) -> str:
     if not workspace:
         return str(Path(file_path).resolve())
 
+    if os.name == "nt":
+        try:
+            validate_windows_declared_path(workspace, file_path)
+        except ValueError:
+            raise WorkspaceViolation(file_path, workspace) from None
+
     p = Path(file_path)
     if not p.is_absolute():
         resolved = (Path(workspace) / file_path).resolve()
@@ -124,7 +132,18 @@ def resolve_for_write(file_path: str, workspace: str | None) -> str:
     Returns the resolved absolute path string.
     Raises :class:`WorkspaceViolation` if the path escapes the workspace.
     """
-    p = Path(file_path)
+    raw_path = Path(file_path)
+    if workspace and os.name == "nt":
+        validation_root = (
+            Path(workspace).resolve() / "suxiaoyou_written"
+            if not raw_path.is_absolute()
+            else Path(workspace).resolve()
+        )
+        try:
+            validate_windows_declared_path(validation_root, file_path)
+        except ValueError:
+            raise WorkspaceViolation(file_path, workspace) from None
+    p = raw_path
     if workspace and not p.is_absolute():
         output_dir = Path(workspace).resolve() / "suxiaoyou_written"
         resolved = (output_dir / file_path).resolve()

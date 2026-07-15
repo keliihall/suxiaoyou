@@ -11,24 +11,140 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   cpSync,
   createWriteStream,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { isMainModule } from "./release-metadata.mjs";
+import { resolveCheckoutCommit } from "./office-contract-evidence.mjs";
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 120_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 200;
+
+export const DESKTOP_LIFECYCLE_SCHEMA_VERSION = 1;
+
+export function validateDesktopLifecycleReport(
+  value,
+  { expectedPlatform, expectedCommit, expectedReleaseRef } = {},
+) {
+  const report = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const failures = [];
+  if (report.schema_version !== DESKTOP_LIFECYCLE_SCHEMA_VERSION) {
+    failures.push(`schema_version must be ${DESKTOP_LIFECYCLE_SCHEMA_VERSION}`);
+  }
+  if (report.status !== "ok" || report.ok !== true) {
+    failures.push("status/ok does not prove a successful lifecycle run");
+  }
+  if (!new Set(["win32", "darwin", "linux"]).has(report.platform)) {
+    failures.push(`unsupported platform ${String(report.platform ?? "missing")}`);
+  }
+  if (expectedPlatform && report.platform !== expectedPlatform) {
+    failures.push(
+      `platform is ${String(report.platform ?? "missing")}, expected ${expectedPlatform}`,
+    );
+  }
+  const sourceCommit = String(report.source_commit ?? "").toLowerCase();
+  if (!/^(?!0{40}$)[0-9a-f]{40}$/u.test(sourceCommit)) {
+    failures.push("source_commit must be a full non-zero Git commit ID");
+  }
+  if (expectedCommit && sourceCommit !== String(expectedCommit).toLowerCase()) {
+    failures.push(
+      `source_commit is ${sourceCommit || "missing"}, expected ${expectedCommit}`,
+    );
+  }
+  const releaseRef = String(report.release_ref ?? "");
+  if (!releaseRef) failures.push("release_ref is missing");
+  if (expectedReleaseRef && releaseRef !== expectedReleaseRef) {
+    failures.push(
+      `release_ref is ${releaseRef || "missing"}, expected ${expectedReleaseRef}`,
+    );
+  }
+  if (
+    typeof report.executable_path !== "string" ||
+    !isAbsolute(report.executable_path)
+  ) {
+    failures.push("executable_path must be an absolute canonical path");
+  }
+  if (!Number.isSafeInteger(report.executable_size) || report.executable_size <= 0) {
+    failures.push("executable_size must be a positive safe integer");
+  }
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(String(report.executable_sha256 ?? ""))) {
+    failures.push("executable_sha256 must be a non-zero SHA-256 digest");
+  }
+  const startedAt = Date.parse(String(report.started_at ?? ""));
+  const completedAt = Date.parse(String(report.completed_at ?? ""));
+  if (
+    !Number.isFinite(startedAt) ||
+    !Number.isFinite(completedAt) ||
+    completedAt < startedAt
+  ) {
+    failures.push("started_at/completed_at must be a valid ordered interval");
+  }
+  for (const field of ["desktopPid", "backendPid"]) {
+    if (!Number.isSafeInteger(report[field]) || report[field] <= 1) {
+      failures.push(`${field} must be a process ID`);
+    }
+  }
+  if (report.desktopPid === report.backendPid) {
+    failures.push("desktopPid and backendPid must differ");
+  }
+  const descendants = Array.isArray(report.observedDescendantPids)
+    ? report.observedDescendantPids
+    : [];
+  if (!descendants.every((pid) => Number.isSafeInteger(pid) && pid > 1)) {
+    failures.push("observedDescendantPids must contain only process IDs");
+  }
+  if (!descendants.includes(report.backendPid)) {
+    failures.push("observedDescendantPids must include backendPid");
+  }
+  const exit = report.exit && typeof report.exit === "object" ? report.exit : {};
+  if (exit.code !== 0 || exit.signal !== null) {
+    failures.push("desktop exit must be clean");
+  }
+  const checks = report.checks && typeof report.checks === "object" ? report.checks : {};
+  for (const field of [
+    "backend_ready",
+    "backend_healthy",
+    "graceful_exit",
+    "no_orphan_processes",
+    "backend_stopped",
+  ]) {
+    if (checks[field] !== true) failures.push(`checks.${field} must be true`);
+  }
+  try {
+    const backendUrl = new URL(report.backendUrl);
+    if (
+      backendUrl.protocol !== "http:" ||
+      backendUrl.hostname !== "127.0.0.1" ||
+      backendUrl.pathname !== "/" ||
+      backendUrl.search ||
+      backendUrl.hash ||
+      !backendUrl.port
+    ) {
+      failures.push("backendUrl must be an exact loopback origin");
+    }
+  } catch {
+    failures.push("backendUrl must be a valid URL");
+  }
+  return { ok: failures.length === 0, failures, report };
+}
 
 export function buildIsolatedEnvironment(workDirectory, platform, base = process.env) {
   const work = resolve(workDirectory);
@@ -162,14 +278,63 @@ export function resolveDesktopExecutable(executable) {
   return realpathSync(requested);
 }
 
+export function hashStableExecutable(executable) {
+  const path = resolveDesktopExecutable(executable);
+  const before = statSync(path, { bigint: false });
+  let descriptor = -1;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const openedBefore = fstatSync(descriptor, { bigint: false });
+    if (!openedBefore.isFile() || openedBefore.size <= 0) {
+      throw new Error(`desktop executable must be a non-empty regular file: ${path}`);
+    }
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let total = 0;
+    while (true) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      total += count;
+    }
+    const openedAfter = fstatSync(descriptor, { bigint: false });
+    const after = statSync(path, { bigint: false });
+    for (const candidate of [openedBefore, openedAfter, after]) {
+      if (
+        !candidate.isFile() ||
+        candidate.dev !== before.dev ||
+        candidate.ino !== before.ino ||
+        candidate.size !== before.size ||
+        candidate.mtimeMs !== before.mtimeMs
+      ) {
+        throw new Error(`desktop executable changed while it was hashed: ${path}`);
+      }
+    }
+    if (total !== before.size) {
+      throw new Error(`desktop executable changed while it was hashed: ${path}`);
+    }
+    return {
+      path,
+      size: total,
+      sha256: hash.digest("hex"),
+    };
+  } finally {
+    if (descriptor >= 0) closeSync(descriptor);
+  }
+}
+
 export async function verifyDesktopLifecycle({
   executable,
   workDirectory,
   platform = process.platform,
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
   shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  sourceCommit = resolveCheckoutCommit(),
+  releaseRef = process.env.GITHUB_REF_NAME || "local",
 }) {
+  const startedAt = new Date().toISOString();
   const application = resolveDesktopExecutable(executable);
+  const executableEvidence = hashStableExecutable(application);
   const work = resolve(workDirectory);
   if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) {
     throw new Error("startup timeout must be a positive integer");
@@ -264,13 +429,40 @@ export async function verifyDesktopLifecycle({
     copyApplicationLogs(ready.appLogDir, work);
 
     const result = {
+      schema_version: DESKTOP_LIFECYCLE_SCHEMA_VERSION,
+      status: "ok",
       ok: true,
+      platform,
+      source_commit: sourceCommit,
+      release_ref: releaseRef,
+      executable_path: executableEvidence.path,
+      executable_size: executableEvidence.size,
+      executable_sha256: executableEvidence.sha256,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
       desktopPid: child.pid,
       backendPid: ready.backendPid,
       backendUrl: ready.backendUrl,
       observedDescendantPids: observedProcesses,
       exit: desktopExit,
+      checks: {
+        backend_ready: true,
+        backend_healthy: true,
+        graceful_exit: true,
+        no_orphan_processes: true,
+        backend_stopped: true,
+      },
     };
+    const validation = validateDesktopLifecycleReport(result, {
+      expectedPlatform: platform,
+      expectedCommit: sourceCommit,
+      expectedReleaseRef: releaseRef,
+    });
+    if (!validation.ok) {
+      throw new Error(
+        `generated lifecycle report is invalid: ${validation.failures.join("; ")}`,
+      );
+    }
     writeFileSync(join(work, "result.json"), `${JSON.stringify(result, null, 2)}\n`);
     console.log(
       `[verify-desktop-lifecycle] ready=${ready.backendUrl}, desktop=${child.pid}, ` +
@@ -282,6 +474,17 @@ export async function verifyDesktopLifecycle({
       join(work, "failure.json"),
       `${JSON.stringify(
         {
+          schema_version: DESKTOP_LIFECYCLE_SCHEMA_VERSION,
+          status: "failed",
+          ok: false,
+          platform,
+          source_commit: sourceCommit,
+          release_ref: releaseRef,
+          executable_path: executableEvidence.path,
+          executable_size: executableEvidence.size,
+          executable_sha256: executableEvidence.sha256,
+          started_at: startedAt,
+          completed_at: new Date().toISOString(),
           error: error instanceof Error ? error.message : String(error),
           desktopPid: child?.pid ?? null,
           backendPid: ready?.backendPid ?? null,

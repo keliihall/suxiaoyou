@@ -27,7 +27,7 @@ For large datasets or precise calculations, use `code_execute` — no temp files
 - **Always use Python**: pandas, numpy, and matplotlib are pre-installed.
 - **One call = one complete script**: Each `code_execute` call runs in a fresh, isolated process. No variables or data persist between calls. Include ALL imports, data loading, and analysis in a single call. Never split related analysis across multiple calls.
 - **For output files** (charts, CSVs): code_execute can write output files to disk; use `read` to view them
-- **Additional packages**: Use `bash` to run `pip install <package>` if a specialized library is needed
+- **Additional packages**: create a workspace-local environment with `python -m venv --copies .venv`, then use `.venv/bin/python -m pip install <package>` (or `.venv\\Scripts\\python.exe -m pip install <package>` on Windows)
 
 Only use `write` + `bash` when the script itself needs to be saved for reuse.
 

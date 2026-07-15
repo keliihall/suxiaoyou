@@ -13,6 +13,7 @@ from app.auth.credential_store import (
     CredentialStore,
     CredentialStoreError,
     StagedSecretTree,
+    get_credential_store,
     prepare_stale_secret_cleanup,
     resolve_secret_tree,
     stage_protected_secret_tree,
@@ -48,9 +49,17 @@ class McpTokenStore:
         )
         self._path = root / "mcp" / f"{scope_hash}.json"
         self._namespace = f"mcp:{scope_hash}"
-        self._credential_store = credential_store or CredentialStore(
-            fallback_path=root / "fallback.json"
-        )
+        if credential_store is not None:
+            self._credential_store = credential_store
+        elif storage_root is None:
+            # Production MCP credentials share the process-wide store and its
+            # one macOS aggregate-vault read/cache with provider credentials.
+            self._credential_store = get_credential_store()
+        else:
+            # Explicit storage roots are isolated test/embedding instances.
+            self._credential_store = CredentialStore(
+                fallback_path=root / "fallback.json"
+            )
 
         # v0.8.x stored OAuth credentials in the selected workspace. Import the
         # legacy file once, persist it privately, then remove it only after the
@@ -75,8 +84,17 @@ class McpTokenStore:
 
     def get(self, server_name: str) -> TokenSet | None:
         """Retrieve stored tokens for a server."""
-        entry = self._data.get(server_name)
-        if not entry:
+        protected_entry = self._data.get(server_name)
+        if not protected_entry:
+            return None
+        # Keep native credential access at the connector-use boundary. Startup
+        # and ``has_token`` only need protected metadata and must never open an
+        # OS vault while the desktop is still becoming ready.
+        entry = resolve_secret_tree(
+            protected_entry,
+            store=self._credential_store,
+        )
+        if not isinstance(entry, dict):
             return None
         return TokenSet(
             access_token=entry.get("access_token", ""),
@@ -231,8 +249,7 @@ class McpTokenStore:
                 ) from exc
             if cleanup_transaction is not None:
                 cleanup_transaction.commit()
-        resolved = resolve_secret_tree(protected, store=self._credential_store)
-        return resolved if isinstance(resolved, dict) else {}
+        return protected if isinstance(protected, dict) else {}
 
     @staticmethod
     def _read_file(path: Path) -> dict[str, dict[str, Any]] | None:

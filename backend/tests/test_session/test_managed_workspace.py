@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,10 @@ from app.session.managed_workspace import (
     managed_workspace_for_session,
     snapshot_attachments,
 )
-from app.session.prompt import _uses_managed_workspace
+from app.session.prompt import (
+    _registered_session_attachment_paths,
+    _uses_managed_workspace,
+)
 from app.tool.builtin.write import WriteTool
 from app.tool.context import ToolContext
 
@@ -137,6 +141,35 @@ def test_attachment_batch_limit_is_checked_before_any_copy(
 def test_existing_folderless_session_ignores_stale_global_workspace() -> None:
     assert _uses_managed_workspace(".", "/previous/project") is True
     assert _uses_managed_workspace(None, "/explicit/new/project") is False
+
+
+def test_only_user_file_parts_register_external_attachment_paths(tmp_path: Path) -> None:
+    selected = tmp_path / "selected.png"
+    selected.write_bytes(b"selected")
+    tool_output = tmp_path / "tool-output.png"
+    tool_output.write_bytes(b"untrusted tool path")
+    missing = tmp_path / "missing.png"
+
+    messages = [
+        SimpleNamespace(
+            data={"role": "user"},
+            parts=[
+                SimpleNamespace(data={"type": "file", "path": str(selected)}),
+                SimpleNamespace(data={"type": "file", "path": str(missing)}),
+                SimpleNamespace(data={"type": "text", "text": str(tool_output)}),
+            ],
+        ),
+        SimpleNamespace(
+            data={"role": "assistant"},
+            parts=[
+                SimpleNamespace(data={"type": "file", "path": str(tool_output)})
+            ],
+        ),
+    ]
+
+    assert _registered_session_attachment_paths(messages) == {
+        str(selected.resolve())
+    }
 
 
 @pytest.mark.asyncio

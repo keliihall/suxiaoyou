@@ -11,6 +11,7 @@ import { useActivityStore } from "@/stores/activity-store";
 import { extractTextFromParts } from "@/lib/utils";
 import type { MessageResponse, PartData, ToolPart, StepStartPart, StepFinishPart, CompactionPart as CompactionPartType } from "@/types/message";
 import { computeDuration, type ActivityData, type ChainItem } from "@/stores/activity-store";
+import { hasVisibleMessageOutput } from "@/lib/message-presentation";
 
 interface AssistantMessageProps {
   message: MessageResponse;
@@ -62,9 +63,8 @@ export function AssistantMessage({ message, combinedParts, onRegenerate, isNew =
       reasoningTexts,
       toolParts,
       stepParts,
-      hasVisibleOutput: mainParts.some((p) =>
-        p.type === "text" || p.type === "file" || p.type === "subtask",
-      ),
+      isTerminal: true,
+      hasVisibleOutput: hasVisibleMessageOutput(mainParts),
       chain,
     };
     data.thinkingDuration = computeDuration(data);
@@ -153,6 +153,10 @@ export const StreamingMessage = memo(function StreamingMessage({
     const bucket = sessionId === null ? s.draftSession : s.sessions[sessionId];
     return bucket?.generationStartedAt ?? null;
   });
+  const isGenerating = useChatStore((s) => {
+    const bucket = sessionId === null ? s.draftSession : s.sessions[sessionId];
+    return bucket?.isGenerating ?? false;
+  });
 
   // Track whether this component mounted with no existing stream content.
   // If it did, the fade-in is a genuine "new response appearing" cue. If the
@@ -203,7 +207,8 @@ export const StreamingMessage = memo(function StreamingMessage({
   // just waiting for DONE event — e.g. during title generation).
   const lastStepFinish = [...liveParts].reverse().find((p) => p.type === "step-finish") as
     | (PartData & { type: "step-finish"; reason?: string }) | undefined;
-  const isGenerationDone = !!lastStepFinish && lastStepFinish.reason !== "tool_use";
+  const isGenerationDone =
+    !isGenerating || (!!lastStepFinish && lastStepFinish.reason !== "tool_use");
   // Only trail the dot-row when there is actual activity (reasoning/tool)
   // above it. Without this gate, an early step-start part (no visible content
   // yet) renders the StreamingStage line AND the trailing dots at the same
@@ -222,7 +227,7 @@ export const StreamingMessage = memo(function StreamingMessage({
       <MessageContent
         parts={liveParts}
         sessionId={sessionId}
-        isStreaming
+        isStreaming={isGenerating}
         isAwaitingConfirmation={isAwaitingConfirmation}
         generationStartedAt={generationStartedAt}
       />

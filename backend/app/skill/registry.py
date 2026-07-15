@@ -7,12 +7,17 @@ import logging
 from pathlib import Path
 
 from app.skill.model import SkillInfo, parse_skill_file
+from app.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
 # Directories under a project root (or home dir) that may contain skills.
 _EXTERNAL_SKILL_DIRS = [".claude", ".agents"]
 _SUXIAOYOU_SKILL_DIR = ".suxiaoyou"
+
+
+class SkillPersistenceError(RuntimeError):
+    """A skill state transition could not be durably persisted."""
 
 
 class SkillRegistry:
@@ -120,8 +125,9 @@ class SkillRegistry:
         """Enable a disabled skill. Returns True if it was actually disabled."""
         if name not in self._disabled:
             return False
-        self._disabled.discard(name)
-        self._persist_disabled()
+        disabled = self._disabled - {name}
+        self._persist_disabled(disabled)
+        self._disabled = disabled
         logger.info("Skill enabled: %s", name)
         return True
 
@@ -129,8 +135,9 @@ class SkillRegistry:
         """Disable a skill. Returns True if it was actually enabled."""
         if name in self._disabled:
             return False
-        self._disabled.add(name)
-        self._persist_disabled()
+        disabled = {*self._disabled, name}
+        self._persist_disabled(disabled)
+        self._disabled = disabled
         logger.info("Skill disabled: %s", name)
         return True
 
@@ -187,14 +194,19 @@ class SkillRegistry:
             pass
         return set()
 
-    def _persist_disabled(self) -> None:
+    def _persist_disabled(self, disabled: set[str] | None = None) -> None:
         if not self._disabled_path:
             return
+        desired = self._disabled if disabled is None else disabled
         try:
             self._disabled_path.parent.mkdir(parents=True, exist_ok=True)
-            self._disabled_path.write_text(
-                json.dumps(sorted(self._disabled), indent=2),
+            atomic_write_text(
+                self._disabled_path,
+                json.dumps(sorted(desired), indent=2),
                 encoding="utf-8",
             )
-        except OSError as e:
-            logger.warning("Cannot persist disabled skills: %s", e)
+        except OSError as exc:
+            logger.error("Cannot persist disabled skills: %s", exc)
+            raise SkillPersistenceError(
+                "Skill state could not be saved; no runtime change was applied"
+            ) from exc

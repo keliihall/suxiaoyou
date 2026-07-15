@@ -19,6 +19,7 @@ const expectedProductVersion = JSON.parse(
   readFileSync(join(repositoryRoot, "package.json"), "utf8"),
 ).version;
 const EXPECTED_BUNDLE_IDENTIFIER = "com.suxiaoyou.desktop";
+const EXPECTED_BACKEND_IDENTIFIER = "com.suxiaoyou.backend";
 const EXPECTED_PRODUCT_NAME = "苏小有";
 const SUPPORTED_ARCHITECTURES = new Set(["arm64", "x86_64"]);
 const DISALLOWED_BUNDLE_XATTRS = Object.freeze([
@@ -232,6 +233,21 @@ export async function verifyMacOSBundle(
       "--verbose=2",
       app,
     ]);
+    const backendSignature = await runCommand("codesign", [
+      "-dv",
+      "--verbose=4",
+      backendExecutable,
+    ]);
+    const backendSignatureText = [
+      backendSignature?.stdout,
+      backendSignature?.stderr,
+    ].filter(Boolean).join("\n");
+    const backendIdentifier = /^Identifier=(.+)$/m.exec(backendSignatureText)?.[1];
+    requireEqual(
+      backendIdentifier,
+      EXPECTED_BACKEND_IDENTIFIER,
+      "backend signing identifier",
+    );
   }
 
   const backendHelp = await commandText(runCommand, backendExecutable, ["--help"]);

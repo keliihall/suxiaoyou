@@ -28,6 +28,7 @@ interface ConversationOutlineProps {
   locatingMessageId: string | null;
   locateErrorMessageId: string | null;
   contentIsTallEnough: boolean;
+  hidden?: boolean;
   onSelect: (turn: ConversationTurn) => void;
   onRetry: () => void;
 }
@@ -42,6 +43,7 @@ export function ConversationOutline({
   locatingMessageId,
   locateErrorMessageId,
   contentIsTallEnough,
+  hidden = false,
   onSelect,
   onRetry,
 }: ConversationOutlineProps) {
@@ -57,7 +59,11 @@ export function ConversationOutline({
     marker?.scrollIntoView({ block: "nearest" });
   }, [activeMessageId]);
 
-  if (turns.length < CONVERSATION_OUTLINE_MIN_TURNS || !contentIsTallEnough) {
+  if (
+    hidden
+    || turns.length < CONVERSATION_OUTLINE_MIN_TURNS
+    || !contentIsTallEnough
+  ) {
     return null;
   }
 
@@ -89,6 +95,70 @@ export function ConversationOutline({
       total: turns.length,
       summary: turnSummary(turn, t("conversationOutlineUntitled")),
     });
+  const hasActiveTurn = turns.some(
+    (turn) => turn.message_id === activeMessageId,
+  );
+  const isRovingTarget = (turn: ConversationTurn, index: number) =>
+    turn.message_id === activeMessageId || (!hasActiveTurn && index === 0);
+
+  const expandedTurnList = (close: () => void) => (
+    <>
+      {locateErrorMessageId && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="mb-1 flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-[var(--color-destructive)] hover:bg-[var(--surface-secondary)]"
+        >
+          <RotateCcw className="h-3.5 w-3.5" />
+          {t("conversationLocateFailedRetry")}
+        </button>
+      )}
+      <div
+        data-conversation-outline-list
+        className="max-h-[60vh] overflow-y-auto overscroll-contain"
+      >
+        {turns.map((turn, index) => {
+          const active = turn.message_id === activeMessageId;
+          const locating = turn.message_id === locatingMessageId;
+          return (
+            <button
+              key={turn.message_id}
+              type="button"
+              data-outline-turn
+              tabIndex={isRovingTarget(turn, index) ? 0 : -1}
+              aria-current={active ? "location" : undefined}
+              aria-label={markerLabel(turn)}
+              onClick={() => {
+                onSelect(turn);
+                close();
+              }}
+              onKeyDown={(event) => focusAndSelect(event, index)}
+              className={cn(
+                "flex min-h-11 w-full items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-[var(--surface-secondary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]",
+                active && "bg-[var(--surface-secondary)]",
+              )}
+            >
+              <span className="flex h-5 w-7 shrink-0 items-center justify-end text-[11px] tabular-nums text-[var(--text-tertiary)]">
+                {locating ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  turn.ordinal
+                )}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="line-clamp-2 block text-xs text-[var(--text-primary)]">
+                  {turnSummary(turn, t("conversationOutlineUntitled"))}
+                </span>
+                <span className="mt-0.5 block text-[11px] text-[var(--text-tertiary)]">
+                  {formatFullDateTime(turn.time_created, i18n.language)}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
 
   return (
     <>
@@ -101,68 +171,65 @@ export function ConversationOutline({
           <div
             data-conversation-outline-list
             className={cn(
-              "flex max-h-full w-full flex-col items-center overflow-y-auto overscroll-contain py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-              locateErrorMessageId && "max-h-[calc(100%_-_1.75rem)]",
+              "min-h-0 w-full shrink overflow-y-auto overscroll-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+              locateErrorMessageId
+                ? "max-h-[calc(100%_-_1.75rem)]"
+                : "max-h-full",
             )}
           >
-            {turns.map((turn, index) => {
-              const active = turn.message_id === activeMessageId;
-              const locating = turn.message_id === locatingMessageId;
-              return (
-                <Tooltip key={turn.message_id}>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      data-outline-turn
-                      data-turn-marker={turn.message_id}
-                      aria-current={active ? "location" : undefined}
-                      aria-label={markerLabel(turn)}
-                      onClick={() => onSelect(turn)}
-                      onKeyDown={(event) => focusAndSelect(event, index)}
-                      className="group flex h-6 min-h-6 w-6 items-center justify-start rounded-sm pl-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+            <div className="flex w-full flex-col items-center py-1">
+              {turns.map((turn, index) => {
+                const active = turn.message_id === activeMessageId;
+                const locating = turn.message_id === locatingMessageId;
+                return (
+                  <Tooltip key={turn.message_id}>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        data-outline-turn
+                        data-turn-marker={turn.message_id}
+                        tabIndex={isRovingTarget(turn, index) ? 0 : -1}
+                        aria-current={active ? "location" : undefined}
+                        aria-label={markerLabel(turn)}
+                        onClick={() => onSelect(turn)}
+                        onKeyDown={(event) => focusAndSelect(event, index)}
+                        className="group flex h-2 min-h-2 w-6 items-center justify-start rounded-sm pl-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-[var(--ring)]"
+                      >
+                        {locating ? (
+                          <Loader2 className="h-2 w-2 animate-spin" />
+                        ) : (
+                          <span
+                            aria-hidden="true"
+                            className="block h-0.5 w-1.5 rounded-full bg-current transition-[width,height,color] duration-150 group-hover:h-[3px] group-hover:w-2.5 group-focus-visible:h-[3px] group-focus-visible:w-2.5"
+                          />
+                        )}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent
+                      side="right"
+                      align="center"
+                      sideOffset={8}
+                      className="max-w-80 border border-[var(--border-default)] bg-[var(--surface-tertiary)] px-3 py-2"
                     >
-                      {locating ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <span
-                          aria-hidden="true"
-                          className={cn(
-                            "block h-px rounded-full bg-current transition-[width,color]",
-                            active
-                              ? "w-5 text-[var(--text-primary)]"
-                              : "w-2.5 group-hover:w-4",
-                          )}
-                        />
-                      )}
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent
-                    side="right"
-                    align="center"
-                    sideOffset={8}
-                    className="max-w-80 border border-[var(--border-default)] bg-[var(--surface-tertiary)] px-3 py-2"
-                  >
-                    <p className="font-medium text-[var(--text-primary)]">
-                      {t("conversationTurnNumber", { number: turn.ordinal })}
-                    </p>
-                    <p className="mt-0.5 line-clamp-3 text-[var(--text-secondary)]">
-                      {turnSummary(turn, t("conversationOutlineUntitled"))}
-                    </p>
-                    <p className="mt-1 text-[var(--text-tertiary)]">
-                      {formatFullDateTime(turn.time_created, i18n.language)}
-                    </p>
-                    {turn.attachment_names.length > 0 && (
-                      <p className="mt-1 flex items-start gap-1 text-[var(--text-tertiary)]">
-                        <Paperclip className="mt-0.5 h-3 w-3 shrink-0" />
-                        <span className="break-all">
-                          {turn.attachment_names.join(", ")}
-                        </span>
+                      <p className="line-clamp-3 text-[var(--text-secondary)]">
+                        {turnSummary(turn, t("conversationOutlineUntitled"))}
                       </p>
-                    )}
-                  </TooltipContent>
-                </Tooltip>
-              );
-            })}
+                      <p className="mt-1 text-[var(--text-tertiary)]">
+                        {formatFullDateTime(turn.time_created, i18n.language)}
+                      </p>
+                      {turn.attachment_names.length > 0 && (
+                        <p className="mt-1 flex items-start gap-1 text-[var(--text-tertiary)]">
+                          <Paperclip className="mt-0.5 h-3 w-3 shrink-0" />
+                          <span className="break-all">
+                            {turn.attachment_names.join(", ")}
+                          </span>
+                        </p>
+                      )}
+                    </TooltipContent>
+                  </Tooltip>
+                );
+              })}
+            </div>
           </div>
           {locateErrorMessageId && (
             <Tooltip>
@@ -206,62 +273,7 @@ export function ConversationOutline({
             sideOffset={6}
             className="w-[min(22rem,calc(100vw-1rem))] p-2"
           >
-            <p className="px-2 py-1 text-xs font-medium text-[var(--text-secondary)]">
-              {t("conversationOutlineCount", { count: turns.length })}
-            </p>
-            {locateErrorMessageId && (
-              <button
-                type="button"
-                onClick={onRetry}
-                className="mb-1 flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-[var(--color-destructive)] hover:bg-[var(--surface-secondary)]"
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-                {t("conversationLocateFailedRetry")}
-              </button>
-            )}
-            <div
-              data-conversation-outline-list
-              className="max-h-[60vh] overflow-y-auto overscroll-contain"
-            >
-              {turns.map((turn, index) => {
-                const active = turn.message_id === activeMessageId;
-                const locating = turn.message_id === locatingMessageId;
-                return (
-                  <button
-                    key={turn.message_id}
-                    type="button"
-                    data-outline-turn
-                    aria-current={active ? "location" : undefined}
-                    aria-label={markerLabel(turn)}
-                    onClick={() => {
-                      onSelect(turn);
-                      setMobileOpen(false);
-                    }}
-                    onKeyDown={(event) => focusAndSelect(event, index)}
-                    className={cn(
-                      "flex min-h-11 w-full items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-[var(--surface-secondary)]",
-                      active && "bg-[var(--surface-secondary)]",
-                    )}
-                  >
-                    <span className="flex h-5 w-7 shrink-0 items-center justify-end text-[11px] tabular-nums text-[var(--text-tertiary)]">
-                      {locating ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        turn.ordinal
-                      )}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="line-clamp-2 block text-xs text-[var(--text-primary)]">
-                        {turnSummary(turn, t("conversationOutlineUntitled"))}
-                      </span>
-                      <span className="mt-0.5 block text-[11px] text-[var(--text-tertiary)]">
-                        {formatFullDateTime(turn.time_created, i18n.language)}
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+            {expandedTurnList(() => setMobileOpen(false))}
           </PopoverContent>
         </Popover>
       </div>

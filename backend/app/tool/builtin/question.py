@@ -151,6 +151,11 @@ class QuestionTool(ToolDefinition):
             )
 
         # Block until user responds via POST /api/chat/respond
+        await ctx.set_goal_waiting_user(
+            True,
+            reason="question_required",
+            message="The Goal is waiting for the user's answer",
+        )
         try:
             response = await job.wait_for_response(ctx.call_id, timeout=300.0)
 
@@ -179,7 +184,17 @@ class QuestionTool(ToolDefinition):
                     metadata={"question": question, "answer": response},
                 )
         except TimeoutError:
+            await ctx.block_goal(
+                reason="question_timeout",
+                message="The user did not answer the Goal question before it expired",
+            )
             return ToolResult(
                 output=ctx.tr("（用户在 5 分钟内没有回复）", "(The user did not respond within 5 minutes)"),
                 error=ctx.tr("提问超时：用户未回复", "Question timed out: the user did not respond"),
+            )
+        finally:
+            await ctx.set_goal_waiting_user(
+                False,
+                reason="question_required",
+                message="",
             )

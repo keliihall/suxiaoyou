@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,12 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent.agent import AgentRegistry
 from app.agent.permission import (
     GLOBAL_DEFAULTS,
+    intersect_permission_rulesets,
     merge_rulesets,
     parse_session_permissions,
     presets_to_ruleset,
     serialize_permission_snapshot,
+    tightening_permission_ceiling,
 )
 from app.models.message import Message, Part
+from app.models.todo import Todo
 from app.provider.registry import ProviderRegistry
 from app.schemas.chat import PromptRequest
 from app.session.manager import (
@@ -43,6 +47,7 @@ from app.session.managed_workspace import (
     snapshot_attachments,
     snapshot_existing_session_attachments,
 )
+from app.session.goal_prompt import render_goal_prompt
 from app.session.system_prompt import (
     SystemPromptParts,
     active_skills_from_registry,
@@ -56,9 +61,12 @@ from app.session.system_prompt import (
 from app.streaming.events import (
     AGENT_ERROR,
     DONE,
+    GOAL_BUDGET_WARNING,
     INPUT_APPLIED,
     INPUT_FAILED,
+    STEP_FINISH,
     STEP_START,
+    TEXT_DELTA,
     TITLE_UPDATE,
     SSEEvent,
 )
@@ -79,10 +87,43 @@ def _merge_prompt_permission_layers(
     session_permissions: "Ruleset",
     *,
     request_is_authoritative: bool,
+    enforce_current_ceiling: bool = False,
+    goal_policy_baseline: tuple["Ruleset", "Ruleset"] | None = None,
 ) -> "Ruleset":
     """Merge permissions while preserving a headless parent's hard ceiling."""
 
     if request_is_authoritative:
+        if enforce_current_ceiling:
+            # A Goal's immutable request rules are its historical ceiling.
+            # Current session policy is another full ceiling. For global and
+            # Agent layers, compare the authorization-time baseline with the
+            # current rules so unchanged default ``ask`` rules do not revoke
+            # explicit Goal grants, while allow->ask/deny and ask->deny do.
+            # This cannot be represented by changing layer order: either
+            # order would let one policy's allow widen the other policy.
+            constraints = [request_permissions]
+            if goal_policy_baseline is None:
+                # Legacy snapshots lack layer provenance. Full intersection is
+                # deliberately stricter than guessing and widening authority.
+                constraints.extend((GLOBAL_DEFAULTS, agent_permissions))
+            else:
+                old_global, old_agent = goal_policy_baseline
+                constraints.extend((
+                    tightening_permission_ceiling(
+                        old_global,
+                        GLOBAL_DEFAULTS,
+                    ),
+                    tightening_permission_ceiling(
+                        old_agent,
+                        agent_permissions,
+                    ),
+                ))
+            if (
+                session_permissions.rules
+                or getattr(session_permissions, "_intersection", ())
+            ):
+                constraints.append(session_permissions)
+            return intersect_permission_rulesets(*constraints)
         # The request contains the parent's complete effective rule snapshot.
         # Excluding historical child-session rules prevents a previously
         # remembered allow from widening a resumed non-interactive child.
@@ -116,6 +157,44 @@ def _uses_managed_workspace(
     return existing_directory == "." or (
         existing_directory is None and not requested_workspace
     )
+
+
+def _canonical_attachment_paths(
+    attachments: list[dict[str, Any]],
+) -> set[str]:
+    """Return existing file paths explicitly registered as session attachments.
+
+    The database file part is the trust signal; path-like text in a prompt is
+    deliberately not considered.  Resolve symlinks now so a later tool call
+    must name the same canonical file that the user selected.
+    """
+
+    paths: set[str] = set()
+    for attachment in attachments:
+        value = str(attachment.get("path") or "").strip()
+        if not value:
+            continue
+        try:
+            candidate = Path(value).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if candidate.is_file():
+            paths.add(str(candidate))
+    return paths
+
+
+def _registered_session_attachment_paths(messages: list[Any]) -> set[str]:
+    """Collect canonical paths from user FileParts, never tool-produced parts."""
+
+    attachments: list[dict[str, Any]] = []
+    for message in messages:
+        if (getattr(message, "data", None) or {}).get("role") != "user":
+            continue
+        for part in getattr(message, "parts", ()):
+            data = getattr(part, "data", None) or {}
+            if data.get("type") == "file":
+                attachments.append(data)
+    return _canonical_attachment_paths(attachments)
 
 
 async def _preflight_workspace_boundary(
@@ -208,6 +287,14 @@ class SessionPrompt:
         self.inherited_managed_workspace: Path | None = None
         self.fts_status: dict[str, Any] | None = None
         self.workspace_memory_section: str | None = None
+        self.goal_prompt_section: str | None = None
+        self.goal_snapshot: Any | None = None
+        self._goal_active_started_monotonic = time.monotonic()
+        self._goal_wait_seconds_at_start = job.goal_wait_seconds
+        self._goal_budget_warning_published = False
+        self._goal_usage_recorded_tokens = 0
+        self._goal_usage_recorded_cost_microusd = 0
+        self._goal_durable_source_keys: set[str] = set()
         self.system_prompt_parts: SystemPromptParts | None = None
         self.merged_permissions: list = []
         self.request_permissions: list = []
@@ -216,6 +303,7 @@ class SessionPrompt:
         self.is_first_turn: bool = False
         self.first_user_text: str = request.text
         self.session_permission_data: Any = None
+        self.attachment_paths: set[str] = set()
 
         # Whether the provider supports Anthropic-style prompt caching.
         # Set during _setup() after provider is resolved.
@@ -280,6 +368,25 @@ class SessionPrompt:
 
     async def run(self, *, publish_done: bool = True) -> None:
         """Main entry point: setup → loop → post-loop."""
+        try:
+            from app.security.control import get_security_control
+
+            security_stopped = get_security_control().emergency_stop
+        except RuntimeError:
+            security_stopped = False
+        if security_stopped:
+            self.job.publish(SSEEvent(AGENT_ERROR, {
+                "error_type": "security_emergency_stop",
+                "error_message": "Security emergency stop is active.",
+            }))
+            # Autonomous Goal controllers span multiple SessionPrompt slices
+            # and own the one terminal DONE/complete boundary for the shared
+            # stream.  Completing here would close that stream before the
+            # durable GoalRun is reconciled.  Ordinary prompts still retain
+            # the historical immediate-completion behaviour.
+            if publish_done:
+                self.job.complete()
+            return
         await self._setup()
         await self._loop()
         await self._post_loop(publish_done=publish_done)
@@ -507,6 +614,7 @@ class SessionPrompt:
             except Exception:
                 logger.debug("Workspace memory injection skipped", exc_info=True)
 
+        await self._load_goal_context()
         self.system_prompt_parts = self._build_system_prompt_parts()
 
         # --- 5. Merge permission rulesets ---
@@ -520,13 +628,21 @@ class SessionPrompt:
         )
         self.session_permissions = parse_session_permissions(session_permission_data)
         self.preset_permissions = presets_to_ruleset(self.request.permission_presets)
-        self.request_permissions = parse_session_permissions(self.request.permission_rules)
+        self.request_permissions = (
+            self.request._trusted_permission_ruleset.model_copy(deep=True)
+            if self.request._trusted_permission_ruleset is not None
+            else parse_session_permissions(self.request.permission_rules)
+        )
         self.merged_permissions = _merge_prompt_permission_layers(
             self.agent.permissions,
             self.preset_permissions,
             self.request_permissions,
             self.session_permissions,
             request_is_authoritative=self.request._permission_rules_authoritative,
+            enforce_current_ceiling=(
+                self.request._enforce_current_permission_ceiling
+            ),
+            goal_policy_baseline=self.request._goal_permission_baseline,
         )
         await self._persist_effective_permission_snapshot()
 
@@ -535,6 +651,9 @@ class SessionPrompt:
         async with self.session_factory() as db:
             async with db.begin():
                 _hist_msgs = await get_messages(db, self.job.session_id)
+                self.attachment_paths.update(
+                    _registered_session_attachment_paths(_hist_msgs)
+                )
                 for _msg in _hist_msgs:
                     for _part in _msg.parts:
                         _pd = _part.data or {}
@@ -572,6 +691,60 @@ class SessionPrompt:
         while True:
             if self.job.abort_event.is_set():
                 break
+
+            if self.job.goal_id is not None:
+                from app.session.goal_guard import (
+                    read_goal_budget_gate,
+                    read_goal_execution_gate,
+                )
+
+                gate = await read_goal_execution_gate(
+                    self.session_factory,
+                    session_id=self.job.goal_session_id or self.job.session_id,
+                    goal_id=self.job.goal_id,
+                    goal_run_id=self.job.goal_run_id,
+                )
+                if not gate.allowed:
+                    self.finish_reason = gate.status
+                    break
+
+                counted_tokens, counted_cost = self.job.goal_run_usage
+                budget = await read_goal_budget_gate(
+                    self.session_factory,
+                    session_id=self.job.goal_session_id or self.job.session_id,
+                    goal_id=self.job.goal_id,
+                    local_tokens_used=counted_tokens,
+                    local_cost_microusd=counted_cost,
+                    local_active_seconds=max(
+                        0,
+                        round(
+                            time.monotonic()
+                            - self._goal_active_started_monotonic
+                            - (
+                                self.job.goal_wait_seconds
+                                - self._goal_wait_seconds_at_start
+                            )
+                        ),
+                    ),
+                    warning_ratio=_cfg().goal_budget_warning_ratio,
+                )
+                if budget.warning and not self._goal_budget_warning_published:
+                    self.job.publish(
+                        SSEEvent(
+                            GOAL_BUDGET_WARNING,
+                            {
+                                "goal_id": self.job.goal_id,
+                                "goal_run_id": self.job.goal_run_id,
+                                "token_remaining": budget.token_remaining,
+                                "cost_remaining_microusd": budget.cost_remaining_microusd,
+                                "time_remaining_seconds": budget.time_remaining_seconds,
+                            },
+                        )
+                    )
+                    self._goal_budget_warning_published = True
+                if not budget.allowed:
+                    self.finish_reason = "budget_limited"
+                    break
 
             self.step += 1
 
@@ -710,6 +883,14 @@ class SessionPrompt:
                 )
                 continue
 
+            attachment_paths = getattr(self, "attachment_paths", None)
+            if attachment_paths is None:
+                attachment_paths = set()
+                self.attachment_paths = attachment_paths
+            attachment_paths.update(
+                _canonical_attachment_paths(list(item.attachments or []))
+            )
+
             # A steer changes the language of the work that follows it, but
             # only after the durable input was applied successfully.
             self.job.language = item.language
@@ -793,6 +974,13 @@ class SessionPrompt:
         # Layer 2: Enforce aggregate tool result size budget
         llm_messages = apply_tool_result_budget(llm_messages)
 
+        # Goal creation and autonomous continuations use an ephemeral user
+        # instruction: it reaches the Provider but is never persisted as a
+        # normal conversation bubble (and therefore never creates a false
+        # multi-turn outline marker).
+        if self.skip_user_message and self.job.goal_id is not None:
+            llm_messages.append({"role": "user", "content": self.request.text})
+
         mw_ctx = MiddlewareContext(
             session_id=self.job.session_id,
             step=self.step,
@@ -843,6 +1031,72 @@ class SessionPrompt:
                 "cache_write": processor.usage_data.get("cache_write", 0),
                 "total": processor.usage_data.get("total", 0),
             }
+        # Record each completed step immediately. Child Agents share this
+        # accumulator, so every sibling's next Provider admission observes the
+        # usage instead of waiting until the whole SessionPrompt returns.
+        self._record_incremental_goal_usage()
+
+    def _record_incremental_goal_usage(self) -> None:
+        if self.job.goal_id is None:
+            return
+        total_tokens = sum(
+            max(0, int(self.total_tokens_accumulated.get(key, 0) or 0))
+            for key in ("input", "output", "reasoning", "cache_read")
+        )
+        total_cost_microusd = max(0, round(self.total_cost * 1_000_000))
+        token_delta = max(0, total_tokens - self._goal_usage_recorded_tokens)
+        cost_delta = max(
+            0,
+            total_cost_microusd - self._goal_usage_recorded_cost_microusd,
+        )
+        if token_delta or cost_delta:
+            self.job.record_goal_usage(
+                tokens=token_delta,
+                cost_microusd=cost_delta,
+            )
+            self._goal_usage_recorded_tokens += token_delta
+            self._goal_usage_recorded_cost_microusd += cost_delta
+
+    async def _record_goal_step_usage_before_tools(
+        self,
+        usage_data: dict[str, Any],
+        step_cost: float,
+    ) -> None:
+        """Expose parent inference usage before a Task child can start."""
+
+        if self.job.goal_id is None:
+            return
+        tokens = sum(
+            max(0, int(usage_data.get(key, 0) or 0))
+            for key in ("input", "output", "reasoning", "cache_read")
+        )
+        cost_microusd = max(0, round(step_cost * 1_000_000))
+        if tokens or cost_microusd:
+            if self.job.goal_run_id is None or self.assistant_msg_id is None:
+                raise RuntimeError("Goal Provider usage has no durable run identity")
+            from app.session.goal_manager import record_goal_run_usage
+
+            source_key = f"provider:{self.assistant_msg_id}"
+            if source_key in self._goal_durable_source_keys:
+                return
+
+            async with self.session_factory() as db:
+                async with db.begin():
+                    await record_goal_run_usage(
+                        db,
+                        goal_run_id=self.job.goal_run_id,
+                        source_kind="provider",
+                        source_key=source_key,
+                        tokens_used=tokens,
+                        cost_used_microusd=cost_microusd,
+                    )
+            self._goal_durable_source_keys.add(source_key)
+            self.job.record_goal_usage(
+                tokens=tokens,
+                cost_microusd=cost_microusd,
+            )
+            self._goal_usage_recorded_tokens += tokens
+            self._goal_usage_recorded_cost_microusd += cost_microusd
 
     async def _handle_compact_result(self) -> bool:
         """Handle ``result == 'compact'``.
@@ -977,6 +1231,20 @@ class SessionPrompt:
         injects a system message + continues the loop on the first match.
         Returns True only when none fire (truly done).
         """
+        # A gate can close after the outer loop check but immediately before
+        # Provider admission. Do not let generic todo/empty-output nudges turn
+        # that control-plane stop into another model attempt.
+        if self.job.goal_id is not None and self.finish_reason in {
+            "paused",
+            "blocked",
+            "usage_limited",
+            "budget_limited",
+            "complete",
+            "interrupted",
+            "cleared",
+        }:
+            return True
+
         # Length continuation: model hit token limit, keep going.
         # Cap at 3 to prevent runaway token consumption.
         if self.finish_reason == "length":
@@ -1090,7 +1358,16 @@ class SessionPrompt:
         """Cleanup, persist accumulated cost/tokens, publish DONE, auto-title."""
         from app.session.processor import _delete_empty_assistant_messages
 
+        # A Goal can become complete (or hit a control/budget boundary) in a
+        # tool call.  The next loop guard then exits without another Provider
+        # response, leaving the latest persisted step at ``tool_use`` and, for
+        # completion-tool-only turns, no user-visible text.  Materialize both
+        # presentation boundaries before DONE so history/reconnect consumers
+        # never mistake a finished turn for an in-progress one.
+        await self._ensure_goal_completion_presentation()
+        await self._ensure_terminal_step_finish()
         await _delete_empty_assistant_messages(self.session_factory, self.job.session_id)
+        self._record_incremental_goal_usage()
         # Agent switches and remembered decisions may have changed the merged
         # rules since setup.  Keep the parent's durable delegation ceiling in
         # sync with the rules that actually governed the completed turn.
@@ -1160,6 +1437,145 @@ class SessionPrompt:
         if publish_done:
             self.publish_done()
 
+    async def _ensure_goal_completion_presentation(self) -> None:
+        """Expose the durable Goal completion summary in conversation history."""
+
+        if (
+            self.job.goal_id is None
+            or self.finish_reason != "complete"
+            or self.assistant_msg_id is None
+        ):
+            return
+
+        from app.i18n import localize
+        from app.models.session_goal import SessionGoal
+
+        presented_summary: str | None = None
+        async with self.session_factory() as db:
+            async with db.begin():
+                parts = list(
+                    (
+                        await db.execute(
+                            select(Part)
+                            .where(Part.message_id == self.assistant_msg_id)
+                            .order_by(Part.time_created.asc(), Part.id.asc())
+                        )
+                    ).scalars()
+                )
+                has_existing_text = any(
+                    (part.data or {}).get("type") == "text"
+                    and str((part.data or {}).get("text") or "").strip()
+                    for part in parts
+                )
+                goal = await db.get(SessionGoal, self.job.goal_id)
+                if goal is None or goal.status != "complete":
+                    return
+                summary = str(goal.completion_summary or "").strip() or localize(
+                    self.request.language,
+                    "目标已完成。",
+                    "The Goal is complete.",
+                )
+                # Completion is a distinct user-facing contract, not merely a
+                # fallback for tool-only turns. Preserve the model's prose and
+                # append the durable completion description unless that exact
+                # description is already present. This also makes retries
+                # idempotent after the synthetic part has been committed.
+                if any(
+                    (part.data or {}).get("type") == "text"
+                    and str((part.data or {}).get("text") or "").strip() == summary
+                    for part in parts
+                ):
+                    self._has_any_text = True
+                    return
+                await create_part(
+                    db,
+                    message_id=self.assistant_msg_id,
+                    session_id=self.job.session_id,
+                    data={"type": "text", "text": summary, "synthetic": True},
+                )
+                presented_summary = f"\n\n{summary}" if has_existing_text else summary
+        if presented_summary is not None:
+            self.job.publish(
+                SSEEvent(
+                    TEXT_DELTA,
+                    {
+                        "session_id": self.job.session_id,
+                        "message_id": self.assistant_msg_id,
+                        "text": presented_summary,
+                    },
+                )
+            )
+        self._has_any_text = True
+
+    async def _ensure_terminal_step_finish(self) -> None:
+        """Pair the final tool/control boundary with a durable terminal step."""
+
+        if self.assistant_msg_id is None:
+            return
+
+        terminal_reason = (
+            "error"
+            if self.finish_reason
+            in {"error", "usage_limited", "failed", "interrupted"}
+            else "stop"
+        )
+        persisted = False
+        async with self.session_factory() as db:
+            async with db.begin():
+                parts = list(
+                    (
+                        await db.execute(
+                            select(Part)
+                            .where(Part.message_id == self.assistant_msg_id)
+                            .order_by(Part.time_created.asc(), Part.id.asc())
+                        )
+                    ).scalars()
+                )
+                if not parts:
+                    return
+                latest_step_finish = next(
+                    (
+                        part
+                        for part in reversed(parts)
+                        if (part.data or {}).get("type") == "step-finish"
+                    ),
+                    None,
+                )
+                if (
+                    latest_step_finish is not None
+                    and (latest_step_finish.data or {}).get("reason") != "tool_use"
+                ):
+                    return
+                await create_part(
+                    db,
+                    message_id=self.assistant_msg_id,
+                    session_id=self.job.session_id,
+                    data={
+                        "type": "step-finish",
+                        "goal_run_id": self.job.goal_run_id,
+                        "reason": terminal_reason,
+                        "tokens": {},
+                        "cost": 0.0,
+                        "synthetic": True,
+                    },
+                )
+                persisted = True
+
+        if persisted:
+            # Database-first: clients may immediately reconcile this event
+            # against message history without observing the old tool_use tail.
+            self.job.publish(
+                SSEEvent(
+                    STEP_FINISH,
+                    {
+                        "tokens": {},
+                        "cost": 0.0,
+                        "total_cost": self.total_cost,
+                        "reason": terminal_reason,
+                    },
+                )
+            )
+
     def publish_done(self) -> None:
         """Publish the terminal event after a queued-input chain is exhausted."""
         self.job.publish(
@@ -1190,18 +1606,127 @@ class SessionPrompt:
             self.request_permissions,
             self.session_permissions,
             request_is_authoritative=self.request._permission_rules_authoritative,
+            enforce_current_ceiling=(
+                self.request._enforce_current_permission_ceiling
+            ),
+            goal_policy_baseline=self.request._goal_permission_baseline,
         )
         self.system_prompt_parts = self._build_system_prompt_parts()
 
     async def _persist_effective_permission_snapshot(self) -> None:
         """Persist the server-computed rules used as a child-task ceiling."""
 
-        snapshot = serialize_permission_snapshot(self.merged_permissions)
+        # Goal continuations are governed by an immutable historical ceiling
+        # intersected with the latest policy.  Writing that historical result
+        # back to Session would replace the independent "current policy"
+        # authority source and make later resume decisions self-referential.
+        # The initial user-authored Goal turn is not in this mode and still
+        # persists the snapshot captured at Goal creation.
+        if (
+            self.job.goal_id is not None
+            and self.request._enforce_current_permission_ceiling
+        ):
+            return
+
+        snapshot = serialize_permission_snapshot(
+            self.merged_permissions,
+            global_permissions=GLOBAL_DEFAULTS,
+            agent_permissions=self.agent.permissions,
+        )
         async with self.session_factory() as db:
             async with db.begin():
                 session = await get_session(db, self.job.session_id)
                 if session is not None:
                     session.permission_snapshot = snapshot
+
+    async def _load_goal_context(self) -> None:
+        """Load the current Goal and its Todo projection from durable state.
+
+        A Goal-owned generation fails closed when its snapshot cannot be
+        loaded.  Ordinary conversations remain usable on installations where
+        the Goal feature is absent or has no current Goal.
+        """
+
+        # Goal context is execution authority, not passive conversation
+        # decoration. Ordinary prompts (including chats while a paused legacy
+        # Goal exists) must not receive autonomous instructions, Goal tools,
+        # or Goal Todo state.
+        if self.job.goal_id is None:
+            return
+
+        try:
+            from app.models.session_goal import SessionGoal
+        except ImportError:
+            if self.job.goal_id is not None:
+                raise RuntimeError("Goal execution is unavailable")
+            return
+
+        try:
+            async with self.session_factory() as db:
+                goal_session_id = self.job.goal_session_id or self.job.session_id
+                statement = select(SessionGoal).where(
+                    SessionGoal.session_id == goal_session_id
+                )
+                if self.job.goal_id is not None:
+                    statement = statement.where(SessionGoal.id == self.job.goal_id)
+                goal = (await db.execute(statement)).scalar_one_or_none()
+
+                if goal is None:
+                    if self.job.goal_id is not None:
+                        raise RuntimeError("The active Goal no longer exists")
+                    return
+
+                self.goal_snapshot = goal
+                snapshot = {
+                    key: getattr(goal, key, None)
+                    for key in (
+                        "objective",
+                        "definition_of_done",
+                        "status",
+                        "run_state",
+                        "revision",
+                        "token_budget",
+                        "tokens_used",
+                        "cost_budget_microusd",
+                        "cost_used_microusd",
+                        "time_budget_seconds",
+                        "time_used_seconds",
+                        "max_continuations",
+                        "continuation_count",
+                    )
+                }
+                self.goal_prompt_section = render_goal_prompt(snapshot)
+
+                # Completion guards must survive top-level continuations.  The
+                # old in-memory-only Todo projection was reset for every
+                # SessionPrompt, allowing a later turn to overlook unfinished
+                # work.  Restore the Goal's durable Todo rows here.
+                todo_statement = select(Todo).order_by(Todo.position.asc())
+                if hasattr(Todo, "goal_id"):
+                    todo_statement = todo_statement.where(Todo.goal_id == goal.id)
+                else:
+                    todo_statement = todo_statement.where(
+                        Todo.session_id == goal_session_id
+                    )
+                todos = list((await db.execute(todo_statement)).scalars().all())
+                self.current_todos = [
+                    {
+                        "id": item.id,
+                        "content": item.content,
+                        "status": item.status,
+                        "active_form": item.active_form,
+                        "position": item.position,
+                    }
+                    for item in todos
+                ]
+        except Exception:
+            if self.job.goal_id is not None:
+                raise
+            logger.warning(
+                "Failed to load Goal context for session %s",
+                self.job.session_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Internal: gather impure inputs and call the pure assemble().
@@ -1225,6 +1750,7 @@ class SessionPrompt:
             now=default_now(),
             tz_name=default_tz_name(),
             platform_name=default_platform_name(),
+            goal_section=self.goal_prompt_section,
         )
 
 

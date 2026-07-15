@@ -40,10 +40,25 @@ class TodoReminderMiddleware(Middleware):
 
         todos = self._get_todos()
         if not todos:
+            ctx.job.todo_reminder_signatures.pop(ctx.session_id, None)
             return output
 
         incomplete = [t for t in todos if t.get("status") in ("pending", "in_progress")]
         if not incomplete:
+            ctx.job.todo_reminder_signatures.pop(ctx.session_id, None)
+            return output
+
+        signature = tuple(
+            sorted(
+                (
+                    str(todo.get("id") or ""),
+                    str(todo.get("content") or ""),
+                    str(todo.get("status") or ""),
+                )
+                for todo in incomplete
+            )
+        )
+        if signature == ctx.job.todo_reminder_signatures.get(ctx.session_id):
             return output
 
         output += (
@@ -51,4 +66,5 @@ class TodoReminderMiddleware(Middleware):
             "Call the todo tool NOW to mark this task completed "
             "and start the next one.</reminder>"
         )
+        ctx.job.todo_reminder_signatures[ctx.session_id] = signature
         return output

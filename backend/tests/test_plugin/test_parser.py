@@ -72,6 +72,7 @@ class TestParseMcpJson:
             "type": "local",
             "command": ["python", "-m", "gdrive"],
             "environment": {"GOOGLE_KEY": "xxx"},
+            "cwd": "/reviewed/working-directory",
         }}}
         (tmp_path / ".mcp.json").write_text(json.dumps(data))
         remote, local = parse_mcp_json(tmp_path)
@@ -79,6 +80,7 @@ class TestParseMcpJson:
         assert "gdrive" in local
         assert local["gdrive"]["command"] == ["python", "-m", "gdrive"]
         assert local["gdrive"]["environment"] == {"GOOGLE_KEY": "xxx"}
+        assert local["gdrive"]["cwd"] == "/reviewed/working-directory"
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         remote, local = parse_mcp_json(tmp_path)

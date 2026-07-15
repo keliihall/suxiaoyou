@@ -43,6 +43,11 @@ import {
 } from "@/lib/activity-labels";
 import { formatElapsedDuration, formatElapsedMilliseconds } from "@/lib/duration";
 import type { ToolPart, StepFinishPart } from "@/types/message";
+import { ToolMetadataSummary } from "@/components/parts/tool-metadata-summary";
+import {
+  hasRunningActivityTools,
+  isActivityComplete,
+} from "@/lib/activity-state";
 
 // -- Helpers --
 
@@ -159,12 +164,14 @@ function ThinkingGroup({ texts }: { texts: string[] }) {
 }
 
 /** Individual tool row in the timeline */
-function ToolRow({ tool }: { tool: ToolPart }) {
+function ToolRow({ tool, terminal = false }: { tool: ToolPart; terminal?: boolean }) {
   const { t, i18n } = useTranslation("chat");
   const [isOpen, setIsOpen] = useState(false);
   const ToolIcon = TOOL_ICONS[tool.tool] ?? Plug;
-  const isRunning = tool.state.status === "running" || tool.state.status === "pending";
-  const isError = tool.state.status === "error";
+  const wasLeftRunning =
+    tool.state.status === "running" || tool.state.status === "pending";
+  const isRunning = wasLeftRunning && !terminal;
+  const isError = tool.state.status === "error" || (terminal && wasLeftRunning);
   const elapsed = getElapsed(tool, i18n.language);
   const title = getToolDisplayTitle(tool, t, i18n.language);
   const output = translatePersistedToolOutput(
@@ -217,6 +224,11 @@ function ToolRow({ tool }: { tool: ToolPart }) {
           )}
         />
       </button>
+
+      <ToolMetadataSummary
+        metadata={tool.state.metadata}
+        className="ml-5 mt-1.5"
+      />
 
       {/* Source badges for web tools */}
       {visibleSources.length > 0 && (
@@ -302,25 +314,28 @@ function ActivityPanelContent() {
     (p): p is StepFinishPart => p.type === "step-finish",
   );
   const totalTokens = stepFinishes.reduce((acc, sf) => {
-    const t = sf.tokens;
+    const tokens = sf.tokens || {};
     return {
-      input: acc.input + (t.input || 0),
-      output: acc.output + (t.output || 0),
+      input: acc.input + (tokens.input || 0),
+      output: acc.output + (tokens.output || 0),
+      reasoning: acc.reasoning + (tokens.reasoning || 0),
+      cacheRead: acc.cacheRead + (tokens.cache_read || 0),
     };
-  }, { input: 0, output: 0 });
+  }, { input: 0, output: 0, reasoning: 0, cacheRead: 0 });
+  const totalContextTokens = totalTokens.input
+    + totalTokens.output
+    + totalTokens.reasoning
+    + totalTokens.cacheRead;
   const totalCost = stepFinishes.reduce((acc, sf) => acc + (sf.cost || 0), 0);
-  const hasMetrics = totalTokens.input > 0 || totalTokens.output > 0 || totalCost > 0;
+  const hasMetrics = totalContextTokens > 0 || totalCost > 0;
 
   // Compute total duration
   const duration = computeDuration(activeData);
   const durationLabel = duration != null && duration > 0
     ? formatElapsedDuration(duration, i18n.language)
     : "";
-  const hasRunningTools = activeData.toolParts.some(
-    (tool) => tool.state.status === "running" || tool.state.status === "pending",
-  );
-  const hasTerminalStepFinish = stepFinishes.some((part) => part.reason !== "tool_use");
-  const isComplete = (hasTerminalStepFinish || !!activeData.hasVisibleOutput) && !hasRunningTools;
+  const hasRunningTools = hasRunningActivityTools(activeData);
+  const isComplete = isActivityComplete(activeData);
 
   return (
     <div className="flex flex-col h-full">
@@ -353,7 +368,11 @@ function ActivityPanelContent() {
             item.kind === "thinking-group" ? (
               <ThinkingGroup key={`thinking-${i}`} texts={item.texts} />
             ) : (
-              <ToolRow key={`tool-${item.tool.call_id}-${i}`} tool={item.tool} />
+              <ToolRow
+                key={`tool-${item.tool.call_id}-${i}`}
+                tool={item.tool}
+                terminal={isComplete}
+              />
             ),
           )}
 
@@ -389,22 +408,51 @@ function ActivityPanelContent() {
         {hasMetrics && (
           <div className="pt-4 mt-6">
             <h3 className="text-xs font-medium text-[var(--text-tertiary)] uppercase tracking-wider mb-2">
-              {t("metrics")}
+              {t("currentResponseMetrics")}
             </h3>
+            <p className="mb-2 text-[10px] leading-relaxed text-[var(--text-quaternary)]">
+              {t("currentResponseMetricsScope")}
+            </p>
             <div className="grid grid-cols-2 gap-2 text-xs">
-              {totalTokens.input > 0 && (
-                <div className="flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
-                  <span className="text-[var(--text-tertiary)]">{t("input")}</span>
+              {totalContextTokens > 0 && (
+                <div className="col-span-2 flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-[var(--text-tertiary)]">
+                    {t("totalContextTokens")}
+                  </span>
                   <span className="text-[var(--text-secondary)] font-mono">
-                    {totalTokens.input.toLocaleString()}
+                    {totalContextTokens.toLocaleString(i18n.language)}
                   </span>
                 </div>
               )}
-              {totalTokens.output > 0 && (
+              {totalContextTokens > 0 && (
+                <div className="flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-[var(--text-tertiary)]">{t("uncachedInput")}</span>
+                  <span className="text-[var(--text-secondary)] font-mono">
+                    {totalTokens.input.toLocaleString(i18n.language)}
+                  </span>
+                </div>
+              )}
+              {totalContextTokens > 0 && (
                 <div className="flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
                   <span className="text-[var(--text-tertiary)]">{t("output")}</span>
                   <span className="text-[var(--text-secondary)] font-mono">
-                    {totalTokens.output.toLocaleString()}
+                    {totalTokens.output.toLocaleString(i18n.language)}
+                  </span>
+                </div>
+              )}
+              {totalContextTokens > 0 && (
+                <div className="flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-[var(--text-tertiary)]">{t("reasoning")}</span>
+                  <span className="text-[var(--text-secondary)] font-mono">
+                    {totalTokens.reasoning.toLocaleString(i18n.language)}
+                  </span>
+                </div>
+              )}
+              {totalContextTokens > 0 && (
+                <div className="flex justify-between rounded-lg bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-[var(--text-tertiary)]">{t("cacheRead")}</span>
+                  <span className="text-[var(--text-secondary)] font-mono">
+                    {totalTokens.cacheRead.toLocaleString(i18n.language)}
                   </span>
                 </div>
               )}

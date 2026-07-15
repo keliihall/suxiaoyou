@@ -15,6 +15,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -300,6 +301,9 @@ def _commit_google_tokens_for_generation(
 @router.post("/auth-start")
 async def google_auth_start(request: Request) -> dict[str, Any]:
     """Start Google OAuth flow. Returns auth URL to open in browser."""
+    control = getattr(request.app.state, "security_control", None)
+    if control is not None and control.emergency_stop:
+        return {"success": False, "error": "Security emergency stop is active"}
     settings = request.app.state.settings
 
     if not settings.google_client_id:
@@ -334,6 +338,9 @@ async def google_auth_start(request: Request) -> dict[str, Any]:
 @router.get("/callback")
 async def google_callback(code: str, state: str, request: Request):
     """Google OAuth callback — exchange code for tokens."""
+    control = getattr(request.app.state, "security_control", None)
+    if control is not None and control.emergency_stop:
+        return HTMLResponse("<p>Security emergency stop is active.</p>")
     settings = request.app.state.settings
 
     with _auth_state_lock:
@@ -345,13 +352,19 @@ async def google_callback(code: str, state: str, request: Request):
 
     # Exchange code for tokens
     try:
+        from app.auth.credential_store import resolve_env_value
+
+        client_secret = resolve_env_value(
+            "SUXIAOYOU_GOOGLE_CLIENT_SECRET",
+            settings.google_client_secret,
+        )
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 _GOOGLE_TOKEN_URL,
                 data={
                     "code": code,
                     "client_id": settings.google_client_id,
-                    "client_secret": settings.google_client_secret,
+                    "client_secret": client_secret,
                     "redirect_uri": redirect_uri,
                     "grant_type": "authorization_code",
                 },
@@ -398,7 +411,7 @@ async def google_callback(code: str, state: str, request: Request):
             # generation. Disconnect requests fence before waiting for this
             # lock, so an overlapping callback detects cancellation here before
             # a newer callback can enter and establish its runtime.
-            connector_registry._inject_local_credentials()
+            await asyncio.to_thread(connector_registry._inject_local_credentials)
             try:
                 await connector_registry.reconnect_google_runtime_locked()
             except Exception as e:
@@ -416,7 +429,7 @@ async def google_callback(code: str, state: str, request: Request):
                     project_dir,
                     expected_generation=generation,
                 )
-                connector_registry._inject_local_credentials()
+                await asyncio.to_thread(connector_registry._inject_local_credentials)
                 return HTMLResponse(
                     "<p>This Google authorization was cancelled.</p>"
                 )

@@ -17,6 +17,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app import release_features
 from app.dependencies import (
     AgentRegistryDep,
     IndexManagerDep,
@@ -84,6 +85,18 @@ MODEL_DOES_NOT_SUPPORT_IMAGES = "MODEL_DOES_NOT_SUPPORT_IMAGES"
 _HEARTBEAT_INTERVAL = 15.0
 
 
+def _ensure_security_not_stopped(request: Request) -> None:
+    control = getattr(request.app.state, "security_control", None)
+    if control is not None and control.emergency_stop:
+        raise HTTPException(
+            status_code=423,
+            detail={
+                "code": "security_emergency_stop",
+                "message": "Security emergency stop is active. Resume from Settings before starting a task.",
+            },
+        )
+
+
 def _create_session_job(
     sm: StreamManager,
     *,
@@ -91,7 +104,12 @@ def _create_session_job(
     session_id: str,
 ) -> GenerationJob:
     try:
-        return sm.create_job(stream_id=stream_id, session_id=session_id)
+        return sm.create_job(
+            stream_id=stream_id,
+            session_id=session_id,
+            invocation_source="desktop",
+            invocation_source_id="desktop",
+        )
     except SessionBusyError as exc:
         raise HTTPException(
             status_code=409,
@@ -344,6 +362,7 @@ async def start_prompt(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Start a new generation. Returns stream_id for SSE subscription."""
+    _ensure_security_not_stopped(request)
     body.language = request_language(request)
     request_key = body.client_request_id
     request_hash = canonical_request_hash(
@@ -387,6 +406,32 @@ async def start_prompt(
             model_id=body.model,
             provider_id=body.provider_id,
         )
+
+        if body.session_id and release_features.GOALS_RELEASED:
+            from app.models.session_goal import SessionGoal
+
+            async with session_factory() as db:
+                active_goal = (
+                    await db.execute(
+                        select(SessionGoal.id).where(
+                            SessionGoal.session_id == body.session_id,
+                            SessionGoal.status == "active",
+                        )
+                    )
+                ).scalar_one_or_none()
+            if active_goal is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "goal_active",
+                        "message": (
+                            "This conversation has an active Goal. Queue the "
+                            "message on its current stream or pause the Goal first."
+                        ),
+                        "session_id": body.session_id,
+                        "goal_id": active_goal,
+                    },
+                )
 
         session_id = body.session_id or generate_ulid()
         stream_id = generate_ulid()
@@ -490,6 +535,7 @@ async def start_task_batch(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Start an explicit sequential or parallel multi-agent task batch."""
+    _ensure_security_not_stopped(request)
     body.language = request_language(request)
     session_id = body.session_id or generate_ulid()
     try:
@@ -544,12 +590,14 @@ async def start_task_batch(
 @router.post("/chat/compact", response_model=PromptResponse)
 async def start_compaction(
     body: CompactRequest,
+    request: Request,
     sm: StreamManagerDep,
     session_factory: SessionFactoryDep,
     provider_registry: ProviderRegistryDep,
     agent_registry: AgentRegistryDep,
 ) -> PromptResponse:
     """Start a manual compaction stream. Reuses the normal SSE/abort lifecycle."""
+    _ensure_security_not_stopped(request)
     async with session_factory() as db:
         async with db.begin():
             session = await get_session(db, body.session_id)
@@ -640,6 +688,7 @@ async def edit_and_resend(
     index_manager: IndexManagerDep,
 ) -> PromptResponse:
     """Edit a user message, delete all subsequent messages, and re-generate."""
+    _ensure_security_not_stopped(request)
     body.language = request_language(request)
     active = sm.active_job_for_session(body.session_id)
     if active is not None:
@@ -664,6 +713,22 @@ async def edit_and_resend(
     # Atomic DB operation: update message text + delete subsequent messages
     async with session_factory() as db:
         async with db.begin():
+            from app.session.goal_manager import get_session_goal
+
+            goal = await get_session_goal(db, body.session_id)
+            if goal is not None and goal.status not in {"paused", "complete"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "goal_history_edit_blocked",
+                        "message": (
+                            "Pause or complete the Goal before editing conversation history."
+                        ),
+                        "goal_id": goal.id,
+                        "goal_status": goal.status,
+                        "goal_revision": goal.revision,
+                    },
+                )
             await update_message_text(db, body.message_id, body.text)
             await update_message_file_parts(
                 db, body.message_id, body.session_id, body.attachments or []
@@ -799,13 +864,43 @@ async def stream_events(
 
 
 @router.post("/chat/abort")
-async def abort_generation(sm: StreamManagerDep, body: AbortRequest) -> dict:
+async def abort_generation(
+    sm: StreamManagerDep,
+    session_factory: SessionFactoryDep,
+    body: AbortRequest,
+) -> dict:
     """Abort an active generation."""
     job = sm.get_job(body.stream_id)
     if job is None:
         return {"status": "not_found"}
+    if job.goal_id is not None:
+        from app.schemas.goal import GoalResponse
+        from app.session.goal_manager import request_immediate_goal_stop
+        from app.streaming.events import GOAL_UPDATED
+
+        async with session_factory() as db:
+            async with db.begin():
+                goal = await request_immediate_goal_stop(
+                    db,
+                    goal_id=job.goal_id,
+                )
+        if goal is not None:
+            job.publish(
+                SSEEvent(
+                    GOAL_UPDATED,
+                    {
+                        "goal": GoalResponse.model_validate(goal).model_dump(
+                            mode="json"
+                        )
+                    },
+                )
+            )
+        job.deny_pending_responses(source="goal_immediate_stop")
     job.abort()
-    return {"status": "aborted"}
+    return {
+        "status": "aborted",
+        "goal_stop": job.goal_id is not None,
+    }
 
 
 @router.get("/chat/active")

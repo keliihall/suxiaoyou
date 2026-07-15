@@ -15,6 +15,8 @@ export interface ActivityData {
   thinkingDuration?: number;
   /** True only while an unresolved interactive stream prompt exists. */
   isAwaitingConfirmation?: boolean;
+  /** True once history or a terminal stream boundary proves completion. */
+  isTerminal?: boolean;
   stepParts: (StepStartPart | StepFinishPart)[];
   hasVisibleOutput?: boolean;
   /** Ordered chain of reasoning + tool items (preserves execution order). */

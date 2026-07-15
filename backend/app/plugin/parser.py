@@ -121,6 +121,9 @@ def parse_mcp_json(plugin_dir: Path) -> tuple[list[PluginMcpServer], dict[str, d
                 env = config.get("environment")
                 if env:
                     local_servers[name]["environment"] = env
+                cwd = config.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    local_servers[name]["cwd"] = cwd
         else:
             # Remote HTTP server
             url = config.get("url", "")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 
 class PermissionRule(BaseModel):
@@ -25,9 +25,43 @@ class Ruleset(BaseModel):
     """Ordered list of permission rules (last match wins)."""
 
     rules: list[PermissionRule] = []
+    # A server-created intersection is a hard policy boundary, not another
+    # last-rule-wins layer.  Keep the component policies private so public
+    # Agent/Prompt JSON cannot opt into (or forge) this authority mode.  The
+    # permission module owns the versioned persistence format for this value.
+    _intersection: tuple["Ruleset", ...] = PrivateAttr(default=())
+    # Pair of (policy at Goal authorization, current policy). Evaluation
+    # exposes only decisions that became stricter, preserving unchanged user
+    # overrides while enforcing allow->ask/deny and ask->deny transitions.
+    _tightening_sources: "tuple[Ruleset, Ruleset] | None" = PrivateAttr(
+        default=None
+    )
 
     def evaluate(self, permission: str, pattern: str = "*") -> str:
         """Evaluate permission + resource pattern. Returns 'allow', 'deny', or 'ask'."""
+        if self._tightening_sources is not None:
+            previous, current = self._tightening_sources
+            previous_action = previous.evaluate(permission, pattern)
+            current_action = current.evaluate(permission, pattern)
+            strictness = {"allow": 0, "ask": 1, "deny": 2}
+            return (
+                current_action
+                if strictness[current_action] > strictness[previous_action]
+                else "allow"
+            )
+        if self._intersection:
+            actions = {
+                policy.evaluate(permission, pattern)
+                for policy in self._intersection
+            }
+            if "deny" in actions:
+                return "deny"
+            if "ask" in actions:
+                return "ask"
+            # An intersection permits an operation only when every component
+            # policy independently permits it.
+            return "allow" if actions == {"allow"} else "deny"
+
         result = "deny"  # default if no rules match
         for rule in self.rules:
             if _glob_match(permission, rule.permission) and _glob_match(pattern, rule.pattern):

@@ -124,3 +124,48 @@ test("registry gates setup and disconnect recovery instead of forcing completion
     /status === "disconnected"[\s\S]{0,700}finally\s*\{[\s\S]{0,200}finishCurrentGeneration/,
   );
 });
+
+test("background streams cannot write global workspace or artifact projections", () => {
+  const source = readFileSync("src/lib/session-stream-registry.ts", "utf8");
+
+  assert.match(
+    source,
+    /const isFocusedSession = \(\) =>[\s\S]*focusedSessionId === sessionId/,
+  );
+  assert.match(
+    source,
+    /if \(isFocusedSession\(\) && data\.tool === "todo"[\s\S]*setTodos/,
+  );
+  assert.match(
+    source,
+    /isFocusedSession\(\) &&\s*isCurrentGeneration\(\) &&[\s\S]*API\.SESSIONS\.FILES\(sessionId\)/,
+  );
+  assert.match(
+    source,
+    /\.then\(\(res\) => \{\s*if \(!isFocusedSession\(\) \|\| !isCurrentGeneration\(\)\) return;/,
+  );
+  assert.match(
+    source,
+    /if \(!isFocusedSession\(\)\) return;\s*const ws = useWorkspaceStore\.getState\(\);\s*ws\.setTaskBatch/,
+  );
+  assert.match(
+    source,
+    /if \(isFocusedSession\(\)\) \{\s*const workspace = useWorkspaceStore\.getState\(\);[\s\S]*workspace\.collapseSection\("progress"\)/,
+  );
+  assert.equal(
+    [...source.matchAll(/useArtifactStore\.getState\(\)\.openArtifact/g)].length,
+    2,
+  );
+  assert.match(
+    source,
+    /if \(isFocusedSession\(\) && data\.tool === "artifact" && data\.arguments\)[\s\S]*useArtifactStore\.getState\(\)\.openArtifact/,
+  );
+  assert.match(
+    source,
+    /if \(isFocusedSession\(\) && data\.tool === "artifact" && data\.metadata\)[\s\S]*useArtifactStore\.getState\(\)\.openArtifact/,
+  );
+  assert.match(
+    source,
+    /setPlanReview\(sessionId, reviewData\);\s*if \(!isFocusedSession\(\)\) return;[\s\S]*openReview\(reviewData\)/,
+  );
+});

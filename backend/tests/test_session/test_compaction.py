@@ -1,6 +1,175 @@
 """Compaction tests."""
 
-from app.session.compaction import should_compact
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import select
+
+from app.models.goal_run import GoalRun
+from app.models.goal_usage_record import GoalUsageRecord
+from app.models.message import Message, Part
+from app.models.session import Session
+from app.models.session_goal import SessionGoal
+from app.schemas.provider import ModelInfo, ModelPricing, StreamChunk
+from app.session.compaction import _phase2_summarize, should_compact
+from app.streaming.manager import GenerationJob
+
+
+class _CompactionProvider:
+    id = "compaction-provider"
+
+    def __init__(self) -> None:
+        self.started = False
+        self.messages = None
+        self.system = None
+
+    async def stream_chat(self, _model_id, messages, **kwargs):
+        self.started = True
+        self.messages = messages
+        self.system = kwargs.get("system")
+        yield StreamChunk(type="text-delta", data={"text": "durable summary"})
+        yield StreamChunk(
+            type="usage",
+            data={"input": 10, "output": 5, "total": 15},
+        )
+
+
+class _CompactionRegistry:
+    def __init__(self, provider: _CompactionProvider) -> None:
+        self.provider = provider
+        self.model = ModelInfo(
+            id="compaction-model",
+            name="Compaction",
+            provider_id=provider.id,
+            pricing=ModelPricing(prompt=1.0, completion=2.0),
+        )
+
+    def all_models(self):
+        return [self.model]
+
+    def resolve_model(self, model_id):
+        assert model_id == self.model.id
+        return self.provider, self.model
+
+
+async def _seed_goal_compaction(session_factory) -> GenerationJob:
+    async with session_factory() as db:
+        async with db.begin():
+            db.add(Session(id="compact-session", directory=".", title="Compact"))
+            db.add(
+                SessionGoal(
+                    id="compact-goal",
+                    session_id="compact-session",
+                    objective="Compact without escaping the Goal budget",
+                    status="active",
+                    run_state="running",
+                    revision=2,
+                    last_run_id="compact-run",
+                    token_budget=1_000,
+                    cost_budget_microusd=1_000_000,
+                )
+            )
+            db.add(
+                GoalRun(
+                    id="compact-run",
+                    goal_id="compact-goal",
+                    ordinal=1,
+                    goal_revision=2,
+                    idempotency_key="goal-compaction-run",
+                    trigger="initial",
+                    status="running",
+                )
+            )
+            message = Message(
+                id="compact-user-message",
+                session_id="compact-session",
+                data={"role": "user"},
+            )
+            db.add(message)
+            await db.flush()
+            db.add(
+                Part(
+                    id="compact-user-text",
+                    message_id=message.id,
+                    session_id="compact-session",
+                    data={"type": "text", "text": "Summarize this work"},
+                )
+            )
+    return GenerationJob(
+        "compact-stream",
+        "compact-session",
+        invocation_source="goal",
+        goal_id="compact-goal",
+        goal_run_id="compact-run",
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_compaction_persists_usage_in_same_durable_ledger(
+    session_factory,
+) -> None:
+    job = await _seed_goal_compaction(session_factory)
+    provider = _CompactionProvider()
+
+    summary = await _phase2_summarize(
+        "compact-session",
+        job=job,
+        session_factory=session_factory,
+        provider_registry=_CompactionRegistry(provider),  # type: ignore[arg-type]
+        agent_registry=SimpleNamespace(
+            get=lambda name: SimpleNamespace(system_prompt="Summarize")
+            if name == "compaction"
+            else None
+        ),  # type: ignore[arg-type]
+    )
+
+    assert summary == "durable summary"
+    assert provider.started is True
+    assert provider.messages is not None
+    compaction_request = provider.messages[-1]
+    assert compaction_request["role"] == "user"
+    assert "system-generated compaction instruction" in compaction_request["content"]
+    assert "not a genuine user message" in compaction_request["content"]
+    assert "latest genuine user-authored message" in compaction_request["content"]
+    async with session_factory() as db:
+        records = list((await db.execute(select(GoalUsageRecord))).scalars())
+        usage_message = (
+            await db.execute(
+                select(Message).where(
+                    Message.session_id == "compact-session",
+                    Message.id != "compact-user-message",
+                )
+            )
+        ).scalar_one()
+    assert len(records) == 1
+    assert records[0].source_kind == "compaction"
+    assert records[0].source_key == f"compaction:{usage_message.id}"
+    assert (records[0].tokens_used, records[0].cost_used_microusd) == (15, 20)
+    assert job.goal_run_usage == (15, 20)
+
+
+@pytest.mark.asyncio
+async def test_goal_pause_closes_compaction_provider_admission(
+    session_factory,
+) -> None:
+    job = await _seed_goal_compaction(session_factory)
+    provider = _CompactionProvider()
+    job.close_execution_admission()
+
+    summary = await _phase2_summarize(
+        "compact-session",
+        job=job,
+        session_factory=session_factory,
+        provider_registry=_CompactionRegistry(provider),  # type: ignore[arg-type]
+        agent_registry=SimpleNamespace(
+            get=lambda _name: SimpleNamespace(system_prompt="Summarize")
+        ),  # type: ignore[arg-type]
+    )
+
+    assert summary is None
+    assert provider.started is False
+    async with session_factory() as db:
+        assert list((await db.execute(select(GoalUsageRecord))).scalars()) == []
 
 
 class TestShouldCompact:

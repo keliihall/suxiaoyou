@@ -240,6 +240,7 @@ class OpenAISubscriptionProvider(BaseProvider):
         max_tokens: int | None = None,
         extra_body: dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
+        native_web_search_enabled: bool = True,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat via WHAM Responses API, translating to/from Chat Completions format."""
         await self._ensure_valid_token()
@@ -255,6 +256,7 @@ class OpenAISubscriptionProvider(BaseProvider):
             tools=tools,
             temperature=temperature,
             max_tokens=max_tokens,
+            native_web_search_enabled=native_web_search_enabled,
         )
 
         headers = {
@@ -317,6 +319,7 @@ class OpenAISubscriptionProvider(BaseProvider):
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        native_web_search_enabled: bool = True,
     ) -> dict[str, Any]:
         """Translate Chat Completions format to WHAM Responses format."""
         body: dict[str, Any] = {
@@ -371,8 +374,10 @@ class OpenAISubscriptionProvider(BaseProvider):
                     # Convert to function_call output items
                     for tc in tool_calls:
                         func = tc.get("function", {})
-                        # Skip native web_search calls — handled server-side by WHAM
-                        if func.get("name") == "web_search":
+                        # Native searches are provider-managed response items;
+                        # custom web_search function calls (used for an ``ask``
+                        # permission flow) must retain normal call/output history.
+                        if func.get("name") == "web_search" and tc.get("_native"):
                             native_ws_call_ids.add(tc.get("id", ""))
                             continue
                         wham_input.append({
@@ -404,14 +409,19 @@ class OpenAISubscriptionProvider(BaseProvider):
 
         if tools:
             wham_tools = self._translate_tools(tools)
-            # Add native web search (replaces custom web_search tool)
-            wham_tools.append({
-                "type": "web_search",
-                "search_context_size": get_settings().web_search_context_size,
-            })
+            # Add native web search only after the Security Center, permission,
+            # and quota gates have explicitly allowed it.  The custom
+            # web_search spec is excluded for this provider, so inferring the
+            # setting from ``tools`` alone would bypass those gates.
+            if native_web_search_enabled:
+                wham_tools.append({
+                    "type": "web_search",
+                    "search_context_size": get_settings().web_search_context_size,
+                })
             body["tools"] = wham_tools
-            # Include sources in web search results
-            body["include"] = ["web_search_call.action.sources"]
+            if native_web_search_enabled:
+                # Include sources only when native search can produce them.
+                body["include"] = ["web_search_call.action.sources"]
 
         if temperature is not None:
             body["temperature"] = temperature

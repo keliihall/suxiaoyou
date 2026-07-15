@@ -10,10 +10,12 @@ import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useChatStore } from "@/stores/chat-store";
 import { useArtifactStore } from "@/stores/artifact-store";
 import { useActivityStore } from "@/stores/activity-store";
+import { usePlanReviewStore } from "@/stores/plan-review-store";
 import { useWorkspaceStore, type WorkspaceTodo, type WorkspaceFile } from "@/stores/workspace-store";
 import { api } from "@/lib/api";
 import { API, queryKeys } from "@/lib/constants";
 import { isInteractionAwaitingResolution } from "@/lib/interaction-response";
+import { useIsDesktop } from "@/hooks/use-platform";
 import { ChatHeader } from "./chat-header";
 import { ChatForm } from "./chat-form";
 import { MessageList } from "@/components/messages/message-list";
@@ -29,8 +31,21 @@ interface ChatViewProps {
 }
 
 export function ChatView({ sessionId }: ChatViewProps) {
+  const isDesktop = useIsDesktop();
+  const workspaceIsOpen = useWorkspaceStore((state) => state.isOpen);
+  const activityIsOpen = useActivityStore((state) => state.isOpen);
+  const artifactIsOpen = useArtifactStore((state) => state.isOpen);
+  const planReviewIsOpen = usePlanReviewStore((state) => state.isOpen);
+  const workspaceVisible =
+    isDesktop
+    && workspaceIsOpen
+    && !activityIsOpen
+    && !artifactIsOpen
+    && !planReviewIsOpen;
+
   const {
     sendMessage,
+    handleGoalCommand,
     queueMessage,
     cancelQueuedInput,
     updateQueuedInput,
@@ -56,6 +71,16 @@ export function ChatView({ sessionId }: ChatViewProps) {
     isProgressStalled,
     lastBusinessProgressAt,
   } = useChat(sessionId);
+  const isAwaitingConfirmation =
+    (!!pendingPermission && isInteractionAwaitingResolution(pendingPermission.responseState))
+    || (!!pendingQuestion && isInteractionAwaitingResolution(pendingQuestion.responseState))
+    || (!!pendingPlanReview && isInteractionAwaitingResolution(pendingPlanReview.responseState));
+  // An interaction card is the authoritative explanation while a user choice
+  // is pending or its acknowledgement is being reconciled. Keep the generic
+  // stalled notice out of that entire lifecycle so an old progress timestamp
+  // cannot produce a conflicting status immediately after confirmation.
+  const hasPendingInteraction =
+    !!pendingPermission || !!pendingQuestion || !!pendingPlanReview;
 
   const {
     messages,
@@ -122,6 +147,11 @@ export function ChatView({ sessionId }: ChatViewProps) {
   // stream for any other session — the stream registry keeps it running in
   // the background so the user can come back to it later.
   useEffect(() => {
+    let lifecycleActive = true;
+    const isFreshSessionHydration = () =>
+      lifecycleActive
+      && useChatStore.getState().focusedSessionId === sessionId;
+
     useChatStore.getState().ensureSession(sessionId);
     useChatStore.getState().setFocusedSession(sessionId);
     useArtifactStore.getState().clearAll();
@@ -129,6 +159,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
     useWorkspaceStore.getState().resetForSession();
 
     api.get<SessionResponse>(API.SESSIONS.DETAIL(sessionId)).then((s) => {
+      if (!isFreshSessionHydration()) return;
       if (s.directory) {
         useWorkspaceStore.getState().setActiveWorkspacePath(s.directory);
       }
@@ -137,6 +168,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
     api.get<{ todos: Array<{ content: string; status: string; activeForm?: string }> }>(
       API.SESSIONS.TODOS(sessionId),
     ).then((res) => {
+      if (!isFreshSessionHydration()) return;
       if (res.todos && res.todos.length > 0) {
         useWorkspaceStore.getState().setTodos(res.todos as WorkspaceTodo[]);
         useWorkspaceStore.getState().open();
@@ -146,6 +178,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
     api.get<{ files: Array<{ name: string; path: string; type: string; tool: string }> }>(
       API.SESSIONS.FILES(sessionId),
     ).then((res) => {
+      if (!isFreshSessionHydration()) return;
       if (res.files && res.files.length > 0) {
         useWorkspaceStore.getState().setWorkspaceFiles(
           res.files.map((f) => ({ name: f.name, path: f.path, type: f.type as WorkspaceFile["type"] })),
@@ -154,6 +187,10 @@ export function ChatView({ sessionId }: ChatViewProps) {
     }).catch(() => {});
 
     return () => {
+      // Promise cancellation is not guaranteed by every desktop transport.
+      // Invalidate this lifecycle before a late DETAIL/TODOS/FILES response
+      // can write into the next session's global workspace projection.
+      lifecycleActive = false;
       // Only clear focus if we are still the focused session on unmount —
       // a fast route swap to another ChatView would otherwise wipe the
       // other view's focus claim on its way in.
@@ -219,11 +256,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
         streamingParts={streamingParts}
         streamingText={streamingText}
         streamingReasoning={streamingReasoning}
-        isAwaitingConfirmation={
-          (!!pendingPermission && isInteractionAwaitingResolution(pendingPermission.responseState)) ||
-          (!!pendingQuestion && isInteractionAwaitingResolution(pendingQuestion.responseState)) ||
-          (!!pendingPlanReview && isInteractionAwaitingResolution(pendingPlanReview.responseState))
-        }
+        isAwaitingConfirmation={isAwaitingConfirmation}
         onEditAndResend={handleEditAndResend}
         directory={session?.directory}
         sessionId={sessionId}
@@ -239,6 +272,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
         totalMessageCount={total}
         isHistoryWindow={isHistoryWindow}
         onExitHistoryWindow={exitHistoryWindow}
+        hideConversationOutline={workspaceVisible}
       />
 
       {/* Interactive prompts */}
@@ -247,7 +281,6 @@ export function ChatView({ sessionId }: ChatViewProps) {
           permission={pendingPermission}
           onRespond={respondToPermission}
           onRecover={() => recoverInteraction("permission", pendingPermission.callId)}
-          onStop={stopGeneration}
         />
       )}
 
@@ -256,7 +289,6 @@ export function ChatView({ sessionId }: ChatViewProps) {
           question={pendingQuestion}
           onRespond={respondToQuestion}
           onRecover={() => recoverInteraction("question", pendingQuestion.callId)}
-          onStop={stopGeneration}
         />
       )}
 
@@ -268,7 +300,12 @@ export function ChatView({ sessionId }: ChatViewProps) {
           review={pendingPlanReview}
           onRespond={respondToPlanReview}
           onRecover={() => recoverInteraction("plan", pendingPlanReview.callId)}
-          onStop={stopGeneration}
+          // recovery_needed restores ChatForm, whose Stop remains the single
+          // global stop affordance. Other plan acknowledgement states keep the
+          // composer hidden, so the acknowledgement owns Stop there.
+          onStop={pendingPlanReview.responseState === "recovery_needed"
+            ? undefined
+            : stopGeneration}
         />
       )}
       {(!pendingPlanReview || pendingPlanReview.responseState === "recovery_needed") && (
@@ -276,11 +313,12 @@ export function ChatView({ sessionId }: ChatViewProps) {
           isGenerating={isGenerating}
           isCompacting={isCompacting || !!session?.time_compacting}
           onSend={sendMessage}
+          onGoalCommand={handleGoalCommand}
           onQueue={queueMessage}
           pendingInputs={pendingInputs}
           onCancelInput={cancelQueuedInput}
           onUpdateInput={updateQueuedInput}
-          isProgressStalled={isProgressStalled}
+          isProgressStalled={isProgressStalled && !hasPendingInteraction}
           lastBusinessProgressAt={lastBusinessProgressAt}
           onSendTaskBatch={sendTaskBatch}
           onStop={stopGeneration}

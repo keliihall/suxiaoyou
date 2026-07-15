@@ -6,9 +6,17 @@ license: Apache-2.0
 
 # Spreadsheet workflow
 
-Use `openpyxl` when workbook structure, formulas, styles, charts, or multiple
-sheets matter. Use `pandas` for table-shaped analysis, then write the result
-back carefully.
+Use the built-in `office` tool for its supported declarative operations. Use
+`openpyxl` when advanced formulas, styles, charts, or workbook structure
+matter, and `pandas` for table-shaped analysis before writing the result back
+carefully.
+
+For basic sheet creation/deletion, row appends, cell updates, number formats,
+fonts, and solid fills, use the built-in `office` tool first. It is available
+on macOS, Windows, and Linux, stays inside the selected workspace, versions an
+existing destination, and validates a temporary XLSX before atomic
+installation. It stores formulas but never recalculates their results. Do not
+write a Python or shell helper for operations covered by `office`.
 
 ## Procedure
 

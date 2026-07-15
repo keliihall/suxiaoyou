@@ -153,6 +153,12 @@ function commandRunner(fixture, overrides = {}) {
       return { stdout: "bundle verified\n", stderr: "" };
     }
     if (command === "codesign") {
+      if (args[0] === "-dv") {
+        return {
+          stdout: "",
+          stderr: `Identifier=${overrides.backendIdentifier ?? "com.suxiaoyou.backend"}\n`,
+        };
+      }
       return { stdout: "", stderr: "" };
     }
     throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
@@ -250,6 +256,29 @@ test("can require a complete app-bundle signature", async () => {
         command === "codesign" &&
         args.join(" ") === `--verify --deep --strict --verbose=2 ${fixture.app}`,
     ),
+  );
+  assert.ok(
+    runner.calls.some(
+      ({ command, args }) =>
+        command === "codesign" &&
+        args.join(" ") === `-dv --verbose=4 ${fixture.backendExecutable}`,
+    ),
+  );
+});
+
+test("rejects a signed backend whose identifier changes between releases", async () => {
+  const fixture = appFixture();
+  const runner = commandRunner(fixture, {
+    backendIdentifier: "suxiaoyou-backend-content-derived",
+  });
+
+  await assert.rejects(
+    verifyMacOSBundle(fixture.app, "arm64", "13.3", {
+      runCommand: runner.runCommand,
+      log: () => {},
+      verifySignature: true,
+    }),
+    /expected backend signing identifier com\.suxiaoyou\.backend/,
   );
 });
 

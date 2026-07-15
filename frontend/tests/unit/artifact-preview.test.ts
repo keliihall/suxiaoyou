@@ -10,12 +10,12 @@ test("common raster image extensions use the binary image preview", () => {
     assert.equal(artifactTypeFromExtension(`C:\\Temp\\PREVIEW.${extension.toUpperCase()}`), "image");
   }
 
-  const messageContent = readFileSync(
-    "src/components/messages/message-content.tsx",
+  const messagePresentation = readFileSync(
+    "src/lib/message-presentation.ts",
     "utf8",
   );
   for (const extension of ["png", "jpg", "jpeg", "gif", "webp", "bmp"]) {
-    assert.match(messageContent, new RegExp(`"\\.${extension}"`));
+    assert.match(messagePresentation, new RegExp(`"\\.${extension}"`));
   }
 });
 

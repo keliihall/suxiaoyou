@@ -72,6 +72,17 @@ async def run_compaction(
     if job.abort_event.is_set():
         logger.info("Compaction aborted before start for session %s", session_id)
         return result
+    if job.goal_id is not None:
+        from app.session.goal_guard import goal_job_execution_allowed
+
+        allowed, reason = await goal_job_execution_allowed(session_factory, job)
+        if not allowed:
+            logger.info(
+                "Goal compaction denied before start for session %s: %s",
+                session_id,
+                reason,
+            )
+            return result
 
     # Signal compaction start
     job.publish(SSEEvent(COMPACTION_START, {
@@ -271,22 +282,118 @@ async def _phase2_summarize(
     if not llm_messages:
         return None
 
+    max_tokens = 4096
+    if job.goal_id is not None:
+        from app.config import get_settings
+        from app.session.goal_guard import (
+            read_goal_budget_gate,
+            read_goal_execution_gate,
+        )
+
+        root_session_id = job.goal_session_id or job.session_id
+        gate = await read_goal_execution_gate(
+            session_factory,
+            session_id=root_session_id,
+            goal_id=job.goal_id,
+            goal_run_id=job.goal_run_id,
+        )
+        if not gate.allowed:
+            logger.info(
+                "Goal compaction Provider call denied for session %s: %s",
+                session_id,
+                gate.reason,
+            )
+            return None
+        tokens_used, cost_used = job.goal_run_usage
+        budget = await read_goal_budget_gate(
+            session_factory,
+            session_id=root_session_id,
+            goal_id=job.goal_id,
+            local_tokens_used=tokens_used,
+            local_cost_microusd=cost_used,
+            warning_ratio=get_settings().goal_budget_warning_ratio,
+        )
+        if not budget.allowed:
+            logger.info(
+                "Goal compaction Provider call denied by %s for session %s",
+                budget.reason_code,
+                session_id,
+            )
+            return None
+        if budget.token_remaining is not None:
+            max_tokens = max(1, min(max_tokens, budget.token_remaining))
+
     # Ask compaction agent to summarize
     try:
         summary_prompt = (
-            "Summarize the conversation above. Follow the format in your system prompt."
+            "This is a system-generated compaction instruction, not a genuine user "
+            "message. Summarize the conversation above and follow the format in "
+            "your system prompt. Preserve the language of the latest genuine "
+            "user-authored message for continuation handoff."
         )
         messages = llm_messages + [{"role": "user", "content": summary_prompt}]
 
         summary = ""
         usage_data: dict[str, Any] = {}
         last_reported = 0
-        async for chunk in provider.stream_chat(
-            model_id,
-            messages,
-            system=compaction_agent.system_prompt,
-            max_tokens=4096,
-        ):
+        first_chunk = None
+        if job.goal_id is not None:
+            # Pair the final durable checks and the Provider's first iterator
+            # step with the same runtime lock used by pause/edit/archive. A
+            # control operation therefore wins before this call, or observes
+            # that the compaction request has already started.
+            async with job.execution_admission_lock:
+                if not job.execution_admission_open:
+                    return None
+                root_session_id = job.goal_session_id or job.session_id
+                gate = await read_goal_execution_gate(
+                    session_factory,
+                    session_id=root_session_id,
+                    goal_id=job.goal_id,
+                    goal_run_id=job.goal_run_id,
+                )
+                if not gate.allowed:
+                    return None
+                tokens_used, cost_used = job.goal_run_usage
+                budget = await read_goal_budget_gate(
+                    session_factory,
+                    session_id=root_session_id,
+                    goal_id=job.goal_id,
+                    local_tokens_used=tokens_used,
+                    local_cost_microusd=cost_used,
+                    warning_ratio=get_settings().goal_budget_warning_ratio,
+                )
+                if not budget.allowed:
+                    return None
+                if budget.token_remaining is not None:
+                    max_tokens = max(1, min(max_tokens, budget.token_remaining))
+                provider_stream = provider.stream_chat(
+                    model_id,
+                    messages,
+                    system=compaction_agent.system_prompt,
+                    max_tokens=max_tokens,
+                )
+                try:
+                    first_chunk = await anext(provider_stream)
+                except StopAsyncIteration:
+                    first_chunk = None
+
+            async def admitted_chunks():
+                if first_chunk is not None:
+                    yield first_chunk
+                async for remaining_chunk in provider_stream:
+                    yield remaining_chunk
+
+            chunks = admitted_chunks()
+        else:
+            chunks = provider.stream_chat(
+                model_id,
+                messages,
+                system=compaction_agent.system_prompt,
+                max_tokens=max_tokens,
+            )
+
+        async for chunk in chunks:
             if job.abort_event.is_set():
                 logger.info("Compaction summarize stream aborted for session %s", session_id)
                 return None
@@ -306,21 +413,47 @@ async def _phase2_summarize(
         # Persist usage as a synthetic assistant message so the usage API picks it up
         if usage_data:
             cost = _calculate_step_cost(usage_data, model_info)
+            goal_tokens = sum(
+                max(0, int(usage_data.get(key, 0) or 0))
+                for key in ("input", "output", "reasoning", "cache_read")
+            )
+            goal_cost_microusd = max(0, round(cost * 1_000_000))
             async with session_factory() as db:
                 async with db.begin():
-                    await create_message(
+                    usage_message = await create_message(
                         db,
                         session_id=session_id,
                         data={
                             "role": "assistant",
                             "agent": "compaction",
                             "system": True,
+                            "goal_run_id": job.goal_run_id,
                             "cost": cost,
                             "tokens": usage_data,
                             "model_id": model_id,
                             "provider_id": provider.id,
                         },
                     )
+                    if job.goal_id is not None:
+                        if job.goal_run_id is None:
+                            raise RuntimeError(
+                                "Goal compaction usage has no durable run identity"
+                            )
+                        from app.session.goal_manager import record_goal_run_usage
+
+                        await record_goal_run_usage(
+                            db,
+                            goal_run_id=job.goal_run_id,
+                            source_kind="compaction",
+                            source_key=f"compaction:{usage_message.id}",
+                            tokens_used=goal_tokens,
+                            cost_used_microusd=goal_cost_microusd,
+                        )
+            if job.goal_id is not None:
+                job.record_goal_usage(
+                    tokens=goal_tokens,
+                    cost_microusd=goal_cost_microusd,
+                )
             logger.info(
                 "Compaction usage: %s tokens, $%.6f (session %s)",
                 usage_data.get("total", 0), cost, session_id,

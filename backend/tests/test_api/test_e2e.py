@@ -304,6 +304,37 @@ class TestDoomLoopDetection:
         assert detector.check("s", "search", {"q": "x"}).action == "warn"
         assert detector.check("s", "search", {"q": "x"}).action == "block"
 
+    @pytest.mark.asyncio
+    async def test_command_loop_normalises_transient_paths_and_timeouts(self):
+        from app.session.loop_detection import LoopDetector
+
+        detector = LoopDetector(warn_threshold=2, hard_limit=3)
+        first = {
+            "command": (
+                "python /private/execution-transactions/key/tx-first/workspace/"
+                ".suxiaoyou/sandbox/bash-one/home/install.py"
+            ),
+            "timeout": 30,
+        }
+        second = {
+            "command": (
+                "python /private/execution-transactions/key/tx-second/workspace/"
+                ".suxiaoyou/sandbox/bash-two/home/install.py"
+            ),
+            "timeout": 120,
+        }
+        third = {
+            "command": (
+                "python /private/execution-transactions/key/tx-third/workspace/"
+                ".suxiaoyou/sandbox/bash-three/home/install.py"
+            ),
+            "timeout": 600,
+        }
+
+        assert detector.check("s", "bash", first).action == "allow"
+        assert detector.check("s", "bash", second).action == "warn"
+        assert detector.check("s", "bash", third).action == "block"
+
 
 class TestStreamManager:
     """Stream manager and job lifecycle tests."""

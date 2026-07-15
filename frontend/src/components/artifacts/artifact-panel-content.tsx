@@ -8,6 +8,7 @@ import { SvgRenderer } from "./renderers/svg-renderer";
 import { MermaidRenderer } from "./renderers/mermaid-renderer";
 import { HtmlRenderer } from "./renderers/html-renderer";
 import { ImageRenderer } from "./renderers/image-renderer";
+import { MediaRenderer } from "./renderers/media-renderer";
 import { FilePreviewRenderer } from "./renderers/file-preview-renderer";
 import { CsvRenderer } from "./renderers/csv-renderer";
 // Heavy renderers - lazy loaded to reduce bundle size
@@ -52,6 +53,10 @@ export function ArtifactPanelContent() {
       return <SvgRenderer content={artifact.content} />;
     case "image":
       return <ImageRenderer filePath={artifact.filePath} />;
+    case "audio":
+      return <MediaRenderer filePath={artifact.filePath} kind="audio" />;
+    case "video":
+      return <MediaRenderer filePath={artifact.filePath} kind="video" />;
     case "mermaid":
       return <MermaidRenderer content={artifact.content} />;
     case "html":

@@ -147,6 +147,7 @@ interface ChatStore {
   appendTextDelta: (sessionId: string | null, text: string) => void;
   appendReasoningDelta: (sessionId: string | null, text: string) => void;
   addToolStart: (sessionId: string | null, tool: string, callId: string, args: Record<string, unknown>, title?: string | null) => void;
+  setToolMetadata: (sessionId: string | null, callId: string, title?: string | null, metadata?: Record<string, unknown> | null) => void;
   setToolResult: (sessionId: string | null, callId: string, output: string, title?: string | null, metadata?: Record<string, unknown> | null) => void;
   setToolError: (sessionId: string | null, callId: string, output: string) => void;
   addStepStart: (sessionId: string | null, step: number) => void;
@@ -402,6 +403,27 @@ export const useChatStore = create<ChatStore>((set) => ({
       }),
     ),
 
+  setToolMetadata: (sessionId, callId, title, metadata) =>
+    set((s) =>
+      mutateBucket(s, sessionId, (prev) => ({
+        ...prev,
+        streamingParts: prev.streamingParts.map((p) =>
+          p.type === "tool" && p.call_id === callId
+            ? {
+                ...p,
+                state: {
+                  ...p.state,
+                  title: title ?? p.state.title,
+                  metadata: metadata
+                    ? { ...(p.state.metadata ?? {}), ...metadata }
+                    : p.state.metadata,
+                },
+              }
+            : p,
+        ),
+      })),
+    ),
+
   setToolResult: (sessionId, callId, output, title, metadata) =>
     set((s) =>
       mutateBucket(s, sessionId, (prev) => ({
@@ -415,7 +437,9 @@ export const useChatStore = create<ChatStore>((set) => ({
                   status: "completed" as const,
                   output,
                   title: title ?? p.state.title,
-                  metadata: metadata ?? p.state.metadata,
+                  metadata: metadata
+                    ? { ...(p.state.metadata ?? {}), ...metadata }
+                    : p.state.metadata,
                   time_end: new Date().toISOString(),
                 },
               }

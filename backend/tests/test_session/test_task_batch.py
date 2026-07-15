@@ -40,7 +40,9 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
     session_factory,
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str, str | None, str, str | None, object, Ruleset, bool, bool]] = []
+    calls: list[
+        tuple[str, str | None, str, str | None, object, Ruleset, bool, bool, str, str | None]
+    ] = []
 
     async def fake_run_generation(job, request, **_kwargs):
         calls.append((
@@ -52,12 +54,19 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
             Ruleset.model_validate({"rules": request.permission_rules}),
             request._permission_rules_authoritative,
             job.abort_event is parent_job.abort_event,
+            job.invocation_source,
+            job.invocation_source_id,
         ))
         job.publish(SSEEvent(TEXT_DELTA, {"text": f"done {request.text}"}))
 
     monkeypatch.setattr("app.session.task_batch.run_generation", fake_run_generation)
 
-    job = GenerationJob("stream-1", "parent-1")
+    job = GenerationJob(
+        "stream-1",
+        "parent-1",
+        invocation_source="channel",
+        invocation_source_id="telegram",
+    )
     parent_job = job
     body = TaskBatchRequest(
         session_id="parent-1",
@@ -89,7 +98,8 @@ async def test_parallel_task_batch_streams_progress_and_persists_children(
     ]
     assert all(call[4] is None for call in calls)
     assert all(evaluate("bash", "*", call[5]) == "deny" for call in calls)
-    assert all(call[6:] == (True, True) for call in calls)
+    assert all(call[6:8] == (True, True) for call in calls)
+    assert all(call[8:] == ("channel", "telegram") for call in calls)
     assert [event.event for event in job.events].count(TASK_BATCH_START) == 1
     assert [event.event for event in job.events].count(TASK_BATCH_FINISH) == 1
     assert job.events[-1].event == DONE
@@ -447,7 +457,11 @@ async def test_legacy_permission_and_forged_allow_fall_back_to_headless_ask(
             {"action": "allow", "permission": "bash", "pattern": "*"},
         ],
     )
-    job = GenerationJob("stream-legacy", "legacy-parent")
+    job = GenerationJob(
+        "stream-legacy",
+        "legacy-parent",
+        invocation_source="desktop",
+    )
 
     await run_task_batch(
         job,

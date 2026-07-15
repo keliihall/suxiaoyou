@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -14,6 +15,34 @@ from unittest.mock import Mock
 import pytest
 
 import run
+
+
+def test_main_dispatches_office_self_test_before_server_lifecycle(monkeypatch, capsys):
+    fake_contract = ModuleType("app.tool.office_contract")
+    contract_runner = Mock(
+        return_value={
+            "status": "ok",
+            "all_passed": True,
+            "platform": "windows-x64",
+        }
+    )
+    fake_contract.run_office_contract_sync = contract_runner
+    monkeypatch.setitem(sys.modules, "app.tool.office_contract", fake_contract)
+    crash_reporter = Mock()
+    monkeypatch.setattr(run, "_install_crash_reporter", crash_reporter)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run.py", "--office-self-test", "windows-x64"],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    assert exit_info.value.code == 0
+    contract_runner.assert_called_once_with(expected_platform="windows-x64")
+    assert json.loads(capsys.readouterr().out)["all_passed"] is True
+    crash_reporter.assert_not_called()
 
 
 def test_main_uses_cli_port_for_settings_and_uvicorn(monkeypatch, tmp_path):

@@ -47,6 +47,13 @@ class TestSystemPrompt:
         assert "software engineering" in prompt.lower() or "tool" in prompt.lower()
         assert "Visible process language" in prompt
         assert "reasoning trace" in prompt
+        assert "苏小有 (suyo)" in prompt
+        assert "Yakyak" not in prompt
+        assert "Never call it a former name" in prompt
+        assert "latest genuine user-authored message" in prompt
+        assert "request/UI locale" in prompt
+        assert "Do not use the surrounding UI language to choose the final" in prompt
+        assert "final response in Simplified Chinese" not in prompt
 
     def test_includes_environment(self):
         ar = AgentRegistry()
@@ -63,6 +70,37 @@ class TestSystemPrompt:
         parts = assemble(plan, **_resolve_io(), **_PINNED)
         prompt = parts.as_plain_text()
         assert "PLAN MODE" in prompt or "read-only" in prompt.lower()
+
+    def test_builtin_primary_and_subagents_share_fixed_product_identity(self):
+        ar = AgentRegistry()
+
+        for name in ("build", "plan", "explore", "general"):
+            agent = ar.get(name)
+            parts = assemble(agent, **_resolve_io(), **_PINNED)
+            prompt = parts.as_plain_text()
+            assert "You are 苏小有 (suyo)" in prompt, name
+            assert prompt.index("<product_identity>") < prompt.index(
+                "<response_language>"
+            ), name
+            assert prompt.rstrip().endswith("</response_language>"), name
+            assert "Yakyak" not in prompt, name
+
+    def test_compaction_prompt_preserves_current_product_identity(self):
+        ar = AgentRegistry()
+        compaction = ar.get("compaction")
+
+        assert "苏小有 (suyo) is the product's fixed assistant identity" in (
+            compaction.system_prompt or ""
+        )
+        assert "Yakyak" not in (compaction.system_prompt or "")
+        assert "incorrect assistant response from an older app version" in (
+            compaction.system_prompt or ""
+        )
+        assert "Never call it a former name" in (compaction.system_prompt or "")
+        assert "latest genuine user-authored message" in (
+            compaction.system_prompt or ""
+        )
+        assert "## Continuation Handoff" in (compaction.system_prompt or "")
 
     def test_with_project_instructions(self, tmp_path: Path):
         instructions = tmp_path / "AGENTS.md"
@@ -89,7 +127,8 @@ class TestSystemPrompt:
         build = ar.get("build")
         parts = assemble(build, **_resolve_io(), **_PINNED)
         # Agent base prompt is in cached section
-        assert "Yakyak" in parts.cached or "tool" in parts.cached.lower()
+        assert "苏小有 (suyo)" in parts.cached
+        assert "Yakyak" not in parts.cached
         # Environment info is in dynamic section
         assert "Working directory" in parts.dynamic
 

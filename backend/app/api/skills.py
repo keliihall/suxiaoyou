@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.dependencies import SkillRegistryDep
-from app.skill.registry import SkillRegistry
+from app.skill.registry import SkillPersistenceError, SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -38,21 +38,48 @@ def _skill_source(skill_name: str, location: str) -> str:
     return "project"
 
 
-def _skill_to_dict(skill, registry: SkillRegistry) -> dict[str, Any]:
+def _plugin_source(skill_name: str, request: Request) -> str | None:
+    """Return the owning plugin's installation source, when available.
+
+    Namespaced skill names alone cannot distinguish built-in plugins from
+    global or project plugins. The manager is authoritative and also reflects
+    source precedence when a user plugin overrides a built-in plugin.
+    """
+    if ":" not in skill_name:
+        return None
+
+    manager = getattr(request.app.state, "plugin_manager", None)
+    if manager is None:
+        return None
+
+    plugin_name = skill_name.split(":", 1)[0]
+    detail = manager.detail(plugin_name)
+    if not isinstance(detail, dict):
+        return None
+
+    source = detail.get("source")
+    return source if source in {"builtin", "global", "project"} else None
+
+
+def _skill_to_dict(skill, registry: SkillRegistry, request: Request) -> dict[str, Any]:
     """Convert a SkillInfo to an API response dict."""
+    source = _skill_source(skill.name, skill.location)
+    plugin_source = _plugin_source(skill.name, request)
     return {
         "name": skill.name,
         "description": skill.description,
         "location": skill.location,
-        "source": _skill_source(skill.name, skill.location),
+        "source": source,
+        "plugin_source": plugin_source,
+        "catalog_managed": source == "bundled" or plugin_source == "builtin",
         "enabled": not registry.is_disabled(skill.name),
     }
 
 
 @router.get("/skills")
-async def list_skills(registry: SkillRegistryDep) -> list[dict[str, Any]]:
+async def list_skills(request: Request, registry: SkillRegistryDep) -> list[dict[str, Any]]:
     """List all discovered skills."""
-    return [_skill_to_dict(skill, registry) for skill in registry.all_skills()]
+    return [_skill_to_dict(skill, registry, request) for skill in registry.all_skills()]
 
 
 @router.get("/skills/{skill_name}")
@@ -70,29 +97,49 @@ async def get_skill(registry: SkillRegistryDep, skill_name: str) -> dict[str, An
 
 
 @router.post("/skills/{skill_name}/enable")
-async def enable_skill(registry: SkillRegistryDep, skill_name: str) -> dict[str, Any]:
+async def enable_skill(
+    request: Request,
+    registry: SkillRegistryDep,
+    skill_name: str,
+) -> dict[str, Any]:
     """Enable a disabled skill."""
     skill = registry.get(skill_name)
     if skill is None:
         raise HTTPException(status_code=404, detail=f"Skill not found: {skill_name}")
-    registry.enable(skill_name)
-    return {
-        "success": True,
-        "skills": [_skill_to_dict(s, registry) for s in registry.all_skills()],
+    try:
+        success = registry.enable(skill_name)
+    except SkillPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result: dict[str, Any] = {
+        "success": success,
+        "skills": [_skill_to_dict(s, registry, request) for s in registry.all_skills()],
     }
+    if not success:
+        result["error"] = "Skill is already enabled"
+    return result
 
 
 @router.post("/skills/{skill_name}/disable")
-async def disable_skill(registry: SkillRegistryDep, skill_name: str) -> dict[str, Any]:
+async def disable_skill(
+    request: Request,
+    registry: SkillRegistryDep,
+    skill_name: str,
+) -> dict[str, Any]:
     """Disable a skill (excludes it from LLM available skills)."""
     skill = registry.get(skill_name)
     if skill is None:
         raise HTTPException(status_code=404, detail=f"Skill not found: {skill_name}")
-    registry.disable(skill_name)
-    return {
-        "success": True,
-        "skills": [_skill_to_dict(s, registry) for s in registry.all_skills()],
+    try:
+        success = registry.disable(skill_name)
+    except SkillPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result: dict[str, Any] = {
+        "success": success,
+        "skills": [_skill_to_dict(s, registry, request) for s in registry.all_skills()],
     }
+    if not success:
+        result["error"] = "Skill is already disabled"
+    return result
 
 
 # ---------------------------------------------------------------------

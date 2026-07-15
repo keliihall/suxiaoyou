@@ -9,6 +9,7 @@ Configuration files store opaque references and never the credential itself.
 from __future__ import annotations
 
 import copy
+import ctypes
 import hashlib
 import json
 import logging
@@ -17,8 +18,8 @@ import re
 import secrets
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -31,10 +32,24 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = "com.suxiaoyou.credentials"
 REFERENCE_PREFIX = "suxiaoyou-credential://"
 FALLBACK_VERSION = 1
+MACOS_VAULT_ACCOUNT = "__suxiaoyou_vault_v1__"
+MACOS_VAULT_VERSION = 1
+
+_NATIVE_TARGET_INDIVIDUAL = "individual"
+_NATIVE_TARGET_LEGACY = "legacy"
+_NATIVE_TARGET_VAULT = "vault"
+_NATIVE_TARGETS = frozenset(
+    {_NATIVE_TARGET_INDIVIDUAL, _NATIVE_TARGET_LEGACY, _NATIVE_TARGET_VAULT}
+)
 
 _FILE_LOCK = threading.RLock()
+_NATIVE_BACKEND_UNDISCOVERED = object()
+_CREDENTIAL_STORE_SINGLETON_LOCK = threading.RLock()
 _ENV_LINE = re.compile(
     r"^(?P<prefix>[ \t]*(?:export[ \t]+)?)(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*="
+)
+_EPHEMERAL_ENV_IDENTIFIER = re.compile(
+    r"^env:[A-Z_][A-Z0-9_]*:[0-9a-f]{24}$"
 )
 _V08_SHELL_APOSTROPHE = "'\\''"
 _SECRET_FIELD_NAMES = frozenset(
@@ -72,6 +87,11 @@ class StagedEnvValue:
     value: str
     created_references: frozenset[str]
     _store: CredentialStore = field(repr=False, compare=False)
+    _ephemeral_references: frozenset[str] = field(
+        default_factory=frozenset,
+        repr=False,
+        compare=False,
+    )
 
     def discard_unreferenced(self, configured_values: Iterable[Any] = ()) -> None:
         """Remove newly-created entries that no installed config references."""
@@ -82,7 +102,10 @@ class StagedEnvValue:
         for configured_value in configured_values:
             installed.update(_collect_references(configured_value))
         for reference in self.created_references - installed:
-            self._store.delete(reference)
+            self._store._discard_uncommitted_reference(  # noqa: SLF001
+                reference,
+                ephemeral=reference in self._ephemeral_references,
+            )
 
     def commit_replacement(self, previous_value: Any) -> None:
         """Delete superseded references after config + runtime both commit."""
@@ -178,13 +201,414 @@ class NativeCredentialBackend(Protocol):
     def delete_password(self, service: str, username: str) -> None: ...
 
 
+@dataclass
+class _MacOSVaultState:
+    """Process-shared plaintext state for the one macOS Keychain vault item."""
+
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    loaded: bool = False
+    credentials: dict[str, str] = field(default_factory=dict)
+    legacy_tombstones: set[str] = field(default_factory=set)
+    pending_legacy_deletions: set[str] = field(default_factory=set)
+    legacy_misses: set[str] = field(default_factory=set)
+    load_failure: str | None = None
+
+
+_MACOS_VAULT_STATE = _MacOSVaultState()
+
+
+def _macos_atomic_set_password(service: str, username: str, password: str) -> None:
+    """Atomically replace a generic-password value with Security.framework."""
+
+    from keyring.backends.macOS import api  # type: ignore[import-not-found]
+
+    sec_item_update = api._sec.SecItemUpdate  # noqa: SLF001
+    sec_item_update.restype = api.OS_status
+    sec_item_update.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    query = api.create_query(
+        kSecClass=api.k_("kSecClassGenericPassword"),
+        kSecAttrService=service,
+        kSecAttrAccount=username,
+    )
+    attributes = api.create_query(kSecValueData=password)
+    status = sec_item_update(query, attributes)
+    if status == api.error.item_not_found:
+        add_query = api.create_query(
+            kSecClass=api.k_("kSecClassGenericPassword"),
+            kSecAttrService=service,
+            kSecAttrAccount=username,
+            kSecValueData=password,
+        )
+        status = api.SecItemAdd(add_query, None)
+        if status == -25299:  # errSecDuplicateItem: another writer won Add.
+            status = sec_item_update(query, attributes)
+    api.Error.raise_for_status(status)
+
+
+class _AtomicMacOSKeyringBackend:
+    """Use keyring for reads/legacy deletes and atomic SecItemUpdate for writes."""
+
+    atomic_writes = True
+
+    def __init__(
+        self,
+        delegate: NativeCredentialBackend,
+        *,
+        atomic_setter: Any = _macos_atomic_set_password,
+        missing_error_types: tuple[type[BaseException], ...] = (),
+    ) -> None:
+        self._delegate = delegate
+        self._atomic_setter = atomic_setter
+        self._missing_error_types = missing_error_types
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self._delegate.get_password(service, username)
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self._atomic_setter(service, username, password)
+
+    def delete_password(self, service: str, username: str) -> None:
+        try:
+            self._delegate.delete_password(service, username)
+        except Exception as exc:
+            # keyring wraps api.NotFound in PasswordDeleteError.  Missing is a
+            # completed cleanup; every other error (including ACL denial) must
+            # fail without a follow-up secret read that could reprompt.
+            missing = isinstance(exc.__cause__, self._missing_error_types)
+            if not missing:
+                raise
+
+
+class _MacOSVaultBackend:
+    """Expose many logical credentials through one macOS Keychain item.
+
+    macOS Keychain ACL consent applies per item.  A versioned map under one
+    fixed account therefore turns a multi-reference provider/connector
+    activation into at most one Keychain read after migration.  The delegate
+    is still Apple's native keyring backend; plaintext exists only in process
+    memory and in the encrypted Keychain item.
+
+    Legacy per-identifier items are migrated on demand.  A durable cleanup
+    marker is committed in the aggregate item before the old item is deleted,
+    so a crash can leave a duplicate but can never lose the only copy.
+    """
+
+    vault_managed = True
+
+    def __init__(
+        self,
+        delegate: NativeCredentialBackend,
+        *,
+        state: _MacOSVaultState | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._state = state or _MACOS_VAULT_STATE
+        self.write_failures_are_atomic = bool(
+            getattr(delegate, "atomic_writes", False)
+        )
+
+    @staticmethod
+    def _validate_service(service: str) -> None:
+        if service != SERVICE_NAME:
+            raise CredentialStoreError("Unexpected macOS credential service")
+
+    @staticmethod
+    def _decode_vault(payload: str | None) -> tuple[dict[str, str], set[str], set[str]]:
+        if payload is None:
+            return {}, set(), set()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise CredentialStoreError("macOS credential vault is corrupt") from exc
+        credentials = data.get("credentials") if isinstance(data, dict) else None
+        tombstones = data.get("legacy_tombstones") if isinstance(data, dict) else None
+        pending = (
+            data.get("pending_legacy_deletions") if isinstance(data, dict) else None
+        )
+        if not (
+            isinstance(data, dict)
+            and data.get("version") == MACOS_VAULT_VERSION
+            and isinstance(credentials, dict)
+            and all(
+                isinstance(identifier, str)
+                and 0 < len(identifier) <= 240
+                and isinstance(secret, str)
+                and bool(secret)
+                for identifier, secret in credentials.items()
+            )
+            and isinstance(tombstones, list)
+            and all(
+                isinstance(identifier, str) and 0 < len(identifier) <= 240
+                for identifier in tombstones
+            )
+            and isinstance(pending, list)
+            and all(
+                isinstance(identifier, str) and 0 < len(identifier) <= 240
+                for identifier in pending
+            )
+        ):
+            raise CredentialStoreError("macOS credential vault has an unsupported format")
+        return dict(credentials), set(tombstones), set(pending)
+
+    @staticmethod
+    def _encode_vault(
+        credentials: dict[str, str],
+        legacy_tombstones: set[str],
+        pending_legacy_deletions: set[str],
+    ) -> str:
+        return json.dumps(
+            {
+                "version": MACOS_VAULT_VERSION,
+                "credentials": credentials,
+                "legacy_tombstones": sorted(legacy_tombstones),
+                "pending_legacy_deletions": sorted(pending_legacy_deletions),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _invalidate_locked(self) -> None:
+        self._state.loaded = False
+        self._state.credentials = {}
+        self._state.legacy_tombstones = set()
+        self._state.pending_legacy_deletions = set()
+        self._state.legacy_misses = set()
+        self._state.load_failure = None
+
+    def _write_vault_locked(
+        self,
+        service: str,
+        credentials: dict[str, str],
+        legacy_tombstones: set[str],
+        pending_legacy_deletions: set[str],
+    ) -> None:
+        payload = self._encode_vault(
+            credentials,
+            legacy_tombstones,
+            pending_legacy_deletions,
+        )
+        try:
+            self._delegate.set_password(service, MACOS_VAULT_ACCOUNT, payload)
+        except Exception:
+            # Keyring may commit and then report failure.  Do not let a stale
+            # cache drive the compensating delete; force an exact reload.
+            if not self.write_failures_are_atomic:
+                self._invalidate_locked()
+            raise
+        self._state.loaded = True
+        self._state.credentials = dict(credentials)
+        self._state.legacy_tombstones = set(legacy_tombstones)
+        self._state.pending_legacy_deletions = set(pending_legacy_deletions)
+
+    def _legacy_delete_succeeded_locked(self, service: str, identifier: str) -> bool:
+        try:
+            self._delegate.delete_password(service, identifier)
+            return True
+        except Exception:
+            return False
+
+    def _retry_legacy_cleanup_locked(
+        self,
+        service: str,
+        identifiers: set[str],
+    ) -> None:
+        all_pending = set(self._state.pending_legacy_deletions)
+        candidates = all_pending & identifiers
+        if not candidates:
+            return
+        remaining = {
+            identifier
+            for identifier in candidates
+            if not self._legacy_delete_succeeded_locked(service, identifier)
+        }
+        if remaining == candidates:
+            return
+        next_pending = (all_pending - candidates) | remaining
+        try:
+            self._write_vault_locked(
+                service,
+                self._state.credentials,
+                self._state.legacy_tombstones,
+                next_pending,
+            )
+        except Exception:
+            # The previously committed payload still contains every secret and
+            # the conservative cleanup marker.  A later operation can retry.
+            logger.warning("Could not finalize legacy macOS credential cleanup")
+
+    def _load_vault_locked(self, service: str) -> None:
+        if self._state.loaded:
+            return
+        if self._state.load_failure is not None:
+            raise CredentialStoreError(self._state.load_failure)
+        try:
+            payload = self._delegate.get_password(service, MACOS_VAULT_ACCOUNT)
+            credentials, tombstones, pending = self._decode_vault(payload)
+        except Exception as exc:
+            failure = (
+                str(exc)
+                if isinstance(exc, CredentialStoreError)
+                else "macOS credential vault is unavailable for this app session"
+            )
+            self._state.load_failure = failure
+            raise CredentialStoreError(failure) from exc
+        self._state.credentials = credentials
+        self._state.legacy_tombstones = tombstones
+        self._state.pending_legacy_deletions = pending
+        self._state.legacy_misses = set()
+        self._state.load_failure = None
+        self._state.loaded = True
+
+    def get_vault_password(self, service: str, username: str) -> str | None:
+        """Read only the aggregate item, without consulting legacy items."""
+
+        self._validate_service(service)
+        with self._state.lock:
+            self._load_vault_locked(service)
+            return self._state.credentials.get(username)
+
+    def get_legacy_password(self, service: str, username: str) -> str | None:
+        """Read only a pre-vault per-identifier Keychain item."""
+
+        self._validate_service(service)
+        return self._delegate.get_password(service, username)
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self._validate_service(service)
+        if username == MACOS_VAULT_ACCOUNT:
+            raise CredentialStoreError("Reserved macOS credential identifier")
+        with self._state.lock:
+            self._load_vault_locked(service)
+            value = self._state.credentials.get(username)
+            if value is not None:
+                return value
+            if (
+                username in self._state.legacy_tombstones
+                or username in self._state.legacy_misses
+            ):
+                return None
+
+            legacy_value = self._delegate.get_password(service, username)
+            if legacy_value is None:
+                self._state.legacy_misses.add(username)
+                return None
+
+            credentials = {**self._state.credentials, username: legacy_value}
+            tombstones = {*self._state.legacy_tombstones, username}
+            pending = {*self._state.pending_legacy_deletions, username}
+            # Commit the recoverable copy before touching the old item.
+            self._write_vault_locked(service, credentials, tombstones, pending)
+            self._retry_legacy_cleanup_locked(service, {username})
+            return legacy_value
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self._validate_service(service)
+        if username == MACOS_VAULT_ACCOUNT:
+            raise CredentialStoreError("Reserved macOS credential identifier")
+        with self._state.lock:
+            self._load_vault_locked(service)
+            credentials = {**self._state.credentials, username: password}
+            tombstones = {*self._state.legacy_tombstones, username}
+            self._write_vault_locked(
+                service,
+                credentials,
+                tombstones,
+                self._state.pending_legacy_deletions,
+            )
+            self._retry_legacy_cleanup_locked(service, {username})
+
+    def delete_password(self, service: str, username: str) -> None:
+        """Delete only one logical key from the aggregate vault."""
+
+        self._validate_service(service)
+        if username == MACOS_VAULT_ACCOUNT:
+            raise CredentialStoreError("Reserved macOS credential identifier")
+        with self._state.lock:
+            self._load_vault_locked(service)
+            credentials = dict(self._state.credentials)
+            was_known_to_vault = (
+                username in credentials
+                or username in self._state.legacy_tombstones
+            )
+            credentials.pop(username, None)
+            tombstones = {*self._state.legacy_tombstones, username}
+            pending = set(self._state.pending_legacy_deletions)
+            if not was_known_to_vault:
+                # A config cleanup can retire a legacy reference without ever
+                # resolving it.  Journal that physical deletion inside the
+                # vault before attempting it.  Known vault IDs skip this path,
+                # avoiding one legacy Keychain probe per normal deletion.
+                pending.add(username)
+            self._write_vault_locked(
+                service,
+                credentials,
+                tombstones,
+                pending,
+            )
+            self._retry_legacy_cleanup_locked(service, {username})
+
+    def delete_legacy_password(self, service: str, username: str) -> None:
+        """Delete only a pre-vault item; never mutate the aggregate map."""
+
+        self._validate_service(service)
+        with self._state.lock:
+            if not self._legacy_delete_succeeded_locked(service, username):
+                raise CredentialStoreError("Legacy macOS credential deletion failed")
+
+    def adopt_deletion_journals(
+        self,
+        service: str,
+        *,
+        legacy_identifiers: set[str],
+        vault_identifiers: set[str],
+    ) -> None:
+        """Move file journals into one atomic vault mutation without ACL fan-out."""
+
+        self._validate_service(service)
+        if not legacy_identifiers and not vault_identifiers:
+            return
+        with self._state.lock:
+            self._load_vault_locked(service)
+            credentials = dict(self._state.credentials)
+            originally_known = set(credentials) | self._state.legacy_tombstones
+            for identifier in vault_identifiers:
+                credentials.pop(identifier, None)
+            tombstones = (
+                set(self._state.legacy_tombstones)
+                | legacy_identifiers
+                | vault_identifiers
+            )
+            pending_legacy = (
+                set(self._state.pending_legacy_deletions)
+                | legacy_identifiers
+                | (vault_identifiers - originally_known)
+            )
+            if (
+                credentials == self._state.credentials
+                and tombstones == self._state.legacy_tombstones
+                and pending_legacy == self._state.pending_legacy_deletions
+            ):
+                return
+            self._write_vault_locked(
+                service,
+                credentials,
+                tombstones,
+                pending_legacy,
+            )
+
+
 def _discover_native_backend() -> NativeCredentialBackend | None:
     try:
         # Select only the operating system's native secret service. Avoid the
         # generic keyring chainer here: third-party plaintext keyring backends
         # must never become an implicit production credential store.
-        if sys.platform == "darwin":
-            from keyring.backends.macOS import Keyring  # type: ignore[import-not-found]
+        is_macos = sys.platform == "darwin"
+        if is_macos:
+            from keyring.backends.macOS import (  # type: ignore[import-not-found]
+                Keyring,
+                api,
+            )
 
             backend = Keyring()
         elif sys.platform == "win32":
@@ -202,6 +626,13 @@ def _discover_native_backend() -> NativeCredentialBackend | None:
             priority = 0
         if priority <= 0 or ".fail." in backend_name or ".null." in backend_name:
             return None
+        if is_macos:
+            return _MacOSVaultBackend(
+                _AtomicMacOSKeyringBackend(
+                    backend,
+                    missing_error_types=(api.NotFound,),
+                )
+            )
         return backend
     except Exception as exc:
         logger.info("Native credential backend unavailable; using private fallback: %s", exc)
@@ -223,6 +654,8 @@ def _identifier(reference_or_identifier: str) -> str:
         identifier = reference_or_identifier
     if not identifier or len(identifier) > 240:
         raise CredentialStoreError("Invalid credential identifier")
+    if identifier == MACOS_VAULT_ACCOUNT:
+        raise CredentialStoreError("Reserved credential identifier")
     return identifier
 
 
@@ -260,20 +693,63 @@ class CredentialStore:
             if fallback_path is not None
             else Path.cwd().resolve() / "data" / "credentials" / "fallback.json"
         )
-        self.native_backend = (
-            _discover_native_backend() if native_backend is ... else native_backend
+        self._native_backend: NativeCredentialBackend | None | object = (
+            _NATIVE_BACKEND_UNDISCOVERED
+            if native_backend is ...
+            else native_backend
         )
         (
             self._fallback,
             self._pending_native_deletions,
+            self._pending_native_vault_deletions,
             self._cleanup_transactions,
         ) = self._load_fallback_state()
-        self._reconcile_cleanup_transactions()
-        self._retry_pending_native_deletions()
+        # Recover durable file-side evidence immediately, but do not touch the
+        # OS credential service merely because a CredentialStore was created
+        # during application startup. Public read/write/delete operations retry
+        # any resulting native cleanup journal at an explicit use boundary.
+        self._reconcile_cleanup_transactions(retry_native=False)
 
     @property
     def uses_native_backend(self) -> bool:
         return self.native_backend is not None
+
+    @property
+    def native_backend(self) -> NativeCredentialBackend | None:
+        """Discover the platform vault only at an explicit credential operation."""
+
+        if self._native_backend is _NATIVE_BACKEND_UNDISCOVERED:
+            with _FILE_LOCK:
+                if self._native_backend is _NATIVE_BACKEND_UNDISCOVERED:
+                    self._native_backend = _discover_native_backend()
+        return self._native_backend  # type: ignore[return-value]
+
+    @staticmethod
+    def _target_for_backend(backend: NativeCredentialBackend) -> str:
+        return (
+            _NATIVE_TARGET_VAULT
+            if getattr(backend, "vault_managed", False)
+            else _NATIVE_TARGET_INDIVIDUAL
+        )
+
+    def _cleanup_target_for_new_transaction(self) -> str:
+        # Do not force Keychain discovery while merely preparing file-side
+        # evidence.  All new macOS writes use the aggregate vault, even when
+        # this process has not crossed a credential-use boundary yet.
+        if self._native_backend is _NATIVE_BACKEND_UNDISCOVERED:
+            return (
+                _NATIVE_TARGET_VAULT
+                if sys.platform == "darwin"
+                else _NATIVE_TARGET_INDIVIDUAL
+            )
+        backend = self._native_backend
+        if backend is None:
+            return (
+                _NATIVE_TARGET_VAULT
+                if sys.platform == "darwin"
+                else _NATIVE_TARGET_INDIVIDUAL
+            )
+        return self._target_for_backend(backend)
 
     def put(self, identifier: str, secret: str) -> str:
         self._reconcile_cleanup_transactions()
@@ -284,37 +760,98 @@ class CredentialStore:
         if not isinstance(secret, str) or not secret:
             raise CredentialStoreError("Refusing to persist an empty credential")
 
-        if self.native_backend is not None:
-            try:
-                self.native_backend.set_password(SERVICE_NAME, identifier, secret)  # type: ignore[union-attr]
-            except Exception as exc:
-                logger.warning(
-                    "Native credential write failed for %s; using private fallback: %s",
-                    identifier,
-                    exc,
-                )
-                # Native services may report failure after committing the
-                # write. Compensate inside put(), before callers could lose the
-                # identifier needed to track that partial write.
-                if not self._try_native_delete(identifier):
-                    try:
-                        self._queue_native_deletion(identifier)
-                    except Exception as cleanup_exc:
-                        cleanup_exc.add_note(
-                            f"native write also failed for {identifier}: {exc}"
-                        )
-                        raise
-            else:
+        intended_target = self._cleanup_target_for_new_transaction()
+        backend = self.native_backend
+        if backend is not None:
+            native_target = self._target_for_backend(backend)
+            # Journal adoption also holds this process-wide lock while mutating
+            # the aggregate vault. Keep a fallback-to-vault authority handoff
+            # under the same lock so another store cannot adopt its temporary
+            # marker after the new native value is written but before the file
+            # handoff commits.
+            native_write_guard = (
+                _FILE_LOCK
+                if native_target == _NATIVE_TARGET_VAULT
+                else nullcontext()
+            )
+            with native_write_guard:
+                if native_target == _NATIVE_TARGET_VAULT:
+                    # A fallback remains authoritative until the native write
+                    # and file-side handoff both commit. Persist that authority
+                    # marker before SecItemUpdate so a crash cannot expose an
+                    # unmarked stale fallback or make a denied restart
+                    # ambiguous.
+                    self._reload_fallback_locked()
+                    if (
+                        identifier in self._fallback
+                        and identifier not in self._pending_native_vault_deletions
+                    ):
+                        self._pending_native_vault_deletions.add(identifier)
+                        self._persist_fallback_locked()
                 try:
-                    self._delete_fallback(identifier)
-                except Exception:
-                    # Do not expose a reference after native success if the
-                    # old fallback/journal state could not be retired. Undo or
-                    # durably queue the native write before propagating.
-                    if not self._try_native_delete(identifier):
-                        self._queue_native_deletion(identifier)
-                    raise
-                return _reference(identifier)
+                    backend.set_password(SERVICE_NAME, identifier, secret)
+                except Exception as exc:
+                    logger.warning(
+                        "Native credential write failed for %s; using private fallback: %s",
+                        identifier,
+                        exc,
+                    )
+                    if (
+                        native_target == _NATIVE_TARGET_VAULT
+                        and getattr(backend, "write_failures_are_atomic", False)
+                    ):
+                        # SecItemUpdate/Add failures cannot partially replace
+                        # the vault. Commit the fallback and its logical-key
+                        # cleanup responsibility together; only then may a
+                        # later explicit mutation retire the older vault value.
+                        with _FILE_LOCK:
+                            self._reload_fallback_locked()
+                            self._fallback[identifier] = secret
+                            self._pending_native_vault_deletions.add(identifier)
+                            self._persist_fallback_locked()
+                        return _reference(identifier)
+                    # Native services may report failure after committing the
+                    # write. Compensate inside put(), before callers could lose
+                    # the identifier needed to track that partial write.
+                    if not self._try_native_delete(identifier, target=native_target):
+                        try:
+                            self._queue_native_deletion(
+                                identifier,
+                                target=native_target,
+                            )
+                        except Exception as cleanup_exc:
+                            cleanup_exc.add_note(
+                                f"native write also failed for {identifier}: {exc}"
+                            )
+                            raise
+                else:
+                    try:
+                        self._delete_fallback(identifier, target=native_target)
+                    except Exception as cleanup_exc:
+                        # Authority has not been durably handed from a prior
+                        # fallback to this native write. Compensate the logical
+                        # key (aggregate-vault deletion is atomic and preserves
+                        # every sibling key) and report failure instead of
+                        # letting an older fallback+authority marker mask the
+                        # new value.
+                        if not self._try_native_delete(
+                            identifier,
+                            target=native_target,
+                        ):
+                            try:
+                                self._queue_native_deletion(
+                                    identifier,
+                                    target=native_target,
+                                )
+                            except Exception as journal_exc:
+                                journal_exc.add_note(
+                                    "native credential cleanup also failed after "
+                                    "fallback handoff failure for "
+                                    f"{identifier}: {cleanup_exc}"
+                                )
+                                raise
+                        raise
+                    return _reference(identifier)
 
         with _FILE_LOCK:
             # Multiple CredentialStore instances can share one fallback file
@@ -322,24 +859,76 @@ class CredentialStore:
             # before every mutation so one namespace cannot erase another.
             self._reload_fallback_locked()
             self._fallback[identifier] = secret
+            if intended_target == _NATIVE_TARGET_VAULT:
+                self._pending_native_vault_deletions.add(identifier)
             self._persist_fallback_locked()
         return _reference(identifier)
 
     def get(self, reference_or_identifier: str) -> str | None:
-        self._reconcile_cleanup_transactions()
-        self._retry_pending_native_deletions()
         identifier = _identifier(reference_or_identifier)
-        if self.native_backend is not None:
-            try:
-                value = self.native_backend.get_password(SERVICE_NAME, identifier)  # type: ignore[union-attr]
-            except Exception as exc:
-                logger.warning("Native credential read failed for %s: %s", identifier, exc)
-            else:
-                if value is not None:
-                    return value
+        self._reconcile_cleanup_transactions(retry_native=False)
+        # A present fallback is the committed value after a native write
+        # failure.  Prefer it over a stale/partially-written legacy item and do
+        # not ask the user to unlock Keychain unnecessarily.
         with _FILE_LOCK:
             self._reload_fallback_locked()
-            return self._fallback.get(identifier)
+            fallback_value = self._fallback.get(identifier)
+            fallback_overrides_vault = (
+                identifier in self._pending_native_vault_deletions
+            )
+            legacy_journal_with_fallback = (
+                fallback_value is not None
+                and identifier in self._pending_native_deletions
+            )
+        if fallback_overrides_vault:
+            # The typed marker is a logical authority boundary, not merely a
+            # retry hint.  With a fallback it selects that committed value;
+            # without one it represents a committed deletion.  In both cases
+            # consulting the still-stale aggregate vault could resurrect a
+            # value during the file-intent -> Keychain-mutation crash window.
+            return fallback_value
+
+        backend = self.native_backend
+        if (
+            legacy_journal_with_fallback
+            and backend is not None
+            and getattr(backend, "vault_managed", False)
+        ):
+            # Pre-vault journals paired with a fallback also represent
+            # fallback authority after upgrade.  Avoid letting a stale
+            # aggregate key win during the journal-conversion crash window.
+            return fallback_value
+        if backend is not None and not getattr(backend, "vault_managed", False):
+            # Preserve the historical retry-on-use behavior for Credential
+            # Manager/Secret Service. macOS vault/legacy journals are skipped
+            # on reads so one normal unlock cannot fan out to old ACL items.
+            self._retry_pending_native_deletions()
+        if backend is not None:
+            try:
+                value = backend.get_password(SERVICE_NAME, identifier)
+            except Exception as exc:
+                logger.warning("Native credential read failed for %s: %s", identifier, exc)
+                if getattr(backend, "vault_managed", False):
+                    # Without an explicit ambiguity marker, a fallback may be
+                    # the stale value left by a crash after native commit.
+                    # Never silently downgrade to it while vault authority is
+                    # unknown.
+                    return None
+            else:
+                if value is not None:
+                    if fallback_value is not None:
+                        try:
+                            self._delete_fallback(
+                                identifier,
+                                target=self._target_for_backend(backend),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not retire stale credential fallback for %s",
+                                identifier,
+                            )
+                    return value
+        return fallback_value
 
     def resolve(self, value: str) -> str:
         if not is_credential_reference(value):
@@ -352,38 +941,125 @@ class CredentialStore:
         return secret
 
     def delete(self, reference_or_identifier: str) -> None:
-        self._reconcile_cleanup_transactions()
-        self._retry_pending_native_deletions()
         identifier = _identifier(reference_or_identifier)
-        native_deleted = True
-        if self.native_backend is not None:
-            native_deleted = self._try_native_delete(identifier)
+        self._reconcile_cleanup_transactions(retry_native=False)
+        native_target = self._cleanup_target_for_new_transaction()
+
+        # Commit logical deletion before touching any OS vault.  A crash after
+        # the native mutation can therefore leave only a conservative retry
+        # marker, never an unmarked fallback that resurrects the credential.
         with _FILE_LOCK:
             self._reload_fallback_locked()
             changed = self._fallback.pop(identifier, None) is not None
-            if self.native_backend is not None:
-                if native_deleted:
-                    if identifier in self._pending_native_deletions:
-                        self._pending_native_deletions.discard(identifier)
-                        changed = True
-                elif identifier not in self._pending_native_deletions:
-                    self._pending_native_deletions.add(identifier)
-                    changed = True
+            pending = (
+                self._pending_native_vault_deletions
+                if native_target == _NATIVE_TARGET_VAULT
+                else self._pending_native_deletions
+            )
+            if identifier not in pending:
+                pending.add(identifier)
+                changed = True
             if changed:
-                # A failed native deletion is considered safely handed off only
-                # after this owner-only journal write succeeds.
                 self._persist_fallback_locked()
+
+        backend = self.native_backend
+        if backend is None:
+            return
+
+        actual_target = self._target_for_backend(backend)
+        if actual_target != native_target:
+            # Injectable/test backends can differ from the platform default.
+            # Move the durable intent before invoking that backend.
+            with _FILE_LOCK:
+                self._reload_fallback_locked()
+                old_pending = (
+                    self._pending_native_vault_deletions
+                    if native_target == _NATIVE_TARGET_VAULT
+                    else self._pending_native_deletions
+                )
+                new_pending = (
+                    self._pending_native_vault_deletions
+                    if actual_target == _NATIVE_TARGET_VAULT
+                    else self._pending_native_deletions
+                )
+                old_pending.discard(identifier)
+                new_pending.add(identifier)
+                self._persist_fallback_locked()
+            native_target = actual_target
+
+        if native_target == _NATIVE_TARGET_VAULT:
+            # The macOS adopter applies all logical removals in one aggregate
+            # vault update and clears only journals whose fallback is gone.
+            self._retry_pending_native_deletions()
+            return
+
+        native_deleted = self._try_native_delete(
+            identifier,
+            target=native_target,
+        )
+        if not native_deleted:
+            return
+        with _FILE_LOCK:
+            self._reload_fallback_locked()
+            pending = self._pending_native_deletions
+            if identifier in pending:
+                pending.discard(identifier)
+                self._persist_fallback_locked()
+
+    def _discard_uncommitted_reference(
+        self,
+        reference_or_identifier: str,
+        *,
+        ephemeral: bool,
+    ) -> None:
+        """Roll back one staged reference without inventing a vault tombstone.
+
+        Simple protected env values use a fresh random identifier for every
+        staging attempt. If that attempt conclusively used only this store's
+        fallback (native discovery completed with no backend), no Keychain
+        value can have been written under the new identifier. In that narrow
+        case the fallback value and its provisional authority marker belong to
+        the same uncommitted attempt and can be removed atomically. Every
+        native-success, native-ambiguous, stable-tree, or otherwise uncertain
+        case retains the normal crash-safe delete path.
+        """
+
+        identifier = _identifier(reference_or_identifier)
+        if ephemeral:
+            with _FILE_LOCK:
+                self._reload_fallback_locked()
+                if (
+                    self._native_backend is None
+                    and _EPHEMERAL_ENV_IDENTIFIER.fullmatch(identifier)
+                    and identifier in self._fallback
+                ):
+                    self._fallback.pop(identifier, None)
+                    self._pending_native_deletions.discard(identifier)
+                    self._pending_native_vault_deletions.discard(identifier)
+                    self._persist_fallback_locked()
+                    return
+        self.delete(identifier)
 
     def _load_fallback_state(
         self,
-    ) -> tuple[dict[str, str], set[str], dict[str, dict[str, Any]]]:
+    ) -> tuple[
+        dict[str, str],
+        set[str],
+        set[str],
+        dict[str, dict[str, Any]],
+    ]:
         if not self.fallback_path.is_file():
-            return {}, set(), {}
+            return {}, set(), set(), {}
         try:
             payload = json.loads(self.fallback_path.read_text(encoding="utf-8"))
             credentials = payload.get("credentials") if isinstance(payload, dict) else None
             pending = (
                 payload.get("pending_native_deletions", [])
+                if isinstance(payload, dict)
+                else None
+            )
+            pending_vault = (
+                payload.get("pending_native_vault_deletions", [])
                 if isinstance(payload, dict)
                 else None
             )
@@ -402,6 +1078,11 @@ class CredentialStore:
                     isinstance(identifier, str) and 0 < len(identifier) <= 240
                     for identifier in pending
                 )
+                and isinstance(pending_vault, list)
+                and all(
+                    isinstance(identifier, str) and 0 < len(identifier) <= 240
+                    for identifier in pending_vault
+                )
                 and isinstance(cleanup_transactions, dict)
                 and all(
                     isinstance(transaction_id, str)
@@ -419,6 +1100,10 @@ class CredentialStore:
                     and len(record["previous_evidence"]) == 64
                     and isinstance(record.get("next_evidence"), str)
                     and len(record["next_evidence"]) == 64
+                    and (
+                        "native_target" not in record
+                        or record.get("native_target") in _NATIVE_TARGETS
+                    )
                     for transaction_id, record in cleanup_transactions.items()
                 )
             ):
@@ -429,6 +1114,7 @@ class CredentialStore:
                 return (
                     dict(credentials),
                     set(pending),
+                    set(pending_vault),
                     copy.deepcopy(cleanup_transactions),
                 )
         except (OSError, json.JSONDecodeError) as exc:
@@ -450,6 +1136,9 @@ class CredentialStore:
                     "pending_native_deletions": sorted(
                         self._pending_native_deletions
                     ),
+                    "pending_native_vault_deletions": sorted(
+                        self._pending_native_vault_deletions
+                    ),
                     "cleanup_transactions": self._cleanup_transactions,
                 },
                 indent=2,
@@ -459,12 +1148,17 @@ class CredentialStore:
             mode=0o600,
         )
 
-    def _delete_fallback(self, identifier: str) -> None:
+    def _delete_fallback(self, identifier: str, *, target: str) -> None:
         with _FILE_LOCK:
             self._reload_fallback_locked()
             changed = self._fallback.pop(identifier, None) is not None
-            if identifier in self._pending_native_deletions:
-                self._pending_native_deletions.discard(identifier)
+            pending = (
+                self._pending_native_vault_deletions
+                if target == _NATIVE_TARGET_VAULT
+                else self._pending_native_deletions
+            )
+            if identifier in pending:
+                pending.discard(identifier)
                 changed = True
             if changed:
                 self._persist_fallback_locked()
@@ -473,24 +1167,54 @@ class CredentialStore:
         (
             self._fallback,
             self._pending_native_deletions,
+            self._pending_native_vault_deletions,
             self._cleanup_transactions,
         ) = self._load_fallback_state()
 
-    def _try_native_delete(self, identifier: str) -> bool:
-        if self.native_backend is None:
+    def _try_native_delete(self, identifier: str, *, target: str) -> bool:
+        if target not in _NATIVE_TARGETS:
+            raise CredentialStoreError("Invalid native credential deletion target")
+        backend = self.native_backend
+        if backend is None:
             return False
+
+        if target == _NATIVE_TARGET_LEGACY:
+            deleter = getattr(backend, "delete_legacy_password", None)
+            getter = getattr(backend, "get_legacy_password", None)
+            if deleter is None or getter is None:
+                # Never reinterpret an old physical-item journal as a logical
+                # aggregate-vault deletion.
+                return False
+        elif target == _NATIVE_TARGET_VAULT:
+            if not getattr(backend, "vault_managed", False):
+                # A vault mutation journal is unsafe to replay against a
+                # per-identifier backend.
+                return False
+            deleter = backend.delete_password
+            getter = getattr(backend, "get_vault_password", None)
+            if getter is None:
+                return False
+        else:
+            deleter = backend.delete_password
+            getter = backend.get_password
+
         try:
-            self.native_backend.delete_password(SERVICE_NAME, identifier)  # type: ignore[union-attr]
+            deleter(SERVICE_NAME, identifier)
             return True
         except Exception as exc:
+            if target in {_NATIVE_TARGET_LEGACY, _NATIVE_TARGET_VAULT}:
+                logger.warning(
+                    "Native credential deletion deferred for %s (%s): %s",
+                    identifier,
+                    target,
+                    exc,
+                )
+                return False
             # Some native backends signal a missing item as a deletion error.
             # A follow-up read distinguishes that harmless state from a locked
             # or otherwise unavailable credential service.
             try:
-                still_present = self.native_backend.get_password(  # type: ignore[union-attr]
-                    SERVICE_NAME,
-                    identifier,
-                )
+                still_present = getter(SERVICE_NAME, identifier)
             except Exception:
                 still_present = "unknown"
             if still_present is None:
@@ -502,14 +1226,19 @@ class CredentialStore:
             )
             return False
 
-    def _queue_native_deletion(self, identifier: str) -> None:
+    def _queue_native_deletion(self, identifier: str, *, target: str) -> None:
         """Durably hand a possibly-partial native write to the retry journal."""
 
         with _FILE_LOCK:
             self._reload_fallback_locked()
-            if identifier in self._pending_native_deletions:
+            pending = (
+                self._pending_native_vault_deletions
+                if target == _NATIVE_TARGET_VAULT
+                else self._pending_native_deletions
+            )
+            if identifier in pending:
                 return
-            self._pending_native_deletions.add(identifier)
+            pending.add(identifier)
             self._persist_fallback_locked()
 
     def prepare_cleanup_transaction(
@@ -545,6 +1274,7 @@ class CredentialStore:
         transaction_id = f"cleanup:{secrets.token_hex(16)}"
         record = {
             "identifiers": identifiers,
+            "native_target": self._cleanup_target_for_new_transaction(),
             "evidence_path": str(path),
             "previous_evidence": _content_evidence(
                 exists=previous_exists,
@@ -564,17 +1294,25 @@ class CredentialStore:
     def _activate_cleanup_locked(self, transaction_id: str) -> None:
         record = self._cleanup_transactions[transaction_id]
         identifiers = set(record["identifiers"])
-        native_candidates = identifiers - self._fallback.keys()
+        fallback_backed = identifiers & self._fallback.keys()
         for identifier in identifiers:
             self._fallback.pop(identifier, None)
-        # Native-backend discovery is allowed to be temporarily unavailable
-        # (notably when Linux Secret Service/DBus is offline).  A reference may
-        # still have been written to the OS vault by an earlier process, so the
-        # cleanup responsibility must survive even when *this* process cannot
-        # currently attempt it.  Entries present in ``_fallback`` are known to
-        # be file-backed; missing entries may live in the OS vault and therefore
-        # remain in the durable retry journal until a native backend returns.
-        self._pending_native_deletions.update(native_candidates)
+        target = record.get("native_target")
+        if target == _NATIVE_TARGET_VAULT:
+            # A file fallback can coexist with a stale logical key in the
+            # aggregate vault.  This commit removes the fallback, so every
+            # referenced identifier must acquire a vault-deletion intent in
+            # that same atomic file mutation.
+            self._pending_native_vault_deletions.update(identifiers)
+        else:
+            # Native-backend discovery is allowed to be temporarily
+            # unavailable (notably when Linux Secret Service/DBus is offline).
+            # References without a file-backed value may still live in a
+            # per-identifier native store and therefore remain journaled.
+            native_candidates = identifiers - fallback_backed
+            # Records created before aggregate-vault support had no target and
+            # refer to physical per-identifier items on macOS.
+            self._pending_native_deletions.update(native_candidates)
         del self._cleanup_transactions[transaction_id]
 
     def _finish_cleanup_transaction(
@@ -608,7 +1346,7 @@ class CredentialStore:
         if should_retry_native:
             self._retry_pending_native_deletions()
 
-    def _reconcile_cleanup_transactions(self) -> None:
+    def _reconcile_cleanup_transactions(self, *, retry_native: bool = True) -> None:
         """Recover prepared cleanup records from exact on-disk evidence."""
 
         should_retry_native = False
@@ -619,36 +1357,123 @@ class CredentialStore:
                 current = _path_evidence(Path(record["evidence_path"]))
                 if current == record["next_evidence"]:
                     self._activate_cleanup_locked(transaction_id)
-                    should_retry_native = should_retry_native or self.native_backend is not None
+                    should_retry_native = should_retry_native or (
+                        retry_native and self.native_backend is not None
+                    )
                     changed = True
                 elif current == record["previous_evidence"]:
                     del self._cleanup_transactions[transaction_id]
                     changed = True
             if changed:
                 self._persist_fallback_locked()
-        if should_retry_native:
+        if should_retry_native and retry_native:
             self._retry_pending_native_deletions()
 
     def _retry_pending_native_deletions(self) -> None:
-        if self.native_backend is None:
+        backend = self.native_backend
+        if backend is None:
             return
         with _FILE_LOCK:
             self._reload_fallback_locked()
-            if not self._pending_native_deletions:
+            if (
+                not self._pending_native_deletions
+                and not self._pending_native_vault_deletions
+            ):
                 return
-            remaining = {
+            if getattr(backend, "vault_managed", False):
+                adopter = getattr(backend, "adopt_deletion_journals", None)
+                if adopter is None:
+                    return
+                previous_legacy = set(self._pending_native_deletions)
+                previous_vault = set(self._pending_native_vault_deletions)
+                legacy_fallback_authority = (
+                    previous_legacy & self._fallback.keys()
+                )
+                try:
+                    adopter(
+                        SERVICE_NAME,
+                        legacy_identifiers=previous_legacy,
+                        vault_identifiers=set(
+                            previous_vault | legacy_fallback_authority
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "macOS credential deletion journals remain deferred: %s",
+                        exc,
+                    )
+                    return
+                # A fallback paired with either historical journal is still
+                # the committed value after the vault mutation.  Preserve (or
+                # convert) its typed vault authority marker until a successful
+                # put/delete retires the fallback itself.  Journal-only IDs can
+                # be cleared because their deletion is now durable in the
+                # aggregate vault.
+                fallback_authority = (
+                    previous_legacy | previous_vault
+                ) & self._fallback.keys()
+                self._pending_native_deletions = set()
+                self._pending_native_vault_deletions = set(fallback_authority)
+                if (
+                    self._pending_native_deletions != previous_legacy
+                    or self._pending_native_vault_deletions != previous_vault
+                ):
+                    self._persist_fallback_locked()
+                return
+            legacy_target = (
+                _NATIVE_TARGET_INDIVIDUAL
+            )
+            remaining_individual = {
                 identifier
                 for identifier in self._pending_native_deletions
-                if not self._try_native_delete(identifier)
+                if not self._try_native_delete(identifier, target=legacy_target)
             }
-            if remaining != self._pending_native_deletions:
-                self._pending_native_deletions = remaining
+            remaining_vault = {
+                identifier
+                for identifier in self._pending_native_vault_deletions
+                if not self._try_native_delete(
+                    identifier,
+                    target=_NATIVE_TARGET_VAULT,
+                )
+            }
+            if (
+                remaining_individual != self._pending_native_deletions
+                or remaining_vault != self._pending_native_vault_deletions
+            ):
+                self._pending_native_deletions = remaining_individual
+                self._pending_native_vault_deletions = remaining_vault
                 self._persist_fallback_locked()
 
 
-@lru_cache(maxsize=1)
+_CREDENTIAL_STORE_SINGLETON: CredentialStore | None = None
+
+
 def get_credential_store() -> CredentialStore:
-    return CredentialStore()
+    """Return exactly one process-wide store, including concurrent first use."""
+
+    global _CREDENTIAL_STORE_SINGLETON
+    with _CREDENTIAL_STORE_SINGLETON_LOCK:
+        if _CREDENTIAL_STORE_SINGLETON is None:
+            _CREDENTIAL_STORE_SINGLETON = CredentialStore()
+        return _CREDENTIAL_STORE_SINGLETON
+
+
+def _clear_credential_store_cache() -> None:
+    """Test hook matching the historical ``lru_cache.cache_clear`` surface."""
+
+    global _CREDENTIAL_STORE_SINGLETON
+    with _CREDENTIAL_STORE_SINGLETON_LOCK:
+        _CREDENTIAL_STORE_SINGLETON = None
+        with _MACOS_VAULT_STATE.lock:
+            _MACOS_VAULT_STATE.loaded = False
+            _MACOS_VAULT_STATE.credentials = {}
+            _MACOS_VAULT_STATE.legacy_tombstones = set()
+            _MACOS_VAULT_STATE.pending_legacy_deletions = set()
+            _MACOS_VAULT_STATE.legacy_misses = set()
+            _MACOS_VAULT_STATE.load_failure = None
+
+
+get_credential_store.cache_clear = _clear_credential_store_cache  # type: ignore[attr-defined]
 
 
 def credential_tree_id(namespace: str, path: tuple[str, ...]) -> str:
@@ -819,6 +1644,12 @@ def stage_protected_env_value(
 
     credential_store = store or get_credential_store()
     created: set[str] = set()
+    ephemeral_identifier = (
+        key.upper() != "SUXIAOYOU_CUSTOM_ENDPOINTS"
+        and is_secret_env_key(key)
+        and bool(value)
+        and not is_credential_reference(value)
+    )
     try:
         protected = protect_env_value(
             key,
@@ -829,12 +1660,18 @@ def stage_protected_env_value(
         )
     except Exception:
         for reference in created:
-            credential_store.delete(reference)
+            credential_store._discard_uncommitted_reference(  # noqa: SLF001
+                reference,
+                ephemeral=ephemeral_identifier,
+            )
         raise
     return StagedEnvValue(
         value=protected,
         created_references=frozenset(created),
         _store=credential_store,
+        _ephemeral_references=(
+            frozenset(created) if ephemeral_identifier else frozenset()
+        ),
     )
 
 
@@ -884,11 +1721,18 @@ def migrate_settings_credentials(
     env_path: str | Path = ".env",
     *,
     store: CredentialStore | None = None,
+    hydrate_references: bool = True,
 ) -> int:
-    """Hydrate references and migrate plaintext values found in ``.env``.
+    """Migrate plaintext values found in ``.env`` and optionally hydrate them.
 
     Process-environment plaintext remains externally managed; only values that
     actually reside in the app-owned env file are rewritten and erased.
+
+    Desktop startup passes ``hydrate_references=False`` so loading otherwise
+    inert configuration cannot trigger an OS credential prompt before the UI
+    is ready.  Consumers that actually need a secret resolve the retained
+    opaque reference at their operation boundary.  The default remains
+    hydrated for explicit migration callers and backwards compatibility.
     """
 
     credential_store = store or get_credential_store()
@@ -926,10 +1770,14 @@ def migrate_settings_credentials(
                     replacements[env_key] = protected
                     staged_values[env_key] = staged
                     migrated += 1
-                resolved = resolve_env_value(env_key, protected, store=credential_store)
-                setattr(settings, field_name, resolved)
+                if hydrate_references:
+                    resolved = resolve_env_value(env_key, protected, store=credential_store)
+                    setattr(settings, field_name, resolved)
+                else:
+                    setattr(settings, field_name, protected)
             elif isinstance(runtime_value, str) and is_credential_reference(runtime_value):
-                setattr(settings, field_name, credential_store.resolve(runtime_value))
+                if hydrate_references:
+                    setattr(settings, field_name, credential_store.resolve(runtime_value))
     except Exception:
         for staged in staged_values.values():
             staged.discard_unreferenced(persisted.values())

@@ -224,6 +224,7 @@ export function resolveApiUrl(path: string): string {
 export const API = {
   CHAT: {
     PROMPT: "/api/chat/prompt",
+    GOAL: "/api/chat/goal",
     TASK_BATCH: "/api/chat/task-batch",
     EDIT: "/api/chat/edit",
     COMPACT: "/api/chat/compact",
@@ -256,6 +257,11 @@ export const API = {
     EXPORT_MD: (id: string) => `/api/sessions/${id}/export-md`,
     TODOS: (id: string) => `/api/sessions/${id}/todos`,
     FILES: (id: string) => `/api/sessions/${id}/files`,
+    GOAL: (id: string) => `/api/sessions/${encodeURIComponent(id)}/goal`,
+    GOAL_USAGE: (id: string) =>
+      `/api/sessions/${encodeURIComponent(id)}/goal/usage`,
+    GOAL_PAUSE: (id: string) => `/api/sessions/${encodeURIComponent(id)}/goal/pause`,
+    GOAL_RESUME: (id: string) => `/api/sessions/${encodeURIComponent(id)}/goal/resume`,
   },
   MESSAGES: {
     LIST: (sessionId: string, limit = 50, offset = -1) =>
@@ -278,6 +284,12 @@ export const API = {
     REVEAL_FILE_SYSTEM: "/api/files/reveal-file-system",
     SEARCH: "/api/files/search",
     INGEST: "/api/files/ingest",
+  },
+  FILE_VERSIONS: {
+    LIST: (sessionId: string, filePath: string) =>
+      `/api/file-versions?session_id=${encodeURIComponent(sessionId)}&file_path=${encodeURIComponent(filePath)}` as const,
+    RESTORE: (versionId: string) =>
+      `/api/file-versions/${encodeURIComponent(versionId)}/restore` as const,
   },
   ARTIFACTS: {
     EXPORT_PDF: "/api/artifacts/export-pdf",
@@ -359,6 +371,8 @@ export const API = {
     DISCONNECT: (id: string) => `/api/connectors/${id}/disconnect` as const,
     SET_TOKEN: (id: string) => `/api/connectors/${id}/token` as const,
     RECONNECT: (id: string) => `/api/connectors/${id}/reconnect` as const,
+    APPROVE_LOCAL_STARTUP: (id: string) =>
+      `/api/connectors/${id}/approve-local-startup` as const,
   },
   PLUGINS: {
     STATUS: "/api/plugins/status",
@@ -411,6 +425,9 @@ export const queryKeys = {
     detail: (id: string) => ["sessions", id] as const,
     search: (q: string) => ["sessions", "search", q] as const,
     todos: (id: string) => ["sessions", id, "todos"] as const,
+    goal: (id: string) => ["sessions", id, "goal"] as const,
+    goalUsage: (id: string, goalId: string, revision: number) =>
+      ["sessions", id, "goal", "usage", goalId, revision] as const,
   },
   messages: {
     list: (sessionId: string) => ["messages", sessionId] as const,
@@ -444,6 +461,10 @@ export const queryKeys = {
     detail: (id: string) => ["automations", id] as const,
     runs: (id: string) => ["automations", id, "runs"] as const,
     templates: ["automations", "templates"] as const,
+  },
+  fileVersions: {
+    list: (sessionId: string, filePath: string) =>
+      ["fileVersions", sessionId, filePath] as const,
   },
   workspaceMemory: (workspace: string) =>
     ["workspaceMemory", workspace] as const,

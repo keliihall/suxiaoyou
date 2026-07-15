@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,21 @@ pytest.importorskip("mcp")
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.mcp.client import McpClient, sanitise_name
+from app.mcp.local_approval import (
+    LocalMcpApprovalRequired,
+    local_mcp_launch_spec,
+)
+
+
+TEST_EXECUTABLE = str(Path(sys.executable).resolve())
+
+
+def _approved_client(name: str, config: dict) -> McpClient:
+    return McpClient(
+        name,
+        config,
+        approved_local_fingerprint=local_mcp_launch_spec(config).fingerprint,
+    )
 
 
 class TestSanitiseName:
@@ -54,6 +71,18 @@ class TestClientProperties:
     def test_custom_timeout(self):
         c = McpClient("test", {"timeout": 60})
         assert c.timeout == 60
+
+    def test_connector_provenance_defaults_custom_and_is_snapshotted(self):
+        config = {"connector_provenance": "builtin"}
+        c = McpClient("test", config)
+        config["connector_provenance"] = "custom"
+        assert c.connector_provenance == "builtin"
+
+        assert McpClient("missing", {}).connector_provenance == "custom"
+        assert McpClient(
+            "malformed",
+            {"connector_provenance": ["builtin"]},
+        ).connector_provenance == "custom"
 
 
 class TestOAuthToken:
@@ -109,6 +138,72 @@ class TestClose:
 
 class TestConnectStdio:
     @pytest.mark.asyncio
+    async def test_unapproved_launch_never_reaches_stdio_transport(self):
+        c = McpClient("test", {"type": "local", "command": [TEST_EXECUTABLE]})
+
+        with patch("app.mcp.client.stdio_client") as spawn:
+            await c.connect()
+
+        assert c.status == "needs_approval"
+        assert c.error is None
+        assert c._exit_stack is None
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_stdio_call_is_also_fail_closed(self):
+        c = McpClient("test", {"type": "local", "command": [TEST_EXECUTABLE]})
+        c._exit_stack = MagicMock()
+
+        with (
+            patch("app.mcp.client.stdio_client") as spawn,
+            pytest.raises(LocalMcpApprovalRequired),
+        ):
+            await c._connect_stdio()
+
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approved_exact_launch_reaches_transport_with_snapshot(self):
+        config = {
+            "type": "local",
+            "command": [TEST_EXECUTABLE, "--safe"],
+            "environment": {"MODE": "reviewed"},
+        }
+        launch = local_mcp_launch_spec(config)
+        c = _approved_client("test", config)
+        c._exit_stack = MagicMock()
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        c._exit_stack.enter_async_context = AsyncMock(
+            side_effect=[("read", "write"), session]
+        )
+
+        with (
+            patch("app.mcp.client.stdio_client", return_value="transport") as spawn,
+            patch("app.mcp.client.ClientSession", return_value=session),
+        ):
+            await c._connect_stdio()
+
+        params = spawn.call_args.args[0]
+        assert params.command == TEST_EXECUTABLE
+        assert params.args == ["--safe"]
+        assert params.env == launch.environment
+        assert str(params.cwd) == launch.cwd
+        session.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_change_invalidates_prior_approval_before_spawn(self):
+        config = {"type": "local", "command": [TEST_EXECUTABLE, "--read"]}
+        c = _approved_client("test", config)
+        config["command"] = [TEST_EXECUTABLE, "--write"]
+
+        with patch("app.mcp.client.stdio_client") as spawn:
+            await c.connect()
+
+        assert c.status == "needs_approval"
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_missing_command_raises(self):
         c = McpClient("test", {"type": "local", "command": []})
         c._exit_stack = MagicMock()
@@ -131,9 +226,9 @@ class TestConnectTimeout:
                 cancelled.set()
                 raise
 
-        c = McpClient(
+        c = _approved_client(
             "slow",
-            {"type": "local", "command": ["slow-server"], "timeout": 0.01},
+            {"type": "local", "command": [TEST_EXECUTABLE], "timeout": 0.01},
         )
         c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
 
@@ -153,9 +248,9 @@ class TestConnectTimeout:
             started.set()
             await asyncio.Event().wait()
 
-        c = McpClient(
+        c = _approved_client(
             "slow",
-            {"type": "local", "command": ["slow-server"], "timeout": 60},
+            {"type": "local", "command": [TEST_EXECUTABLE], "timeout": 60},
         )
         c._connect_stdio = AsyncMock(side_effect=never_connects)  # type: ignore[method-assign]
 
@@ -166,3 +261,21 @@ class TestConnectTimeout:
             await task
 
         assert c._exit_stack is None
+
+
+class TestConnectRemote:
+    @pytest.mark.asyncio
+    async def test_remote_transport_does_not_require_local_approval(self):
+        c = McpClient("remote", {"type": "remote", "url": "https://example.test/mcp"})
+        session = MagicMock()
+        session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+
+        async def connect_remote() -> None:
+            c._session = session
+
+        c._connect_remote = AsyncMock(side_effect=connect_remote)  # type: ignore[method-assign]
+
+        await c.connect()
+
+        assert c.status == "connected"
+        c._connect_remote.assert_awaited_once()

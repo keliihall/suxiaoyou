@@ -152,6 +152,11 @@ class SubmitPlanTool(ToolDefinition):
             )
 
         # Block until user responds via POST /api/chat/respond
+        await ctx.set_goal_waiting_user(
+            True,
+            reason="plan_review_required",
+            message="The Goal is waiting for plan review",
+        )
         try:
             response = await job.wait_for_response(ctx.call_id, timeout=600.0)
 
@@ -209,8 +214,18 @@ class SubmitPlanTool(ToolDefinition):
                 )
 
         except TimeoutError:
+            await ctx.block_goal(
+                reason="plan_review_timeout",
+                message="The Goal's plan review expired without a user response",
+            )
             return ToolResult(
                 output=ctx.tr("（用户在 10 分钟内没有回复）", "(The user did not respond within 10 minutes)"),
                 error=ctx.tr("计划审查超时：用户未回复", "Plan review timed out: the user did not respond"),
                 metadata=plan_meta,
+            )
+        finally:
+            await ctx.set_goal_waiting_user(
+                False,
+                reason="plan_review_required",
+                message="",
             )

@@ -10,6 +10,7 @@ import {
   Loader2,
   Plus,
   RotateCw,
+  ShieldCheck,
   Sparkles,
   Star,
   Store,
@@ -25,6 +26,14 @@ import { api } from "@/lib/api";
 import { API, IS_DESKTOP, queryKeys } from "@/lib/constants";
 import { desktopAPI } from "@/lib/tauri-api";
 import {
+  localizeConnectorDescription,
+  localizeConnectorName,
+  localizePluginDescription,
+  localizePluginName,
+  localizeSkillDescription,
+  localizeSkillName,
+} from "@/lib/plugin-catalog-localization";
+import {
   usePluginsStatus,
   usePluginDetail,
   usePluginToggle,
@@ -39,6 +48,7 @@ import {
   useConnectorConnect,
   useConnectorDisconnect,
   useConnectorReconnect,
+  useApproveLocalStartup,
   useAddCustomConnector,
   useSetConnectorToken,
 } from "@/hooks/use-connectors";
@@ -122,6 +132,7 @@ export function PluginsTabContent() {
 const STATUS_COLORS: Record<string, string> = {
   connected: "bg-emerald-500",
   needs_auth: "bg-amber-500",
+  needs_approval: "bg-amber-500",
   failed: "bg-red-500",
   disconnected: "bg-[var(--text-tertiary)]",
   disabled: "bg-[var(--text-tertiary)]",
@@ -136,12 +147,16 @@ function ConnectorsTab({ search }: { search: string }) {
   const entries = Object.entries(connectors);
   const connectedCount = entries.filter(([, c]) => c.status === "connected").length;
 
-  const filtered = search
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const filtered = normalizedSearch
     ? entries.filter(
-        ([id, c]) =>
-          id.toLowerCase().includes(search.toLowerCase()) ||
-          c.name.toLowerCase().includes(search.toLowerCase()) ||
-          c.description.toLowerCase().includes(search.toLowerCase()),
+        ([id, c]) => [
+          id,
+          c.name,
+          c.description,
+          localizeConnectorName(t, id, c.name),
+          localizeConnectorDescription(t, id, c.description),
+        ].some((value) => value.toLocaleLowerCase().includes(normalizedSearch)),
       )
     : entries;
 
@@ -228,27 +243,53 @@ function ConnectorRow({
   const connect = useConnectorConnect();
   const disconnect = useConnectorDisconnect();
   const reconnect = useConnectorReconnect();
+  const approveLocalStartup = useApproveLocalStartup();
   const setToken = useSetConnectorToken();
   const [tokenInput, setTokenInput] = useState("");
+  const usesPersonalToken = connector.auth_mode === "raw_authorization";
+  const displayName = localizeConnectorName(t, id, connector.name);
+  const displayDescription = localizeConnectorDescription(
+    t,
+    id,
+    connector.description,
+  );
 
   const isPending =
-    toggle.isPending || connect.isPending || disconnect.isPending || reconnect.isPending;
+    toggle.isPending || connect.isPending || disconnect.isPending ||
+    reconnect.isPending || setToken.isPending || approveLocalStartup.isPending;
 
   const qc = useQueryClient();
 
   const handleConnect = async () => {
-    let result: { success: boolean; auth_url?: string; state?: string; error?: string };
+    // Google Workspace bypasses the connector mutation and therefore needs
+    // its own request-error toast. Other connectors already report errors in
+    // useConnectorConnect, so do not show a duplicate notification for them.
+    const isGoogle = id === "google-workspace";
+    let result: {
+      success: boolean;
+      auth_url?: string;
+      state?: string;
+      error?: string | null;
+      error_code?: string | null;
+    };
     try {
       // Google Workspace uses direct Google OAuth (not MCP OAuth)
-      const isGoogle = id === "google-workspace";
       result = isGoogle
         ? await api.post<{ success: boolean; auth_url?: string; state?: string; error?: string }>(API.GOOGLE.AUTH_START)
         : await connect.mutateAsync(id);
     } catch {
+      if (isGoogle) {
+        toast.error(t("connectorConnectFailed"));
+      }
       return;
     }
 
-    if (result.success && result.auth_url) {
+    if (!result.success) {
+      toast.error(t("connectorConnectFailed"));
+      return;
+    }
+
+    if (result.auth_url) {
       if (IS_DESKTOP) {
         // Tauri: open system browser + poll for auth completion
         await desktopAPI.openExternal(result.auth_url);
@@ -288,6 +329,26 @@ function ConnectorRow({
     }
   };
 
+  const handleApproveLocalStartup = async () => {
+    const approval = connector.local_approval;
+    if (!approval?.fingerprint) return;
+    const confirmed = window.confirm(t("localApprovalPrompt", {
+      command: JSON.stringify(approval.command),
+      cwd: approval.cwd || "—",
+      environment: approval.environment_keys.join(", ") || "—",
+      fingerprint: approval.fingerprint,
+    }));
+    if (!confirmed) return;
+    try {
+      await approveLocalStartup.mutateAsync({
+        id,
+        fingerprint: approval.fingerprint,
+      });
+    } catch {
+      // The mutation reports the localized failure through its shared toast.
+    }
+  };
+
   return (
     <div className="flex items-center gap-3 rounded-lg border border-[var(--border-default)] p-2.5">
       {/* Status dot */}
@@ -301,7 +362,7 @@ function ConnectorRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-[var(--text-primary)]">
-            {connector.name}
+            {displayName}
           </span>
           {connector.type === "local" && id !== "google-workspace" && (
             <span className="text-ui-3xs px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400">
@@ -320,13 +381,41 @@ function ConnectorRow({
           )}
         </div>
         <p className="text-ui-3xs text-[var(--text-tertiary)] truncate mt-0.5">
-          {connector.description}
+          {displayDescription}
         </p>
+        {connector.status === "needs_approval" && (
+          <p className="text-ui-3xs text-amber-400 mt-0.5">
+            {connector.local_approval?.error
+              ? t("localApprovalUnavailable")
+              : t("localApprovalRequired")}
+          </p>
+        )}
       </div>
 
       {/* Action buttons */}
       <div className="flex items-center gap-1.5 shrink-0">
-        {connector.status === "needs_auth" && (
+        {connector.status === "needs_approval" &&
+          connector.enabled &&
+          connector.local_approval?.fingerprint &&
+          !connector.local_approval.error && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 text-ui-3xs px-2"
+            onClick={handleApproveLocalStartup}
+            disabled={isPending}
+            title={t("localApprovalReview")}
+          >
+            {approveLocalStartup.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <ShieldCheck className="h-3 w-3" />
+            )}
+            <span className="ml-1">{t("reviewAndRun")}</span>
+          </Button>
+        )}
+
+        {connector.status === "needs_auth" && !usesPersonalToken && (
           <Button
             variant="outline"
             size="sm"
@@ -343,8 +432,9 @@ function ConnectorRow({
           </Button>
         )}
 
-        {(connector.status === "needs_auth" || connector.status === "failed") &&
-          connector.enabled &&
+        {((usesPersonalToken && connector.status !== "connected") ||
+          ((connector.status === "needs_auth" || connector.status === "failed") &&
+            connector.enabled)) &&
           id !== "google-workspace" && (
           <form
             className="flex items-center gap-1"
@@ -360,7 +450,11 @@ function ConnectorRow({
               type="password"
               value={tokenInput}
               onChange={(e) => setTokenInput(e.target.value)}
-              placeholder={t("tokenPatPlaceholder")}
+              placeholder={usesPersonalToken
+                ? t("personalTokenPlaceholder")
+                : t("tokenPatPlaceholder")}
+              autoComplete="off"
+              spellCheck={false}
               className="h-6 w-28 rounded border border-[var(--border-default)] bg-transparent px-1.5 text-ui-3xs text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--border-focus)]"
             />
             <Button
@@ -370,8 +464,30 @@ function ConnectorRow({
               className="h-6 text-ui-3xs px-2"
               disabled={!tokenInput.trim() || setToken.isPending}
             >
-              {setToken.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : "OK"}
+              {setToken.isPending ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                t("saveToken")
+              )}
             </Button>
+            {usesPersonalToken && connector.credential_url && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-6 text-ui-3xs px-1.5"
+                title={t("getPersonalToken")}
+                onClick={() => {
+                  if (IS_DESKTOP) {
+                    desktopAPI.openExternal(connector.credential_url);
+                  } else {
+                    window.open(connector.credential_url, "_blank", "noopener,noreferrer");
+                  }
+                }}
+              >
+                <ExternalLink className="h-3 w-3" />
+              </Button>
+            )}
           </form>
         )}
 
@@ -409,12 +525,20 @@ function ConnectorRow({
         <Switch
           checked={connector.enabled}
           onCheckedChange={async (checked) => {
-            await toggle.mutateAsync({ id, enable: checked });
-            if (checked && (connector.type === "remote" || id === "google-workspace")) {
+            try {
+              await toggle.mutateAsync({ id, enable: checked });
+            } catch {
+              return;
+            }
+            if (
+              checked &&
+              (connector.type === "remote" || id === "google-workspace") &&
+              !usesPersonalToken
+            ) {
               // Remote or Google: auto-trigger OAuth after enable
               await new Promise((r) => setTimeout(r, 500));
               await qc.invalidateQueries({ queryKey: queryKeys.connectors });
-              handleConnect();
+              await handleConnect();
             } else if (checked) {
               // Local: just refresh status
               await new Promise((r) => setTimeout(r, 1000));
@@ -439,8 +563,12 @@ function AddConnectorForm({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     if (!name || !url) return;
     const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    await addConnector.mutateAsync({ id, name, url });
-    onClose();
+    try {
+      await addConnector.mutateAsync({ id, name, url });
+      onClose();
+    } catch {
+      // Keep the form open so the user can correct the localized failure.
+    }
   };
 
   return (
@@ -493,11 +621,21 @@ function PluginsTab({ search }: { search: string }) {
   const entries = Object.entries(plugins);
   const enabledCount = entries.filter(([, p]) => p.enabled).length;
 
-  const filtered = search
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const filtered = normalizedSearch
     ? entries.filter(
-        ([name, p]) =>
-          name.toLowerCase().includes(search.toLowerCase()) ||
-          p.description.toLowerCase().includes(search.toLowerCase()),
+        ([name, p]) => {
+          const searchable = [name, p.name, p.description];
+          if (p.source === "builtin") {
+            searchable.push(
+              localizePluginName(t, name),
+              localizePluginDescription(t, name, p.description),
+            );
+          }
+          return searchable.some((value) =>
+            value.toLocaleLowerCase().includes(normalizedSearch),
+          );
+        },
       )
     : entries;
 
@@ -562,13 +700,21 @@ function SkillsTab({ search }: { search: string }) {
   const plugin = allSkills.filter((s) => s.source === "plugin");
   const project = allSkills.filter((s) => s.source === "project");
 
+  const normalizedSearch = search.trim().toLocaleLowerCase();
   const filterSkills = (list: SkillInfo[]) =>
-    search
-      ? list.filter(
-          (s) =>
-            s.name.toLowerCase().includes(search.toLowerCase()) ||
-            s.description.toLowerCase().includes(search.toLowerCase()),
-        )
+    normalizedSearch
+      ? list.filter((skill) => {
+          const searchable = [skill.name, skill.description];
+          if (skill.catalog_managed) {
+            searchable.push(
+              localizeSkillName(t, skill.name),
+              localizeSkillDescription(t, skill.name, skill.description),
+            );
+          }
+          return searchable.some((value) =>
+            value.toLocaleLowerCase().includes(normalizedSearch),
+          );
+        })
       : list;
 
   const filteredBundled = filterSkills(bundled);
@@ -674,11 +820,10 @@ function SkillStoreSection({
       toast.success(
         t("storeInstalled", {
           name: skill.name,
-          defaultValue: `Installed ${skill.name}`,
         }),
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Install failed";
+      const msg = err instanceof Error ? err.message : t("storeInstallFailed");
       toast.error(msg);
     }
   };
@@ -697,12 +842,10 @@ function SkillStoreSection({
         )}
         <Store className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
         <span className="text-xs font-semibold text-[var(--text-primary)]">
-          {t("storeTitle", { defaultValue: "Browse skills" })}
+          {t("storeTitle")}
         </span>
         <span className="text-ui-3xs text-[var(--text-tertiary)]">
-          {t("storeSubtitle", {
-            defaultValue: "Online catalog not included in this release",
-          })}
+          {t("storeSubtitle")}
         </span>
       </button>
 
@@ -711,10 +854,7 @@ function SkillStoreSection({
           {!storeAvailable ? (
             <div className="text-xs text-[var(--text-tertiary)] text-center py-4">
               <p>
-                {t("storeDisabled", {
-                  defaultValue:
-                    "Online skill discovery is not included in this release. Install only skills whose source and license you have reviewed.",
-                })}
+                {t("storeDisabled")}
               </p>
             </div>
           ) : (
@@ -725,9 +865,7 @@ function SkillStoreSection({
                   type="text"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder={t("storeSearchPlaceholder", {
-                    defaultValue: "Search available skills…",
-                  })}
+                  placeholder={t("storeSearchPlaceholder")}
                   className="flex-1 h-8 rounded-md border border-[var(--border-default)] bg-transparent px-3 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--border-focus)]"
                 />
                 <div className="flex items-center rounded-md border border-[var(--border-default)] text-ui-2xs overflow-hidden">
@@ -742,8 +880,8 @@ function SkillStoreSection({
                       }`}
                     >
                       {s === "stars"
-                        ? t("storeSortStars", { defaultValue: "Top" })
-                        : t("storeSortRecent", { defaultValue: "Recent" })}
+                        ? t("storeSortStars")
+                        : t("storeSortRecent")}
                     </button>
                   ))}
                 </div>
@@ -753,9 +891,7 @@ function SkillStoreSection({
               {isError ? (
                 <div className="text-xs text-[var(--text-tertiary)] text-center py-4 space-y-2">
                   <p>
-                    {t("storeUnavailable", {
-                      defaultValue: "Skills store is unreachable.",
-                    })}
+                    {t("storeUnavailable")}
                   </p>
                   <Button
                     variant="outline"
@@ -764,7 +900,7 @@ function SkillStoreSection({
                     onClick={() => refetch()}
                   >
                     <RotateCw className="h-3 w-3 mr-1" />
-                    {t("retry", { defaultValue: "Retry" })}
+                    {t("retry")}
                   </Button>
                 </div>
               ) : isFetching && results.length === 0 ? (
@@ -778,9 +914,7 @@ function SkillStoreSection({
                 </div>
               ) : results.length === 0 ? (
                 <p className="text-xs text-[var(--text-tertiary)] text-center py-4">
-                  {t("storeNoResults", {
-                    defaultValue: "No skills matched your search.",
-                  })}
+                  {t("storeNoResults")}
                 </p>
               ) : (
                 <>
@@ -788,7 +922,6 @@ function SkillStoreSection({
                     {t("storeResultCount", {
                       shown: results.length,
                       total,
-                      defaultValue: `Showing ${results.length} of ${total}`,
                     })}
                   </p>
                   <div className="space-y-1.5">
@@ -838,7 +971,7 @@ function StoreSkillRow({
             {skill.name}
           </span>
           <span className="text-ui-3xs text-[var(--text-tertiary)] truncate">
-            by {skill.author}
+            {t("storeByAuthor", { author: skill.author })}
           </span>
           {skill.stars > 0 && (
             <span className="inline-flex items-center gap-0.5 text-ui-3xs text-[var(--text-tertiary)]">
@@ -857,14 +990,14 @@ function StoreSkillRow({
           target="_blank"
           rel="noopener noreferrer"
           className="p-1 text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"
-          title={t("storeViewOnGithub", { defaultValue: "View on GitHub" })}
+          title={t("storeViewOnGithub")}
         >
           <ExternalLink className="h-3 w-3" />
         </a>
         {installed ? (
           <span className="inline-flex items-center gap-1 text-ui-3xs text-[var(--text-tertiary)] px-2 py-1">
             <Check className="h-3 w-3" />
-            {t("storeInstalledBadge", { defaultValue: "Installed" })}
+            {t("storeInstalledBadge")}
           </span>
         ) : (
           <Button
@@ -880,7 +1013,7 @@ function StoreSkillRow({
               <Download className="h-3 w-3" />
             )}
             <span className="ml-1">
-              {t("storeInstall", { defaultValue: "Install" })}
+              {t("storeInstall")}
             </span>
           </Button>
         )}
@@ -896,7 +1029,7 @@ function SkillGroup({
 }: {
   title: string;
   skills: SkillInfo[];
-  source: string;
+  source: SkillInfo["source"];
 }) {
   const { t } = useTranslation("plugins");
   const toggle = useSkillToggle();
@@ -912,41 +1045,61 @@ function SkillGroup({
         </span>
       </div>
       <div className="space-y-1">
-        {skills.map((skill) => (
-          <div
-            key={skill.name}
-            className="flex items-center gap-3 rounded-lg border border-[var(--border-default)] p-2.5"
-          >
-            <div className={`flex items-start gap-3 min-w-0 flex-1 ${!skill.enabled ? "opacity-50" : ""}`}>
-              <Sparkles className="h-3.5 w-3.5 text-[var(--text-tertiary)] mt-0.5 shrink-0" />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono font-medium text-[var(--text-primary)]">
-                    {skill.name}
-                  </span>
-                  <span
-                    className={`text-ui-3xs px-1.5 py-0.5 rounded-full ${
-                      SOURCE_COLORS[source] ?? SOURCE_COLORS.bundled
-                    }`}
-                  >
-                    {skill.name.includes(":") ? skill.name.split(":")[0] : t(source, source)}
-                  </span>
+        {skills.map((skill) => {
+          const useCatalog = skill.catalog_managed;
+          const displayName = useCatalog
+            ? localizeSkillName(t, skill.name)
+            : skill.name;
+          const displayDescription = useCatalog
+            ? localizeSkillDescription(t, skill.name, skill.description)
+            : skill.description;
+          const pluginId = skill.name.includes(":")
+            ? skill.name.split(":")[0]
+            : null;
+
+          return (
+            <div
+              key={skill.name}
+              className="flex items-center gap-3 rounded-lg border border-[var(--border-default)] p-2.5"
+            >
+              <div className={`flex items-start gap-3 min-w-0 flex-1 ${!skill.enabled ? "opacity-50" : ""}`}>
+                <Sparkles className="h-3.5 w-3.5 text-[var(--text-tertiary)] mt-0.5 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="text-xs font-medium text-[var(--text-primary)]"
+                      title={skill.name}
+                    >
+                      {displayName}
+                    </span>
+                    <span
+                      className={`text-ui-3xs px-1.5 py-0.5 rounded-full ${
+                        SOURCE_COLORS[source] ?? SOURCE_COLORS.bundled
+                      }`}
+                    >
+                      {source === "plugin" && pluginId
+                        ? useCatalog
+                          ? localizePluginName(t, pluginId)
+                          : pluginId
+                        : t(source, source)}
+                    </span>
+                  </div>
+                  <p className="text-ui-2xs text-[var(--text-tertiary)] mt-0.5 line-clamp-2">
+                    {displayDescription}
+                  </p>
                 </div>
-                <p className="text-ui-2xs text-[var(--text-tertiary)] mt-0.5 line-clamp-2">
-                  {skill.description}
-                </p>
               </div>
+              <Switch
+                checked={skill.enabled}
+                onCheckedChange={(checked) =>
+                  toggle.mutate({ name: skill.name, enable: checked })
+                }
+                disabled={toggle.isPending}
+                className="shrink-0"
+              />
             </div>
-            <Switch
-              checked={skill.enabled}
-              onCheckedChange={(checked) =>
-                toggle.mutate({ name: skill.name, enable: checked })
-              }
-              disabled={toggle.isPending}
-              className="shrink-0"
-            />
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -969,6 +1122,13 @@ function PluginCard({
 }) {
   const { t } = useTranslation("plugins");
   const toggle = usePluginToggle();
+  const useCatalog = plugin.source === "builtin";
+  const displayName = useCatalog
+    ? localizePluginName(t, name)
+    : plugin.name || name;
+  const displayDescription = useCatalog
+    ? localizePluginDescription(t, name, plugin.description)
+    : plugin.description;
 
   return (
     <div className="rounded-lg border border-[var(--border-default)] overflow-hidden">
@@ -994,7 +1154,7 @@ function PluginCard({
         <div className="flex-1 min-w-0" onClick={onToggleExpand} role="button">
           <div className="flex items-center gap-2">
             <p className="text-sm font-medium text-[var(--text-primary)] truncate">
-              {name}
+              {displayName}
             </p>
             <span className="text-ui-3xs text-[var(--text-tertiary)]">
               {t("version", { version: plugin.version })}
@@ -1008,7 +1168,7 @@ function PluginCard({
             </span>
           </div>
           <p className="text-ui-2xs text-[var(--text-tertiary)] truncate mt-0.5">
-            {plugin.description}
+            {displayDescription}
           </p>
         </div>
 
@@ -1058,6 +1218,7 @@ function PluginDetailPanel({ name }: { name: string }) {
   if (!data) return null;
 
   const connectorIds = data.connector_ids ?? [];
+  const useCatalog = data.source === "builtin";
 
   return (
     <div className="border-t border-[var(--border-default)] bg-[var(--surface-secondary)] px-3 py-3">
@@ -1070,11 +1231,16 @@ function PluginDetailPanel({ name }: { name: string }) {
           <div className="space-y-1">
             {data.skills.map((skill) => (
               <div key={skill.name} className="flex gap-2">
-                <span className="text-xs font-mono text-[var(--text-primary)] shrink-0">
-                  {skill.name}
+                <span
+                  className="text-xs text-[var(--text-primary)] shrink-0"
+                  title={skill.name}
+                >
+                  {useCatalog ? localizeSkillName(t, skill.name) : skill.name}
                 </span>
                 <span className="text-ui-2xs text-[var(--text-tertiary)] truncate">
-                  {skill.description}
+                  {useCatalog
+                    ? localizeSkillDescription(t, skill.name, skill.description)
+                    : skill.description}
                 </span>
               </div>
             ))}
@@ -1101,7 +1267,9 @@ function PluginDetailPanel({ name }: { name: string }) {
                   className="inline-flex items-center gap-1.5 text-ui-2xs text-[var(--text-primary)] rounded border border-[var(--border-default)] bg-[var(--surface-primary)] px-2 py-1"
                 >
                   <span className={`h-1.5 w-1.5 rounded-full ${statusColor}`} />
-                  {connector?.name ?? cid}
+                  {connector
+                    ? localizeConnectorName(t, cid, connector.name)
+                    : cid}
                 </span>
               );
             })}

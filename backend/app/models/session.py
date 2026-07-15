@@ -14,6 +14,7 @@ from app.utils.id import generate_ulid
 if TYPE_CHECKING:
     from app.models.message import Message
     from app.models.project import Project
+    from app.models.session_goal import SessionGoal
 
 
 class Session(Base, TimestampMixin):
@@ -68,3 +69,34 @@ class Session(Base, TimestampMixin):
     messages: Mapped[list[Message]] = relationship(
         back_populates="session", cascade="all, delete-orphan", order_by="Message.time_created"
     )
+    goal: Mapped[SessionGoal | None] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy="selectin",
+    )
+
+    @property
+    def goal_status(self) -> str | None:
+        return self.goal.status if self.goal is not None else None
+
+    @property
+    def goal_run_state(self) -> str | None:
+        return self.goal.run_state if self.goal is not None else None
+
+    @property
+    def goal_needs_input(self) -> bool:
+        return bool(
+            self.goal is not None
+            and (
+                self.goal.run_state == "waiting_user"
+                or self.goal.needs_review
+            )
+        )
+
+    @property
+    def goal_objective_preview(self) -> str | None:
+        if self.goal is None:
+            return None
+        objective = " ".join(self.goal.objective.split())
+        return objective[:120] or None

@@ -7,7 +7,15 @@ import {
 
 async function setup(page: Page) {
   await seed苏小有Storage(page);
-  return mock苏小有Api(page);
+  const state = await mock苏小有Api(page);
+  await page.route("**/api/sessions/session-long/todos", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ todos: [] }),
+    }),
+  );
+  return state;
 }
 
 const delay = (milliseconds: number) =>
@@ -28,6 +36,140 @@ async function submitFirstTurnEdit(page: Page, text: string) {
 }
 
 test.describe("苏小有 conversation outline navigation", () => {
+  test("keeps idle desktop markers uniform and only emphasizes hover or focus", async ({ page }) => {
+    await setup(page);
+    await page.goto("/c/session-long");
+
+    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    await expect(outline).toBeVisible();
+    const markers = outline.locator("button[data-outline-turn]");
+    const firstMarker = markers.nth(0);
+    const secondMarker = markers.nth(1);
+    const firstBox = await firstMarker.boundingBox();
+    const secondBox = await secondMarker.boundingBox();
+    expect(firstBox).not.toBeNull();
+    expect(secondBox).not.toBeNull();
+    expect((secondBox?.y ?? 0) - (firstBox?.y ?? 0)).toBe(8);
+
+    const firstLine = firstMarker.locator('span[aria-hidden="true"]');
+    await page.evaluate(() => document.documentElement.classList.remove("dark"));
+    await expect(firstMarker).toHaveCSS("color", "rgb(138, 143, 152)");
+    const idleMarkerStyles = await markers.evaluateAll((elements) =>
+      elements.map((element) => {
+        const line = element.querySelector<HTMLElement>('span[aria-hidden="true"]');
+        return {
+          color: getComputedStyle(element).color,
+          height: line ? getComputedStyle(line).height : null,
+          width: line ? getComputedStyle(line).width : null,
+        };
+      }),
+    );
+    expect(idleMarkerStyles).toHaveLength(await markers.count());
+    expect(
+      idleMarkerStyles.every(
+        ({ color, height, width }) =>
+          color === "rgb(138, 143, 152)" && height === "2px" && width === "6px",
+      ),
+    ).toBe(true);
+    await page.evaluate(() => document.documentElement.classList.add("dark"));
+    await expect(firstMarker).toHaveCSS("color", "rgb(149, 151, 157)");
+    await page.evaluate(() => document.documentElement.classList.remove("dark"));
+    await expect(firstLine).toHaveCSS("height", "2px");
+    await expect(firstLine).toHaveCSS("width", "6px");
+    await firstMarker.hover();
+    await expect(firstLine).toHaveCSS("height", "3px");
+    await expect(firstLine).toHaveCSS("width", "10px");
+    const markerTooltip = page.getByRole("tooltip");
+    await expect(markerTooltip).toContainText("Long user turn 001:");
+    await expect(markerTooltip.locator("p")).toHaveCount(2);
+    expect(await markerTooltip.innerText()).not.toMatch(
+      /(?:Turn\s+\d+(?:\s+of\s+\d+)?|第\s*\d+(?:\s*\/\s*\d+)?\s*轮)/u,
+    );
+    await expect(page.getByText(/^(?:60 turns|60\s*轮对话)$/i)).toHaveCount(0);
+    await page.mouse.move(800, 400);
+    await expect(firstMarker).toHaveCSS("color", "rgb(138, 143, 152)");
+    await expect(firstLine).toHaveCSS("height", "2px");
+    await expect(firstLine).toHaveCSS("width", "6px");
+    await firstMarker.focus();
+    await expect(firstMarker).toHaveCSS("outline-style", "solid");
+    await expect(firstMarker).toHaveCSS("outline-width", "1px");
+    await expect(firstMarker).toHaveCSS("outline-offset", "1px");
+    await expect(firstMarker).toHaveCSS("outline-color", "rgb(51, 156, 255)");
+    const focusedLine = firstMarker.locator('span[aria-hidden="true"]');
+    await expect(focusedLine).toHaveCSS("height", "3px");
+    await expect(focusedLine).toHaveCSS("width", "10px");
+    const activeMarker = outline.locator('button[aria-current="location"]');
+    const activeLine = activeMarker.locator('span[aria-hidden="true"]');
+    await expect(activeMarker).toHaveCSS("color", "rgb(138, 143, 152)");
+    await expect(activeLine).toHaveCSS("height", "2px");
+    await expect(activeLine).toHaveCSS("width", "6px");
+    await activeMarker.hover();
+    await expect(activeMarker).toHaveCSS("color", "rgb(26, 28, 31)");
+    await expect(activeLine).toHaveCSS("height", "3px");
+    await expect(activeLine).toHaveCSS("width", "10px");
+
+    // The compact rail remains at an 8px pitch and contributes only one
+    // roving marker to the Tab order, without a separate turn-count control.
+    const rovingMarker = outline.locator(
+      'button[data-outline-turn][tabindex="0"]',
+    );
+    await expect(rovingMarker).toHaveCount(1);
+    await expect(
+      outline.locator('button[data-outline-turn][tabindex="-1"]'),
+    ).toHaveCount((await markers.count()) - 1);
+    await expect(outline.locator("button")).toHaveCount(await markers.count());
+    await expect(outline.getByRole("button")).toHaveCount(await markers.count());
+    await expect(
+      outline.getByRole("button", { name: "Open full conversation navigation" }),
+    ).toHaveCount(0);
+
+    // Center the rail as a flex item when it fits. In a short window, cap the
+    // scroll container itself so both ends remain reachable from a stable
+    // start position instead of falling into negative centered overflow.
+    await page.setViewportSize({ width: 1280, height: 520 });
+    await expect(outline).toBeVisible();
+    const markerScroller = outline.locator("[data-conversation-outline-list]");
+    expect(
+      await markerScroller.evaluate(
+        (element) => element.scrollHeight > element.clientHeight,
+      ),
+    ).toBe(true);
+    const shortStartGeometry = await markerScroller.evaluate((element) => {
+      element.scrollTop = 0;
+      const scrollerBox = element.getBoundingClientRect();
+      const firstBox = element
+        .querySelector("button[data-outline-turn]")
+        ?.getBoundingClientRect();
+      return {
+        firstTop: firstBox?.top ?? Number.NEGATIVE_INFINITY,
+        scrollerTop: scrollerBox.top,
+      };
+    });
+    expect(shortStartGeometry.firstTop + 0.5).toBeGreaterThanOrEqual(
+      shortStartGeometry.scrollerTop,
+    );
+    const shortEndGeometry = await markerScroller.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+      const scrollerBox = element.getBoundingClientRect();
+      const markerButtons = element.querySelectorAll("button[data-outline-turn]");
+      const lastBox = markerButtons.item(markerButtons.length - 1).getBoundingClientRect();
+      return {
+        lastBottom: lastBox.bottom,
+        scrollerBottom: scrollerBox.bottom,
+      };
+    });
+    expect(shortEndGeometry.lastBottom).toBeLessThanOrEqual(
+      shortEndGeometry.scrollerBottom + 0.5,
+    );
+
+    await page.getByRole("button", { name: "Show workspace" }).click();
+    await expect(page.getByRole("button", { name: "Hide workspace" })).toBeVisible();
+    await expect(outline).toBeHidden();
+
+    await page.getByRole("button", { name: "Hide workspace" }).click();
+    await expect(outline).toBeVisible();
+  });
+
   test("loads an unloaded early turn and returns to the live latest page", async ({ page }) => {
     await setup(page);
     await page.goto("/c/session-long");
@@ -95,6 +237,7 @@ test.describe("苏小有 conversation outline navigation", () => {
     const outlineButton = page.getByRole("button", { name: "Conversation outline" });
     await expect(outlineButton).toBeVisible();
     await outlineButton.click();
+    await expect(page.getByText("60 turns", { exact: true })).toHaveCount(0);
     const firstTurn = page.getByRole("button", { name: /Turn 1 of 60:/ });
     await expect(firstTurn).toBeVisible();
     await firstTurn.click();

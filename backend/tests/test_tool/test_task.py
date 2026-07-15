@@ -1,10 +1,16 @@
 """Task tool (SubAgent) tests — recursion guard, validation."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
 
-from app.schemas.agent import AgentInfo
+from app.agent.permission import (
+    evaluate,
+    intersect_permission_rulesets,
+    serialize_permission_snapshot,
+)
+from app.schemas.agent import AgentInfo, PermissionRule, Ruleset
 from app.schemas.chat import PromptRequest
 from app.session.managed_workspace import managed_workspace_for_session
 from app.session.manager import create_session
@@ -119,10 +125,14 @@ async def test_child_generation_inherits_english_locale(session_factory, monkeyp
         captured["permission_rules_authoritative"] = request._permission_rules_authoritative
         captured["abort_shared"] = job.abort_event is ctx.abort_event
         captured["interactive"] = job.interactive
+        captured["invocation_source"] = job.invocation_source
+        captured["invocation_source_id"] = job.invocation_source_id
 
     monkeypatch.setattr("app.session.processor.run_generation", fake_run_generation)
     ctx = _make_ctx(depth=0)
     ctx.language = "en"
+    ctx.invocation_source = "scheduler"
+    ctx.invocation_source_id = "task-parent"
     ctx.permission_rules = (
         {"action": "deny", "permission": "bash", "pattern": "*"},
         {"action": "allow", "permission": "read", "pattern": "*"},
@@ -151,6 +161,8 @@ async def test_child_generation_inherits_english_locale(session_factory, monkeyp
         "permission_rules_authoritative": True,
         "abort_shared": True,
         "interactive": False,
+        "invocation_source": "scheduler",
+        "invocation_source_id": "task-parent",
     }
     assert result.title == "Subtask (explore): locale propagation"
 
@@ -160,6 +172,53 @@ async def test_child_generation_inherits_english_locale(session_factory, monkeyp
         child = await get_session(db, result.metadata["task_id"])
     assert child is not None
     assert child.directory == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_goal_subtask_keeps_compound_permission_ceiling(
+    session_factory,
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+
+    async def fake_run_generation(_job, request, **_kwargs):
+        captured["trusted"] = request._trusted_permission_ruleset
+        captured["enforced"] = request._enforce_current_permission_ceiling
+
+    monkeypatch.setattr("app.session.processor.run_generation", fake_run_generation)
+    ctx = _make_ctx(depth=0)
+    ctx.goal_id = "goal-with-compound-ceiling"
+    compound = intersect_permission_rulesets(
+        Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="allow", permission="bash"),
+        ]),
+        Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="deny", permission="bash"),
+        ]),
+    )
+    ctx.permission_snapshot = serialize_permission_snapshot(compound)
+    ctx.permission_rules = tuple(
+        ctx.permission_snapshot["rules"]
+    )
+    ctx._app_state = {  # type: ignore[attr-defined]
+        "session_factory": session_factory,
+        "provider_registry": MagicMock(),
+        "agent_registry": MagicMock(),
+        "tool_registry": MagicMock(),
+    }
+
+    result = await TaskTool().execute(
+        {"description": "secure child", "prompt": "do not run bash"},
+        ctx,
+    )
+
+    assert result.success
+    assert captured["enforced"] is True
+    trusted = captured["trusted"]
+    assert isinstance(trusted, Ruleset)
+    assert evaluate("bash", "*", trusted) == "deny"
 
 
 @pytest.mark.asyncio
@@ -196,6 +255,39 @@ async def test_subtask_agent_error_is_a_failed_tool_result(
 
     assert not result.success
     assert "child permission failed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_subtask_timeout_is_a_failed_tool_result(
+    session_factory,
+    monkeypatch,
+):
+    async def fake_run_generation(job, _request, **_kwargs):
+        job.publish(SSEEvent("text-delta", {"text": "incomplete child output"}))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("app.session.processor.run_generation", fake_run_generation)
+    monkeypatch.setattr("app.tool.builtin.task.SUBTASK_TIMEOUT", 0.01)
+    ctx = _make_ctx()
+    ctx.language = "en"
+    ctx._app_state = {  # type: ignore[attr-defined]
+        "session_factory": session_factory,
+        "provider_registry": MagicMock(),
+        "agent_registry": MagicMock(),
+        "tool_registry": MagicMock(),
+    }
+
+    result = await TaskTool().execute(
+        {"description": "slow child", "prompt": "wait forever"},
+        ctx,
+    )
+
+    assert not result.success
+    assert "timed out" in (result.error or "")
+    assert result.output == ""
+    assert result.metadata["timeout"] is True
+    assert result.metadata["timeout_seconds"] == pytest.approx(0.01)
+    assert result.metadata["partial_output"] == "incomplete child output"
 
 
 @pytest.mark.asyncio
@@ -258,9 +350,17 @@ def test_external_prompt_cannot_enable_authoritative_permission_mode():
         "text": "untrusted",
         "permission_rules_authoritative": True,
         "_permission_rules_authoritative": True,
+        "_enforce_current_permission_ceiling": True,
+        "_trusted_permission_ruleset": {
+            "rules": [
+                {"action": "allow", "permission": "*", "pattern": "*"},
+            ],
+        },
     })
 
     assert request._permission_rules_authoritative is False
+    assert request._enforce_current_permission_ceiling is False
+    assert request._trusted_permission_ruleset is None
     assert "permission_rules_authoritative" not in request.model_dump()
 
 

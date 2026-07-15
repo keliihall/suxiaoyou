@@ -12,8 +12,13 @@ from app.plugin.loader import PluginLoadResult, load_plugin, scan_plugins_dir
 from app.plugin.parser import PluginMeta
 from app.skill.model import SkillInfo
 from app.skill.registry import SkillRegistry
+from app.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
+
+
+class PluginPersistenceError(RuntimeError):
+    """A plugin state transition could not be durably persisted."""
 
 
 @dataclass
@@ -144,12 +149,16 @@ class PluginManager:
         if not info or info.enabled:
             return False
 
+        # Persist the desired state before changing the live registry.  An API
+        # response must never claim success for a transition that will be lost
+        # at restart, nor leave memory and disk disagreeing after an I/O error.
+        enabled = {*self._enabled, name}
+        self._persist_enabled(enabled)
         for skill in info.skills:
             self._skill_registry.register(skill)
 
         info.enabled = True
-        self._enabled.add(name)
-        self._persist_enabled()
+        self._enabled = enabled
         logger.info("Plugin enabled: %s (%d skills)", name, len(info.skills))
         return True
 
@@ -159,12 +168,13 @@ class PluginManager:
         if not info or not info.enabled:
             return False
 
+        enabled = self._enabled - {name}
+        self._persist_enabled(enabled)
         for skill in info.skills:
             self._skill_registry.unregister(skill.name)
 
         info.enabled = False
-        self._enabled.discard(name)
-        self._persist_enabled()
+        self._enabled = enabled
         logger.info("Plugin disabled: %s (%d skills removed)", name, len(info.skills))
         return True
 
@@ -188,14 +198,19 @@ class PluginManager:
             pass
         return set()
 
-    def _persist_enabled(self) -> None:
+    def _persist_enabled(self, enabled: set[str] | None = None) -> None:
         if not self._enabled_path:
             return
+        desired = self._enabled if enabled is None else enabled
         try:
             self._enabled_path.parent.mkdir(parents=True, exist_ok=True)
-            self._enabled_path.write_text(
-                json.dumps(sorted(self._enabled), indent=2),
+            atomic_write_text(
+                self._enabled_path,
+                json.dumps(sorted(desired), indent=2),
                 encoding="utf-8",
             )
-        except OSError as e:
-            logger.warning("Cannot persist disabled plugins: %s", e)
+        except OSError as exc:
+            logger.error("Cannot persist enabled plugins: %s", exc)
+            raise PluginPersistenceError(
+                "Plugin state could not be saved; no runtime change was applied"
+            ) from exc

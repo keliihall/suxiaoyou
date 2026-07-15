@@ -54,6 +54,10 @@ class SessionResponse(BaseModel):
     time_updated: datetime
     time_compacting: datetime | None = None
     time_archived: datetime | None = None
+    goal_status: str | None = None
+    goal_run_state: str | None = None
+    goal_needs_input: bool = False
+    goal_objective_preview: str | None = None
 
     # protected_namespaces=() — allow the ``model_id`` field without Pydantic's
     # "model_" reserved-namespace warning (consistent with the rest of the app).

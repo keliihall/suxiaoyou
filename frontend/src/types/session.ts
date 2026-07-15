@@ -42,4 +42,8 @@ export interface SessionResponse {
   time_updated: string;
   time_compacting: string | null;
   time_archived: string | null;
+  goal_status: import("./goal").GoalStatus | null;
+  goal_run_state: import("./goal").GoalRunState | null;
+  goal_needs_input: boolean;
+  goal_objective_preview: string | null;
 }

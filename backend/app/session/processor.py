@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -29,8 +30,17 @@ from app.agent.agent import AgentRegistry
 from app.agent.permission import (
     RejectedError,
     evaluate,
+    serialize_permission_snapshot,
 )
 from app.provider.registry import ProviderRegistry
+from app.security.audit import AuditPersistenceError, record_security_event
+from app.security.capabilities import (
+    denied_invocation_capabilities,
+    denied_tool_capabilities,
+    describe_tool_source,
+    primary_capability,
+    tool_requires_durable_audit,
+)
 from app.schemas.agent import PermissionRule
 from app.schemas.chat import PromptRequest
 from app.schemas.message import StepFinishReason
@@ -53,6 +63,7 @@ from app.streaming.events import (
     DONE,
     INPUT_STARTED,
     MODEL_LOADING,
+    GOAL_NEEDS_USER,
     PERMISSION_REQUEST,
     REASONING_DELTA,
     RETRY,
@@ -74,7 +85,6 @@ from app.session.utils import (
     llm_messages_have_image_content as _llm_messages_have_image_content,
     repair_tool_call_payload as _repair_tool_call_payload,
 )
-from app.utils.atomic_write import atomic_write_text
 from app.utils.id import generate_ulid
 
 if TYPE_CHECKING:
@@ -82,14 +92,90 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+async def _audit_tool_event(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    tool: Any,
+    job: GenerationJob,
+    call_id: str,
+    decision: str,
+    outcome: str,
+    interactive: bool,
+    extra_details: dict[str, Any] | None = None,
+    required: bool = False,
+) -> None:
+    source_kind, source_id, capabilities = describe_tool_source(tool)
+    details: dict[str, Any] = {
+        "capabilities": ",".join(sorted(capabilities)),
+        "interactive": interactive,
+        "tool_id": tool.id,
+    }
+    connector_provenance = getattr(tool, "connector_provenance", None)
+    if connector_provenance is not None:
+        details["connector_provenance"] = str(connector_provenance)
+    if extra_details:
+        details.update(extra_details)
+    await record_security_event(
+        session_factory,
+        source_kind=source_kind,
+        source_id=source_id,
+        invocation_source_kind=job.invocation_source,
+        invocation_source_id=job.invocation_source_id,
+        capability=primary_capability(tool),
+        action="execute",
+        decision=decision,
+        outcome=outcome,
+        session_id=job.session_id,
+        call_id=call_id,
+        details=details,
+        required=required,
+    )
+
+
+async def _audit_provider_event(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    provider_id: str,
+    job: GenerationJob,
+    call_id: str,
+    outcome: str,
+    step: int,
+    attempt: int,
+) -> None:
+    """Record inference lifecycle metadata without prompts, content, or credentials."""
+
+    await record_security_event(
+        session_factory,
+        source_kind="provider",
+        source_id=provider_id,
+        invocation_source_kind=job.invocation_source,
+        invocation_source_id=job.invocation_source_id,
+        capability="model_inference",
+        action="infer",
+        decision="system",
+        outcome=outcome,
+        session_id=job.session_id,
+        call_id=call_id,
+        details={
+            "step": step,
+            "attempt": attempt,
+            "invocation_source": job.invocation_source,
+        },
+        required=outcome == "started",
+    )
+
 # Loop detection: two-stage warn-then-stop (replaces old doom loop)
-from app.session.loop_detection import loop_detector, LoopCheckResult
+from app.session.loop_detection import (
+    WEB_FETCH_CIRCUIT_OPEN_MSG,
+    WEB_SEARCH_LIMIT_MSG,
+    LoopCheckResult,
+    loop_detector,
+    web_fetch_circuit_scope,
+)
 
 # Tools that operate on file paths — used for two-dimensional permission check
-_FILE_TOOLS = frozenset({"read", "write", "edit"})
-
-# Tools that modify state — trigger todo reminders after execution
-_MODIFYING_TOOLS = frozenset({"edit", "write", "bash", "code_execute"})
+_FILE_TOOLS = frozenset({"read", "write", "edit", "image_generate", "office"})
 
 _PERMISSION_ARGUMENT_CHAR_LIMIT = 20_000
 _SENSITIVE_ARG_KEY_RE = re.compile(
@@ -101,6 +187,30 @@ _SENSITIVE_ARG_KEY_RE = re.compile(
 # Accessed via _cfg() to avoid stale module-level reads.
 def _cfg():
     return get_settings()
+
+
+def _native_web_search_allowed(
+    tool_registry: ToolRegistry,
+    permissions: Any,
+    *,
+    quota_exhausted: bool,
+    invocation_source: str = "desktop",
+) -> bool:
+    """Apply the same Security Center and permission gates to provider-native search."""
+
+    return (
+        not quota_exhausted
+        and not denied_invocation_capabilities(
+            invocation_source,
+            ("network", "remote_data_read"),
+        )
+        and tool_registry.is_enabled("web_search")
+        # Provider-native search cannot pause for an interactive permission
+        # response.  Only an explicit allow may use it; ``ask`` stays on the
+        # ordinary web_search tool path where the existing confirmation flow
+        # can run.
+        and evaluate("web_search", "*", permissions) == "allow"
+    )
 
 
 def _normalize_step_finish_reason(reason: str | None) -> StepFinishReason:
@@ -188,15 +298,36 @@ async def _track_session_file(
 
 
 _PRESENTABLE_DELIVERABLE_EXTS = {
+    ".aac",
+    ".avi",
     ".csv",
     ".docx",
+    ".flac",
+    ".gif",
     ".html",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".m4a",
     ".md",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".opus",
     ".pdf",
+    ".png",
+    ".ppt",
     ".pptx",
     ".svg",
     ".txt",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".xls",
     ".xlsx",
+    ".zip",
 }
 
 _NON_PRESENTABLE_OUTPUT_HINTS = {
@@ -206,24 +337,80 @@ _NON_PRESENTABLE_OUTPUT_HINTS = {
     "tmp",
 }
 
+_NON_PRESENTABLE_PATH_SEGMENTS = {
+    ".git",
+    ".suxiaoyou",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+}
+
+_PRIMARY_OUTPUT_FILE_TOOLS = {
+    "edit",
+    "image_generate",
+    "office",
+    "write",
+}
+
+
+def _artifact_delivery_paths(
+    tool_id: str,
+    metadata: dict[str, Any] | None,
+) -> list[str]:
+    """Extract generated-file paths from the shared tool metadata contract.
+
+    ``written_files`` is intentionally tool-agnostic so shell runners, code
+    execution, plugins, and future generators receive the same tracking and
+    deterministic file-card behavior.  ``artifact_files`` is the forward
+    contract for tools that want to declare delivery without also claiming a
+    workspace mutation.  Existing single-output tools retain ``file_path``.
+    """
+    if not metadata:
+        return []
+
+    files: list[str] = []
+    for key in ("artifact_files", "written_files"):
+        values = metadata.get(key)
+        if not isinstance(values, (list, tuple)):
+            continue
+        for value in values:
+            if isinstance(value, str) and value:
+                files.append(value)
+            elif isinstance(value, dict):
+                path = value.get("path") or value.get("file_path")
+                if isinstance(path, str) and path:
+                    files.append(path)
+
+    primary = metadata.get("file_path")
+    if (
+        isinstance(primary, str)
+        and primary
+        and (
+            tool_id in _PRIMARY_OUTPUT_FILE_TOOLS
+            or metadata.get("artifact_delivery") is True
+        )
+    ):
+        files.append(primary)
+
+    return list(dict.fromkeys(files))
+
 
 def _presentation_reminder(tool_id: str, metadata: dict[str, Any] | None) -> str:
     """Return an LLM-only reminder when a tool produced likely deliverables."""
-    if not metadata:
+    # image_generate returns a persisted attachment and the frontend renders
+    # its file card directly from this tool result. Asking the model to call
+    # present_file would add a redundant, non-deterministic second tool call.
+    if tool_id == "image_generate" or not metadata:
         return ""
 
-    files: list[str] = []
-    if tool_id in ("write", "edit") and metadata.get("file_path"):
-        files.append(str(metadata["file_path"]))
-    elif tool_id == "code_execute" and metadata.get("written_files"):
-        files.extend(str(path) for path in metadata["written_files"])
-
     candidates: list[str] = []
-    for file_path in files:
+    for file_path in _artifact_delivery_paths(tool_id, metadata):
         path = Path(file_path)
         suffix = path.suffix.lower()
         name = path.name.lower()
         if suffix not in _PRESENTABLE_DELIVERABLE_EXTS:
+            continue
+        if any(part.lower() in _NON_PRESENTABLE_PATH_SEGMENTS for part in path.parts):
             continue
         if any(hint in name for hint in _NON_PRESENTABLE_OUTPUT_HINTS):
             continue
@@ -241,90 +428,6 @@ def _presentation_reminder(tool_id: str, metadata: dict[str, Any] | None) -> str
         "them. Do not present temporary scripts, scratch files, logs, helper "
         "files, or intermediate outputs.</reminder>"
     )
-
-
-# Extension mapping for artifact types
-_ARTIFACT_TYPE_EXT: dict[str, str] = {
-    "markdown": ".md",
-    "html": ".html",
-    "svg": ".svg",
-    "react": ".jsx",
-    "mermaid": ".mmd",
-    "code": ".txt",  # fallback; overridden by language when available
-}
-
-# Language → extension mapping for code artifacts
-_LANG_EXT: dict[str, str] = {
-    "python": ".py",
-    "javascript": ".js",
-    "typescript": ".ts",
-    "java": ".java",
-    "c": ".c",
-    "cpp": ".cpp",
-    "go": ".go",
-    "rust": ".rs",
-    "ruby": ".rb",
-    "php": ".php",
-    "swift": ".swift",
-    "kotlin": ".kt",
-    "css": ".css",
-    "json": ".json",
-    "yaml": ".yaml",
-    "sql": ".sql",
-    "shell": ".sh",
-    "bash": ".sh",
-}
-
-
-async def _save_artifact_as_file(
-    session_factory: Any,
-    session_id: str,
-    workspace: str | None,
-    metadata: dict[str, Any],
-) -> None:
-    """Save artifact content to suxiaoyou_written/ and track as a session file."""
-    import re
-    from pathlib import Path
-
-    if not workspace:
-        return
-
-    content = metadata.get("content", "")
-    title = metadata.get("title", "artifact")
-    artifact_type = metadata.get("type", "code")
-    language = metadata.get("language", "")
-
-    # Determine file extension
-    if artifact_type == "code" and language:
-        ext = _LANG_EXT.get(language.lower(), ".txt")
-    else:
-        ext = _ARTIFACT_TYPE_EXT.get(artifact_type, ".txt")
-
-    # Sanitize title for filename: keep alphanumeric, spaces, hyphens, underscores,
-    # and CJK/Unicode letters; replace others with underscore
-    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title).strip()
-    if not safe_title:
-        safe_title = "artifact"
-    # Truncate to reasonable length
-    if len(safe_title) > 100:
-        safe_title = safe_title[:100]
-
-    filename = f"{safe_title}{ext}"
-    output_dir = Path(workspace).resolve() / "suxiaoyou_written"
-
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        file_path = output_dir / filename
-        atomic_write_text(file_path, content)
-
-        await _track_session_file(
-            session_factory,
-            session_id=session_id,
-            file_path=str(file_path),
-            tool_id="artifact",
-        )
-    except Exception:
-        logger.debug("Failed to save artifact as file: %s", filename, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -674,13 +777,19 @@ class SessionProcessor:
         # Phase 4: persist text + reasoning parts.
         await self._persist_text_and_reasoning()
 
-        # Phase 5: dispatch concurrent tool calls.
+        # Phase 5: account Provider usage before dispatching tools. A Task tool
+        # can start a child Agent immediately; recording here makes the child's
+        # first Provider gate observe the parent step's spend.
+        self._compute_step_cost()
+        await self._sp._record_goal_step_usage_before_tools(
+            self.usage_data,
+            self.step_cost,
+        )
+
+        # Phase 6: dispatch concurrent tool calls.
         early = await self._dispatch_tool_calls()
         if early is not None:
             return early
-
-        # Phase 6: cost tracking.
-        self._compute_step_cost()
 
         # If this step produced tool calls, the agent loop is not actually
         # finished yet, even if the provider reported a generic "stop".
@@ -718,12 +827,16 @@ class SessionProcessor:
         self._tool_calls_in_step: list[dict[str, Any]] = []
         self._has_tool_calls: bool = False
         self._native_search_ids: set[str] = set()
+        self._native_search_completed: set[str] = set()
         self._native_search_count: int = 0
         self._ws_part_ids: dict[str, str] = {}  # web_search call_id → part_id
         self._stream_error: Exception | None = None
 
         # Streaming tool executor: starts concurrent-safe tools during streaming
-        self._streaming_executor = StreamingToolExecutor(self._sp.job.abort_event)
+        self._streaming_executor = StreamingToolExecutor(
+            self._sp.job.abort_event,
+            task_tracker=self._sp.job.track_tool_task,
+        )
         self._exec_metadata: dict[int, dict[str, Any]] = {}
         self._exec_index: int = 0
         self._exec_blocked: bool = False  # Set True if loop detection blocks
@@ -757,8 +870,44 @@ class SessionProcessor:
             if job.abort_event.is_set():
                 break
 
+            provider_call_id = f"{self._assistant_msg_id}:{sp.step}:{attempt + 1}"
+            provider_started = False
+            provider_finished = False
+
             try:
-                reasoning_extra, safe_max_tokens, exclude_tools = await self._build_stream_args()
+                provider_denied = denied_invocation_capabilities(
+                    job.invocation_source,
+                    ("model_inference",),
+                )
+                if provider_denied:
+                    await record_security_event(
+                        sp.session_factory,
+                        source_kind="provider",
+                        source_id=sp.provider.id,
+                        invocation_source_kind=job.invocation_source,
+                        invocation_source_id=job.invocation_source_id,
+                        capability="model_inference",
+                        action="infer",
+                        decision="deny",
+                        outcome="blocked",
+                        session_id=job.session_id,
+                        call_id=provider_call_id,
+                        details={"invocation_source": job.invocation_source},
+                    )
+                    raise PermissionError(
+                        f"Invocation source {job.invocation_source!r} is not "
+                        "allowed to use model inference"
+                    )
+
+                stream_args = await self._build_stream_args()
+                if stream_args is None:
+                    return "stop"
+                (
+                    reasoning_extra,
+                    safe_max_tokens,
+                    exclude_tools,
+                    native_web_search_enabled,
+                ) = stream_args
 
                 logger.info(
                     "Starting LLM stream for model=%s, messages=%d, max_tokens=%d",
@@ -775,7 +924,7 @@ class SessionProcessor:
                 if blocked is not None:
                     return blocked
 
-                async for chunk in stream_llm(
+                llm_stream = stream_llm(
                     sp.provider,
                     sp.model_id,
                     self._llm_messages,
@@ -787,7 +936,43 @@ class SessionProcessor:
                     exclude_tools=exclude_tools,
                     discovered_tools=sp.discovered_tools,
                     response_format=sp.request.format,
-                ):
+                    native_web_search_enabled=native_web_search_enabled,
+                )
+
+                first_chunk = None
+                async with job.execution_admission_lock:
+                    if not job.execution_admission_open:
+                        self.finish_reason = "paused" if job.goal_id else "stop"
+                        return "stop"
+                    # The control plane may change while message/tool specs are
+                    # prepared. Re-check and start the Provider iterator under
+                    # the same admission lock used by Goal pause/edit/archive.
+                    # Pause therefore linearizes either before this call (deny)
+                    # or after the request has actually begun.
+                    if not await self._goal_provider_admission_allowed():
+                        return "stop"
+                    await _audit_provider_event(
+                        sp.session_factory,
+                        provider_id=sp.provider.id,
+                        job=job,
+                        call_id=provider_call_id,
+                        outcome="started",
+                        step=sp.step,
+                        attempt=attempt + 1,
+                    )
+                    provider_started = True
+                    try:
+                        first_chunk = await anext(llm_stream)
+                    except StopAsyncIteration:
+                        first_chunk = None
+
+                async def admitted_chunks():
+                    if first_chunk is not None:
+                        yield first_chunk
+                    async for remaining_chunk in llm_stream:
+                        yield remaining_chunk
+
+                async for chunk in admitted_chunks():
                     if job.abort_event.is_set():
                         break
 
@@ -828,7 +1013,28 @@ class SessionProcessor:
                             )
 
                         case "error":
+                            await _audit_provider_event(
+                                sp.session_factory,
+                                provider_id=sp.provider.id,
+                                job=job,
+                                call_id=provider_call_id,
+                                outcome="error",
+                                step=sp.step,
+                                attempt=attempt + 1,
+                            )
+                            provider_finished = True
                             return await self._handle_stream_error_chunk(chunk)
+
+                await _audit_provider_event(
+                    sp.session_factory,
+                    provider_id=sp.provider.id,
+                    job=job,
+                    call_id=provider_call_id,
+                    outcome="cancelled" if job.abort_event.is_set() else "success",
+                    step=sp.step,
+                    attempt=attempt + 1,
+                )
+                provider_finished = True
 
                 self._stream_error = None
                 logger.info(
@@ -859,6 +1065,16 @@ class SessionProcessor:
                 break
 
             except Exception as e:
+                if provider_started and not provider_finished:
+                    await _audit_provider_event(
+                        sp.session_factory,
+                        provider_id=sp.provider.id,
+                        job=job,
+                        call_id=provider_call_id,
+                        outcome="error",
+                        step=sp.step,
+                        attempt=attempt + 1,
+                    )
                 self._stream_error = e
                 retry_reason = is_retryable(e)
                 effective_max = max_retries_for_error(e)
@@ -890,8 +1106,10 @@ class SessionProcessor:
 
         return None
 
-    async def _build_stream_args(self) -> tuple[Any, int, set[str] | None]:
-        """Compute (reasoning_extra, safe_max_tokens, exclude_tools) for one stream attempt."""
+    async def _build_stream_args(
+        self,
+    ) -> tuple[Any, int, set[str] | None, bool] | None:
+        """Compute provider and native-search gates for one stream attempt."""
         sp = self._sp
 
         reasoning_extra = None
@@ -907,18 +1125,156 @@ class SessionProcessor:
                 sp.model_info.capabilities.max_output if sp.model_info else None
             ),
         )
+        if sp.job.goal_id is not None:
+            from app.session.goal_guard import (
+                read_goal_budget_gate,
+                read_goal_execution_gate,
+            )
+
+            root_session_id = sp.job.goal_session_id or sp.job.session_id
+            gate = await read_goal_execution_gate(
+                sp.session_factory,
+                session_id=root_session_id,
+                goal_id=sp.job.goal_id,
+                goal_run_id=sp.job.goal_run_id,
+            )
+            if not gate.allowed:
+                self.finish_reason = self._goal_gate_finish_reason(
+                    gate.status,
+                    gate.run_state,
+                )
+                return None
+
+            counted_tokens, counted_cost = sp.job.goal_run_usage
+            budget = await read_goal_budget_gate(
+                sp.session_factory,
+                session_id=root_session_id,
+                goal_id=sp.job.goal_id,
+                local_tokens_used=counted_tokens,
+                local_cost_microusd=counted_cost,
+                local_active_seconds=max(
+                    0,
+                    round(
+                        time.monotonic()
+                        - sp._goal_active_started_monotonic
+                        - (
+                            sp.job.goal_wait_seconds
+                            - sp._goal_wait_seconds_at_start
+                        )
+                    ),
+                ),
+                warning_ratio=_cfg().goal_budget_warning_ratio,
+            )
+            if not budget.allowed:
+                self.finish_reason = "budget_limited"
+                return None
+            # Provider input accounting is only known after the call.  Clamp
+            # the controllable output portion to the remaining hard budget;
+            # at most this already-admitted provider step can overshoot due to
+            # input-token estimation differences.
+            if budget.token_remaining is not None:
+                safe_max_tokens = max(
+                    1,
+                    min(safe_max_tokens, budget.token_remaining),
+                )
 
         exclude_tools: set[str] | None = None
+        all_tools = getattr(sp.tool_registry, "all_tools", None)
+        if callable(all_tools):
+            source_denied = {
+                tool.id
+                for tool in all_tools()
+                if denied_tool_capabilities(sp.job.invocation_source, tool)
+            }
+            if source_denied:
+                exclude_tools = source_denied
         sq_count, sq_credits = await _search_quota.get_quota()
-        if not sq_credits and sq_count >= get_settings().daily_search_limit:
-            exclude_tools = {"web_search"}
-
-        # Use native web search for OpenAI subscription provider
-        if sp.provider.id == "openai-subscription":
+        quota_exhausted = not sq_credits and sq_count >= get_settings().daily_search_limit
+        if quota_exhausted:
             exclude_tools = exclude_tools or set()
             exclude_tools.add("web_search")
 
-        return reasoning_extra, safe_max_tokens, exclude_tools
+        native_web_search_enabled = _native_web_search_allowed(
+            sp.tool_registry,
+            sp.merged_permissions,
+            quota_exhausted=quota_exhausted,
+            invocation_source=sp.job.invocation_source,
+        )
+        web_search_permission = evaluate("web_search", "*", sp.merged_permissions)
+
+        # An explicit allow uses provider-native search.  An explicit deny is
+        # hidden entirely, while ``ask`` deliberately keeps the custom tool so
+        # the normal interactive confirmation path can run.
+        if sp.provider.id == "openai-subscription" and (
+            native_web_search_enabled or web_search_permission == "deny"
+        ):
+            exclude_tools = exclude_tools or set()
+            exclude_tools.add("web_search")
+
+        return reasoning_extra, safe_max_tokens, exclude_tools, native_web_search_enabled
+
+    @staticmethod
+    def _goal_gate_finish_reason(status: str, run_state: str) -> str:
+        if status != "active":
+            return status
+        if run_state == "pausing":
+            return "paused"
+        if run_state == "interrupted":
+            return "interrupted"
+        return "blocked"
+
+    async def _goal_provider_admission_allowed(self) -> bool:
+        """Fail closed at the last await boundary before Provider inference."""
+
+        sp = self._sp
+        job = sp.job
+        if job.goal_id is None:
+            return True
+
+        if not job.execution_admission_open:
+            self.finish_reason = "paused"
+            return False
+
+        from app.session.goal_guard import (
+            read_goal_budget_gate,
+            read_goal_execution_gate,
+        )
+
+        root_session_id = job.goal_session_id or job.session_id
+        gate = await read_goal_execution_gate(
+            sp.session_factory,
+            session_id=root_session_id,
+            goal_id=job.goal_id,
+            goal_run_id=job.goal_run_id,
+        )
+        if not gate.allowed:
+            self.finish_reason = self._goal_gate_finish_reason(
+                gate.status,
+                gate.run_state,
+            )
+            return False
+
+        tokens_used, cost_used = job.goal_run_usage
+        budget = await read_goal_budget_gate(
+            sp.session_factory,
+            session_id=root_session_id,
+            goal_id=job.goal_id,
+            local_tokens_used=tokens_used,
+            local_cost_microusd=cost_used,
+            local_active_seconds=max(
+                0,
+                round(
+                    time.monotonic()
+                    - sp._goal_active_started_monotonic
+                    - (job.goal_wait_seconds - sp._goal_wait_seconds_at_start)
+                ),
+            ),
+            warning_ratio=_cfg().goal_budget_warning_ratio,
+        )
+        if not budget.allowed:
+            self.finish_reason = "budget_limited"
+            return False
+        return True
 
     async def _check_vision_blocked(self) -> Literal["stop"] | None:
         """If a non-vision model received image content, persist an error + return 'stop'."""
@@ -962,6 +1318,7 @@ class SessionProcessor:
                     session_id=job.session_id,
                     data={
                         "type": "step-finish",
+                        "goal_run_id": job.goal_run_id,
                         "reason": "error",
                         "tokens": {},
                         "cost": 0.0,
@@ -994,6 +1351,65 @@ class SessionProcessor:
         ta = tc.get("arguments", {})
         ci = tc.get("id", generate_ulid())
         tn, ta = _repair_tool_call_payload(tn, ta)
+        response_scope = web_fetch_circuit_scope(
+            job.session_id,
+            job.stream_id,
+        )
+
+        # A run of different URLs can evade the generic identical-call loop
+        # detector while repeatedly hitting the same SSRF policy boundary.
+        # Skip later web_fetch calls with a model-readable tool error, but do
+        # not set _exec_blocked: the model must remain free to continue with
+        # web_search summaries or produce a bounded final answer.
+        if (
+            tn.lower() == "web_fetch"
+            and loop_detector.is_web_fetch_circuit_open(response_scope)
+        ):
+            job.publish(SSEEvent(
+                TOOL_ERROR,
+                {
+                    "call_id": ci,
+                    "error": WEB_FETCH_CIRCUIT_OPEN_MSG,
+                    "tool": "web_fetch",
+                },
+            ))
+            await _persist_tool_error(
+                session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                "web_fetch",
+                ci,
+                ta,
+                WEB_FETCH_CIRCUIT_OPEN_MSG,
+            )
+            return
+
+        # Custom web_search is bounded across the entire model response, not
+        # merely per step. Reserve the slot synchronously so a batch of
+        # different concurrent queries cannot bypass the limit. Provider-
+        # native search follows its separate per-step provider path.
+        if (
+            tn.lower() == "web_search"
+            and not loop_detector.admit_custom_web_search(response_scope)
+        ):
+            job.publish(SSEEvent(
+                TOOL_ERROR,
+                {
+                    "call_id": ci,
+                    "error": WEB_SEARCH_LIMIT_MSG,
+                    "tool": "web_search",
+                },
+            ))
+            await _persist_tool_error(
+                session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                "web_search",
+                ci,
+                ta,
+                WEB_SEARCH_LIMIT_MSG,
+            )
+            return
 
         # Loop detection
         lr: LoopCheckResult = loop_detector.check(job.session_id, tn, ta)
@@ -1016,6 +1432,40 @@ class SessionProcessor:
         if tool is None:
             tool = sp.tool_registry.get(tn.lower())
         if tool is None:
+            get_registered = getattr(sp.tool_registry, "get_registered", None)
+            is_enabled = getattr(sp.tool_registry, "is_enabled", None)
+            disabled_tool = (
+                get_registered(tn) or get_registered(tn.lower())
+                if callable(get_registered)
+                else None
+            )
+            if (
+                disabled_tool is not None
+                and callable(is_enabled)
+                and not is_enabled(disabled_tool.id)
+            ):
+                error = f"Tool disabled by Security Center: {disabled_tool.id}"
+                await _audit_tool_event(
+                    session_factory,
+                    tool=disabled_tool,
+                    job=job,
+                    call_id=ci,
+                    decision="deny",
+                    outcome="blocked",
+                    interactive=job.interactive,
+                )
+                job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": error}))
+                await _persist_tool_error(
+                    session_factory,
+                    self._assistant_msg_id,
+                    job.session_id,
+                    disabled_tool.id,
+                    ci,
+                    ta,
+                    error,
+                )
+                return
+        if tool is None:
             tool = sp.tool_registry.get("invalid")
             if tool:
                 ta = {"name": tn}
@@ -1023,13 +1473,68 @@ class SessionProcessor:
             job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": f"Tool not found: {tn}"}))
             return
 
+        # The invocation-source profile is a hard ceiling above user/session
+        # permission rules.  It evaluates every capability, so a multi-purpose
+        # tool cannot hide a write/process/network side effect behind a benign
+        # primary label.
+        blocked_capabilities = denied_tool_capabilities(
+            job.invocation_source,
+            tool,
+        )
+        if blocked_capabilities:
+            blocked_summary = ",".join(blocked_capabilities)
+            error = (
+                f"Invocation source {job.invocation_source!r} is not allowed "
+                f"to use {tool.id}: {blocked_summary}"
+            )
+            await _audit_tool_event(
+                session_factory,
+                tool=tool,
+                job=job,
+                call_id=ci,
+                decision="deny",
+                outcome="blocked",
+                interactive=job.interactive,
+                extra_details={"blocked_capabilities": blocked_summary},
+            )
+            job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": error}))
+            job.publish(SSEEvent(AGENT_ERROR, {
+                "error_type": "invocation_source_denied",
+                "error_message": error,
+                "tool": tool.id,
+                "call_id": ci,
+            }))
+            self._exec_blocked = True
+            self.finish_reason = "error"
+            await _persist_tool_error(
+                session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                tool.id,
+                ci,
+                ta,
+                error,
+            )
+            return
+
         # Permission check
         rp = "*"
         if tool.id in _FILE_TOOLS:
-            rp = ta.get("file_path", "*")
+            rp = ta.get("file_path") or ta.get("output_path") or "*"
         action = evaluate(tool.id, rp, sp.merged_permissions)
+        if action == "allow" and getattr(tool, "requires_approval", False):
+            action = "ask"
 
         if action == "deny":
+            await _audit_tool_event(
+                session_factory,
+                tool=tool,
+                job=job,
+                call_id=ci,
+                decision="deny",
+                outcome="denied",
+                interactive=job.interactive,
+            )
             job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": f"Permission denied for tool: {tool.id}"}))
             await _persist_tool_error(
                 session_factory, self._assistant_msg_id,
@@ -1055,6 +1560,15 @@ class SessionProcessor:
                 }))
                 self._exec_blocked = True
                 self.finish_reason = "error"
+                await _audit_tool_event(
+                    session_factory,
+                    tool=tool,
+                    job=job,
+                    call_id=ci,
+                    decision="ask",
+                    outcome="blocked",
+                    interactive=False,
+                )
                 await _persist_tool_error(
                     session_factory,
                     self._assistant_msg_id,
@@ -1066,13 +1580,54 @@ class SessionProcessor:
                 )
                 return
 
-            decision = await _ask_permission(
-                job,
-                call_id=ci,
-                tool_name=tool.id,
-                tool_args=ta,
-                resource_pattern=rp,
-            )
+            if job.goal_id is not None:
+                from app.session.goal_guard import set_goal_waiting_user
+
+                job.set_goal_waiting(True)
+                await set_goal_waiting_user(
+                    session_factory,
+                    session_id=job.goal_session_id or job.session_id,
+                    goal_id=job.goal_id,
+                    goal_run_id=job.goal_run_id,
+                    waiting=True,
+                    blocker_code="permission_required",
+                    blocker_message=f"Permission required for {tool.id}",
+                )
+                job.publish(
+                    SSEEvent(
+                        GOAL_NEEDS_USER,
+                        {
+                            "goal_id": job.goal_id,
+                            "goal_run_id": job.goal_run_id,
+                            "reason": "permission_required",
+                            "tool": tool.id,
+                            "call_id": ci,
+                        },
+                    )
+                )
+            try:
+                decision = await _ask_permission(
+                    job,
+                    call_id=ci,
+                    tool_name=tool.id,
+                    tool_args=ta,
+                    resource_pattern=rp,
+                    language=sp.request.language,
+                )
+            finally:
+                if job.goal_id is not None:
+                    from app.session.goal_guard import set_goal_waiting_user
+
+                    try:
+                        await set_goal_waiting_user(
+                            session_factory,
+                            session_id=job.goal_session_id or job.session_id,
+                            goal_id=job.goal_id,
+                            goal_run_id=job.goal_run_id,
+                            waiting=False,
+                        )
+                    finally:
+                        job.set_goal_waiting(False)
             if decision.get("remember"):
                 await _remember_permission_rule(
                     session_factory,
@@ -1083,6 +1638,46 @@ class SessionProcessor:
                     allow=bool(decision.get("allowed")),
                 )
             if not decision.get("allowed"):
+                if job.goal_id is not None:
+                    from app.session.goal_guard import block_goal_for_user_action
+                    from app.session.goal_guard import read_goal_execution_gate
+
+                    goal_gate = await read_goal_execution_gate(
+                        session_factory,
+                        session_id=job.goal_session_id or job.session_id,
+                        goal_id=job.goal_id,
+                        goal_run_id=job.goal_run_id,
+                    )
+                    # A safe pause wakes permission waits with a denial. Keep
+                    # the durable pausing state so the outer Goal boundary can
+                    # finish the current slice as paused instead of turning it
+                    # into a user-denied blocker.
+                    if goal_gate.run_state != "pausing":
+                        await block_goal_for_user_action(
+                            session_factory,
+                            session_id=job.goal_session_id or job.session_id,
+                            goal_id=job.goal_id,
+                            goal_run_id=job.goal_run_id,
+                            blocker_code=(
+                                "permission_timeout"
+                                if decision.get("timed_out")
+                                else "permission_denied"
+                            ),
+                            blocker_message=(
+                                f"Permission request expired for {tool.id}"
+                                if decision.get("timed_out")
+                                else f"Permission denied for {tool.id}"
+                            ),
+                        )
+                await _audit_tool_event(
+                    session_factory,
+                    tool=tool,
+                    job=job,
+                    call_id=ci,
+                    decision="ask",
+                    outcome="denied",
+                    interactive=True,
+                )
                 job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": f"User denied permission for: {tool.id}"}))
                 await _persist_tool_error(
                     session_factory, self._assistant_msg_id,
@@ -1090,10 +1685,58 @@ class SessionProcessor:
                 )
                 return
 
+        # Privileged tools may only enter the executor after their pre-action
+        # audit record commits.  An unavailable audit store is a hard stop;
+        # outcome records after execution remain best effort because a generic
+        # tool side effect cannot be rolled back here.
+        try:
+            await _audit_tool_event(
+                session_factory,
+                tool=tool,
+                job=job,
+                call_id=ci,
+                decision=action,
+                outcome="started",
+                interactive=job.interactive,
+                required=tool_requires_durable_audit(tool),
+            )
+        except AuditPersistenceError:
+            error = (
+                f"Security audit unavailable; privileged tool blocked: {tool.id}"
+            )
+            job.publish(SSEEvent(TOOL_ERROR, {"call_id": ci, "error": error}))
+            job.publish(SSEEvent(AGENT_ERROR, {
+                "error_type": "security_audit_unavailable",
+                "error_message": error,
+                "tool": tool.id,
+                "call_id": ci,
+            }))
+            self._exec_blocked = True
+            self.finish_reason = "error"
+            await _persist_tool_error(
+                session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                tool.id,
+                ci,
+                ta,
+                error,
+            )
+            return
+
         # Persist "running" state
         tool_part_id = generate_ulid()
         async with session_factory() as db:
             async with db.begin():
+                if job.goal_run_id is not None:
+                    from app.models.goal_run import GoalRun
+
+                    run = await db.get(GoalRun, job.goal_run_id)
+                    if run is not None:
+                        # Commit this conservative marker before the executor
+                        # can begin an external side effect. Recovery will
+                        # require review rather than replaying the run.
+                        run.side_effects_started = True
                 await create_part(
                     db, message_id=self._assistant_msg_id,
                     session_id=job.session_id, part_id=tool_part_id,
@@ -1104,7 +1747,6 @@ class SessionProcessor:
             "tool": tool.id, "call_id": ci,
             "arguments": ta, "session_id": job.session_id,
         }))
-
         # Build context
         ctx = ToolContext(
             session_id=job.session_id,
@@ -1120,8 +1762,34 @@ class SessionProcessor:
                 rule.model_dump(mode="json")
                 for rule in sp.merged_permissions.rules
             ),
+            permission_snapshot=serialize_permission_snapshot(
+                sp.merged_permissions,
+                global_permissions=(
+                    sp.request._goal_permission_baseline[0]
+                    if sp.request._goal_permission_baseline is not None
+                    else None
+                ),
+                agent_permissions=(
+                    sp.request._goal_permission_baseline[1]
+                    if sp.request._goal_permission_baseline is not None
+                    else None
+                ),
+            ),
+            attachment_paths=frozenset(getattr(sp, "attachment_paths", ())),
+            invocation_source=job.invocation_source,
+            invocation_source_id=job.invocation_source_id,
+            goal_id=job.goal_id,
+            goal_run_id=job.goal_run_id,
+            goal_session_id=job.goal_session_id,
             _publish_fn=lambda et, d: job.publish(SSEEvent(et, d)),
         )
+        if job.goal_id is not None:
+            from app.session.goal_guard import goal_job_execution_allowed
+
+            ctx._execution_guard_fn = lambda: goal_job_execution_allowed(
+                session_factory,
+                job,
+            )
         ctx._app_state = {  # type: ignore[attr-defined]
             "session_factory": session_factory,
             "provider_registry": sp.provider_registry,
@@ -1145,6 +1813,7 @@ class SessionProcessor:
             "tool": tool,
             "tool_args": ta,
             "call_id": ci,
+            "permission_decision": action,
         }
         self._exec_index += 1
 
@@ -1158,6 +1827,26 @@ class SessionProcessor:
         self._native_search_ids.add(ws_call_id)
         self._native_search_count += 1
 
+        await record_security_event(
+            sp.session_factory,
+            source_kind="provider",
+            source_id=sp.provider.id,
+            invocation_source_kind=job.invocation_source,
+            invocation_source_id=job.invocation_source_id,
+            capability="web_search",
+            action="search",
+            decision="allow",
+            outcome="started",
+            session_id=job.session_id,
+            call_id=ws_call_id,
+            details={
+                "native": True,
+                "step": sp.step,
+                "invocation_source": job.invocation_source,
+            },
+            required=True,
+        )
+
         # Drop excess searches beyond the per-step cap
         if self._native_search_count > get_settings().max_native_searches_per_step:
             return
@@ -1165,6 +1854,12 @@ class SessionProcessor:
         self._ws_part_ids[ws_call_id] = generate_ulid()
         async with sp.session_factory() as db:
             async with db.begin():
+                if job.goal_run_id is not None:
+                    from app.models.goal_run import GoalRun
+
+                    run = await db.get(GoalRun, job.goal_run_id)
+                    if run is not None:
+                        run.side_effects_started = True
                 await create_part(
                     db,
                     message_id=self._assistant_msg_id,
@@ -1197,6 +1892,34 @@ class SessionProcessor:
         ws_call_id = chunk.data.get("id", "")
         ws_query = chunk.data.get("query", "")
         ws_results = chunk.data.get("results", [])
+
+        # Account and audit every provider-native search exactly once, even if
+        # its UI part was dropped by the per-step display cap.  Audit metadata
+        # deliberately excludes both the query and returned sources.
+        if (
+            ws_call_id in self._native_search_ids
+            and ws_call_id not in self._native_search_completed
+        ):
+            self._native_search_completed.add(ws_call_id)
+            await _search_quota.increment(charged=False)
+            await record_security_event(
+                sp.session_factory,
+                source_kind="provider",
+                source_id=sp.provider.id,
+                capability="web_search",
+                action="search",
+                decision="allow",
+                outcome="success",
+                session_id=job.session_id,
+                call_id=ws_call_id,
+                invocation_source_kind=job.invocation_source,
+                invocation_source_id=job.invocation_source_id,
+                details={
+                    "native": True,
+                    "step": sp.step,
+                    "invocation_source": job.invocation_source,
+                },
+            )
 
         # Skip results for searches that exceeded the per-step cap
         if ws_call_id not in self._ws_part_ids:
@@ -1272,6 +1995,8 @@ class SessionProcessor:
         """Mid-stream 'error' chunk: persist any accumulated text + publish error + clean up."""
         sp = self._sp
         job = sp.job
+        self.finish_reason = "error"
+        self.has_text = bool(self._accumulated_text.strip())
 
         if self._accumulated_text:
             async with sp.session_factory() as db:
@@ -1334,6 +2059,7 @@ class SessionProcessor:
                         session_id=job.session_id,
                         data={
                             "type": "step-finish",
+                            "goal_run_id": job.goal_run_id,
                             "reason": self.finish_reason,
                             "tokens": self.usage_data,
                             "cost": self.step_cost,
@@ -1461,6 +2187,7 @@ class SessionProcessor:
         tool = meta["tool"]
         tool_args = meta["tool_args"]
         call_id = meta["call_id"]
+        permission_decision = meta.get("permission_decision", "system")
 
         # Handle timeout
         if exec_result.timed_out:
@@ -1470,12 +2197,23 @@ class SessionProcessor:
             await _update_tool_part_error(
                 session_factory, tool_part_id, tool.id, call_id, tool_args, timeout_msg,
             )
+            await _audit_tool_event(
+                session_factory,
+                tool=tool,
+                job=job,
+                call_id=call_id,
+                decision=permission_decision,
+                outcome="timeout",
+                interactive=job.interactive,
+            )
             return
 
         # Handle execution error
         if exec_result.error is not None:
             if isinstance(exec_result.error, RejectedError):
                 err_msg = f"Permission denied: {exec_result.error.permission}"
+            elif isinstance(exec_result.error, asyncio.CancelledError):
+                err_msg = str(exec_result.error) or "Tool execution cancelled"
             else:
                 err_msg = str(exec_result.error)
                 logger.exception("Tool execution error: %s", tool.id)
@@ -1483,11 +2221,49 @@ class SessionProcessor:
             await _update_tool_part_error(
                 session_factory, tool_part_id, tool.id, call_id, tool_args, err_msg,
             )
+            await _audit_tool_event(
+                session_factory,
+                tool=tool,
+                job=job,
+                call_id=call_id,
+                decision=permission_decision,
+                outcome=(
+                    "denied"
+                    if isinstance(exec_result.error, RejectedError)
+                    else "cancelled"
+                    if isinstance(exec_result.error, asyncio.CancelledError)
+                    else "error"
+                ),
+                interactive=job.interactive,
+            )
             return
 
         result = exec_result.result
         if result is None:
             return
+
+        loop_detector.record_tool_result(
+            web_fetch_circuit_scope(job.session_id, job.stream_id),
+            tool.id,
+            success=result.success,
+            error=result.error,
+        )
+
+        await _audit_tool_event(
+            session_factory,
+            tool=tool,
+            job=job,
+            call_id=call_id,
+            decision=permission_decision,
+            outcome="success" if result.success else "error",
+            interactive=job.interactive,
+        )
+
+        # Persist generated-file/todo side effects before announcing the result.
+        # The client refreshes the workspace file list as soon as TOOL_RESULT
+        # arrives, so emitting first creates a real race where a successfully
+        # generated artifact is absent from that refresh.
+        await self._apply_tool_side_effects(tool, result)
 
         # Emit SSE result
         if result.error:
@@ -1507,7 +2283,6 @@ class SessionProcessor:
                 },
             ))
 
-        await self._apply_tool_side_effects(tool, result)
         persist_output = await self._build_tool_persist_output(
             tool, tool_args, result, loop_result,
         )
@@ -1547,7 +2322,15 @@ class SessionProcessor:
         self._maybe_switch_agent(result)
 
     async def _apply_tool_side_effects(self, tool: Any, result: Any) -> None:
-        """Update session files / artifact files / todos / web_search quota from a tool result."""
+        """Update session files, todos, and web-search quota from a tool result.
+
+        Visual artifacts remain message-backed preview state.  They must not be
+        silently materialized into the user's workspace: ``artifact`` is an
+        agent-control capability, so doing so would bypass the source policy,
+        file-write approval, versioning, and guarded workspace transaction.
+        Users can request an explicit ``write`` when they want an artifact on
+        disk.
+        """
         sp = self._sp
         job = sp.job
         session_factory = sp.session_factory
@@ -1557,48 +2340,17 @@ class SessionProcessor:
             charged = bool(result.metadata and result.metadata.get("charged"))
             await _search_quota.increment(charged=charged)
 
-        # Track session files from write/edit tools
-        if (
-            tool.id in ("write", "edit")
-            and result.success
-            and result.metadata
-            and result.metadata.get("file_path")
-        ):
-            await _track_session_file(
-                session_factory,
-                session_id=job.session_id,
-                file_path=result.metadata["file_path"],
-                tool_id=tool.id,
-            )
-
-        # Track files created or modified inside code_execute runs.
-        if (
-            tool.id == "code_execute"
-            and result.success
-            and result.metadata
-            and result.metadata.get("written_files")
-        ):
-            for file_path in result.metadata["written_files"]:
+        # Track every declared generated file through one metadata contract.
+        # This includes shell-created outputs (for example edge-tts MP3 files),
+        # plugin artifacts, code execution, and existing single-file tools.
+        if result.success:
+            for file_path in _artifact_delivery_paths(tool.id, result.metadata):
                 await _track_session_file(
                     session_factory,
                     session_id=job.session_id,
                     file_path=file_path,
                     tool_id=tool.id,
                 )
-
-        # Track artifacts as workspace files (save to disk)
-        if (
-            tool.id == "artifact"
-            and result.success
-            and result.metadata
-            and result.metadata.get("content")
-        ):
-            await _save_artifact_as_file(
-                session_factory,
-                session_id=job.session_id,
-                workspace=sp.workspace,
-                metadata=result.metadata,
-            )
 
         # Track todos from todo tool results
         if tool.id == "todo" and result.metadata and "todos" in result.metadata:
@@ -1621,21 +2373,6 @@ class SessionProcessor:
         # Inject loop warning into output so LLM sees it
         if loop_result.action == "warn" and loop_result.message:
             persist_output += f"\n\n{loop_result.message}"
-
-        if (
-            tool.id in _MODIFYING_TOOLS
-            and tool.id != "todo"
-            and sp.current_todos
-            and any(
-                t.get("status") in ("pending", "in_progress")
-                for t in sp.current_todos
-            )
-        ):
-            persist_output += (
-                "\n\n<reminder>You have an active todo list. "
-                "Call the todo tool NOW to mark this task completed "
-                "and start the next one.</reminder>"
-            )
 
         # Run middleware after_tool_exec hooks
         if self._mw_ctx is not None:
@@ -1701,10 +2438,30 @@ class SessionProcessor:
             )
 
     async def _persist_step_finish(self) -> None:
-        """Emit STEP_FINISH SSE event + persist the step-finish part."""
+        """Persist the step boundary, then publish it to the live stream.
+
+        Database-first ordering guarantees that a client reacting to the SSE
+        event can immediately reconcile the same terminal boundary from the
+        messages API.  Publishing first creates a race where recovery sees an
+        active-looking final message and leaves the UI in "finalizing".
+        """
         sp = self._sp
         job = sp.job
 
+        async with sp.session_factory() as db:
+            async with db.begin():
+                await create_part(
+                    db,
+                    message_id=self._assistant_msg_id,
+                    session_id=job.session_id,
+                    data={
+                        "type": "step-finish",
+                        "goal_run_id": job.goal_run_id,
+                        "reason": self.finish_reason,
+                        "tokens": self.usage_data,
+                        "cost": self.step_cost,
+                    },
+                )
         job.publish(SSEEvent(
             STEP_FINISH,
             {
@@ -1714,19 +2471,6 @@ class SessionProcessor:
                 "reason": self.finish_reason,
             },
         ))
-        async with sp.session_factory() as db:
-            async with db.begin():
-                await create_part(
-                    db,
-                    message_id=self._assistant_msg_id,
-                    session_id=job.session_id,
-                    data={
-                        "type": "step-finish",
-                        "reason": self.finish_reason,
-                        "tokens": self.usage_data,
-                        "cost": self.step_cost,
-                    },
-                )
 
     def _check_context_overflow(self) -> bool:
         """Return True if usage_data exceeds the safe compaction threshold."""
@@ -1758,11 +2502,13 @@ async def _ask_permission(
     tool_name: str,
     tool_args: dict[str, Any],
     resource_pattern: str = "*",
+    language: str = "en",
 ) -> dict[str, bool]:
     """Ask user for permission via SSE and wait for response."""
     permission_call_id = generate_ulid()
     arguments, truncated = _permission_arguments_for_event(tool_args)
-    message = _permission_message(tool_name, arguments, truncated)
+    message = _permission_message(tool_name, arguments, truncated, language=language)
+    metadata = _permission_metadata(tool_name, arguments)
     job.register_response_request(
         permission_call_id,
         prompt_type="permission",
@@ -1780,6 +2526,7 @@ async def _ask_permission(
                 "permission": tool_name,
                 "patterns": [resource_pattern] if resource_pattern else [],
                 "arguments": arguments,
+                "metadata": metadata,
                 "message": message,
                 "arguments_truncated": truncated,
             },
@@ -1791,7 +2538,7 @@ async def _ask_permission(
         return _permission_decision_from_response(response)
     except TimeoutError:
         logger.warning("Permission request timed out for %s", tool_name)
-        return {"allowed": False, "remember": False}
+        return {"allowed": False, "remember": False, "timed_out": True}
 
 
 def _permission_decision_from_response(response: Any) -> dict[str, bool]:
@@ -1874,7 +2621,21 @@ def _permission_message(
     tool_name: str,
     arguments: dict[str, Any],
     truncated: bool,
+    *,
+    language: str = "en",
 ) -> str:
+    if tool_name == "image_generate":
+        if language == "zh":
+            return (
+                "是否允许通过 SiliconFlow 发起一次图片生成？图片描述会发送给外部供应商；"
+                "目录估价可能变化，最终费用以供应商账单为准。本次确认仅授权一次生成。"
+            )
+        return (
+            "Allow one image generation request through SiliconFlow? The prompt is sent "
+            "to an external provider; catalog pricing may change and the provider bill "
+            "is authoritative. This confirmation authorizes one generation only."
+        )
+
     if tool_name == "bash":
         command = arguments.get("command")
         if isinstance(command, str) and command.strip():
@@ -1889,6 +2650,38 @@ def _permission_message(
 
     suffix = " Preview was truncated." if truncated else ""
     return f"Allow tool '{tool_name}' with the shown arguments?{suffix}"
+
+
+def _permission_metadata(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Return additive context used by richer permission prompts."""
+
+    if tool_name != "image_generate":
+        return {}
+
+    from app.image_generation.siliconflow import (
+        SILICONFLOW_IMAGE_ESTIMATED_COST_CNY,
+        SILICONFLOW_IMAGE_MODEL,
+        SILICONFLOW_IMAGE_PRICING_AS_OF,
+        SILICONFLOW_IMAGE_PRICING_SOURCE_URL,
+    )
+
+    return {
+        "provider": "siliconflow",
+        "provider_name": "SiliconFlow",
+        "model": SILICONFLOW_IMAGE_MODEL,
+        "image_size": arguments.get("image_size", "1024x1024"),
+        "estimated_cost": SILICONFLOW_IMAGE_ESTIMATED_COST_CNY,
+        "currency": "CNY",
+        "pricing_unit": "image",
+        "pricing_basis": "official_catalog",
+        "pricing_as_of": SILICONFLOW_IMAGE_PRICING_AS_OF,
+        "pricing_source_url": SILICONFLOW_IMAGE_PRICING_SOURCE_URL,
+        "approval_mode": "per_call",
+        "external_billing": True,
+    }
 
 
 async def _delete_empty_assistant_messages(

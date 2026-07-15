@@ -5,6 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any, TYPE_CHECKING
 
+from app.connector.model import (
+    CONNECTOR_PROVENANCE_CUSTOM,
+    SUPPORTED_CONNECTOR_PROVENANCE,
+)
 from app.tool.base import ToolDefinition, ToolResult
 
 if TYPE_CHECKING:
@@ -25,15 +29,42 @@ class McpToolWrapper(ToolDefinition):
         self._client = client
         self._mcp_tool = mcp_tool
         self._tool_id = client.tool_id(mcp_tool.name)
+        client_provenance = getattr(
+            client,
+            "connector_provenance",
+            CONNECTOR_PROVENANCE_CUSTOM,
+        )
+        # Keep the discovered tool's trust label immutable for its lifetime.
+        self._connector_provenance = (
+            client_provenance
+            if isinstance(client_provenance, str)
+            and client_provenance in SUPPORTED_CONNECTOR_PROVENANCE
+            else CONNECTOR_PROVENANCE_CUSTOM
+        )
 
     @property
     def id(self) -> str:
         return self._tool_id
 
     @property
+    def connector_provenance(self) -> str:
+        return self._connector_provenance
+
+    @property
     def description(self) -> str:
         desc = self._mcp_tool.description or f"MCP tool from {self._client.name}"
         return f"[MCP: {self._client.name}] {desc}"
+
+    @property
+    def requires_approval(self) -> bool:
+        # A custom MCP server controls its own tool names, descriptions, and
+        # schemas, so those fields cannot establish that an operation is read
+        # only.  Require fresh interactive approval for every custom call;
+        # remembered broad allows must not silently promote it to built-in
+        # trust.
+        if self._connector_provenance == CONNECTOR_PROVENANCE_CUSTOM:
+            return True
+        return self._client.tool_requires_approval(self._mcp_tool.name)
 
     def parameters_schema(self) -> dict[str, Any]:
         schema = self._mcp_tool.inputSchema
@@ -49,7 +80,8 @@ class McpToolWrapper(ToolDefinition):
         try:
             result = await self._client.call_tool(self._mcp_tool.name, args)
         except Exception as e:
-            return ToolResult(error=f"MCP tool call failed: {e}")
+            error = self._client.scrub_sensitive_text(str(e))
+            return ToolResult(error=f"MCP tool call failed: {error}")
 
         # Convert MCP result content to ToolResult
         text_parts: list[str] = []
@@ -57,7 +89,7 @@ class McpToolWrapper(ToolDefinition):
 
         for item in result.content:
             if item.type == "text":
-                text_parts.append(item.text)
+                text_parts.append(self._client.scrub_sensitive_text(item.text))
             elif item.type == "image":
                 attachments.append({
                     "type": "file",
@@ -67,7 +99,9 @@ class McpToolWrapper(ToolDefinition):
             elif item.type == "resource":
                 resource = item.resource
                 if hasattr(resource, "text") and resource.text:
-                    text_parts.append(resource.text)
+                    text_parts.append(
+                        self._client.scrub_sensitive_text(resource.text)
+                    )
                 elif hasattr(resource, "blob") and resource.blob:
                     attachments.append({
                         "type": "file",

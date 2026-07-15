@@ -1,11 +1,15 @@
 """Truncation tests — mirrors OpenCode's file-based overflow behavior."""
 
+import asyncio
 import os
-import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from app.schemas.agent import AgentInfo
+from app.tool.base import ToolDefinition, ToolResult
+from app.tool.context import ToolContext
 from app.tool.truncation import (
     MAX_BYTES,
     MAX_LINES,
@@ -26,7 +30,11 @@ class TestTruncateOutput:
 
     def test_short_text_unchanged(self, tmp_workspace):
         text = "short text here"
-        result = truncate_output(text, workspace=tmp_workspace)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=True,
+        )
         assert isinstance(result, TruncationResult)
         assert result.content == text
         assert result.truncated is False
@@ -35,13 +43,21 @@ class TestTruncateOutput:
     def test_within_line_limit(self, tmp_workspace):
         lines = ["line %d" % i for i in range(MAX_LINES)]
         text = "\n".join(lines)
-        result = truncate_output(text, workspace=tmp_workspace)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=True,
+        )
         assert result.truncated is False
 
     def test_exceeds_line_limit(self, tmp_workspace):
         lines = ["line %d" % i for i in range(MAX_LINES + 500)]
         text = "\n".join(lines)
-        result = truncate_output(text, workspace=tmp_workspace)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=True,
+        )
         assert result.truncated is True
         assert result.output_path is not None
         assert "truncated" in result.content
@@ -53,7 +69,11 @@ class TestTruncateOutput:
     def test_exceeds_byte_limit(self, tmp_workspace):
         # Each line ~100 bytes, 600 lines = ~60KB > 50KB limit
         text = "\n".join(["x" * 100 for _ in range(600)])
-        result = truncate_output(text, workspace=tmp_workspace)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=True,
+        )
         assert result.truncated is True
         assert "bytes" in result.content or "truncated" in result.content
         assert Path(result.output_path).exists()
@@ -78,29 +98,62 @@ class TestTruncateOutput:
 
     def test_hint_with_task_tool(self, tmp_workspace):
         text = "\n".join(["line" for _ in range(MAX_LINES + 10)])
-        result = truncate_output(text, workspace=tmp_workspace, has_task_tool=True)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            has_task_tool=True,
+            persist_full_output=True,
+        )
         assert result.truncated is True
         assert "Task tool" in result.content
         assert "delegate" in result.content
 
     def test_hint_without_task_tool(self, tmp_workspace):
         text = "\n".join(["line" for _ in range(MAX_LINES + 10)])
-        result = truncate_output(text, workspace=tmp_workspace, has_task_tool=False)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            has_task_tool=False,
+            persist_full_output=True,
+        )
         assert result.truncated is True
         assert "Grep" in result.content
 
     def test_custom_limits(self, tmp_workspace):
         text = "a\nb\nc\nd\ne\nf"
-        result = truncate_output(text, workspace=tmp_workspace, max_lines=3)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            max_lines=3,
+            persist_full_output=True,
+        )
         assert result.truncated is True
         assert result.output_path is not None
 
     def test_output_dir_created(self, tmp_workspace):
         text = "\n".join(["line" for _ in range(MAX_LINES + 10)])
-        result = truncate_output(text, workspace=tmp_workspace)
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=True,
+        )
         output_dir = Path(tmp_workspace) / ".suxiaoyou" / "tool-output"
         assert output_dir.exists()
         assert result.output_path is not None
+
+    def test_read_only_call_can_truncate_without_writing_workspace(self, tmp_workspace):
+        text = "\n".join(["line" for _ in range(MAX_LINES + 10)])
+
+        result = truncate_output(
+            text,
+            workspace=tmp_workspace,
+            persist_full_output=False,
+        )
+
+        assert result.truncated is True
+        assert result.output_path is None
+        assert "no independent file-write authorization" in result.content
+        assert not (Path(tmp_workspace) / ".suxiaoyou").exists()
 
     def test_empty_text(self, tmp_workspace):
         result = truncate_output("", workspace=tmp_workspace)
@@ -140,3 +193,39 @@ class TestCleanup:
         # Non-existent dir should not error
         removed = cleanup_old_outputs(workspace=str(Path(tmp_workspace) / "nonexistent"))
         assert removed == 0
+
+
+class _LongReadTool(ToolDefinition):
+    @property
+    def id(self) -> str:
+        return "read"
+
+    @property
+    def description(self) -> str:
+        return "test"
+
+    def parameters_schema(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        return ToolResult(output="\n".join("line" for _ in range(MAX_LINES + 10)))
+
+
+@pytest.mark.asyncio
+async def test_tool_middleware_does_not_give_read_tool_hidden_write(tmp_path):
+    ctx = ToolContext(
+        session_id="session",
+        message_id="message",
+        call_id="call",
+        agent=AgentInfo(name="test", description="", mode="primary"),
+        workspace=str(tmp_path),
+        abort_event=asyncio.Event(),
+        invocation_source="scheduler",
+    )
+
+    result = await _LongReadTool()({}, ctx)
+
+    assert result.success
+    assert result.metadata["truncated"] is True
+    assert "output_path" not in result.metadata
+    assert not (tmp_path / ".suxiaoyou").exists()

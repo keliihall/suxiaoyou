@@ -47,14 +47,16 @@ def truncate_output(
     max_bytes: int = MAX_BYTES,
     direction: Literal["head", "tail"] = "head",
     has_task_tool: bool = False,
+    persist_full_output: bool = False,
 ) -> TruncationResult:
     """Truncate tool output; save full text to file if oversized.
 
     Mirrors OpenCode ``Truncate.output()``.
 
-    When output exceeds *max_lines* or *max_bytes* the full text is written to
-    a file under ``{workspace}/.suxiaoyou/tool-output/`` and a truncated preview
-    with a hint is returned so the agent can use Read/Grep to access the rest.
+    When output exceeds *max_lines* or *max_bytes*, a truncated preview is
+    returned.  Legacy callers may explicitly request a full-text file under
+    ``{workspace}/.suxiaoyou/tool-output/``; agent middleware deliberately does
+    not, because an auxiliary truncation step is not file-write authorization.
     """
     lines = text.split("\n")
     total_bytes = len(text.encode("utf-8"))
@@ -92,14 +94,26 @@ def truncate_output(
     unit = "bytes" if hit_bytes else "lines"
     preview = "\n".join(out)
 
-    # Write full output to file
-    output_dir = _get_output_dir(workspace)
-    file_id = generate_ulid()
-    filepath = output_dir / f"{file_id}.txt"
-    filepath.write_text(text, encoding="utf-8")
+    filepath: Path | None = None
+    if persist_full_output:
+        # Only callers that already crossed a filesystem-write capability
+        # boundary may persist an auxiliary result inside the workspace.  A
+        # read/network/agent-control tool must not acquire an undeclared write
+        # side effect merely because its output happened to be long.
+        output_dir = _get_output_dir(workspace)
+        file_id = generate_ulid()
+        filepath = output_dir / f"{file_id}.txt"
+        filepath.write_text(text, encoding="utf-8")
 
     # Build hint message
-    if has_task_tool:
+    if filepath is None:
+        hint = (
+            "The tool call succeeded but the output exceeded the safe context "
+            "budget. The omitted portion was not written to the workspace because "
+            "truncation middleware has no independent file-write authorization. "
+            "Narrow the request or use filtering, pagination, or a more specific query."
+        )
+    elif has_task_tool:
         hint = (
             f"The tool call succeeded but the output was truncated. "
             f"Full output saved to: {filepath}\n"
@@ -121,7 +135,9 @@ def truncate_output(
         message = f"...{removed} {unit} truncated...\n\n{hint}\n\n{preview}"
 
     return TruncationResult(
-        content=message, truncated=True, output_path=str(filepath)
+        content=message,
+        truncated=True,
+        output_path=str(filepath) if filepath is not None else None,
     )
 
 

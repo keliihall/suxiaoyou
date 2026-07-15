@@ -2,7 +2,7 @@
 
 import { useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { API, queryKeys } from "@/lib/constants";
@@ -18,6 +18,20 @@ import {
   startStream,
   stopStream,
 } from "@/lib/session-stream-registry";
+import {
+  clearSessionGoal,
+  createGoalClientRequestId,
+  getSessionGoal,
+  isGoalStartResponse,
+  pauseSessionGoal,
+  preferNewestGoalSnapshot,
+  resumeSessionGoal,
+  startGoal,
+  updateSessionGoal,
+} from "@/lib/goal";
+import { isActiveGoalStream } from "@/lib/goal-state";
+import { requestOpenSessionGoal } from "@/lib/goal-ui";
+import type { ParsedGoalCommand } from "@/lib/goal-command";
 import { canSubmitInteraction, type InteractionPromptType } from "@/lib/interaction-response";
 import {
   clearSessionInputRequestId,
@@ -31,6 +45,12 @@ import {
   promptRequestFingerprint,
   reservePromptRequestId,
 } from "@/lib/prompt-idempotency";
+import {
+  DESKTOP_PERMISSION_SOURCE,
+  normalizePermissionWorkspace,
+  savedPermissionRulesForContext,
+  type SavedPermissionContext,
+} from "@/lib/saved-permissions";
 import { useRemoteGenerationSync } from "./use-remote-generation-sync";
 import type { InfiniteData } from "@tanstack/react-query";
 import type {
@@ -48,6 +68,7 @@ import type {
 import type { ConversationTurnIndex, PaginatedMessages } from "@/types/message";
 import type { SessionResponse } from "@/types/session";
 import type { ModelInfo } from "@/types/model";
+import type { GoalStartRequest, SessionGoal } from "@/types/goal";
 
 const MODEL_DOES_NOT_SUPPORT_IMAGES = "MODEL_DOES_NOT_SUPPORT_IMAGES";
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
@@ -137,6 +158,111 @@ function formatTaskBatchPrompt(batch: Pick<TaskBatchRequest, "mode" | "tasks">):
   return [heading, ...lines].join("\n");
 }
 
+function desktopPermissionContext(
+  queryClient: QueryClient,
+  sessionId: string | null,
+  fallbackWorkspace: string | null,
+): SavedPermissionContext | null {
+  if (sessionId) {
+    const session = queryClient.getQueryData<SessionResponse>(
+      queryKeys.sessions.detail(sessionId),
+    );
+    return {
+      workspace: session
+        ? normalizePermissionWorkspace(session.directory)
+        : null,
+      // Keep the session id even for workspace-backed sessions so a rule that
+      // was safely remembered before session metadata loaded remains usable
+      // only in that same conversation.
+      sessionId,
+      source: DESKTOP_PERMISSION_SOURCE,
+    };
+  }
+
+  const workspace = normalizePermissionWorkspace(fallbackWorkspace);
+  if (!workspace) return null;
+  return {
+    workspace,
+    sessionId: null,
+    source: DESKTOP_PERMISSION_SOURCE,
+  };
+}
+
+function rememberedPermissionRules(
+  queryClient: QueryClient,
+  sessionId: string | null,
+  settingsState: ReturnType<typeof useSettingsStore.getState>,
+) {
+  const context = desktopPermissionContext(
+    queryClient,
+    sessionId,
+    settingsState.workspaceDirectory,
+  );
+  return context
+    ? savedPermissionRulesForContext(settingsState.savedPermissions, context)
+    : [];
+}
+
+function goalObjectivePreview(goal: SessionGoal | null): string | null {
+  if (!goal) return null;
+  const normalized = goal.objective.trim().split(/\s+/u).join(" ");
+  return normalized.slice(0, 120) || null;
+}
+
+function updateSessionGoalSummary(
+  queryClient: QueryClient,
+  sessionId: string,
+  goal: SessionGoal | null,
+): void {
+  const patch = {
+    goal_status: goal?.status ?? null,
+    goal_run_state: goal?.run_state ?? null,
+    goal_needs_input: Boolean(goal?.needs_review || goal?.run_state === "waiting_user"),
+    goal_objective_preview: goalObjectivePreview(goal),
+  };
+  queryClient.setQueryData<SessionResponse>(
+    queryKeys.sessions.detail(sessionId),
+    (current) => current ? { ...current, ...patch } : current,
+  );
+  queryClient.setQueryData<InfiniteData<SessionResponse[]>>(
+    queryKeys.sessions.all,
+    (current) => current
+      ? {
+          ...current,
+          pages: current.pages.map((page) =>
+            page.map((item) => item.id === sessionId ? { ...item, ...patch } : item),
+          ),
+        }
+      : current,
+  );
+}
+
+function writeGoalSnapshot(
+  queryClient: QueryClient,
+  incoming: SessionGoal,
+): SessionGoal {
+  const key = queryKeys.sessions.goal(incoming.session_id);
+  const current = queryClient.getQueryData<SessionGoal | null>(key);
+  const next = preferNewestGoalSnapshot(current, incoming);
+  queryClient.setQueryData<SessionGoal | null>(key, next);
+  updateSessionGoalSummary(queryClient, incoming.session_id, next);
+  return next;
+}
+
+function clearGoalSnapshot(queryClient: QueryClient, sessionId: string): void {
+  queryClient.setQueryData<SessionGoal | null>(queryKeys.sessions.goal(sessionId), null);
+  updateSessionGoalSummary(queryClient, sessionId, null);
+}
+
+function goalCommandFailureKey(action: ParsedGoalCommand["action"]): string {
+  if (action === "edit") return "goalUpdateFailed";
+  if (action === "pause") return "goalPauseFailed";
+  if (action === "resume") return "goalResumeFailed";
+  if (action === "clear") return "goalClearFailed";
+  if (action === "view") return "goalLoadFailed";
+  return "goalCommandFailed";
+}
+
 /**
  * Core chat hook — orchestrates the prompt → stream → assemble cycle for one
  * session. When called from Landing without a sessionId, all state lives in
@@ -169,6 +295,254 @@ export function useChat(currentSessionId?: string) {
 
   // Polling sync for streams started by other clients (e.g. mobile)
   useRemoteGenerationSync(currentSessionId);
+
+  const handleGoalCommand = useCallback(
+    async (
+      command: ParsedGoalCommand,
+      attachments?: FileAttachment[],
+    ): Promise<boolean> => {
+      const targetSessionId = currentSessionId ?? null;
+      const reportFailure = (error: unknown): false => {
+        console.error(`Failed to run Goal command ${command.action}:`, error);
+        if (targetSessionId && error instanceof ApiError && error.status === 409) {
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.sessions.goal(targetSessionId),
+          });
+        }
+        toast.error(i18n.t(goalCommandFailureKey(command.action), { ns: "chat" }));
+        return false;
+      };
+      const readLatestGoal = async (): Promise<SessionGoal | null> => {
+        if (!targetSessionId) return null;
+        const latest = await getSessionGoal(targetSessionId);
+        if (latest) return writeGoalSnapshot(queryClient, latest);
+        clearGoalSnapshot(queryClient, targetSessionId);
+        return null;
+      };
+
+      if (attachments?.length && command.action !== "create") {
+        toast.error(i18n.t("goalCommandAttachmentsUnsupported", { ns: "chat" }));
+        return false;
+      }
+
+      if (command.action === "view") {
+        if (!targetSessionId) {
+          toast.info(i18n.t("goalEmptyDescription", { ns: "chat" }));
+          return true;
+        }
+        try {
+          await readLatestGoal();
+          // Opening the workspace handles desktop; the event reaches the
+          // mobile-only sheet without introducing Goal state into the store.
+          useWorkspaceStore.getState().open();
+          requestOpenSessionGoal(targetSessionId);
+          return true;
+        } catch (error) {
+          return reportFailure(error);
+        }
+      }
+
+      if (command.action === "create") {
+        const objective = command.objective?.trim();
+        if (!objective) return reportFailure(new Error("Goal objective is unavailable"));
+
+        const chatState = useChatStore.getState();
+        const currentBucket = targetSessionId === null
+          ? chatState.draftSession
+          : chatState.sessions[targetSessionId];
+        if (currentBucket?.isGenerating || currentBucket?.isCompacting) {
+          return reportFailure(new Error("The conversation is busy"));
+        }
+
+        const settingsState = useSettingsStore.getState();
+        if (
+          hasImageAttachments(attachments) &&
+          !selectedModelSupportsVision(
+            queryClient.getQueryData<ModelInfo[]>(queryKeys.models),
+            settingsState.selectedModel,
+            settingsState.selectedProviderId,
+          )
+        ) {
+          toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+          return false;
+        }
+        const presets = settingsState.permissionPresets;
+        const permissionPresets = {
+          file_changes: presets.fileChanges,
+          run_commands: presets.runCommands,
+        };
+        const permissionRules = rememberedPermissionRules(
+          queryClient,
+          targetSessionId,
+          settingsState,
+        );
+        const payload: Omit<GoalStartRequest, "client_request_id"> = {
+          session_id: targetSessionId,
+          objective,
+          model: settingsState.selectedModel,
+          provider_id: settingsState.selectedProviderId,
+          agent: settingsState.selectedAgent,
+          reasoning: settingsState.reasoningEnabled,
+          workspace: settingsState.workspaceDirectory,
+          attachments: attachments ?? [],
+          permission_presets: Object.values(permissionPresets).some(Boolean)
+            ? permissionPresets
+            : null,
+          permission_rules: permissionRules.length > 0 ? permissionRules : null,
+        };
+        const goalRequestScope = `goal-start:${targetSessionId ?? "__new__"}`;
+        const clientRequestId = reservePromptRequestId(
+          goalRequestScope,
+          promptRequestFingerprint(payload),
+        );
+
+        if (!currentSessionId) chatState.resetSession(null);
+        // A Goal objective is genuine user-authored conversation content.
+        // Keep its optimistic bubble visible while admission is in flight so
+        // the prior assistant turn cannot be mistaken for this Goal stream.
+        chatState.beginSending(targetSessionId, objective, attachments);
+        let response: Awaited<ReturnType<typeof startGoal>>;
+        try {
+          response = await startGoal({
+            ...payload,
+            client_request_id: clientRequestId,
+          });
+        } catch (error) {
+          chatState.resetSession(targetSessionId);
+          // Preserve this id across uncertain transport/5xx failures so a
+          // retry converges on a durably admitted Goal instead of duplicating
+          // the operation. A concrete 4xx is definitive and can release it.
+          if (
+            error instanceof ApiError
+            && error.status >= 400
+            && error.status < 500
+          ) {
+            clearPromptRequestId(goalRequestScope, clientRequestId);
+          }
+          return reportFailure(error);
+        }
+
+        // From here on the backend has durably accepted the Goal. Clear the
+        // command's idempotency reservation and always treat the composer
+        // command as accepted, even if a later UI refresh needs reconciliation.
+        clearPromptRequestId(goalRequestScope, clientRequestId);
+        writeGoalSnapshot(queryClient, response.goal);
+
+        // The atomic endpoint has already admitted this exact stream. Seed
+        // its bucket before SSE attachment so early events cannot be lost.
+        chatState.startGeneration(response.session_id, response.stream_id);
+        void startStream(response.session_id, response.stream_id);
+
+        if (!currentSessionId) {
+          const now = new Date().toISOString();
+          const tempSession: SessionResponse = {
+            id: response.session_id,
+            project_id: null,
+            parent_id: null,
+            slug: null,
+            directory: settingsState.workspaceDirectory || null,
+            title: objective.slice(0, 60),
+            version: 0,
+            summary_additions: 0,
+            summary_deletions: 0,
+            summary_files: 0,
+            summary_diffs: [],
+            is_pinned: false,
+            permission: {},
+            model_id: settingsState.selectedModel,
+            provider_id: settingsState.selectedProviderId,
+            time_created: now,
+            time_updated: now,
+            time_compacting: null,
+            time_archived: null,
+            goal_status: response.goal.status,
+            goal_run_state: response.goal.run_state,
+            goal_needs_input:
+              response.goal.needs_review || response.goal.run_state === "waiting_user",
+            goal_objective_preview: goalObjectivePreview(response.goal),
+          };
+          queryClient.setQueryData<InfiniteData<SessionResponse[]>>(
+            queryKeys.sessions.all,
+            (old) => {
+              if (!old) return { pages: [[tempSession]], pageParams: [0] };
+              const pages = old.pages.map((page) =>
+                page.filter((item) => item.id !== tempSession.id),
+              );
+              return {
+                ...old,
+                pages: [[tempSession, ...(pages[0] ?? [])], ...pages.slice(1)],
+              };
+            },
+          );
+          router.push(getChatRoute(response.session_id));
+        }
+        return true;
+      }
+
+      if (!targetSessionId) {
+        toast.error(i18n.t("goalCommandSessionRequired", { ns: "chat" }));
+        return false;
+      }
+
+      try {
+        const latest = await readLatestGoal();
+        if (!latest) throw new Error("Goal is unavailable");
+
+        if (command.action === "edit") {
+          const objective = command.objective?.trim();
+          if (!objective) throw new Error("Goal objective is unavailable");
+          const updated = await updateSessionGoal(targetSessionId, {
+            objective,
+            expected_revision: latest.revision,
+            client_request_id: createGoalClientRequestId(),
+          });
+          writeGoalSnapshot(queryClient, updated);
+          toast.success(i18n.t("goalUpdated", { ns: "chat" }));
+          return true;
+        }
+
+        if (command.action === "pause") {
+          const paused = await pauseSessionGoal(targetSessionId, {
+            expected_revision: latest.revision,
+            client_request_id: createGoalClientRequestId(),
+          });
+          writeGoalSnapshot(queryClient, paused);
+          toast.success(i18n.t("goalPaused", { ns: "chat" }));
+          return true;
+        }
+
+        if (command.action === "resume") {
+          const resumed = await resumeSessionGoal(targetSessionId, {
+            expected_revision: latest.revision,
+            client_request_id: createGoalClientRequestId(),
+          });
+          const resumedGoal = isGoalStartResponse(resumed) ? resumed.goal : resumed;
+          writeGoalSnapshot(queryClient, resumedGoal);
+          if (isGoalStartResponse(resumed)) {
+            useChatStore.getState().startGeneration(resumed.session_id, resumed.stream_id);
+            void startStream(resumed.session_id, resumed.stream_id);
+          }
+          toast.success(i18n.t("goalResumed", { ns: "chat" }));
+          return true;
+        }
+
+        if (["reserved", "running", "waiting_user", "pausing"].includes(latest.run_state)) {
+          toast.error(i18n.t("goalClearPauseFirst", { ns: "chat" }));
+          return false;
+        }
+        await clearSessionGoal(targetSessionId, {
+          expected_revision: latest.revision,
+          client_request_id: createGoalClientRequestId(),
+        });
+        clearGoalSnapshot(queryClient, targetSessionId);
+        toast.success(i18n.t("goalCleared", { ns: "chat" }));
+        return true;
+      } catch (error) {
+        return reportFailure(error);
+      }
+    },
+    [currentSessionId, queryClient, router],
+  );
 
   const sendMessage = useCallback(
     async (text: string, attachments?: FileAttachment[]): Promise<boolean> => {
@@ -222,11 +596,11 @@ export function useChat(currentSessionId?: string) {
           run_commands: presets.runCommands,
         };
         const hasActivePresets = Object.values(permissionPresets).some(Boolean);
-        const permissionRules = settingsState.savedPermissions.map((rule) => ({
-          action: rule.allow ? "allow" as const : "deny" as const,
-          permission: rule.tool,
-          pattern: "*",
-        }));
+        const permissionRules = rememberedPermissionRules(
+          queryClient,
+          currentSessionId ?? null,
+          settingsState,
+        );
 
         const promptPayload: PromptRequest = {
           text: text.trim(),
@@ -280,6 +654,10 @@ export function useChat(currentSessionId?: string) {
             time_updated: new Date().toISOString(),
             time_compacting: null,
             time_archived: null,
+            goal_status: null,
+            goal_run_state: null,
+            goal_needs_input: false,
+            goal_objective_preview: null,
           };
           queryClient.setQueryData<InfiniteData<SessionResponse[]>>(
             queryKeys.sessions.all,
@@ -372,11 +750,11 @@ export function useChat(currentSessionId?: string) {
           run_commands: presets.runCommands,
         };
         const hasActivePresets = Object.values(permissionPresets).some(Boolean);
-        const permissionRules = settingsState.savedPermissions.map((rule) => ({
-          action: rule.allow ? "allow" as const : "deny" as const,
-          permission: rule.tool,
-          pattern: "*",
-        }));
+        const permissionRules = rememberedPermissionRules(
+          queryClient,
+          currentSessionId ?? null,
+          settingsState,
+        );
         const res = await api.post<PromptResponse>(API.CHAT.TASK_BATCH, {
           session_id: currentSessionId ?? null,
           mode: batch.mode,
@@ -410,6 +788,10 @@ export function useChat(currentSessionId?: string) {
             time_updated: new Date().toISOString(),
             time_compacting: null,
             time_archived: null,
+            goal_status: null,
+            goal_run_state: null,
+            goal_needs_input: false,
+            goal_objective_preview: null,
           };
           queryClient.setQueryData<InfiniteData<SessionResponse[]>>(
             queryKeys.sessions.all,
@@ -469,11 +851,11 @@ export function useChat(currentSessionId?: string) {
         run_commands: presets.runCommands,
       };
       const hasActivePresets = Object.values(permissionPresets).some(Boolean);
-      const permissionRules = settingsState.savedPermissions.map((rule) => ({
-        action: rule.allow ? "allow" as const : "deny" as const,
-        permission: rule.tool,
-        pattern: "*",
-      }));
+      const permissionRules = rememberedPermissionRules(
+        queryClient,
+        currentSessionId,
+        settingsState,
+      );
       const fingerprint = queuedInputFingerprint(currentSessionId, mode, text, attachments);
       const clientRequestId = reserveSessionInputRequestId(fingerprint);
 
@@ -656,23 +1038,74 @@ export function useChat(currentSessionId?: string) {
     if (!streamId) return false;
     stopInFlightRef.current = true;
     try {
-      const result = await api.post<{ status: "aborted" | "not_found" }>(
-        API.CHAT.ABORT,
-        { stream_id: streamId },
-        // Aborting the same stream more than once has the same outcome, so a
-        // response lost at the network boundary is safe to retry.
-        { retryNetworkErrors: true },
-      );
-      if (result.status !== "aborted" && result.status !== "not_found") {
-        throw new Error(`Unexpected abort status: ${String(result.status)}`);
+      if (targetSessionId) {
+        const goalKey = queryKeys.sessions.goal(targetSessionId);
+        const cachedGoal = queryClient.getQueryData<SessionGoal | null>(goalKey);
+        let latestGoal: SessionGoal | null = null;
+        let latestGoalReadSucceeded = false;
+
+        try {
+          // Pause is a revision-CAS operation. Always read the authoritative
+          // revision immediately before it instead of trusting a header card
+          // or an earlier SSE snapshot.
+          latestGoal = await getSessionGoal(targetSessionId);
+          latestGoalReadSucceeded = true;
+          if (latestGoal) latestGoal = writeGoalSnapshot(queryClient, latestGoal);
+          else clearGoalSnapshot(queryClient, targetSessionId);
+        } catch (error) {
+          // If the cached Goal proves this stream is autonomous, fail closed:
+          // never turn a transient Goal-read failure into an emergency abort.
+          if (isActiveGoalStream(cachedGoal, streamId)) {
+            console.error("Could not read the latest Goal revision before pausing:", error);
+            toast.error(i18n.t("goalPauseFailed", { ns: "chat" }));
+            return false;
+          }
+        }
+
+        if (
+          latestGoalReadSucceeded
+          && isActiveGoalStream(latestGoal, streamId)
+        ) {
+          try {
+            const paused = await pauseSessionGoal(targetSessionId, {
+              expected_revision: latestGoal.revision,
+              client_request_id: createGoalClientRequestId(),
+            });
+            writeGoalSnapshot(queryClient, paused);
+            toast.success(i18n.t("goalPaused", { ns: "chat" }));
+            // Keep SSE attached and keep the generation bucket running. The
+            // Goal worker stops at its next safe boundary and emits its own
+            // durable terminal events; /abort must never run on this branch.
+            return true;
+          } catch (error) {
+            console.error("Failed to request a safe Goal pause:", error);
+            if (error instanceof ApiError && error.status === 409) {
+              void queryClient.invalidateQueries({ queryKey: goalKey });
+            }
+            toast.error(i18n.t("goalPauseFailed", { ns: "chat" }));
+            return false;
+          }
+        }
       }
-    } catch (err) {
-      // Truthful stop semantics: if the backend did not acknowledge the abort,
-      // keep the stream attached and the UI in its running state. The task may
-      // still be writing files and the user must be able to retry Stop.
-      console.error("Failed to abort — backend may still be generating:", err);
-      toast.error(i18n.t("stopFailed", { ns: "chat" }));
-      return false;
+
+      try {
+        const result = await api.post<{ status: "aborted" | "not_found" }>(
+          API.CHAT.ABORT,
+          { stream_id: streamId },
+          // Aborting the same ordinary stream more than once has the same
+          // outcome, so a response lost at the network boundary is safe to retry.
+          { retryNetworkErrors: true },
+        );
+        if (result.status !== "aborted" && result.status !== "not_found") {
+          throw new Error(`Unexpected abort status: ${String(result.status)}`);
+        }
+      } catch (error) {
+        // Truthful stop semantics: if the backend did not acknowledge the abort,
+        // keep the stream attached and let the user retry Stop.
+        console.error("Failed to abort — backend may still be generating:", error);
+        toast.error(i18n.t("stopFailed", { ns: "chat" }));
+        return false;
+      }
     } finally {
       stopInFlightRef.current = false;
     }
@@ -735,14 +1168,27 @@ export function useChat(currentSessionId?: string) {
       const streamId = bucket?.streamId;
       if (!perm || !streamId || !canSubmitInteraction(perm.responseState)) return;
 
+      const explicitPattern = perm.patterns.find(
+        (pattern) => typeof pattern === "string" && Boolean(pattern.trim()),
+      );
+      const settingsState = useSettingsStore.getState();
+      const permissionContext = desktopPermissionContext(
+        queryClient,
+        targetSessionId,
+        settingsState.workspaceDirectory,
+      );
+      const shouldRemember = Boolean(
+        remember && explicitPattern && permissionContext,
+      );
+
       const req: RespondRequest = {
         stream_id: streamId,
         call_id: perm.callId,
         response: {
           allowed: allow,
-          remember,
+          remember: shouldRemember,
           permission: perm.tool || perm.permission,
-          pattern: perm.patterns[0] ?? "*",
+          pattern: explicitPattern ?? "*",
         },
       };
 
@@ -761,11 +1207,13 @@ export function useChat(currentSessionId?: string) {
           "resolved",
           { decision: result.decision, source: result.source },
         );
-        if (remember) {
-          useSettingsStore.getState().savePermissionRule(
-            perm.tool || perm.permission,
+        if (shouldRemember && explicitPattern && permissionContext) {
+          useSettingsStore.getState().savePermissionRule({
+            tool: perm.tool || perm.permission,
             allow,
-          );
+            pattern: explicitPattern,
+            ...permissionContext,
+          });
         }
       } catch (err) {
         const detail = respondErrorDetail(err);
@@ -800,7 +1248,7 @@ export function useChat(currentSessionId?: string) {
         );
       }
     },
-    [currentSessionId],
+    [currentSessionId, queryClient],
   );
 
   const editAndResend = useCallback(
@@ -842,11 +1290,11 @@ export function useChat(currentSessionId?: string) {
           run_commands: presets.runCommands,
         };
         const hasActivePresets = Object.values(permissionPresets).some(Boolean);
-        const permissionRules = settingsState.savedPermissions.map((rule) => ({
-          action: rule.allow ? "allow" as const : "deny" as const,
-          permission: rule.tool,
-          pattern: "*",
-        }));
+        const permissionRules = rememberedPermissionRules(
+          queryClient,
+          currentSessionId,
+          settingsState,
+        );
 
         const res = await api.post<PromptResponse>(API.CHAT.EDIT, {
           session_id: currentSessionId,
@@ -1187,6 +1635,7 @@ export function useChat(currentSessionId?: string) {
 
   return {
     sendMessage,
+    handleGoalCommand,
     queueMessage,
     cancelQueuedInput,
     updateQueuedInput,

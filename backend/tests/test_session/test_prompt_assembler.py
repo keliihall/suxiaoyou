@@ -110,6 +110,59 @@ class TestCachedSection:
 
 
 class TestDynamicSection:
+    def test_product_identity_overrides_stale_summary_on_continuation(self) -> None:
+        parts = assemble(
+            _agent(),
+            workspace_memory_section=(
+                "# Compacted Memory\nOlder assistant reply: Yakyak is a former name."
+            ),
+            goal_section="# Goal\ncontinue the resumed task",
+            **_PINNED,
+        )
+
+        assert "You are 苏小有 (suyo)" in parts.dynamic
+        assert "only an incorrect response produced by an older app version" in (
+            parts.dynamic
+        )
+        assert "Never describe that name as a former or previous name" in (
+            parts.dynamic
+        )
+        assert "language of the latest genuine user-authored message" in (
+            parts.dynamic
+        )
+        assert "request/UI locale controls process and UI-generated strings only" in (
+            parts.dynamic
+        )
+        assert "Yakyak is a former name" in parts.dynamic
+        assert parts.dynamic.index("# Compacted Memory") < parts.dynamic.index(
+            "<product_identity>"
+        )
+        assert parts.dynamic.index("# Goal") < parts.dynamic.index(
+            "<product_identity>"
+        )
+        assert parts.dynamic.index("<product_identity>") < parts.dynamic.index(
+            "<response_language>"
+        )
+        assert parts.dynamic.rstrip().endswith("</response_language>")
+
+    @pytest.mark.parametrize("persona_kind", ["custom", "plugin"])
+    def test_explicit_agent_persona_is_not_overridden(
+        self, persona_kind: str
+    ) -> None:
+        agent = _agent(system_prompt="You are the user's named specialist.")
+        agent.metadata[persona_kind] = True
+
+        parts = assemble(agent, **_PINNED)
+
+        assert "You are the user's named specialist." in parts.cached
+        assert "You are 苏小有 (suyo)" not in parts.as_plain_text()
+        assert "incorrect response produced by an older app version" not in (
+            parts.as_plain_text()
+        )
+        assert "<response_language>" in parts.dynamic
+        assert "latest genuine user-authored message" in parts.dynamic
+        assert parts.dynamic.rstrip().endswith("</response_language>")
+
     def test_workspace_memory_first(self) -> None:
         parts = assemble(
             _agent(),

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.auth.credential_store import (
     CredentialCleanupTransaction,
     StagedEnvValue,
+    is_credential_reference,
     prepare_stale_secret_cleanup,
     stage_protected_env_value,
 )
@@ -68,6 +69,8 @@ _ENV_PATH = Path(".env")
 
 def _mask_key(key: str) -> str:
     """Mask API key for display: show first 7 and last 4 chars."""
+    if is_credential_reference(key):
+        return "********"
     if len(key) <= 11:
         return "****"
     return f"{key[:7]}...{key[-4:]}"
@@ -79,6 +82,8 @@ def _mask_header_value(value: str) -> str:
     values; short ones get the universal ``****`` treatment."""
     if not value:
         return ""
+    if is_credential_reference(value):
+        return "********"
     if len(value) <= 8:
         return "****"
     return f"{value[:4]}...{value[-2:]}"

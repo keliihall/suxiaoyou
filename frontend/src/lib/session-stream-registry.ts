@@ -5,10 +5,19 @@ import { toast } from "sonner";
 import i18n from "@/i18n/config";
 import { SSEClient, type SSEConnectionStatus, type SSEEventHandler } from "@/lib/sse";
 import { API, IS_DESKTOP, getBackendToken, getBackendUrl, queryKeys } from "@/lib/constants";
+import {
+  goalSSEWatermarkForClear,
+  goalSSEWatermarkForSnapshot,
+  isGoalSnapshotBlockedByWatermark,
+  reconcileGoalClearedEvent,
+  reconcileGoalSnapshotEvent,
+  shouldRefetchGoalForPartialEvent,
+  type GoalSSEWatermark,
+} from "@/lib/goal-sse";
 import { isRemoteMode } from "@/lib/remote-connection";
 import { desktopAPI } from "@/lib/tauri-api";
 import { api } from "@/lib/api";
-import { SSE_EVENTS } from "@/types/streaming";
+import { SSE_EVENTS, type SSEEventData } from "@/types/streaming";
 import { notifyBackgroundFinish } from "@/lib/background-notify";
 import {
   hasProgressStalled,
@@ -34,6 +43,7 @@ import { useSettingsStore } from "@/stores/settings-store";
 import type { SessionResponse } from "@/types/session";
 import type { ArtifactType } from "@/types/artifact";
 import type { PaginatedMessages } from "@/types/message";
+import type { SessionGoal } from "@/types/goal";
 
 /**
  * Module-level registry of live SSE streams, keyed by sessionId.
@@ -297,6 +307,12 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     isCurrentStream()
     && store.getState().sessions[sessionId]?.streamId === streamId;
 
+  // Chat state is session-keyed and may keep updating in the background.
+  // Workspace/artifact stores are a single visible projection, so only the
+  // currently focused session may write to them.
+  const isFocusedSession = () =>
+    store.getState().focusedSessionId === sessionId;
+
   const textBuffer = new ProgressiveBuffer((text) => {
     if (isCurrentGeneration()) store.getState().appendTextDelta(sessionId, text);
   });
@@ -402,12 +418,14 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     if (!isCurrentGeneration()) return false;
     store.getState().finishGeneration(sid);
     if (instances.size === 0) connectionStore.getState().setStatus("idle");
-    const workspace = useWorkspaceStore.getState();
-    if (
-      workspace.todos.length > 0 &&
-      workspace.todos.every((todo) => todo.status === "completed")
-    ) {
-      workspace.collapseSection("progress");
+    if (isFocusedSession()) {
+      const workspace = useWorkspaceStore.getState();
+      if (
+        workspace.todos.length > 0 &&
+        workspace.todos.every((todo) => todo.status === "completed")
+      ) {
+        workspace.collapseSection("progress");
+      }
     }
     if (qc) qc.invalidateQueries({ queryKey: queryKeys.sessions.all });
     return true;
@@ -808,7 +826,79 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       handler(data, id);
     });
 
+  const goalKey = queryKeys.sessions.goal(sessionId);
+  const goalWatermarkKey = [...goalKey, "sse-watermark"] as const;
+  const invalidateGoalCache = () => {
+    const qc = queryClientRef;
+    if (qc) void qc.invalidateQueries({ queryKey: goalKey });
+  };
+  const syncGoalSnapshot = (data: SSEEventData) => {
+    const qc = queryClientRef;
+    if (!qc) return;
+    const current = qc.getQueryData<SessionGoal | null>(goalKey);
+    const decision = reconcileGoalSnapshotEvent(current, data, sessionId);
+    if (decision.kind === "apply") {
+      const watermark = qc.getQueryData<GoalSSEWatermark>(goalWatermarkKey);
+      if (isGoalSnapshotBlockedByWatermark(decision.goal, watermark)) return;
+      qc.setQueryData<SessionGoal | null>(goalKey, decision.goal);
+      qc.setQueryData(
+        goalWatermarkKey,
+        goalSSEWatermarkForSnapshot(decision.goal),
+      );
+    } else if (decision.kind === "refetch") {
+      invalidateGoalCache();
+    }
+  };
+  const clearGoalSnapshot = (data: SSEEventData) => {
+    const qc = queryClientRef;
+    if (!qc) return;
+    const current = qc.getQueryData<SessionGoal | null>(goalKey);
+    const watermark = qc.getQueryData<GoalSSEWatermark>(goalWatermarkKey);
+    if (
+      !current
+      && data.goal_id
+      && watermark
+      && (
+        data.goal_id !== watermark.goalId
+        || (
+          typeof data.revision === "number"
+          && data.revision < watermark.revision
+        )
+      )
+    ) {
+      return;
+    }
+    const decision = reconcileGoalClearedEvent(current, data, sessionId);
+    if (decision.kind === "clear") {
+      qc.setQueryData<SessionGoal | null>(goalKey, null);
+      const nextWatermark = goalSSEWatermarkForClear(current, data, watermark);
+      if (nextWatermark) qc.setQueryData(goalWatermarkKey, nextWatermark);
+    }
+  };
+  const refreshGoalFromPartialEvent = (data: SSEEventData) => {
+    if (shouldRefetchGoalForPartialEvent(data, sessionId)) {
+      invalidateGoalCache();
+    }
+  };
+  const refreshGoalAfterInteractionResolution = () => {
+    const qc = queryClientRef;
+    if (!qc?.getQueryData<SessionGoal | null>(goalKey)) return;
+    invalidateGoalCache();
+    // The acknowledgement can arrive just before the prompt coroutine commits
+    // waiting_user -> running. Recheck once across that short DB boundary.
+    setTimeout(() => {
+      if (isCurrentStream()) invalidateGoalCache();
+    }, 250);
+  };
+
   // ─── Event handlers ───
+
+  onCurrent(SSE_EVENTS.GOAL_UPDATED, syncGoalSnapshot);
+  onCurrent(SSE_EVENTS.GOAL_RUN_STARTED, syncGoalSnapshot);
+  onCurrent(SSE_EVENTS.GOAL_RUN_FINISHED, syncGoalSnapshot);
+  onCurrent(SSE_EVENTS.GOAL_BUDGET_WARNING, refreshGoalFromPartialEvent);
+  onCurrent(SSE_EVENTS.GOAL_NEEDS_USER, refreshGoalFromPartialEvent);
+  onCurrent(SSE_EVENTS.GOAL_CLEARED, clearGoalSnapshot);
 
   onCurrent(SSE_EVENTS.MODEL_LOADING, () => {
     store.getState().setModelLoading(sessionId, true);
@@ -838,7 +928,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       );
       markToolContinuation(data.call_id);
 
-      if (data.tool === "artifact" && data.arguments) {
+      if (isFocusedSession() && data.tool === "artifact" && data.arguments) {
         const args = data.arguments as Record<string, string>;
         const command = args.command || "create";
         if (command === "create" && args.type && args.title && args.content) {
@@ -867,7 +957,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     );
     markToolContinuation(data.call_id);
 
-    if (data.tool === "todo" && data.metadata) {
+    if (isFocusedSession() && data.tool === "todo" && data.metadata) {
       const meta = data.metadata as { todos?: Array<{ content: string; status: string; activeForm?: string }> };
       if (meta.todos) {
         useWorkspaceStore.getState().setTodos(meta.todos as WorkspaceTodo[]);
@@ -877,11 +967,24 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       }
     }
 
-    if (data.tool && ["write", "edit", "bash", "artifact"].includes(data.tool)) {
+    const resultMetadata = (data.metadata ?? {}) as Record<string, unknown>;
+    const deliveredFiles =
+      Array.isArray(resultMetadata.artifact_files) ||
+      Array.isArray(resultMetadata.written_files) ||
+      resultMetadata.artifact_delivery === true;
+    if (
+      isFocusedSession() &&
+      isCurrentGeneration() &&
+      data.tool &&
+      (
+        deliveredFiles ||
+        ["write", "edit", "image_generate", "office", "code_execute", "bash", "artifact"].includes(data.tool)
+      )
+    ) {
       api.get<{ files: Array<{ name: string; path: string; type: string }> }>(
         API.SESSIONS.FILES(sessionId),
       ).then((res) => {
-        if (!isCurrentStream()) return;
+        if (!isFocusedSession() || !isCurrentGeneration()) return;
         if (res.files) {
           useWorkspaceStore.getState().setWorkspaceFiles(
             res.files.map((f) => ({ name: f.name, path: f.path, type: f.type as WorkspaceFile["type"] })),
@@ -890,7 +993,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       }).catch((e) => console.warn("[stream-registry] Failed to refresh workspace files:", e));
     }
 
-    if (data.tool === "artifact" && data.metadata) {
+    if (isFocusedSession() && data.tool === "artifact" && data.metadata) {
       const meta = data.metadata as Record<string, string>;
       if (
         (meta.command === "update" || meta.command === "rewrite") &&
@@ -907,6 +1010,17 @@ export async function startStream(sessionId: string, streamId: string): Promise<
         });
       }
     }
+  });
+
+  onCurrent(SSE_EVENTS.TOOL_METADATA, (data) => {
+    if (!data.call_id) return;
+    store.getState().setToolMetadata(
+      sessionId,
+      data.call_id,
+      data.title,
+      data.metadata,
+    );
+    markToolContinuation(data.call_id);
   });
 
   onCurrent(SSE_EVENTS.TOOL_ERROR, (data) => {
@@ -953,6 +1067,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
 
   const updateTaskBatch = (data: { batch_id?: string | null; mode?: string | null; tasks?: unknown[] | null }) => {
     if (!data.batch_id || !data.mode || !Array.isArray(data.tasks)) return;
+    if (!isFocusedSession()) return;
     const ws = useWorkspaceStore.getState();
     ws.setTaskBatch({
       batch_id: data.batch_id,
@@ -997,7 +1112,8 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     if (!data.call_id) return;
     clearInteractionRecovery();
     const workMode = useSettingsStore.getState().workMode;
-    if (workMode === "auto") {
+    const requiresPerCallApproval = data.metadata?.approval_mode === "per_call";
+    if (workMode === "auto" && !requiresPerCallApproval) {
       api.post(API.CHAT.RESPOND, {
         stream_id: streamId,
         call_id: data.call_id,
@@ -1012,6 +1128,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       permission: data.permission ?? "",
       patterns: data.patterns ?? [],
       arguments: data.arguments ?? {},
+      metadata: data.metadata,
       message: data.message,
       argumentsTruncated: data.arguments_truncated ?? false,
     });
@@ -1038,6 +1155,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
         { decision: data.decision, source: data.source },
       );
     }
+    refreshGoalAfterInteractionResolution();
   });
 
   onCurrent(SSE_EVENTS.QUESTION_RESOLVED, (data) => {
@@ -1051,6 +1169,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
         { decision: data.decision, source: data.source },
       );
     }
+    refreshGoalAfterInteractionResolution();
   });
 
   onCurrent(SSE_EVENTS.PLAN_REVIEW_RESOLVED, (data) => {
@@ -1064,6 +1183,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
         { decision: data.decision, source: data.source },
       );
     }
+    refreshGoalAfterInteractionResolution();
   });
 
   onCurrent(SSE_EVENTS.PLAN_REVIEW, (data) => {
@@ -1076,6 +1196,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       filesToModify: data.files_to_modify ?? [],
     };
     store.getState().setPlanReview(sessionId, reviewData);
+    if (!isFocusedSession()) return;
     try {
       const { usePlanReviewStore } = require("@/stores/plan-review-store");
       usePlanReviewStore.getState().openReview(reviewData);
@@ -1131,26 +1252,29 @@ export async function startStream(sessionId: string, streamId: string): Promise<
 
   onCurrent(SSE_EVENTS.DESYNC, () => {
     const qc = queryClientRef;
-    if (qc) qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) });
+    if (qc) {
+      qc.invalidateQueries({ queryKey: queryKeys.messages.list(sessionId) });
+      invalidateGoalCache();
+    }
   });
 
   onCurrent(SSE_EVENTS.COMPACTION_ERROR, (data) => {
     toast.warning(data.error_message || "Context compression failed. Consider starting a new chat.");
   });
 
-  onCurrent(SSE_EVENTS.DONE, async () => {
-    // Close synchronously before the awaits below: the stream ends right after
-    // DONE, so the dying EventSource must not schedule a reconnect to a job
+  onCurrent(SSE_EVENTS.DONE, () => {
+    // Close synchronously: the stream ends right after DONE, so the dying
+    // EventSource must not schedule a reconnect to a job
     // that is already complete (→ a spurious "Job not found").
     client.close();
     cancelPendingStepFinish();
     textBuffer.flush();
     reasoningBuffer.flush();
-    try {
-      await finishFromDatabase(sessionId);
-    } finally {
-      finishCurrentGeneration();
-    }
+    // DONE is the authoritative terminal boundary.  Do not keep the product
+    // in "Finalizing" while a messages refetch or the backend's active-job
+    // cleanup races behind this event; DB verification is only required when
+    // recovering a stream that missed DONE.
+    finishCurrentGeneration();
     if (!isCurrentStream()) return;
     const qc = queryClientRef;
     if (qc) {
@@ -1160,14 +1284,15 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       qc.invalidateQueries({ queryKey: queryKeys.sessions.all });
       qc.invalidateQueries({ queryKey: queryKeys.sessions.detail(sessionId) });
       qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) });
+      invalidateGoalCache();
     }
     maybeNotifyFinish(sessionId, "done");
     stopCurrentStream();
   });
 
-  const handleAgentError = async (data: { error_message?: string | null; code?: string | null }) => {
-    // Close the dead connection synchronously, before the awaits below. The
-    // server ends the response right after this single error event, so the
+  const handleAgentError = (data: { error_message?: string | null; code?: string | null }) => {
+    // Close the dead connection synchronously. The server ends the response
+    // right after this single error event, so the
     // EventSource would otherwise fire onerror mid-await and schedule a
     // reconnect to a stream the backend no longer has.
     client.close();
@@ -1188,11 +1313,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     console.warn("SSE agent error:", message);
     textBuffer.flush();
     reasoningBuffer.flush();
-    try {
-      await finishFromDatabase(sessionId);
-    } finally {
-      finishCurrentGeneration();
-    }
+    finishCurrentGeneration();
     if (!isCurrentStream()) return;
     const qc = queryClientRef;
     if (qc) {
@@ -1201,6 +1322,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       }, 500);
       qc.invalidateQueries({ queryKey: queryKeys.sessions.detail(sessionId) });
       qc.invalidateQueries({ queryKey: queryKeys.sessionInputs(sessionId) });
+      invalidateGoalCache();
     }
     if (!streamGone) maybeNotifyFinish(sessionId, "error", message);
     stopCurrentStream();

@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.plugin.manager import PluginPersistenceError
+
 router = APIRouter(prefix="/plugins")
 
 
@@ -43,7 +45,10 @@ async def enable_plugin(name: str, request: Request) -> dict[str, Any]:
     manager = _get_manager(request)
     if manager is None:
         return {"success": False, "error": "Plugin system not available"}
-    success = manager.enable(name)
+    try:
+        success = manager.enable(name)
+    except PluginPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"success": success, "plugins": manager.status()}
 
 
@@ -53,5 +58,8 @@ async def disable_plugin(name: str, request: Request) -> dict[str, Any]:
     manager = _get_manager(request)
     if manager is None:
         return {"success": False, "error": "Plugin system not available"}
-    success = manager.disable(name)
+    try:
+        success = manager.disable(name)
+    except PluginPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"success": success, "plugins": manager.status()}

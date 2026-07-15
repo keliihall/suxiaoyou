@@ -54,7 +54,7 @@
     },
     "google-workspace": {
       "type": "local",
-      "command": ["uvx", "--from", "google-workspace-mcp", "google-workspace-worker"],
+      "command": ["uvx", "--from", "google-workspace-mcp==2.0.8", "google-workspace-worker"],
       "enabled": false
     },
     "similarweb": {

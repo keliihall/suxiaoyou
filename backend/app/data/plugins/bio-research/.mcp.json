@@ -2,7 +2,7 @@
   "mcpServers": {
     "pubmed": {
       "type": "local",
-      "command": ["uvx", "pubmed-mcp"],
+      "command": ["uvx", "--from", "pubmed-search-mcp==0.5.17", "pubmed-search-mcp"],
       "enabled": false
     },
     "biorender": {

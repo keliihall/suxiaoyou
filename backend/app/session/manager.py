@@ -525,16 +525,20 @@ async def get_message_history_for_llm(
                     tool_name = part_data.get("tool", "")
                     call_id = part_data.get("call_id", "")
                     state = part_data.get("state", {})
+                    metadata = state.get("metadata") or {}
 
                     # Tool call from assistant
-                    tool_calls.append({
+                    tool_call = {
                         "id": call_id,
                         "type": "function",
                         "function": {
                             "name": tool_name,
                             "arguments": _serialize_args(state.get("input", {})),
                         },
-                    })
+                    }
+                    if metadata.get("_native"):
+                        tool_call["_native"] = True
+                    tool_calls.append(tool_call)
 
                     # Tool result
                     output = state.get("output", "")
@@ -543,7 +547,6 @@ async def get_message_history_for_llm(
                     output = trim_for_context(output or "", max_tool_output_chars, "tool output")
 
                     # Check for image data in tool metadata (from read tool)
-                    metadata = state.get("metadata") or {}
                     image_data_url = metadata.get("image_data_url")
 
                     if image_data_url:
@@ -814,6 +817,7 @@ async def update_session(
     db: AsyncSession,
     session_id: str,
     body: SessionUpdate,
+    stream_manager: StreamManager,
 ) -> Session:
     """Apply partial updates to a session.
 
@@ -840,6 +844,24 @@ async def update_session(
         _trigger_index(body.directory, session_id)
     if "time_archived" in body.model_fields_set:
         session.time_archived = body.time_archived
+        if body.time_archived is not None:
+            from app.session.goal_manager import pause_active_goal_for_archive
+
+            active = (
+                stream_manager.active_job_for_session(session_id)
+                if stream_manager is not None
+                else None
+            )
+            if active is not None and active.goal_id is not None:
+                async with active.execution_admission_lock:
+                    active.close_execution_admission()
+                    paused_goal = await pause_active_goal_for_archive(db, session_id)
+                    if paused_goal:
+                        active.deny_pending_responses(source="session_archived")
+            else:
+                paused_goal = await pause_active_goal_for_archive(db, session_id)
+                if paused_goal and active is not None:
+                    active.deny_pending_responses(source="session_archived")
     if body.is_pinned is not None:
         session.is_pinned = body.is_pinned
     if preserve_time_updated:
@@ -865,21 +887,44 @@ async def delete_session_cascade(
     from app.dependencies import get_index_manager
 
     if stream_manager is not None:
-        stream_manager.abort_session(session_id)
+        _count, quiesced = await stream_manager.abort_session_and_wait(
+            session_id,
+            timeout=10.0,
+        )
+        if not quiesced:
+            logger.warning(
+                "Session %s required forced worker cancellation before deletion",
+                session_id,
+            )
 
     await delete_session_uploads(db, session_id)
     deleted = await delete_by_id(db, Session, session_id)
     if not deleted:
         raise NotFound("Session not found")
 
-    # Interactive confirmations can contain free-form answers.  They use the
-    # existing durable idempotency ledger so retries survive a restart, but
-    # they must not outlive the conversation the user explicitly deleted.
-    # Keep this in the same route-owned transaction as the Session deletion.
+    # Interactive confirmations and Goal controls use the durable idempotency
+    # ledger so retries survive a restart. Neither may outlive the conversation
+    # the user explicitly deleted. Keep cleanup in the route-owned transaction.
+    goal_idempotency_scopes = tuple(
+        f"goal.{operation}:{session_id}"
+        for operation in ("create", "update", "pause", "resume", "clear")
+    )
     await db.execute(
         delete(IdempotencyRecord).where(
-            IdempotencyRecord.scope.like("chat.respond:%"),
-            IdempotencyRecord.response["session_id"].as_string() == session_id,
+            or_(
+                and_(
+                    IdempotencyRecord.scope.like("chat.respond:%"),
+                    IdempotencyRecord.response["session_id"].as_string()
+                    == session_id,
+                ),
+                and_(
+                    IdempotencyRecord.scope == "chat.goal",
+                    IdempotencyRecord.response["session_id"].as_string()
+                    == session_id,
+                ),
+                IdempotencyRecord.scope.in_(goal_idempotency_scopes),
+                IdempotencyRecord.scope == f"goal.resume.run:{session_id}",
+            )
         )
     )
 
@@ -928,6 +973,8 @@ async def compact_session_cascade(
     job = GenerationJob(
         stream_id=f"manual-compact-{generate_ulid()}",
         session_id=session_id,
+        invocation_source="desktop",
+        invocation_source_id="desktop",
     )
 
     async with session_factory() as s:

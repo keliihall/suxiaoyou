@@ -153,7 +153,7 @@ The corresponding bundled license reports are
 
 The checked-in `release-licenses/` directory is a curated, mandatory baseline;
 it also contains generated JavaScript, Python, and Rust reports for the locked
-v0.9.0 production graphs. Platform-specific build-only JavaScript packages can
+v1.0.0 production graphs. Platform-specific build-only JavaScript packages can
 vary by build host and are not part of the installed static web application.
 Each dependency remains subject to its own license, and package-specific
 license files retained inside runtime payloads remain in force. Release

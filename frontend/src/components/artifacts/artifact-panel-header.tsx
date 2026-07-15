@@ -1,6 +1,6 @@
 "use client";
 
-import { X, ChevronLeft, ChevronRight, Code, FileText, FileSpreadsheet, Globe, Image, LayoutDashboard, GitBranch, Presentation } from "lucide-react";
+import { X, ChevronLeft, ChevronRight, Code, FileText, FileSpreadsheet, Globe, Image, LayoutDashboard, GitBranch, Music, Presentation, Video } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useArtifactStore } from "@/stores/artifact-store";
 import type { ArtifactType } from "@/types/artifact";
@@ -10,6 +10,8 @@ const TYPE_CONFIG: Record<ArtifactType, { icon: React.ComponentType<{ className?
   html: { icon: Globe, label: "HTML" },
   svg: { icon: Image, label: "SVG" },
   image: { icon: Image, label: "Image" },
+  audio: { icon: Music, label: "Audio" },
+  video: { icon: Video, label: "Video" },
   code: { icon: Code, label: "Code" },
   markdown: { icon: FileText, label: "Markdown" },
   mermaid: { icon: GitBranch, label: "Diagram" },

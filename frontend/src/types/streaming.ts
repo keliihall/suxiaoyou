@@ -1,11 +1,13 @@
 /** SSE event types — mirrors backend app/streaming/events.py */
 
 import type { InteractionResponseState } from "@/lib/interaction-response";
+import type { SessionGoal } from "@/types/goal";
 
 export const SSE_EVENTS = {
   TEXT_DELTA: "text-delta",
   REASONING_DELTA: "reasoning-delta",
   TOOL_START: "tool-call",
+  TOOL_METADATA: "tool_metadata",
   TOOL_RESULT: "tool-result",
   TOOL_ERROR: "tool-error",
   STEP_START: "step-start",
@@ -35,6 +37,12 @@ export const SSE_EVENTS = {
   INPUT_APPLIED: "input-applied",
   INPUT_STARTED: "input-started",
   INPUT_FAILED: "input-failed",
+  GOAL_UPDATED: "goal-updated",
+  GOAL_CLEARED: "goal-cleared",
+  GOAL_RUN_STARTED: "goal-run-started",
+  GOAL_RUN_FINISHED: "goal-run-finished",
+  GOAL_BUDGET_WARNING: "goal-budget-warning",
+  GOAL_NEEDS_USER: "goal-needs-user",
 } as const;
 
 export interface TaskBatchProgressItem {
@@ -46,6 +54,37 @@ export interface TaskBatchProgressItem {
   provider_id?: string | null;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   error?: string | null;
+}
+
+export interface GoalRunSSESnapshot {
+  id: string;
+  goal_id: string;
+  ordinal: number;
+  goal_revision: number;
+  idempotency_key: string;
+  stream_id: string | null;
+  trigger: "initial" | "auto" | "resume" | "user_input";
+  status:
+    | "reserved"
+    | "running"
+    | "waiting_user"
+    | "completed"
+    | "blocked"
+    | "interrupted"
+    | "failed";
+  tokens_used: number;
+  cost_used_microusd: number;
+  active_seconds: number;
+  progress_summary: string | null;
+  stop_reason: string | null;
+  error_code: string | null;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  side_effects_started: boolean;
+  time_started: string | null;
+  time_finished: string | null;
+  time_created: string;
+  time_updated: string;
 }
 
 /** SSE event payload — mirrors backend app/schemas/streaming.py SSEEventData */
@@ -123,6 +162,17 @@ export interface SSEEventData {
   input_id?: string | null;
   position?: number | null;
   error?: string | null;
+
+  // persistent Goal lifecycle
+  goal?: SessionGoal | null;
+  run?: GoalRunSSESnapshot | null;
+  goal_id?: string | null;
+  goal_run_id?: string | null;
+  /** Reserved for identity-safe goal-cleared events; no publisher exists yet. */
+  revision?: number | null;
+  token_remaining?: number | null;
+  cost_remaining_microusd?: number | null;
+  time_remaining_seconds?: number | null;
 }
 
 /** Parsed SSE event with type and data. */
@@ -140,6 +190,7 @@ export interface PermissionRequest {
   permission: string;
   patterns: string[];
   arguments: Record<string, unknown>;
+  metadata?: Record<string, unknown> | null;
   message?: string | null;
   argumentsTruncated?: boolean;
   responseState?: InteractionResponseState;

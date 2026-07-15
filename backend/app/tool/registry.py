@@ -17,6 +17,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._disabled: set[str] = set()
 
     def register(self, tool: ToolDefinition) -> None:
         """Register a tool."""
@@ -29,11 +30,41 @@ class ToolRegistry:
 
     def get(self, tool_id: str) -> ToolDefinition | None:
         """Get a tool by ID."""
+        if tool_id in self._disabled:
+            return None
+        return self._tools.get(tool_id)
+
+    def get_registered(self, tool_id: str) -> ToolDefinition | None:
+        """Get a registered tool even when Security Center disabled it."""
+
         return self._tools.get(tool_id)
 
     def all_tools(self) -> list[ToolDefinition]:
         """List all registered tools."""
+        return [tool for tool_id, tool in self._tools.items() if tool_id not in self._disabled]
+
+    def registered_tools(self) -> list[ToolDefinition]:
+        """List registered tools including entries disabled by Security Center."""
+
         return list(self._tools.values())
+
+    def set_disabled(self, tool_ids: set[str] | frozenset[str]) -> None:
+        self._disabled = set(tool_ids)
+
+    def set_enabled(self, tool_id: str, enabled: bool) -> bool:
+        """Enable/disable one registered tool; return whether state changed."""
+
+        if tool_id not in self._tools:
+            return False
+        before = tool_id not in self._disabled
+        if enabled:
+            self._disabled.discard(tool_id)
+        else:
+            self._disabled.add(tool_id)
+        return before is not enabled
+
+    def is_enabled(self, tool_id: str) -> bool:
+        return tool_id in self._tools and tool_id not in self._disabled
 
     def resolve_for_agent(
         self,
@@ -57,6 +88,8 @@ class ToolRegistry:
             ]
         else:
             candidates = list(self._tools.values())
+
+        candidates = [tool for tool in candidates if tool.id not in self._disabled]
 
         # Filter by permissions
         ruleset = agent.permissions

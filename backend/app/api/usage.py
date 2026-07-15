@@ -86,6 +86,20 @@ class UsageStats(BaseModel):
 # --- Endpoint ---
 
 
+def _message_token_value(field: str):
+    """Use full multi-step totals, falling back to legacy/latest snapshots."""
+
+    return func.coalesce(
+        func.json_extract(Message.data, f"$.tokens_accumulated.{field}"),
+        func.json_extract(Message.data, f"$.tokens.{field}"),
+        0,
+    )
+
+
+def _message_token_sum(field: str):
+    return func.coalesce(func.sum(_message_token_value(field)), 0)
+
+
 @router.get("/usage", response_model=UsageStats)
 async def get_usage_stats(
     db: AsyncSession = Depends(get_db),
@@ -101,21 +115,11 @@ async def get_usage_stats(
             func.coalesce(
                 func.sum(func.json_extract(Message.data, "$.cost")), 0
             ).label("total_cost"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.input")), 0
-            ).label("total_input"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.output")), 0
-            ).label("total_output"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.reasoning")), 0
-            ).label("total_reasoning"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.cache_read")), 0
-            ).label("total_cache_read"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.cache_write")), 0
-            ).label("total_cache_write"),
+            _message_token_sum("input").label("total_input"),
+            _message_token_sum("output").label("total_output"),
+            _message_token_sum("reasoning").label("total_reasoning"),
+            _message_token_sum("cache_read").label("total_cache_read"),
+            _message_token_sum("cache_write").label("total_cache_write"),
         )
         .where(
             func.json_extract(Message.data, "$.role") == "assistant",
@@ -145,7 +149,17 @@ async def get_usage_stats(
     )
     total_sessions = (await db.execute(session_count_stmt)).scalar() or 0
 
-    all_tokens = total_tokens.input + total_tokens.output + total_tokens.reasoning
+    # Match the durable Goal ledger: cached prompt tokens are still consumed
+    # Provider tokens and must not disappear from the 7/30/90-day dashboard.
+    # Cache-write is retained as diagnostic data but is not added separately,
+    # because providers may already include it in input and the Goal ledger
+    # intentionally uses the same four-field accounting formula.
+    all_tokens = (
+        total_tokens.input
+        + total_tokens.output
+        + total_tokens.reasoning
+        + total_tokens.cache_read
+    )
     avg_tokens_per_session = all_tokens / total_sessions if total_sessions > 0 else 0.0
 
     # --- Per-model breakdown ---
@@ -157,21 +171,11 @@ async def get_usage_stats(
             func.coalesce(
                 func.sum(func.json_extract(Message.data, "$.cost")), 0
             ).label("total_cost"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.input")), 0
-            ).label("total_input"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.output")), 0
-            ).label("total_output"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.reasoning")), 0
-            ).label("total_reasoning"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.cache_read")), 0
-            ).label("total_cache_read"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.cache_write")), 0
-            ).label("total_cache_write"),
+            _message_token_sum("input").label("total_input"),
+            _message_token_sum("output").label("total_output"),
+            _message_token_sum("reasoning").label("total_reasoning"),
+            _message_token_sum("cache_read").label("total_cache_read"),
+            _message_token_sum("cache_write").label("total_cache_write"),
         )
         .where(
             func.json_extract(Message.data, "$.role") == "assistant",
@@ -184,9 +188,13 @@ async def get_usage_stats(
         )
         .having(
             # Filter out models with zero total tokens (unused models)
-            (func.coalesce(func.sum(func.json_extract(Message.data, "$.tokens.input")), 0)
-             + func.coalesce(func.sum(func.json_extract(Message.data, "$.tokens.output")), 0)
-             + func.coalesce(func.sum(func.json_extract(Message.data, "$.tokens.reasoning")), 0)) > 0
+            (
+                _message_token_sum("input")
+                + _message_token_sum("output")
+                + _message_token_sum("reasoning")
+                + _message_token_sum("cache_read")
+            )
+            > 0
         )
         .order_by(text("total_cost DESC"))
         .limit(20)
@@ -219,15 +227,10 @@ async def get_usage_stats(
             func.coalesce(
                 func.sum(func.json_extract(Message.data, "$.cost")), 0
             ).label("total_cost"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.input")), 0
-            ).label("total_input"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.output")), 0
-            ).label("total_output"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.reasoning")), 0
-            ).label("total_reasoning"),
+            _message_token_sum("input").label("total_input"),
+            _message_token_sum("output").label("total_output"),
+            _message_token_sum("reasoning").label("total_reasoning"),
+            _message_token_sum("cache_read").label("total_cache_read"),
         )
         .join(Session, Message.session_id == Session.id)
         .where(
@@ -245,7 +248,12 @@ async def get_usage_stats(
             session_id=row.session_id,
             title=row.title or "Untitled",
             total_cost=float(row.total_cost),
-            total_tokens=int(row.total_input) + int(row.total_output) + int(row.total_reasoning),
+            total_tokens=(
+                int(row.total_input)
+                + int(row.total_output)
+                + int(row.total_reasoning)
+                + int(row.total_cache_read)
+            ),
             message_count=int(row.message_count),
             time_created=row.session_created,
         )
@@ -260,15 +268,10 @@ async def get_usage_stats(
             func.coalesce(
                 func.sum(func.json_extract(Message.data, "$.cost")), 0
             ).label("cost"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.input")), 0
-            ).label("tokens_in"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.output")), 0
-            ).label("tokens_out"),
-            func.coalesce(
-                func.sum(func.json_extract(Message.data, "$.tokens.reasoning")), 0
-            ).label("tokens_reasoning"),
+            _message_token_sum("input").label("tokens_in"),
+            _message_token_sum("output").label("tokens_out"),
+            _message_token_sum("reasoning").label("tokens_reasoning"),
+            _message_token_sum("cache_read").label("tokens_cache_read"),
         )
         .where(
             func.json_extract(Message.data, "$.role") == "assistant",
@@ -282,7 +285,12 @@ async def get_usage_stats(
         DailyUsage(
             date=str(row.date),
             cost=float(row.cost),
-            tokens=int(row.tokens_in) + int(row.tokens_out) + int(row.tokens_reasoning),
+            tokens=(
+                int(row.tokens_in)
+                + int(row.tokens_out)
+                + int(row.tokens_reasoning)
+                + int(row.tokens_cache_read)
+            ),
             messages=int(row.messages),
         )
         for row in daily_rows

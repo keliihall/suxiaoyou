@@ -371,7 +371,12 @@ async def chat_completions(
         )
 
     # Create generation job
-    job = sm.create_job(stream_id=stream_id, session_id=session_id)
+    job = sm.create_job(
+        stream_id=stream_id,
+        session_id=session_id,
+        invocation_source="openai_compat",
+        invocation_source_id="openai_compat",
+    )
     # Non-interactive: permissions auto-approve in headless mode
     job.interactive = False
 

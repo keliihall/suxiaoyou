@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import tomllib
 from pathlib import Path
 
 from app.channels.registry import CHINA_READY_CHANNELS
+from app.main import APP_VERSION, create_app
 
 
 SPEC_PATH = Path(__file__).parents[1] / "suxiaoyou.spec"
+PYPROJECT_PATH = Path(__file__).parents[1] / "pyproject.toml"
+
+
+def test_backend_api_reports_the_release_metadata_version() -> None:
+    project = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+
+    assert APP_VERSION == project["project"]["version"]
+    assert create_app().version == APP_VERSION
 
 
 def _spec_tree() -> ast.Module:

@@ -12,6 +12,7 @@
  * Handled shapes:
  *   - `string`                                          → returned (clipped to 300 chars to survive 502 HTML or rate-limit text dumps)
  *   - `{ detail: string }`                              → returns the detail
+ *   - `{ detail: {message: string} }`                   → returns the nested message
  *   - `{ detail: [{msg: string, ...}, ...] }` (FastAPI) → joins all `msg` fields with "; "
  *   - `{ detail: ["str1", "str2"] }`                    → joins items with "; "
  *   - `{ message: string }`                             → returns the message
@@ -33,6 +34,12 @@ export function extractErrorMessage(body: unknown, fallback: string): string {
   if ("detail" in body) {
     const detail = (body as { detail: unknown }).detail;
     if (typeof detail === "string" && detail.trim()) return detail;
+    if (detail && typeof detail === "object" && "message" in detail) {
+      const message = (detail as { message: unknown }).message;
+      if (typeof message === "string" && message.trim()) {
+        return message.slice(0, 300);
+      }
+    }
     if (Array.isArray(detail)) {
       const messages: string[] = [];
       for (const item of detail) {

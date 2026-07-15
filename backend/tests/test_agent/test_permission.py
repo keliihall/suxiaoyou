@@ -5,9 +5,12 @@ from app.agent.permission import (
     RejectedError,
     disabled_tools,
     evaluate,
+    intersect_permission_rulesets,
     merge_rulesets,
+    parse_permission_snapshot,
     parse_session_permissions,
     presets_to_ruleset,
+    serialize_permission_snapshot,
 )
 from app.schemas.agent import PermissionRule, Ruleset
 from app.session.prompt import _merge_prompt_permission_layers
@@ -52,7 +55,10 @@ class TestEvaluate:
         assert evaluate("anything", "*", rs) == "deny"
 
     def test_global_defaults_ask_for_all_execution_and_file_mutation(self):
-        for permission in ("bash", "code_execute", "write", "edit", "apply_patch"):
+        for permission in (
+            "bash", "code_execute", "write", "edit", "apply_patch",
+            "office", "restore_file_version",
+        ):
             assert evaluate(permission, "*", GLOBAL_DEFAULTS) == "ask"
 
 
@@ -67,6 +73,8 @@ class TestPermissionPresets:
         assert evaluate("write", "*", rules) == "allow"
         assert evaluate("edit", "*", rules) == "allow"
         assert evaluate("apply_patch", "*", rules) == "allow"
+        assert evaluate("office", "*", rules) == "allow"
+        assert evaluate("restore_file_version", "*", rules) == "allow"
 
     def test_exact_match(self):
         rs = Ruleset(rules=[
@@ -177,9 +185,216 @@ class TestMergeRulesets:
             parent_snapshot,
             stale_child_session,
             request_is_authoritative=True,
+            enforce_current_ceiling=True,
         )
 
         assert evaluate("bash", "*", merged) == "deny"
+
+    def test_current_agent_deny_blocks_stale_authoritative_allow(self):
+        current_agent = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="deny", permission="bash"),
+        ])
+        stale_snapshot = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="allow", permission="bash"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            current_agent,
+            Ruleset(),
+            stale_snapshot,
+            Ruleset(),
+            request_is_authoritative=True,
+            enforce_current_ceiling=True,
+        )
+
+        assert evaluate("bash", "*", merged) == "deny"
+
+    def test_current_session_deny_blocks_stale_authoritative_allow(self):
+        stale_snapshot = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="allow", permission="web_search"),
+        ])
+        current_session = Ruleset(rules=[
+            PermissionRule(action="deny", permission="web_search"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            Ruleset(rules=[
+                PermissionRule(action="allow", permission="*"),
+            ]),
+            Ruleset(),
+            stale_snapshot,
+            current_session,
+            request_is_authoritative=True,
+            enforce_current_ceiling=True,
+        )
+
+        assert evaluate("web_search", "*", merged) == "deny"
+
+    def test_authoritative_deny_blocks_current_agent_allow(self):
+        current_agent = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="allow", permission="bash"),
+        ])
+        parent_snapshot = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="deny", permission="bash"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            current_agent,
+            Ruleset(),
+            parent_snapshot,
+            Ruleset(),
+            request_is_authoritative=True,
+            enforce_current_ceiling=True,
+        )
+
+        assert evaluate("bash", "*", merged) == "deny"
+
+    def test_changed_agent_allow_to_ask_tightens_goal_with_baseline(self):
+        old_agent = Ruleset(rules=[
+            PermissionRule(action="allow", permission="web_search"),
+        ])
+        current_agent = Ruleset(rules=[
+            PermissionRule(action="ask", permission="web_search"),
+        ])
+        old_goal = Ruleset(rules=[
+            PermissionRule(action="allow", permission="web_search"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            current_agent,
+            Ruleset(),
+            old_goal,
+            Ruleset(),
+            request_is_authoritative=True,
+            enforce_current_ceiling=True,
+            goal_policy_baseline=(GLOBAL_DEFAULTS, old_agent),
+        )
+
+        assert evaluate("web_search", "*", merged) == "ask"
+
+    def test_unchanged_agent_ask_preserves_authorized_goal_allow(self):
+        agent = Ruleset(rules=[
+            PermissionRule(action="ask", permission="bash"),
+        ])
+        old_goal = Ruleset(rules=[
+            PermissionRule(action="allow", permission="bash"),
+        ])
+
+        merged = _merge_prompt_permission_layers(
+            agent,
+            Ruleset(),
+            old_goal,
+            Ruleset(),
+            request_is_authoritative=True,
+            enforce_current_ceiling=True,
+            goal_policy_baseline=(GLOBAL_DEFAULTS, agent),
+        )
+
+        assert evaluate("bash", "*", merged) == "allow"
+
+
+class TestIntersectPermissionRulesets:
+    def test_allow_and_deny_intersection_is_deny_in_both_orders(self):
+        allowed = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+        ])
+        denied = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(action="deny", permission="bash"),
+        ])
+
+        assert evaluate(
+            "bash", "*", intersect_permission_rulesets(allowed, denied)
+        ) == "deny"
+        assert evaluate(
+            "bash", "*", intersect_permission_rulesets(denied, allowed)
+        ) == "deny"
+        assert evaluate(
+            "read", "*", intersect_permission_rulesets(allowed, denied)
+        ) == "allow"
+
+    def test_ask_is_stricter_than_allow_but_not_deny(self):
+        allowed = Ruleset(rules=[
+            PermissionRule(action="allow", permission="web_search"),
+        ])
+        asked = Ruleset(rules=[
+            PermissionRule(action="ask", permission="web_search"),
+        ])
+        denied = Ruleset(rules=[
+            PermissionRule(action="deny", permission="web_search"),
+        ])
+
+        assert evaluate(
+            "web_search", "*", intersect_permission_rulesets(allowed, asked)
+        ) == "ask"
+        assert evaluate(
+            "web_search", "*", intersect_permission_rulesets(asked, denied)
+        ) == "deny"
+
+    def test_intersection_preserves_two_dimensional_path_policy(self):
+        broad_allow = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+        ])
+        current_path_policy = Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+            PermissionRule(
+                action="deny",
+                permission="write",
+                pattern="/etc/*",
+            ),
+        ])
+
+        for effective in (
+            intersect_permission_rulesets(broad_allow, current_path_policy),
+            intersect_permission_rulesets(current_path_policy, broad_allow),
+        ):
+            assert evaluate("write", "/etc/passwd", effective) == "deny"
+            assert evaluate("write", "/workspace/result.txt", effective) == "allow"
+
+    def test_intersection_survives_snapshot_roundtrip(self):
+        original = intersect_permission_rulesets(
+            Ruleset(rules=[
+                PermissionRule(action="allow", permission="*"),
+                PermissionRule(action="ask", permission="bash"),
+            ]),
+            Ruleset(rules=[
+                PermissionRule(action="allow", permission="*"),
+                PermissionRule(
+                    action="deny",
+                    permission="read",
+                    pattern="*.env",
+                ),
+            ]),
+        )
+
+        restored = parse_permission_snapshot(
+            serialize_permission_snapshot(original)
+        )
+
+        assert restored is not None
+        for permission, pattern, expected in (
+            ("read", "README.md", "allow"),
+            ("read", ".env", "deny"),
+            ("bash", "*", "ask"),
+        ):
+            assert evaluate(permission, pattern, restored) == expected
+
+    def test_malformed_authority_snapshot_is_rejected_as_a_whole(self):
+        snapshot = serialize_permission_snapshot(Ruleset(rules=[
+            PermissionRule(action="allow", permission="*"),
+        ]))
+        snapshot["rules"].append({
+            "action": "not-a-real-action",
+            "permission": "bash",
+            "pattern": "*",
+        })
+
+        assert parse_permission_snapshot(snapshot) is None
 
 
 class TestDisabledTools:

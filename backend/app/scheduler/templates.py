@@ -141,25 +141,32 @@ _TEMPLATES: list[dict] = [
     # --- Loop templates (office / productivity scenarios) ---
     {
         "id": "loop-email-batch",
-        "name": {"zh": "批量处理邮件 (循环)", "en": "Batch Process Emails (Loop)"},
+        "name": {"zh": "逐封审阅邮件 (循环)", "en": "Review Inbox Emails (Loop)"},
         "description": {
-            "zh": "逐封处理收件箱中的待办邮件，草拟回复或归档",
-            "en": "Process inbox emails one by one — draft replies or archive",
+            "zh": (
+                "逐封审阅待办邮件，草拟回复并报告建议操作（不修改邮箱）"
+            ),
+            "en": (
+                "Review inbox emails, draft replies, and report suggested actions "
+                "without changing the mailbox"
+            ),
         },
         "prompt": {
             "zh": (
-                "查看收件箱中下一封未处理的邮件。根据内容决定：\n"
+                "查看收件箱中下一封未审阅的邮件。根据内容给出建议：\n"
                 "- 需要回复的：草拟一封简洁的回复\n"
-                "- 仅供知会的：标记为已读并归档\n"
-                "- 需要跟进的：创建一个待办提醒\n"
-                "如果所有邮件都已处理完毕，输出 [LOOP_DONE]。"
+                "- 仅供知会的：建议是否标记已读或归档\n"
+                "- 需要跟进的：拟定一个待办提醒\n"
+                "不要修改邮箱状态、发送邮件或创建待办。"
+                "如果所有邮件都已审阅完毕，输出 [LOOP_DONE]。"
             ),
             "en": (
-                "Check the next unprocessed email in the inbox. Based on content:\n"
+                "Check the next unreviewed email in the inbox. Based on content:\n"
                 "- Needs reply: draft a concise response\n"
-                "- FYI only: mark as read and archive\n"
-                "- Needs follow-up: create a todo reminder\n"
-                "If all emails are processed, output [LOOP_DONE]."
+                "- FYI only: suggest whether to mark as read or archive\n"
+                "- Needs follow-up: propose a todo reminder\n"
+                "Do not change mailbox state, send messages, or create tasks. "
+                "If all emails are reviewed, output [LOOP_DONE]."
             ),
         },
         "schedule_config": None,
@@ -181,7 +188,7 @@ _TEMPLATES: list[dict] = [
                 "1. 逻辑是否连贯，论述是否充分\n"
                 "2. 语法和用词是否准确\n"
                 "3. 格式是否统一\n"
-                "给出修改建议或直接修正。"
+                "给出修改建议，不要直接修改原文。"
                 "如果所有章节都已审阅完毕，输出 [LOOP_DONE]。"
             ),
             "en": (
@@ -189,7 +196,7 @@ _TEMPLATES: list[dict] = [
                 "1. Is the logic coherent and reasoning sound?\n"
                 "2. Are grammar and wording accurate?\n"
                 "3. Is formatting consistent?\n"
-                "Suggest edits or fix directly. "
+                "Suggest edits without modifying the document. "
                 "If all sections are reviewed, output [LOOP_DONE]."
             ),
         },
@@ -201,25 +208,30 @@ _TEMPLATES: list[dict] = [
     },
     {
         "id": "loop-data-cleanup",
-        "name": {"zh": "数据批量清洗 (循环)", "en": "Batch Data Cleanup (Loop)"},
+        "name": {"zh": "数据清洗审阅 (循环)", "en": "Data Cleanup Review (Loop)"},
         "description": {
-            "zh": "逐批清洗和标准化表格数据",
-            "en": "Clean and standardize spreadsheet data batch by batch",
+            "zh": "逐批检查表格数据并报告清洗建议（不修改数据）",
+            "en": (
+                "Review spreadsheet data batch by batch and report cleanup "
+                "suggestions without changing it"
+            ),
         },
         "prompt": {
             "zh": (
-                "检查数据中的下一批记录，执行以下清洗操作：\n"
-                "- 修正格式不一致的字段（日期、电话、地址等）\n"
-                "- 标记或删除重复记录\n"
-                "- 补全缺失的必填字段\n"
-                "如果所有数据都已清洗完毕，输出 [LOOP_DONE]。"
+                "检查数据中的下一批记录，报告以下清洗建议：\n"
+                "- 格式不一致的字段及建议格式（日期、电话、地址等）\n"
+                "- 可能重复的记录及判定依据\n"
+                "- 缺失的必填字段\n"
+                "不要修改或删除任何数据。"
+                "如果所有数据都已审阅完毕，输出 [LOOP_DONE]。"
             ),
             "en": (
-                "Check the next batch of records and perform cleanup:\n"
-                "- Fix inconsistent formatting (dates, phones, addresses)\n"
-                "- Flag or remove duplicate entries\n"
-                "- Fill in missing required fields\n"
-                "If all data is cleaned, output [LOOP_DONE]."
+                "Check the next batch of records and report cleanup suggestions:\n"
+                "- Inconsistent fields and their proposed format (dates, phones, addresses)\n"
+                "- Potential duplicate entries and the reason they match\n"
+                "- Missing required fields\n"
+                "Do not modify or delete any data. "
+                "If all data is reviewed, output [LOOP_DONE]."
             ),
         },
         "schedule_config": None,

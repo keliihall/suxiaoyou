@@ -45,9 +45,18 @@ test("English locale values never contain CJK text", () => {
 
 test("English and Chinese namespaces have matching keys", () => {
   for (const file of readdirSync(`${localeRoot}/en`).filter((name) => name.endsWith(".json"))) {
+    // plugins.catalog is intentionally a Chinese presentation sidecar for
+    // English metadata supplied by the backend. English uses that metadata as
+    // its fallback/source of truth; duplicating it into en/plugins.json would
+    // create a second catalog that can drift. Its exact backend coverage is
+    // enforced by plugin-catalog-localization.test.ts.
+    const sharedKeys = (language: "en" | "zh") =>
+      Object.keys(flattenLocale(readLocale(language, file)))
+        .filter((key) => !key.startsWith("catalog."))
+        .sort();
     assert.deepEqual(
-      Object.keys(flattenLocale(readLocale("en", file))).sort(),
-      Object.keys(flattenLocale(readLocale("zh", file))).sort(),
+      sharedKeys("en"),
+      sharedKeys("zh"),
       `${file} locale keys must stay in sync`,
     );
   }

@@ -8,9 +8,14 @@ from app.models.scheduled_task import ScheduledTask
 from app.models.task_run import TaskRun
 from app.models.session_input import SessionInput
 from app.models.idempotency_record import IdempotencyRecord
+from app.models.security_audit_event import SecurityAuditEvent
+from app.models.session_goal import SessionGoal
+from app.models.goal_run import GoalRun
+from app.models.goal_usage_record import GoalUsageRecord
 
 __all__ = [
     "Base", "TimestampMixin", "Project", "Session", "Message", "Part", "Todo",
     "SessionFile", "ScheduledTask", "TaskRun", "SessionInput",
-    "IdempotencyRecord",
+    "IdempotencyRecord", "SecurityAuditEvent", "SessionGoal", "GoalRun",
+    "GoalUsageRecord",
 ]

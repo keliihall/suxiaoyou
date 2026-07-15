@@ -30,6 +30,7 @@ async def stream_llm(
     exclude_tools: set[str] | None = None,
     discovered_tools: set[str] | None = None,
     response_format: dict[str, Any] | None = None,
+    native_web_search_enabled: bool = True,
 ) -> AsyncIterator[StreamChunk]:
     """Unified LLM streaming call.
 
@@ -42,14 +43,25 @@ async def stream_llm(
         agent, exclude=exclude_tools, discovered=discovered_tools,
     )
 
-    async for chunk in provider.stream_chat(
-        model_id,
-        messages,
-        system=system_prompt,
-        tools=tool_specs if tool_specs else None,
-        temperature=agent.temperature,
-        max_tokens=max_tokens,
-        extra_body=extra_body,
-        response_format=response_format,
+    provider_kwargs: dict[str, Any] = {
+        "system": system_prompt,
+        "tools": tool_specs if tool_specs else None,
+        "temperature": agent.temperature,
+        "max_tokens": max_tokens,
+        "extra_body": extra_body,
+        "response_format": response_format,
+    }
+    # Native search belongs only to the subscription transport.  Do not put an
+    # internal switch into generic ``extra_body`` because other compatible
+    # providers forward that dictionary to third-party APIs.
+    from app.provider.openai_subscription import OpenAISubscriptionProvider
+
+    if isinstance(provider, OpenAISubscriptionProvider) or getattr(
+        provider,
+        "supports_native_web_search",
+        False,
     ):
+        provider_kwargs["native_web_search_enabled"] = native_web_search_enabled
+
+    async for chunk in provider.stream_chat(model_id, messages, **provider_kwargs):
         yield chunk

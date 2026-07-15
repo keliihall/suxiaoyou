@@ -24,14 +24,22 @@ class TestUsageStats:
                 await create_message(db, session_id=s.id, data={
                     "role": "assistant", "model_id": "test", "provider_id": "p",
                     "cost": 0.001,
-                    "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache_read": 0, "cache_write": 0},
+                    "tokens": {"input": 100, "output": 50, "reasoning": 0, "cache_read": 700, "cache_write": 0},
+                    "tokens_accumulated": {"input": 1000, "output": 500, "reasoning": 100, "cache_read": 700, "cache_write": 0},
                 })
         resp = await app_client.get("/api/usage")
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_cost"] > 0
         assert data["total_messages"] == 1
-        assert data["total_tokens"]["input"] == 100
+        assert data["total_tokens"]["input"] == 1000
+        assert data["total_tokens"]["output"] == 500
+        assert data["total_tokens"]["reasoning"] == 100
+        assert data["total_tokens"]["cache_read"] == 700
+        assert data["avg_tokens_per_session"] == 2300
+        assert data["by_model"][0]["total_tokens"]["input"] == 1000
+        assert data["by_session"][0]["total_tokens"] == 2300
+        assert data["daily"][0]["tokens"] == 2300
 
     async def test_custom_days(self, app_client):
         resp = await app_client.get("/api/usage", params={"days": 7})

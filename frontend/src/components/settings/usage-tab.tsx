@@ -59,7 +59,7 @@ function formatModelName(modelId: string): string {
 }
 
 function tokenTotal(t: TokenBreakdown): number {
-  return t.input + t.output + t.reasoning;
+  return t.input + t.output + t.reasoning + t.cache_read;
 }
 
 type TrendMetric = "cost" | "tokens";
@@ -135,6 +135,7 @@ function TokenBreakdownBar({ tokens }: { tokens: TokenBreakdown }) {
     { label: t('input'), value: tokens.input, color: "var(--brand-primary)" },
     { label: t('output'), value: tokens.output, color: "var(--color-success)" },
     { label: t('reasoning'), value: tokens.reasoning, color: "var(--color-warning)" },
+    { label: t('cacheRead'), value: tokens.cache_read, color: "var(--text-tertiary)" },
   ].filter((s) => s.value > 0);
 
   return (
@@ -441,18 +442,11 @@ export function UsageTab() {
                           0,
                         );
                         const totalModelTokens = data.by_model.reduce(
-                          (sum, item) =>
-                            sum +
-                            item.total_tokens.input +
-                            item.total_tokens.output +
-                            item.total_tokens.reasoning,
+                          (sum, item) => sum + tokenTotal(item.total_tokens),
                           0,
                         );
                         return data.by_model.map((m, idx) => {
-                          const modelTokens =
-                            m.total_tokens.input +
-                            m.total_tokens.output +
-                            m.total_tokens.reasoning;
+                          const modelTokens = tokenTotal(m.total_tokens);
                           const share =
                             totalModelCost > 0
                               ? (m.total_cost / totalModelCost) * 100

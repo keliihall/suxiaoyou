@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.plugin.loader import PluginLoadResult
-from app.plugin.manager import PluginManager
+from app.plugin.manager import PluginManager, PluginPersistenceError
 from app.plugin.parser import PluginMeta
 from app.schemas.agent import AgentInfo
 from app.skill.model import SkillInfo
@@ -119,3 +119,44 @@ class TestPluginManager:
         detail = pm2.detail("myplugin")
         assert detail is not None
         assert detail["enabled"] is True
+
+    def test_enable_persistence_failure_is_visible_and_rolls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sr = SkillRegistry()
+        sr.register(_make_skill("myplugin:greet"))
+        pm = PluginManager(sr, project_dir=str(tmp_path))
+        result, meta_map = _make_load_result("myplugin")
+        pm.register_loaded(result, "project", meta_map)
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("disk is read-only")
+
+        monkeypatch.setattr("app.plugin.manager.atomic_write_text", fail_write)
+
+        with pytest.raises(PluginPersistenceError, match="could not be saved"):
+            pm.enable("myplugin")
+
+        assert pm.detail("myplugin")["enabled"] is False
+        assert sr.get("myplugin:greet") is None
+
+    def test_disable_persistence_failure_is_visible_and_rolls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        sr = SkillRegistry()
+        sr.register(_make_skill("myplugin:greet"))
+        pm = PluginManager(sr, project_dir=str(tmp_path))
+        result, meta_map = _make_load_result("myplugin")
+        pm.register_loaded(result, "project", meta_map)
+        assert pm.enable("myplugin") is True
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("disk is full")
+
+        monkeypatch.setattr("app.plugin.manager.atomic_write_text", fail_write)
+
+        with pytest.raises(PluginPersistenceError, match="could not be saved"):
+            pm.disable("myplugin")
+
+        assert pm.detail("myplugin")["enabled"] is True
+        assert sr.get("myplugin:greet") is not None

@@ -379,6 +379,8 @@ async def run_task_batch(
                 stream_id=generate_ulid(),
                 session_id=state.session_id,
                 language=body.language,
+                invocation_source=job.invocation_source,
+                invocation_source_id=job.invocation_source_id,
             )
             child_job.abort_event = job.abort_event
             child_job.interactive = False

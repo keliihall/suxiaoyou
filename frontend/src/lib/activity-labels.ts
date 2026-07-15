@@ -171,6 +171,7 @@ export function getToolDisplayTitle(
     case "read":
     case "write":
     case "edit":
+    case "office":
     case "multiedit":
       return getFileName(input.file_path) ?? t("file");
     case "apply_patch":

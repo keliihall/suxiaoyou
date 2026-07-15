@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.sessions import _extract_file_paths_from_messages
+from app.api.sessions import _extract_file_paths_from_messages, _list_session_todos
+from app.errors import InternalError
+from app.models.session_goal import SessionGoal
+from app.models.todo import Todo
 
 pytestmark = pytest.mark.asyncio
 
@@ -39,6 +42,53 @@ class TestListSessions:
         data = resp.json()
         assert len(data) == 1
         assert data[0]["project_id"] == "p1"
+
+    async def test_list_and_search_expose_goal_summary(
+        self, app_client, session_factory
+    ) -> None:
+        created = await app_client.post(
+            "/api/sessions", json={"title": "Goal API summary"}
+        )
+        session_id = created.json()["id"]
+        async with session_factory() as db:
+            async with db.begin():
+                db.add(
+                    SessionGoal(
+                        session_id=session_id,
+                        objective="Finish the stable Goal release",
+                        status="blocked",
+                        run_state="waiting_user",
+                        needs_review=True,
+                    )
+                )
+
+        listed = await app_client.get("/api/sessions")
+        listed_item = next(
+            item for item in listed.json() if item["id"] == session_id
+        )
+        assert listed_item["goal_status"] == "blocked"
+        assert listed_item["goal_run_state"] == "waiting_user"
+        assert listed_item["goal_needs_input"] is True
+        assert (
+            listed_item["goal_objective_preview"]
+            == "Finish the stable Goal release"
+        )
+
+        searched = await app_client.get(
+            "/api/sessions/search", params={"q": "Goal API summary"}
+        )
+        searched_item = next(
+            item["session"]
+            for item in searched.json()
+            if item["session"]["id"] == session_id
+        )
+        assert searched_item["goal_status"] == "blocked"
+        assert searched_item["goal_run_state"] == "waiting_user"
+        assert searched_item["goal_needs_input"] is True
+        assert (
+            searched_item["goal_objective_preview"]
+            == "Finish the stable Goal release"
+        )
 
 
 class TestCreateSession:
@@ -89,6 +139,113 @@ class TestGetSession:
         got = resp.json()
         assert "model_id" in got and got["model_id"] is None
         assert "provider_id" in got and got["provider_id"] is None
+
+
+class TestSessionTodos:
+    async def test_reload_groups_goal_and_ordinary_todos_without_mixing(
+        self,
+        app_client,
+        session_factory,
+    ) -> None:
+        created = await app_client.post(
+            "/api/sessions",
+            json={"title": "Scoped todos"},
+        )
+        session_id = created.json()["id"]
+        async with session_factory() as db:
+            async with db.begin():
+                goal = SessionGoal(
+                    session_id=session_id,
+                    objective="Keep working",
+                    status="budget_limited",
+                )
+                db.add(goal)
+                await db.flush()
+                db.add_all([
+                    Todo(
+                        id="ordinary-todo",
+                        session_id=session_id,
+                        content="Ordinary follow-up",
+                        status="pending",
+                        position=0,
+                    ),
+                    Todo(
+                        id="goal-todo",
+                        session_id=session_id,
+                        goal_id=goal.id,
+                        content="Goal work",
+                        status="in_progress",
+                        active_form="Working on Goal",
+                        position=0,
+                    ),
+                ])
+
+        response = await app_client.get(f"/api/sessions/{session_id}/todos")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["scope"] == "goal"
+        assert payload["goal_id"] == goal.id
+        assert payload["goal_status"] == "budget_limited"
+        assert payload["todos"] == [{
+            "content": "Goal work",
+            "status": "in_progress",
+            "activeForm": "Working on Goal",
+        }]
+        assert payload["groups"] == {
+            "session": [{
+                "content": "Ordinary follow-up",
+                "status": "pending",
+                "activeForm": "",
+            }],
+            "goal": payload["todos"],
+        }
+
+    async def test_reload_without_goal_preserves_ordinary_todos(
+        self,
+        app_client,
+        session_factory,
+    ) -> None:
+        created = await app_client.post(
+            "/api/sessions",
+            json={"title": "Ordinary todos"},
+        )
+        session_id = created.json()["id"]
+        async with session_factory() as db:
+            async with db.begin():
+                db.add(Todo(
+                    id="ordinary-only",
+                    session_id=session_id,
+                    content="Ordinary task",
+                    status="completed",
+                ))
+
+        payload = (await app_client.get(
+            f"/api/sessions/{session_id}/todos",
+        )).json()
+
+        assert payload["scope"] == "session"
+        assert payload["goal_id"] is None
+        assert payload["todos"] == payload["groups"]["session"]
+        assert payload["groups"]["goal"] == []
+
+    async def test_reload_fails_closed_when_storage_is_unavailable(
+        self,
+        monkeypatch,
+    ) -> None:
+        def unavailable_factory():
+            raise RuntimeError("Database not initialized")
+
+        monkeypatch.setattr(
+            "app.api.sessions.get_session_factory",
+            unavailable_factory,
+        )
+
+        with pytest.raises(InternalError, match="Todo storage is unavailable"):
+            await _list_session_todos(
+                "session",
+                SimpleNamespace(),  # type: ignore[arg-type]
+            )
 
 
 class TestUpdateSession:

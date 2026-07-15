@@ -1,0 +1,377 @@
+"""Restricted model tools for inspecting and reporting a persistent Goal."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import select
+
+from app.models.goal_run import GoalRun
+from app.models.message import Part
+from app.models.session_input import SessionInput
+from app.models.todo import Todo
+from app.schemas.goal import GoalResponse
+from app.session.goal_manager import (
+    GoalControlError,
+    get_session_goal,
+    transition_goal_status,
+)
+from app.tool.base import ToolDefinition, ToolResult
+from app.tool.context import ToolContext
+from app.tool.workspace import WorkspaceViolation, resolve_and_validate
+
+
+def _factory(ctx: ToolContext):
+    app_state = getattr(ctx, "_app_state", None) or {}
+    return app_state.get("session_factory")
+
+
+def _public_goal(goal: Any) -> dict[str, Any]:
+    return GoalResponse.model_validate(goal).model_dump(mode="json")
+
+
+class GetGoalTool(ToolDefinition):
+    @property
+    def id(self) -> str:
+        return "get_goal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read the current persistent Goal, its exact revision, budgets, "
+            "status, blockers, and completion contract. This tool never changes it."
+        )
+
+    def parameters_schema(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        del args
+        session_factory = _factory(ctx)
+        if session_factory is None:
+            return ToolResult(error="Goal storage is unavailable")
+        async with session_factory() as db:
+            goal = await get_session_goal(
+                db,
+                ctx.goal_session_id or ctx.session_id,
+            )
+        if goal is None:
+            return ToolResult(output="No Goal is set for this session", title="No Goal")
+        snapshot = _public_goal(goal)
+        return ToolResult(
+            output=json.dumps(snapshot, ensure_ascii=False, indent=2),
+            title=f"Goal: {goal.status}",
+            metadata={"goal": snapshot},
+        )
+
+
+class UpdateGoalTool(ToolDefinition):
+    @property
+    def id(self) -> str:
+        return "update_goal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Report that the current persistent Goal is complete or genuinely "
+            "blocked. Completion requires current-revision evidence and passes "
+            "server validation. You cannot edit, pause, resume, clear, or raise "
+            "the Goal budget with this tool."
+        )
+
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["complete", "blocked"],
+                },
+                "expected_revision": {"type": "integer", "minimum": 1},
+                "summary": {"type": "string"},
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "criterion": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "path": {"type": "string"},
+                            "call_id": {"type": "string"},
+                        },
+                        "required": ["criterion", "evidence"],
+                    },
+                },
+                "blocker_code": {"type": "string"},
+                "blocker_message": {"type": "string"},
+            },
+            "required": ["status", "expected_revision", "summary", "evidence"],
+        }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session_factory = _factory(ctx)
+        if session_factory is None:
+            return ToolResult(error="Goal storage is unavailable")
+        if ctx.invocation_source != "goal" or ctx.goal_id is None:
+            return ToolResult(
+                error="Only the active Goal runner may report Goal status"
+            )
+        if ctx.goal_session_id not in {None, ctx.session_id}:
+            return ToolResult(
+                error="A Goal sub-agent may gather evidence but only the root runner may report final status"
+            )
+
+        status = str(args["status"])
+        summary = str(args.get("summary") or "").strip()
+        evidence = args.get("evidence")
+        if not summary:
+            return ToolResult(error="A non-empty Goal summary is required")
+        if not isinstance(evidence, list) or not evidence:
+            return ToolResult(error="At least one structured evidence item is required")
+
+        job = getattr(ctx, "_job", None)
+        if job is None or not hasattr(job, "session_input_lock"):
+            return ToolResult(
+                error="Goal status cannot be finalized without the root input admission lock"
+            )
+
+        try:
+            # Serialize the final queued-input observation with POST
+            # /chat/inputs. Any input committed first must be processed before
+            # the model may declare completion/blocking; once the terminal
+            # transition commits, close admission before releasing the lock.
+            async with job.session_input_lock:
+                async with session_factory() as db:
+                    async with db.begin():
+                        goal_session_id = ctx.goal_session_id or ctx.session_id
+                        goal = await get_session_goal(db, goal_session_id)
+                        if goal is None or goal.id != ctx.goal_id:
+                            return ToolResult(error="The active Goal no longer exists")
+                        if goal.status != "active":
+                            return ToolResult(error=f"Goal status is already {goal.status}")
+
+                        pending_input = (
+                            await db.execute(
+                                select(SessionInput.id)
+                                .where(
+                                    SessionInput.session_id == goal_session_id,
+                                    SessionInput.status == "queued",
+                                )
+                                .limit(1)
+                            )
+                        ).scalar_one_or_none()
+                        if pending_input is not None:
+                            return ToolResult(
+                                error=(
+                                    "A real user input is queued and must be processed "
+                                    "before the Goal can be finalized"
+                                )
+                            )
+
+                        if status == "complete":
+                            validation_error = await _validate_completion(
+                                db,
+                                goal_id=goal.id,
+                                run_id=ctx.goal_run_id,
+                                session_id=goal_session_id,
+                                current_call_id=ctx.call_id,
+                                evidence=evidence,
+                                workspace=ctx.workspace,
+                                completion_contract=(
+                                    goal.definition_of_done or goal.objective
+                                ),
+                            )
+                            if validation_error:
+                                return ToolResult(error=validation_error)
+                            goal = await transition_goal_status(
+                                db,
+                                goal_id=goal.id,
+                                expected_revision=int(args["expected_revision"]),
+                                target_status="complete",
+                                completion_summary=summary,
+                                completion_evidence=evidence,
+                            )
+                        else:
+                            blocker_code = str(
+                                args.get("blocker_code") or "model_reported_blocker"
+                            ).strip()[:80]
+                            blocker_message = str(
+                                args.get("blocker_message") or summary
+                            ).strip()
+                            if not blocker_message:
+                                return ToolResult(error="A concrete blocker is required")
+                            goal = await transition_goal_status(
+                                db,
+                                goal_id=goal.id,
+                                expected_revision=int(args["expected_revision"]),
+                                target_status="blocked",
+                                blocker_code=blocker_code,
+                                blocker_message=blocker_message,
+                                completion_evidence=evidence,
+                            )
+                job.close_session_input_admission()
+                job.close_execution_admission()
+        except GoalControlError as exc:
+            return ToolResult(error=str(exc))
+
+        snapshot = _public_goal(goal)
+        return ToolResult(
+            output=(
+                "Goal completion accepted"
+                if status == "complete"
+                else "Goal blocker recorded; autonomous continuation will stop"
+            ),
+            title="Goal complete" if status == "complete" else "Goal blocked",
+            metadata={"goal": snapshot, "goal_status_updated": True},
+        )
+
+
+async def _validate_completion(
+    db,
+    *,
+    goal_id: str,
+    run_id: str | None,
+    session_id: str,
+    current_call_id: str,
+    evidence: list[Any],
+    workspace: str | None,
+    completion_contract: str,
+) -> str | None:
+    incomplete = list(
+        (
+            await db.execute(
+                select(Todo).where(
+                    Todo.goal_id == goal_id,
+                    Todo.status.in_(("pending", "in_progress")),
+                )
+            )
+        ).scalars().all()
+    )
+    if incomplete:
+        return "Goal cannot complete while Goal Todo items remain unfinished"
+
+    if run_id is None:
+        return "Goal completion requires an active GoalRun"
+    run = await db.get(GoalRun, run_id)
+    if run is None or run.goal_id != goal_id or run.status not in {
+        "running",
+        "waiting_user",
+    }:
+        return "Goal completion came from a stale or inactive GoalRun"
+
+    # A still-running tool means the completion claim raced ahead of a side
+    # effect. The runner must reach a clean safe boundary first.
+    part_statement = select(Part).where(Part.session_id == session_id)
+    if run.time_started is not None:
+        part_statement = part_statement.where(Part.time_created >= run.time_started)
+    parts = list(
+        (
+            await db.execute(part_statement.order_by(Part.time_created.asc()))
+        ).scalars().all()
+    )
+    if any(
+        (part.data or {}).get("type") == "tool"
+        and (part.data or {}).get("call_id") != current_call_id
+        and ((part.data or {}).get("state") or {}).get("status") == "running"
+        for part in parts
+    ):
+        return "Goal cannot complete while a tool call is still running"
+
+    step_finishes = [
+        part
+        for part in parts
+        if (part.data or {}).get("type") == "step-finish"
+    ]
+    if step_finishes and str((step_finishes[-1].data or {}).get("reason")) == "error":
+        return "Goal cannot complete with an unhandled error in the latest step"
+
+    verified_criteria: list[str] = []
+    successful_tools = {
+        str((part.data or {}).get("call_id")): part
+        for part in parts
+        if (part.data or {}).get("type") == "tool"
+        and ((part.data or {}).get("state") or {}).get("status") == "completed"
+        and (part.data or {}).get("call_id")
+        and (part.data or {}).get("call_id") != current_call_id
+    }
+
+    for item in evidence:
+        if not isinstance(item, dict):
+            return "Each evidence item must be an object"
+        criterion = str(item.get("criterion") or "").strip()
+        proof = str(item.get("evidence") or "").strip()
+        if not criterion or not proof:
+            return "Each evidence item needs criterion and evidence text"
+        verified_criteria.append(criterion)
+        path_value = item.get("path")
+        call_id = str(item.get("call_id") or "").strip()
+        if not path_value and not call_id:
+            return (
+                "Completion evidence must reference either a verified workspace "
+                "file path or a successful tool call_id"
+            )
+        if path_value:
+            if not workspace:
+                return "File evidence requires an active trusted workspace"
+            try:
+                resolved = resolve_and_validate(str(path_value), workspace)
+                path = Path(resolved).expanduser().resolve(strict=True)
+            except WorkspaceViolation:
+                return f"Evidence path is outside the active workspace: {path_value}"
+            except (OSError, RuntimeError):
+                return f"Evidence path does not exist: {path_value}"
+            if not path.is_file():
+                return f"Evidence path is not a file: {path_value}"
+            file_info = path.stat()
+            if file_info.st_size > 512 * 1024 * 1024:
+                return f"Evidence file is too large to verify: {path_value}"
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            # Replace any model-supplied verification fields with facts
+            # computed by the server at the completion boundary.
+            item["path"] = str(path)
+            item["verification"] = "server-file-sha256"
+            item["sha256"] = digest.hexdigest()
+            item["size_bytes"] = file_info.st_size
+        if call_id:
+            tool_part = successful_tools.get(call_id)
+            if tool_part is None:
+                return (
+                    "Evidence call_id does not reference a successful tool call "
+                    f"from the active Goal run: {call_id}"
+                )
+            data = tool_part.data or {}
+            item["call_id"] = call_id
+            item["tool"] = str(data.get("tool") or "unknown")
+            item["verification"] = "server-successful-tool-call"
+
+    contract_lines = [
+        _normalize_contract_line(line)
+        for line in re.split(r"[\n;；]+", completion_contract)
+        if _normalize_contract_line(line)
+    ]
+    normalized_criteria = [_normalize_contract_line(value) for value in verified_criteria]
+    for contract_line in contract_lines:
+        if not any(
+            criterion in contract_line or contract_line in criterion
+            for criterion in normalized_criteria
+            if criterion
+        ):
+            return (
+                "Completion evidence does not cover the current completion "
+                f"criterion: {contract_line}"
+            )
+    return None
+
+
+def _normalize_contract_line(value: str) -> str:
+    text = value.strip().casefold()
+    while text[:1] in {"-", "*", "•", "·"}:
+        text = text[1:].strip()
+    return "".join(text.split())

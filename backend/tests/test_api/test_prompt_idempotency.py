@@ -8,13 +8,61 @@ import gc
 import pytest
 from sqlalchemy import select
 
+from app import release_features
 from app.api import chat as chat_api
 from app.dependencies import set_stream_manager
 from app.models.idempotency_record import IdempotencyRecord
 from app.models.session import Session
+from app.models.session_goal import SessionGoal
 from app.schemas.chat import PromptRequest
 from app.session.idempotency import canonical_request_hash
 from app.streaming.manager import StreamManager
+
+
+@pytest.mark.asyncio
+async def test_unreleased_legacy_goal_row_does_not_block_ordinary_prompt(
+    app_client,
+    session_factory,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(release_features, "GOALS_RELEASED", False)
+    manager = StreamManager()
+    set_stream_manager(manager)
+    calls = 0
+
+    async def fake_generation(job, _request, **_kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        job.complete()
+
+    monkeypatch.setattr(chat_api, "run_generation", fake_generation)
+    async with session_factory() as db:
+        async with db.begin():
+            db.add(Session(id="legacy-goal-session", directory=".", title="Legacy"))
+            db.add(
+                SessionGoal(
+                    id="legacy-hidden-goal",
+                    session_id="legacy-goal-session",
+                    objective="A hidden pre-release Goal row",
+                    status="active",
+                    run_state="idle",
+                )
+            )
+
+    response = await app_client.post(
+        "/api/chat/prompt",
+        json={
+            "client_request_id": "legacy-goal-ordinary-prompt",
+            "session_id": "legacy-goal-session",
+            "text": "Continue as an ordinary conversation",
+        },
+    )
+
+    assert response.status_code == 200
+    job = manager.get_job(response.json()["stream_id"])
+    assert job is not None and job.task is not None
+    await job.task
+    assert calls == 1
 
 
 @pytest.mark.asyncio

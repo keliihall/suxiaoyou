@@ -3,17 +3,21 @@
 import { useState, useEffect } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import {
+  getSavedPermissionDecision,
+  migrateSavedPermissionRules,
+  savedPermissionRuleKey,
+  upsertSavedPermissionRule,
+  type SavedPermissionContext,
+  type SavedPermissionRule,
+  type SavedPermissionRuleInput,
+} from "@/lib/saved-permissions";
+
+export type { SavedPermissionRule } from "@/lib/saved-permissions";
 
 export interface PermissionPresets {
   fileChanges: boolean;
   runCommands: boolean;
-}
-
-/** Saved permission rules for specific tools */
-export interface SavedPermissionRule {
-  tool: string;
-  allow: boolean;
-  timestamp: number;
 }
 
 export type ActiveProvider =
@@ -71,12 +75,16 @@ interface SettingsStore {
   setReasoningEnabled: (enabled: boolean) => void;
   /** Toggle a single permission preset */
   togglePermissionPreset: (key: keyof PermissionPresets) => void;
-  /** Save a permission rule for a tool */
-  savePermissionRule: (tool: string, allow: boolean) => void;
-  /** Get saved permission for a tool (if any) */
-  getSavedPermission: (tool: string) => boolean | null;
+  /** Save one exact permission decision in its original invocation scope. */
+  savePermissionRule: (rule: SavedPermissionRuleInput) => void;
+  /** Get an exact saved decision in one invocation scope (if any). */
+  getSavedPermission: (
+    tool: string,
+    pattern: string,
+    context: SavedPermissionContext,
+  ) => boolean | null;
   /** Clear a saved permission rule */
-  clearPermissionRule: (tool: string) => void;
+  clearPermissionRule: (rule: SavedPermissionRule) => void;
   /** Clear all saved permission rules */
   clearAllPermissionRules: () => void;
   /** Set workspace directory (null = unrestricted) */
@@ -176,20 +184,26 @@ export const useSettingsStore = create<SettingsStore>()(
                 : "ask";
           return { permissionPresets: next, workMode };
         }),
-      savePermissionRule: (tool, allow) =>
+      savePermissionRule: (rule) =>
         set((s) => ({
-          savedPermissions: [
-            ...s.savedPermissions.filter((r) => r.tool !== tool),
-            { tool, allow, timestamp: Date.now() },
-          ],
+          savedPermissions: upsertSavedPermissionRule(
+            s.savedPermissions,
+            rule,
+          ),
         })),
-      getSavedPermission: (tool) => {
-        const rule = get().savedPermissions.find((r) => r.tool === tool);
-        return rule ? rule.allow : null;
-      },
-      clearPermissionRule: (tool) =>
+      getSavedPermission: (tool, pattern, context) =>
+        getSavedPermissionDecision(
+          get().savedPermissions,
+          tool,
+          pattern,
+          context,
+        ),
+      clearPermissionRule: (rule) =>
         set((s) => ({
-          savedPermissions: s.savedPermissions.filter((r) => r.tool !== tool),
+          savedPermissions: s.savedPermissions.filter(
+            (candidate) =>
+              savedPermissionRuleKey(candidate) !== savedPermissionRuleKey(rule),
+          ),
         })),
       clearAllPermissionRules: () => set({ savedPermissions: [] }),
       setWorkspaceDirectory: (dir) => set({ workspaceDirectory: dir }),
@@ -212,7 +226,7 @@ export const useSettingsStore = create<SettingsStore>()(
     }),
     {
       name: "suxiaoyou-settings",
-      version: 4,
+      version: 5,
       migrate: (persistedState, persistedVersion) => {
         if (!persistedState || typeof persistedState !== "object") {
           return persistedState as SettingsStore;
@@ -237,7 +251,7 @@ export const useSettingsStore = create<SettingsStore>()(
           const hasWorkspace =
             normalizedWorkspace.length > 0 && normalizedWorkspace !== ".";
 
-          return {
+          Object.assign(state, {
             ...state,
             // v0.9 resets the inherited Auto default to the fail-safe Ask
             // posture. Plan remains read-only; users can explicitly opt back
@@ -264,8 +278,19 @@ export const useSettingsStore = create<SettingsStore>()(
             // through the new workspace-first onboarding once.
             hasCompletedOnboarding:
               Boolean(state.hasCompletedOnboarding) && hasWorkspace,
-          } as SettingsStore;
+          });
         }
+
+        if (persistedVersion < 5) {
+          // v4 remembered only a tool name and later replayed every decision
+          // as pattern="*". Discard those ambiguous entries; retain only
+          // already-explicit patterns that can be scoped to the workspace.
+          state.savedPermissions = migrateSavedPermissionRules(
+            state.savedPermissions,
+            state.workspaceDirectory,
+          );
+        }
+
         return state as SettingsStore;
       },
     },

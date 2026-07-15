@@ -351,18 +351,15 @@ async def _list_session_todos(
     session_id: str,
     request: Request,
 ) -> dict:
-    """Return the in-memory todo list for ``session_id``.
+    """Return the durable, owner-safe Todo projection for ``session_id``."""
+    del request
+    from app.tool.builtin.todo import get_todo_reload_state
 
-    ``get_todos`` reads from a side-channel keyed off ``session_id`` rather
-    than the DB, so we pass through to the existing helper.
-    """
-    from app.tool.builtin.todo import get_todos
-
-    session_factory = get_session_factory()
-    if session_factory is None:
-        return {"todos": []}
-    todos = await get_todos(session_id, session_factory)
-    return {"todos": todos}
+    try:
+        session_factory = get_session_factory()
+    except RuntimeError as exc:
+        raise InternalError("Todo storage is unavailable") from exc
+    return await get_todo_reload_state(session_id, session_factory)
 
 
 def _extract_file_paths_from_messages(

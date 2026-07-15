@@ -8,7 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from functools import wraps
 from pathlib import Path
-from typing import AsyncGenerator, Awaitable, Callable
+from typing import AsyncGenerator, Awaitable, Callable, Final
 
 import httpx
 
@@ -47,6 +47,8 @@ from app.storage.database import create_engine, create_session_factory
 from app.tool.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+APP_VERSION: Final = "1.0.0"
 
 
 class _BackgroundTaskManager:
@@ -145,6 +147,11 @@ def _start_models_dev_background_refresh(
 
 async def _initialize_subscription_provider(provider: object) -> None:
     """Refresh OAuth after liveness is available."""
+    if getattr(provider, "credential_deferred", False):
+        # Merely launching the app is not authorization to open the native
+        # credential vault. The subscription provider validates/refreshes its
+        # token when the user first sends a request through it.
+        return
     try:
         await provider._ensure_valid_token()  # type: ignore[attr-defined]
     except asyncio.CancelledError:
@@ -290,6 +297,23 @@ async def _maintain_upload_store(
 async def _stop_active_generation_jobs(stream_manager, timeout: float) -> None:
     if stream_manager is None:
         return
+    abort_and_wait = getattr(stream_manager, "abort_all_and_wait", None)
+    if abort_and_wait is not None:
+        aborted, quiesced = await abort_and_wait(timeout=timeout)
+        if aborted:
+            logger.info(
+                "Shutdown: aborted %d active generation job(s), waiting up to %.1fs",
+                aborted,
+                timeout,
+            )
+        if not quiesced:
+            logger.warning(
+                "Shutdown: force-cancelled lingering generation or tool task(s)",
+            )
+        return
+
+    # Backward-compatible fallback for lightweight embedders/test doubles that
+    # expose the historical StreamManager surface only.
     aborted = stream_manager.abort_all()
     if aborted:
         logger.info(
@@ -334,6 +358,7 @@ async def _shutdown_runtime(
     rapid_mlx_manager,
     provider_registry,
     engine,
+    session_factory=None,
 ) -> None:
     """Stop producers/consumers before their provider and database resources."""
 
@@ -354,6 +379,23 @@ async def _shutdown_runtime(
     await step("startup background tasks", background_tasks.cancel_and_wait)
     if task_scheduler is not None:
         await step("task scheduler", task_scheduler.stop)
+    if session_factory is not None:
+        async def prepare_goal_shutdown() -> None:
+            from app.session.goal_manager import prepare_active_goals_for_shutdown
+
+            if stream_manager is not None:
+                for job in stream_manager._jobs.values():
+                    if not job.completed and job.goal_id is not None:
+                        async with job.execution_admission_lock:
+                            job.close_execution_admission()
+                            job.deny_pending_responses(
+                                source="application_shutdown"
+                            )
+            async with session_factory() as shutdown_db:
+                async with shutdown_db.begin():
+                    await prepare_active_goals_for_shutdown(shutdown_db)
+
+        await step("persistent Goal shutdown gate", prepare_goal_shutdown)
     await step(
         "active generations",
         lambda: _stop_active_generation_jobs(stream_manager, shutdown_timeout),
@@ -447,9 +489,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         settings.remote_permission_mode = "deny"
 
     # Rewrite app-owned plaintext credentials to opaque references before any
-    # provider, connector, or channel sees them. Runtime settings remain
-    # hydrated so existing consumers do not need storage-specific knowledge.
-    migrate_settings_credentials(settings, Path(".env"))
+    # provider, connector, or channel sees them. Existing references stay
+    # opaque until the corresponding provider/connector is actually used, so
+    # OS credential consent can never block the readiness-critical path.
+    migrate_settings_credentials(
+        settings,
+        Path(".env"),
+        hydrate_references=False,
+    )
 
     # Secure v0.8 credential artifacts even while their Remote/Channels
     # consumers are behind code-owned release gates. Unsupported runtime state
@@ -475,6 +522,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         level=logging.INFO,
         format="%(levelname)s:     %(name)s - %(message)s",
     )
+
+    # A hard process exit can interrupt a multi-file Linux command between
+    # otherwise atomic file installs. Recover its durable pre-commit journal
+    # before providers, schedulers, connectors, or Agent writers can run.
+    from app.tool.workspace_transaction import recover_pending_workspace_transactions
+
+    recovered_command_transactions = await asyncio.to_thread(
+        recover_pending_workspace_transactions
+    )
+    if recovered_command_transactions:
+        logger.warning(
+            "Recovered %d interrupted command workspace transaction(s)",
+            len(recovered_command_transactions),
+        )
 
     # Install global asyncio exception handler
     loop = asyncio.get_running_loop()
@@ -544,12 +605,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         store=credential_store,
     )
 
-    # A process can exit after an input is durably claimed but before it is
-    # safe to say whether its tools ran.  Never auto-replay that ambiguous
-    # instruction on restart: surface it as blocked so the user can review and
+    # A process can exit after an input or GoalRun is durably claimed but before
+    # it is safe to say whether its tools ran. Never auto-replay that ambiguous
+    # work on restart: surface it as blocked so the user can review and
     # explicitly retry or cancel it.
     from app.session.idempotency import interrupt_inflight_idempotency_records
     from app.session.input_queue import block_interrupted_inputs
+    from app.session.goal_manager import interrupt_inflight_goal_runs
     from app.session.recovery import interrupt_inflight_tool_parts
 
     async with session_factory() as recovery_db:
@@ -558,6 +620,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             interrupted_requests = await interrupt_inflight_idempotency_records(
                 recovery_db
             )
+            interrupted_goal_runs = await interrupt_inflight_goal_runs(recovery_db)
             interrupted_tools = await interrupt_inflight_tool_parts(recovery_db)
     if blocked_inputs:
         logger.warning(
@@ -568,6 +631,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning(
             "Recovered %d in-flight request(s) as interrupted",
             interrupted_requests,
+        )
+    if interrupted_goal_runs:
+        logger.warning(
+            "Recovered %d in-flight Goal run(s) as interrupted; review is required",
+            interrupted_goal_runs,
         )
     if interrupted_tools:
         logger.warning(
@@ -589,22 +657,64 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # refresh is a background concern and must never delay /livez.
     sub_provider = None
     if settings.openai_oauth_access_token and settings.openai_oauth_account_id:
+        from app.auth.credential_store import (
+            is_credential_reference,
+            resolve_secret_tree,
+        )
+        from app.provider.deferred import DeferredCredentialProvider
         from app.provider.openai_subscription import OpenAISubscriptionProvider
 
-        sub_provider = OpenAISubscriptionProvider(
-            access_token=settings.openai_oauth_access_token,
-            account_id=settings.openai_oauth_account_id,
-            refresh_token=settings.openai_oauth_refresh_token,
-            expires_at_ms=settings.openai_oauth_expires_at,
-            settings=settings,
-        )
+        subscription_tokens = {
+            "access_token": settings.openai_oauth_access_token,
+            "refresh_token": settings.openai_oauth_refresh_token,
+        }
+
+        def create_subscription(tokens: dict[str, str]) -> OpenAISubscriptionProvider:
+            return OpenAISubscriptionProvider(
+                access_token=tokens["access_token"],
+                account_id=settings.openai_oauth_account_id,
+                refresh_token=tokens["refresh_token"],
+                expires_at_ms=settings.openai_oauth_expires_at,
+                settings=settings,
+            )
+
+        if any(is_credential_reference(value) for value in subscription_tokens.values()):
+            metadata_provider = create_subscription(
+                {
+                    "access_token": "deferred-credential",
+                    "refresh_token": "deferred-credential",
+                }
+            )
+
+            def activate_subscription() -> OpenAISubscriptionProvider:
+                resolved = resolve_secret_tree(subscription_tokens)
+                # The live subscription provider persists refreshed OAuth
+                # tokens through Settings, so install plaintext in memory only
+                # after the user actually selects this provider.
+                settings.openai_oauth_access_token = resolved["access_token"]
+                settings.openai_oauth_refresh_token = resolved["refresh_token"]
+                return create_subscription(resolved)
+
+            sub_provider = DeferredCredentialProvider(
+                provider_id="openai-subscription",
+                metadata_provider=metadata_provider,
+                activate=activate_subscription,
+            )
+        else:
+            sub_provider = create_subscription(subscription_tokens)
         registry.register(sub_provider)
-        logger.info("OpenAI subscription provider registered from saved tokens")
+        logger.info("OpenAI subscription provider registered from saved configuration")
 
     # Ollama runtime manager (always created — manages binary + process)
     from app.ollama.manager import OllamaManager
 
     data_dir = Path.cwd()  # Desktop mode: run.py sets cwd to the data directory
+    from app.security.control import SecurityControl, set_security_control
+
+    security_control = SecurityControl(data_dir / "security-state.json")
+    app.state.security_control = security_control
+    set_security_control(security_control)
+
     ollama_manager = OllamaManager(data_dir=data_dir)
     app.state.ollama_manager = ollama_manager
 
@@ -744,7 +854,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Extract connectors from plugins into ConnectorRegistry (dedup)
         connector_ids_by_plugin: dict[str, list[str]] = {}
         for plugin_name, mcp_servers in plugin_result.mcp_by_plugin.items():
-            cids = connector_registry.register_from_plugin(plugin_name, mcp_servers)
+            # Only MCP definitions shipped inside the application receive
+            # built-in provenance. Global/project plugins remain custom even
+            # when they reuse the same configuration shape.
+            connector_source = "builtin" if source == "builtin" else "custom"
+            cids = connector_registry.register_from_plugin(
+                plugin_name,
+                mcp_servers,
+                source=connector_source,
+            )
             connector_ids_by_plugin[plugin_name] = cids
 
         # Track in plugin manager (handles disable state)
@@ -769,6 +887,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Tool registry (tools registered in Step 6)
     tool_registry = ToolRegistry()
     _register_builtin_tools(tool_registry, skill_registry=skill_registry, settings=settings)
+    tool_registry.set_disabled(security_control.disabled_tools)
 
     # Bind before background connection. ``connect_enabled`` calls sync_tools
     # after discovery, so tools appear incrementally without restarting.
@@ -792,6 +911,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from app.api.remote import get_or_create_tunnel_manager
 
         tunnel_mgr = get_or_create_tunnel_manager(app)
+    app.state.tunnel_manager = tunnel_mgr
 
     # Built-in FTS5 search (enabled by default)
     if settings.fts_enabled:
@@ -802,7 +922,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Task scheduler (cron + interval automations)
     from app.scheduler.engine import TaskScheduler
     task_scheduler = TaskScheduler(session_factory, app.state)
-    await task_scheduler.start()
+    if not security_control.emergency_stop:
+        await task_scheduler.start()
     app.state.task_scheduler = task_scheduler
 
     # Messaging channels feed an unattended Agent and are not release-ready.
@@ -811,7 +932,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.message_bus = None
     app.state.channel_manager = None
     app.state.agent_adapter = None
-    if MESSAGING_CHANNELS_RELEASED and settings.channels_enabled:
+    if (
+        MESSAGING_CHANNELS_RELEASED
+        and settings.channels_enabled
+        and not security_control.emergency_stop
+    ):
         from app.channels.bus.queue import MessageBus
         from app.channels.config import load_channels_config
         from app.channels.manager import ChannelManager
@@ -849,51 +974,53 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Every network/process-bound provider startup action is tracked and
     # scheduled immediately before yield.  The registry already contains its
     # local seed, so the UI has a usable snapshot while these jobs run.
-    background_tasks.create(
-        connector_registry.connect_enabled(),
-        name="mcp-connect-enabled",
-    )
+    if not security_control.emergency_stop:
+        background_tasks.create(
+            connector_registry.connect_enabled(),
+            name="mcp-connect-enabled",
+        )
     background_tasks.create(
         _maintain_upload_store(rebuild_hash_index, session_factory, UPLOAD_DIR),
         name="upload-store-maintenance",
     )
-    background_tasks.create(
-        registry.refresh_models(),
-        name="provider-initial-model-refresh",
-    )
-    _start_models_dev_background_refresh(
-        models_dev,
-        registry=registry,
-        task_manager=background_tasks,
-    )
-    if sub_provider is not None:
+    if not security_control.emergency_stop:
         background_tasks.create(
-            _initialize_subscription_provider(sub_provider),
-            name="subscription-token-refresh",
+            registry.refresh_models(),
+            name="provider-initial-model-refresh",
         )
-    if settings.ollama_base_url:
-        background_tasks.create(
-            _initialize_ollama_runtime(
-                manager=ollama_manager,
-                settings=settings,
-                registry=registry,
-            ),
-            name="ollama-startup",
+        _start_models_dev_background_refresh(
+            models_dev,
+            registry=registry,
+            task_manager=background_tasks,
         )
-    if settings.rapid_mlx_base_url:
-        background_tasks.create(
-            _initialize_rapid_mlx_runtime(
-                manager=rapid_mlx_manager,
-                settings=settings,
-                registry=registry,
-            ),
-            name="rapid-mlx-startup",
-        )
-    if tunnel_mgr is not None:
-        background_tasks.create(
-            _start_remote_tunnel(tunnel_mgr),
-            name="remote-tunnel-startup",
-        )
+        if sub_provider is not None:
+            background_tasks.create(
+                _initialize_subscription_provider(sub_provider),
+                name="subscription-token-refresh",
+            )
+        if settings.ollama_base_url:
+            background_tasks.create(
+                _initialize_ollama_runtime(
+                    manager=ollama_manager,
+                    settings=settings,
+                    registry=registry,
+                ),
+                name="ollama-startup",
+            )
+        if settings.rapid_mlx_base_url:
+            background_tasks.create(
+                _initialize_rapid_mlx_runtime(
+                    manager=rapid_mlx_manager,
+                    settings=settings,
+                    registry=registry,
+                ),
+                name="rapid-mlx-startup",
+            )
+        if tunnel_mgr is not None:
+            background_tasks.create(
+                _start_remote_tunnel(tunnel_mgr),
+                name="remote-tunnel-startup",
+            )
 
     try:
         yield
@@ -916,6 +1043,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             rapid_mlx_manager=getattr(app.state, "rapid_mlx_manager", None),
             provider_registry=registry,
             engine=engine,
+            session_factory=session_factory,
         )
 
 
@@ -929,9 +1057,13 @@ def _register_builtin_tools(
     from app.tool.builtin.apply_patch import ApplyPatchTool
     from app.tool.builtin.artifact import ArtifactTool
     from app.tool.builtin.edit import EditTool
+    from app.tool.builtin.file_versions import FileVersionsTool, RestoreFileVersionTool
     from app.tool.builtin.glob_tool import GlobTool
     from app.tool.builtin.grep import GrepTool
+    from app.tool.builtin.goal import GetGoalTool, UpdateGoalTool
+    from app.tool.builtin.image_generate import ImageGenerateTool
     from app.tool.builtin.invalid import InvalidTool
+    from app.tool.builtin.office import OfficeTool
     from app.tool.builtin.plan import PlanTool
     from app.tool.builtin.present_file import PresentFileTool
     from app.tool.builtin.question import QuestionTool
@@ -946,18 +1078,20 @@ def _register_builtin_tools(
 
     tool_classes = [
         ReadTool, WriteTool, EditTool, ApplyPatchTool,
-        GlobTool, GrepTool, QuestionTool, TodoTool,
+        FileVersionsTool, RestoreFileVersionTool,
+        GlobTool, GrepTool, QuestionTool, TodoTool, GetGoalTool, UpdateGoalTool,
         TaskTool, WebFetchTool, WebSearchTool, InvalidTool,
         PlanTool, SubmitPlanTool, ArtifactTool, PresentFileTool,
+        ImageGenerateTool, OfficeTool,
     ]
-    if sys.platform.startswith("linux"):
-        # Only bubblewrap provides the complete filesystem/network/PID lifetime
-        # boundary required by command and Python execution in v0.9. Do not
-        # advertise tools that can only fail on macOS or Windows.
-        from app.tool.builtin.bash import BashTool
-        from app.tool.builtin.code_execute import CodeExecuteTool
+    # Command execution is a desktop baseline capability on every supported
+    # platform.  Each tool performs a fail-closed runtime probe before launch,
+    # so a broken/missing native backend is reported as an actionable startup
+    # error instead of making the terminal silently disappear from the model.
+    from app.tool.builtin.bash import BashTool
+    from app.tool.builtin.code_execute import CodeExecuteTool
 
-        tool_classes.extend((BashTool, CodeExecuteTool))
+    tool_classes.extend((BashTool, CodeExecuteTool))
 
     for tool_cls in tool_classes:
         registry.register(tool_cls())
@@ -993,7 +1127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="suyo",
-        version="0.0.1",
+        version=APP_VERSION,
         lifespan=lifespan,
     )
     app.state.settings = settings

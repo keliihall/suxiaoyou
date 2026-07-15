@@ -734,7 +734,7 @@ test.describe("苏小有 UI preflight", () => {
     });
   });
 
-  test("desktop interactive path: always allow persists permission rules to future prompts", async ({
+  test("desktop interactive path: always allow persists the exact session scope without leaking", async ({
     page,
   }) => {
     await openNewChat(page);
@@ -744,7 +744,7 @@ test.describe("苏小有 UI preflight", () => {
     await sendPrompt(page, "Trigger permission flow for always allow");
     await expect(page.getByText("Permission Required")).toBeVisible();
     await page
-      .getByRole("switch", { name: /Remember this choice for bash/i })
+      .getByRole("switch", { name: /Remember only for this exact scope: npm run preflight:ui/i })
       .setChecked(true);
 
     const respond = page.waitForResponse(
@@ -762,16 +762,54 @@ test.describe("苏小有 UI preflight", () => {
       },
     });
 
+    const remembered = await page.evaluate(() => {
+      const persisted = JSON.parse(
+        window.localStorage.getItem("suxiaoyou-settings") ?? "{}",
+      );
+      return persisted.state?.savedPermissions ?? [];
+    });
+    expect(remembered).toEqual([
+      expect.objectContaining({
+        tool: "bash",
+        allow: true,
+        pattern: "npm run preflight:ui",
+        workspace: null,
+        sessionId: "session-new",
+        source: "desktop",
+      }),
+    ]);
+
     await openNewChat(page);
     await sendPrompt(page, "Create a follow-up checklist");
     expect(mockState.promptBodies.at(-1)).toMatchObject({
-      permission_rules: [
-        {
-          action: "allow",
-          permission: "bash",
-          pattern: "*",
-        },
-      ],
+      permission_rules: null,
+    });
+  });
+
+  test("desktop prompt path: an exact workspace rule is reused only with its original pattern", async ({
+    page,
+  }) => {
+    await seed苏小有Storage(page, {
+      force: true,
+      savedPermissions: [{
+        tool: "bash",
+        allow: true,
+        pattern: "npm run preflight:ui",
+        workspace: "/Users/alex/suxiaoyou-demo",
+        sessionId: null,
+        source: "desktop",
+        timestamp: Date.parse("2026-04-26T12:00:00.000Z"),
+      }],
+    });
+
+    await openNewChat(page, true);
+    await sendPrompt(page, "Create a workspace-scoped follow-up checklist");
+    expect(mockState.promptBodies.at(-1)).toMatchObject({
+      permission_rules: [{
+        action: "allow",
+        permission: "bash",
+        pattern: "npm run preflight:ui",
+      }],
     });
   });
 
@@ -807,7 +845,7 @@ test.describe("苏小有 UI preflight", () => {
     });
   });
 
-  test("desktop interactive path: always deny persists permission rules to future prompts", async ({
+  test("desktop interactive path: always deny persists the exact session scope without leaking", async ({
     page,
   }) => {
     await openNewChat(page);
@@ -817,7 +855,7 @@ test.describe("苏小有 UI preflight", () => {
     await sendPrompt(page, "Trigger permission flow for always deny");
     await expect(page.getByText("Permission Required")).toBeVisible();
     await page
-      .getByRole("switch", { name: /Remember this choice for bash/i })
+      .getByRole("switch", { name: /Remember only for this exact scope: npm run preflight:ui/i })
       .setChecked(true);
 
     const respond = page.waitForResponse(
@@ -835,16 +873,27 @@ test.describe("苏小有 UI preflight", () => {
       },
     });
 
+    const remembered = await page.evaluate(() => {
+      const persisted = JSON.parse(
+        window.localStorage.getItem("suxiaoyou-settings") ?? "{}",
+      );
+      return persisted.state?.savedPermissions ?? [];
+    });
+    expect(remembered).toEqual([
+      expect.objectContaining({
+        tool: "bash",
+        allow: false,
+        pattern: "npm run preflight:ui",
+        workspace: null,
+        sessionId: "session-new",
+        source: "desktop",
+      }),
+    ]);
+
     await openNewChat(page);
     await sendPrompt(page, "Create a follow-up checklist");
     expect(mockState.promptBodies.at(-1)).toMatchObject({
-      permission_rules: [
-        {
-          action: "deny",
-          permission: "bash",
-          pattern: "*",
-        },
-      ],
+      permission_rules: null,
     });
   });
 
@@ -963,11 +1012,19 @@ test.describe("苏小有 UI preflight", () => {
         {
           tool: "bash",
           allow: true,
+          pattern: "npm run preflight:ui",
+          workspace: "/Users/alex/suxiaoyou-demo",
+          sessionId: null,
+          source: "desktop",
           timestamp: Date.parse("2026-04-26T12:00:00.000Z"),
         },
         {
           tool: "write",
           allow: false,
+          pattern: "reports/q3.docx",
+          workspace: "/Users/alex/suxiaoyou-demo",
+          sessionId: null,
+          source: "desktop",
           timestamp: Date.parse("2026-04-26T12:05:00.000Z"),
         },
       ],
@@ -978,9 +1035,9 @@ test.describe("苏小有 UI preflight", () => {
       page.getByRole("heading", { name: "Permissions", exact: true }),
     ).toBeVisible();
     await expect(page.getByText("Shell", { exact: true })).toBeVisible();
-    await expect(page.getByText("All bash requests")).toBeVisible();
+    await expect(page.getByText("bash · npm run preflight:ui")).toBeVisible();
     await expect(page.getByText("Write", { exact: true })).toBeVisible();
-    await expect(page.getByText("All write requests")).toBeVisible();
+    await expect(page.getByText("write · reports/q3.docx")).toBeVisible();
 
     await page.getByRole("button", { name: "Revoke bash permission" }).click();
     await expect(page.getByText("Shell", { exact: true })).toBeHidden();

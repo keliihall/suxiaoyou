@@ -23,6 +23,7 @@ import {
 import { humanizeSchedule } from "./helpers";
 import { AutomationCard } from "./automation-card";
 import { CreateAutomationDialog, EditAutomationDialog } from "./automation-dialogs";
+import { AutomationReadOnlyNotice } from "./shared-ui";
 import type { AutomationResponse, ScheduleConfig } from "@/types/automation";
 
 /* ------------------------------------------------------------------ */
@@ -47,6 +48,7 @@ export function AutomationsTabContent() {
 
   return (
     <div className="space-y-4">
+      <AutomationReadOnlyNotice />
       {/* Action bar */}
       <div className="flex justify-end">
         <Button

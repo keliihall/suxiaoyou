@@ -6,8 +6,11 @@ are only loaded when the provider is actually used.
 
 from __future__ import annotations
 
+import copy
 import logging
+from typing import Any
 
+from app.auth.credential_store import is_credential_reference, resolve_secret_tree
 from app.provider.base import BaseProvider
 from app.provider.catalog import PROVIDER_CATALOG
 
@@ -42,6 +45,86 @@ def create_provider(
         ValueError: If provider_id is not in the catalog.
         ImportError: If a native SDK is required but not installed.
     """
+    protected_payload = {
+        "api_key": api_key,
+        "extra_headers": copy.deepcopy(extra_headers),
+    }
+    if _contains_credential_reference(protected_payload):
+        from app.provider.deferred import DeferredCredentialProvider
+
+        metadata_payload = _replace_credential_references(
+            protected_payload,
+            replacement="deferred-credential",
+        )
+        metadata_provider = _create_provider(
+            provider_id,
+            str(metadata_payload["api_key"]),
+            base_url=base_url,
+            models_override=models_override,
+            extra_headers=metadata_payload["extra_headers"],
+        )
+
+        def activate() -> BaseProvider:
+            resolved = resolve_secret_tree(protected_payload)
+            return _create_provider(
+                provider_id,
+                str(resolved["api_key"]),
+                base_url=base_url,
+                models_override=models_override,
+                extra_headers=resolved["extra_headers"],
+            )
+
+        return DeferredCredentialProvider(
+            provider_id=provider_id,
+            metadata_provider=metadata_provider,
+            activate=activate,
+        )
+
+    return _create_provider(
+        provider_id,
+        api_key,
+        base_url=base_url,
+        models_override=models_override,
+        extra_headers=extra_headers,
+    )
+
+
+def _contains_credential_reference(value: Any) -> bool:
+    if is_credential_reference(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_credential_reference(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_credential_reference(item) for item in value)
+    return False
+
+
+def _replace_credential_references(value: Any, *, replacement: str) -> Any:
+    if is_credential_reference(value):
+        return replacement
+    if isinstance(value, dict):
+        return {
+            key: _replace_credential_references(item, replacement=replacement)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_credential_references(item, replacement=replacement)
+            for item in value
+        ]
+    return copy.deepcopy(value)
+
+
+def _create_provider(
+    provider_id: str,
+    api_key: str,
+    *,
+    base_url: str | None = None,
+    models_override: list[dict] | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> BaseProvider:
+    """Create a provider from already-resolved runtime configuration."""
+
     pdef = PROVIDER_CATALOG.get(provider_id)
     if pdef is None:
         if provider_id.startswith("custom_"):

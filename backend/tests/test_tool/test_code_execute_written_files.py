@@ -36,8 +36,8 @@ async def test_execution_without_workspace_fails_closed(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="v0.9 Python execution is enabled only under Linux bubblewrap",
+    sys.platform not in {"linux", "darwin"},
+    reason="transactional POSIX execution contract",
 )
 async def test_tracks_written_files_inside_workspace(tmp_path: Path):
     tool = CodeExecuteTool()

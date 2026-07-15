@@ -6,6 +6,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.session_goal import SessionGoal
+from app.schemas.session import SessionResponse
 from app.session.manager import (
     create_message,
     create_part,
@@ -15,6 +17,7 @@ from app.session.manager import (
     get_messages,
     get_session,
     list_sessions,
+    search_sessions,
     update_session_title,
 )
 
@@ -44,6 +47,46 @@ class TestSessionManager:
         await create_session(db, title="S2")
         sessions = await list_sessions(db)
         assert len(sessions) >= 2
+
+    @pytest.mark.asyncio
+    async def test_list_and_search_sessions_include_goal_summary(
+        self, db: AsyncSession
+    ) -> None:
+        session = await create_session(db, title="Goal summary contract")
+        db.add(
+            SessionGoal(
+                session_id=session.id,
+                objective="Ship the durable Goal summary",
+                status="blocked",
+                run_state="waiting_user",
+                needs_review=True,
+            )
+        )
+        await db.flush()
+        db.expunge_all()
+
+        listed = await list_sessions(db)
+        listed_session = next(item for item in listed if item.id == session.id)
+        listed_response = SessionResponse.model_validate(listed_session)
+        assert listed_response.goal_status == "blocked"
+        assert listed_response.goal_run_state == "waiting_user"
+        assert listed_response.goal_needs_input is True
+        assert (
+            listed_response.goal_objective_preview
+            == "Ship the durable Goal summary"
+        )
+
+        searched = await search_sessions(db, "Goal summary contract")
+        searched_response = next(
+            item.session for item in searched if item.session.id == session.id
+        )
+        assert searched_response.goal_status == "blocked"
+        assert searched_response.goal_run_state == "waiting_user"
+        assert searched_response.goal_needs_input is True
+        assert (
+            searched_response.goal_objective_preview
+            == "Ship the durable Goal summary"
+        )
 
     @pytest.mark.asyncio
     async def test_update_title(self, db: AsyncSession):

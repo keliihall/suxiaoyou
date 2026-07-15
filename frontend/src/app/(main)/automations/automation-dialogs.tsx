@@ -18,7 +18,13 @@ import {
 import { useModels } from "@/hooks/use-models";
 import { useSettingsStore } from "@/stores/settings-store";
 import { browseDirectory } from "@/lib/upload";
-import { DialogOverlay, ScheduleEditor, RunHistoryPanel, inputClass } from "./shared-ui";
+import {
+  AutomationReadOnlyNotice,
+  DialogOverlay,
+  ScheduleEditor,
+  RunHistoryPanel,
+  inputClass,
+} from "./shared-ui";
 import type {
   AutomationCreate,
   AutomationUpdate,
@@ -193,6 +199,7 @@ export function CreateAutomationDialog({ onClose }: { onClose: () => void }) {
       </div>
 
       <div className="px-4 py-4 space-y-4 max-h-[70vh] overflow-y-auto">
+        <AutomationReadOnlyNotice compact />
         <div>
           <label className="text-xs font-medium text-[var(--text-secondary)] mb-1 block">{t("name")}</label>
           <input type="text" value={name} onChange={(e) => setName(e.target.value)}
@@ -301,6 +308,7 @@ export function EditAutomationDialog({ automationId, onClose }: { automationId: 
       </div>
 
       <div className="px-4 py-4 space-y-4 max-h-[70vh] overflow-y-auto">
+        <AutomationReadOnlyNotice compact />
         <div>
           <label className="text-xs font-medium text-[var(--text-secondary)] mb-1 block">{t("name")}</label>
           <input type="text" value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />

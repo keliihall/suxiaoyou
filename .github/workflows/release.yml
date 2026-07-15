@@ -143,6 +143,81 @@ jobs:
           node scripts/release-metadata.mjs "$APP_VERSION"
           node --test scripts/*.test.mjs
 
+      - name: Capture v1 integration contract evidence
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v1.0.0')
+        run: |
+          set -euo pipefail
+          node scripts/v1-real-integration-gates.mjs contract \
+            --require-evidence-eligible true \
+            --evidence-dir "$RUNNER_TEMP/v1-integration-evidence"
+
+      - name: Require real integration credentials for stable tag
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
+        env:
+          TENCENT_DOCS_E2E_TOKEN: ${{ secrets.TENCENT_DOCS_E2E_TOKEN }}
+          TENCENT_DOCS_E2E_TEST_DOCUMENT_ID: ${{ secrets.TENCENT_DOCS_E2E_TEST_DOCUMENT_ID }}
+          TENCENT_DOCS_E2E_BASELINE_TEXT: ${{ secrets.TENCENT_DOCS_E2E_BASELINE_TEXT }}
+          TENCENT_DOCS_E2E_READ_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_READ_ARGS_JSON }}
+          TENCENT_DOCS_E2E_WRITE_TOOL: ${{ secrets.TENCENT_DOCS_E2E_WRITE_TOOL }}
+          TENCENT_DOCS_E2E_WRITE_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_WRITE_ARGS_JSON }}
+          TENCENT_DOCS_E2E_RESTORE_TOOL: ${{ secrets.TENCENT_DOCS_E2E_RESTORE_TOOL }}
+          TENCENT_DOCS_E2E_RESTORE_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_RESTORE_ARGS_JSON }}
+          SILICONFLOW_IMAGE_E2E_API_KEY: ${{ secrets.SILICONFLOW_IMAGE_E2E_API_KEY }}
+          SILICONFLOW_IMAGE_E2E_MAX_COST_CNY: ${{ secrets.SILICONFLOW_IMAGE_E2E_MAX_COST_CNY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            TENCENT_DOCS_E2E_TOKEN \
+            TENCENT_DOCS_E2E_TEST_DOCUMENT_ID \
+            TENCENT_DOCS_E2E_BASELINE_TEXT \
+            TENCENT_DOCS_E2E_READ_ARGS_JSON \
+            TENCENT_DOCS_E2E_WRITE_TOOL \
+            TENCENT_DOCS_E2E_WRITE_ARGS_JSON \
+            TENCENT_DOCS_E2E_RESTORE_TOOL \
+            TENCENT_DOCS_E2E_RESTORE_ARGS_JSON \
+            SILICONFLOW_IMAGE_E2E_API_KEY \
+            SILICONFLOW_IMAGE_E2E_MAX_COST_CNY
+          do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::stable v1.0.0 requires real integration secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Capture stable real integration evidence
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
+        env:
+          TENCENT_DOCS_E2E_TOKEN: ${{ secrets.TENCENT_DOCS_E2E_TOKEN }}
+          TENCENT_DOCS_E2E_ALLOW_WRITE: I_UNDERSTAND_THIS_MODIFIES_A_DEDICATED_TEST_DOCUMENT
+          TENCENT_DOCS_E2E_TEST_DOCUMENT_ID: ${{ secrets.TENCENT_DOCS_E2E_TEST_DOCUMENT_ID }}
+          TENCENT_DOCS_E2E_BASELINE_TEXT: ${{ secrets.TENCENT_DOCS_E2E_BASELINE_TEXT }}
+          TENCENT_DOCS_E2E_READ_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_READ_ARGS_JSON }}
+          TENCENT_DOCS_E2E_WRITE_TOOL: ${{ secrets.TENCENT_DOCS_E2E_WRITE_TOOL }}
+          TENCENT_DOCS_E2E_WRITE_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_WRITE_ARGS_JSON }}
+          TENCENT_DOCS_E2E_RESTORE_TOOL: ${{ secrets.TENCENT_DOCS_E2E_RESTORE_TOOL }}
+          TENCENT_DOCS_E2E_RESTORE_ARGS_JSON: ${{ secrets.TENCENT_DOCS_E2E_RESTORE_ARGS_JSON }}
+          SILICONFLOW_IMAGE_E2E_API_KEY: ${{ secrets.SILICONFLOW_IMAGE_E2E_API_KEY }}
+          SILICONFLOW_IMAGE_E2E_ALLOW_PAID_REQUEST: I_UNDERSTAND_THIS_MAY_USE_PROVIDER_QUOTA_OR_INCUR_COST
+          SILICONFLOW_IMAGE_E2E_MAX_REQUESTS: "1"
+          SILICONFLOW_IMAGE_E2E_MAX_COST_CNY: ${{ secrets.SILICONFLOW_IMAGE_E2E_MAX_COST_CNY }}
+        run: |
+          set -euo pipefail
+          node scripts/v1-real-integration-gates.mjs live tencent-real-write \
+            --evidence-dir "$RUNNER_TEMP/v1-integration-evidence"
+          node scripts/v1-real-integration-gates.mjs live siliconflow-image-real \
+            --evidence-dir "$RUNNER_TEMP/v1-integration-evidence"
+
+      - name: Upload v1 integration evidence
+        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v1.0.0')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v1-integration-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v1-integration-evidence
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Audit and test JavaScript production graphs
         run: |
           npm audit --omit=dev
@@ -238,8 +313,8 @@ jobs:
       - name: Build backend with locked PyInstaller
         run: |
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pip-audit==2.10.1
-          python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py
+          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pytest-asyncio==1.4.0 pip-audit==2.10.1
+          python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py backend/tests/test_tool/test_windows_process.py backend/tests/test_tool/test_windows_mutation_safety.py backend/tests/test_tool/test_sandbox.py backend/tests/test_tool/test_sandbox_self_test.py backend/tests/test_tool/test_bash.py backend/tests/test_tool/test_code_execute.py backend/tests/test_tool/test_registry.py
           cd backend
           python -m PyInstaller suxiaoyou.spec --noconfirm
 
@@ -247,6 +322,8 @@ jobs:
         run: python -m pip_audit --strict --require-hashes -r backend/requirements.txt
 
       - name: Verify backend bundle
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
         run: node scripts/verify-bundle.mjs backend/dist/suxiaoyou-backend
 
       - name: Download verified Node.js runtime
@@ -272,6 +349,9 @@ jobs:
 
       - name: Install NSIS package and verify packaged Node.js toolchain
         id: install-windows
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
+          VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-windows/office-contract.json
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -510,9 +590,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-lifecycle-diagnostics-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-windows
+          path: |
+            ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-windows
+            ${{ runner.temp }}/suxiaoyou-office-contract-windows
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload Windows artifact
         if: always()
@@ -585,11 +667,21 @@ jobs:
       - name: Build native backend with locked PyInstaller
         run: |
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0
+          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pytest-asyncio==1.4.0
+          python -m pytest -q \
+            backend/tests/test_tool/test_posix_process.py \
+            backend/tests/test_tool/test_sandbox.py \
+            backend/tests/test_tool/test_sandbox_self_test.py \
+            backend/tests/test_tool/test_bash.py \
+            backend/tests/test_tool/test_code_execute.py \
+            backend/tests/test_tool/test_code_execute_written_files.py \
+            backend/tests/test_tool/test_registry.py
           cd backend
           python -m PyInstaller suxiaoyou.spec --noconfirm --distpath "$BACKEND_DIST" --workpath "build-$BUNDLE_ARCH"
 
       - name: Verify backend bundle with full smoke
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-arm64' || 'macos-x64' }}
         run: node scripts/verify-bundle.mjs "backend/$BACKEND_DIST/suxiaoyou-backend"
 
       - name: Download verified native Node.js runtime
@@ -675,86 +767,15 @@ jobs:
         run: |
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
-          BACKEND_BINARY="$APP_PATH/Contents/Resources/backend/suxiaoyou-backend"
-          BACKEND_ADHOC_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"
-          NODE_BINARY="$APP_PATH/Contents/Resources/nodejs/bin/node"
-          NODE_ENTITLEMENTS="desktop-tauri/src-tauri/entitlements.node.plist"
-          SIGNED_BACKEND_ENTITLEMENTS="$RUNNER_TEMP/signed-backend-entitlements.plist"
-          SIGNED_NODE_ENTITLEMENTS="$RUNNER_TEMP/signed-node-entitlements.plist"
-          MACHO_LIST="$RUNNER_TEMP/macho-files.txt"
 
           if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
             [[ -n "$DEVELOPER_IDENTITY" ]]
             SIGNING_IDENTITY="$DEVELOPER_IDENTITY"
-            SIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
           else
             SIGNING_IDENTITY="-"
-            SIGN_ARGS=(--force --options runtime --sign -)
           fi
 
-          python3 - "$APP_PATH" "$MACHO_LIST" <<'PY'
-          import os
-          import sys
-
-          root, output = sys.argv[1:]
-          paths = []
-          for directory, _subdirectories, filenames in os.walk(root):
-              for filename in filenames:
-                  path = os.path.join(directory, filename)
-                  if os.path.isfile(path) and not os.path.islink(path):
-                      paths.append(path)
-          paths.sort(key=lambda path: (path.count(os.sep), path), reverse=True)
-          with open(output, "w", encoding="utf-8") as handle:
-              handle.write("\n".join(paths))
-              handle.write("\n")
-          PY
-
-          while IFS= read -r candidate; do
-            if file -b "$candidate" | grep -q "Mach-O"; then
-              if [[ "$candidate" == "$NODE_BINARY" ]]; then
-                codesign "${SIGN_ARGS[@]}" --entitlements "$NODE_ENTITLEMENTS" "$candidate"
-              elif [[ "$SIGNING_IDENTITY" == "-" && "$candidate" == "$BACKEND_BINARY" ]]; then
-                codesign "${SIGN_ARGS[@]}" --entitlements "$BACKEND_ADHOC_ENTITLEMENTS" "$candidate"
-              else
-                codesign "${SIGN_ARGS[@]}" "$candidate"
-              fi
-            fi
-          done < "$MACHO_LIST"
-
-          while IFS= read -r -d '' framework; do
-            codesign "${SIGN_ARGS[@]}" "$framework"
-          done < <(find "$APP_PATH" -type d -name '*.framework' -print0)
-
-          codesign "${SIGN_ARGS[@]}" "$APP_PATH"
-
-          codesign -d --entitlements - "$BACKEND_BINARY" > "$SIGNED_BACKEND_ENTITLEMENTS" 2>/dev/null
-          if [[ "$SIGNING_IDENTITY" == "-" ]]; then
-            grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"
-          elif grep -q "com.apple.security.cs.disable-library-validation" "$SIGNED_BACKEND_ENTITLEMENTS"; then
-            echo "::error::Developer ID backend must not disable library validation"
-            exit 1
-          fi
-
-          codesign -d --entitlements - "$NODE_BINARY" > "$SIGNED_NODE_ENTITLEMENTS" 2>/dev/null
-          for required in \
-            "com.apple.security.cs.allow-jit" \
-            "com.apple.security.cs.allow-unsigned-executable-memory"
-          do
-            grep -q "$required" "$SIGNED_NODE_ENTITLEMENTS"
-          done
-          for forbidden in \
-            "com.apple.security.get-task-allow" \
-            "com.apple.security.cs.allow-dyld-environment-variables" \
-            "com.apple.security.cs.disable-executable-page-protection" \
-            "com.apple.security.cs.disable-library-validation"
-          do
-            if grep -q "$forbidden" "$SIGNED_NODE_ENTITLEMENTS"; then
-              echo "::error::signed Node contains forbidden entitlement: $forbidden"
-              exit 1
-            fi
-          done
-
-          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          scripts/sign-macos-app.sh "$APP_PATH" "$SIGNING_IDENTITY"
           APP_SIGNATURE="$RUNNER_TEMP/app-signature-$DMG_ARCH.txt"
           codesign -dv --verbose=4 "$APP_PATH" 2> "$APP_SIGNATURE"
           cat "$APP_SIGNATURE"
@@ -872,6 +893,9 @@ jobs:
           fi
 
       - name: Verify final DMG contents
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-arm64' || 'macos-x64' }}
+          VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-macos-${{ env.DMG_ARCH }}/office-contract.json
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
@@ -908,9 +932,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-${{ env.DMG_ARCH }}-lifecycle-diagnostics-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-macos-${{ env.DMG_ARCH }}
+          path: |
+            ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-macos-${{ env.DMG_ARCH }}
+            ${{ runner.temp }}/suxiaoyou-office-contract-macos-${{ env.DMG_ARCH }}
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload macOS artifact
         if: always()
@@ -973,6 +999,8 @@ jobs:
           python -m PyInstaller suxiaoyou.spec --noconfirm
 
       - name: Verify backend bundle
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
         run: node scripts/verify-bundle.mjs backend/dist/suxiaoyou-backend
 
       - name: Download verified Node.js runtime
@@ -989,6 +1017,9 @@ jobs:
           npm exec tauri build -- --config "$BUILD_CONFIG" --no-sign
 
       - name: Verify Linux installers and packaged Node.js toolchain
+        env:
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
+          VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}/office-contract.json
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -1196,9 +1227,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}-lifecycle-diagnostics-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-linux-*
+          path: |
+            ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-linux-*
+            ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload Linux artifacts
         if: always()
@@ -1238,6 +1271,46 @@ jobs:
 
       - name: List artifacts
         run: find artifacts -type f -print | sort
+
+      - name: Verify native Office compatibility evidence
+        run: |
+          set -euo pipefail
+          RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          node scripts/office-contract-evidence.mjs \
+            aggregate \
+            artifacts \
+            "$RELEASE_COMMIT" \
+            "$GITHUB_REF_NAME" \
+            OFFICE-COMPATIBILITY.json
+
+      - name: Verify and summarize v1 integration evidence
+        run: |
+          set -euo pipefail
+          mapfile -t evidence_directories < <(
+            find artifacts -mindepth 1 -maxdepth 1 -type d \
+              -name 'v1-integration-evidence-*' -print
+          )
+          if [[ ${#evidence_directories[@]} -ne 1 ]]; then
+            echo "::error::expected one v1 integration evidence artifact, found ${#evidence_directories[@]}"
+            exit 1
+          fi
+          RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+            INTEGRATION_MODE="rc"
+          else
+            INTEGRATION_MODE="ga"
+          fi
+          node scripts/v1-real-integration-gates.mjs verify \
+            --mode "$INTEGRATION_MODE" \
+            --release-tag "$GITHUB_REF_NAME" \
+            --commit "$RELEASE_COMMIT" \
+            --evidence-dir "${evidence_directories[0]}"
+          node scripts/v1-real-integration-gates.mjs summarize \
+            --mode "$INTEGRATION_MODE" \
+            --release-tag "$GITHUB_REF_NAME" \
+            --commit "$RELEASE_COMMIT" \
+            --evidence-dir "${evidence_directories[0]}" \
+            --output INTEGRATION-CONTRACTS.json
 
       - name: Verify artifact completeness
         run: |
@@ -1311,9 +1384,31 @@ jobs:
       - name: Generate SHA-256 checksums
         run: node scripts/generate-checksums.mjs release-assets CHECKSUMS.md
 
+      - name: Generate scorecard-ready native package evidence
+        run: |
+          set -euo pipefail
+          RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          node scripts/native-package-evidence.mjs \
+            aggregate \
+            release-assets \
+            artifacts \
+            CHECKSUMS.md \
+            "$RELEASE_COMMIT" \
+            "$GITHUB_REF_NAME" \
+            "$RELEASE_CHANNEL" \
+            PACKAGE-LIFECYCLE.json
+
+      - name: Retain native package evidence for RC scorecard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v1-native-package-evidence-${{ github.run_attempt }}
+          path: PACKAGE-LIFECYCLE.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Generate and verify manual-download release manifest
         run: |
-          RELEASE_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
           node scripts/generate-release-manifest.mjs \
             release-assets \
             "$GITHUB_REF_NAME" \
@@ -1342,11 +1437,31 @@ jobs:
           EOF
             fi
             cat <<'EOF'
+          ## 版本重点
+
+          - 文件与 Office：DOCX/XLSX/PPTX 的受限创建和编辑、写前版本、恢复与受守卫的目标文件提交由五个原生平台分别验证。
+          - 目标模式：目标、阶段进展和完成摘要保留在对话中，旧问答不再因目标状态消失；移除累计 Token 分解与累计上下文用量展示。
+          - 对话体验：修复侧栏右键重命名失焦；简化多轮导航短横，移除总轮数按钮和“第 x 轮”文字。
+          - 凭据：改为按需激活与聚合保存，覆盖环境变量引用解析及同进程重复请求回归。
+
+          ## 已知边界
+
+          - Windows Bash/Python 使用 Job Object 回收进程树，但直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动；不得将其理解为 Linux/macOS 的私有事务执行。
+
+          EOF
+            if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+              printf '%s\n\n' '- 公开 RC 前仍需在同一候选包上完成 macOS 旧凭据覆盖升级、首次实际请求至多一次系统密码提示，以及 20 人、200 个核心任务、连续 7 天的受控 Beta 计分卡；证据未完成时本 Release 保持草稿。'
+            fi
+            cat <<'EOF'
+
           ## 安装包信任与验证状态
 
           - Windows NSIS：安装界面支持 English 与简体中文并提供语言选择；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
           - Linux x64/ARM64 DEB/RPM：当前未配置仓库签名；已在对应原生 runner 验证包元数据、完整解包、内置运行时和桌面生命周期。
           - 七个安装包（Windows x64、macOS arm64/x64、Linux x64/ARM64）均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
+          - 五个原生目标均由冻结后端完成 DOCX/XLSX/PPTX 的创建、有限编辑、独立重开、原子安装和写前版本快照验证；机器可复核结果见 `OFFICE-COMPATIBILITY.json`。
+          - 腾讯文档与 SiliconFlow 集成证据均绑定同一 tag/commit 且无跳过；RC 验证无凭据合同，稳定版还必须通过腾讯文档可逆写入和 SiliconFlow 真实工具闭环。manifest 与日志摘要见 `INTEGRATION-CONTRACTS.json`。
+          - Release 草稿固定包含十一个资产：七个安装包，以及 `CHECKSUMS.md`、`release-manifest.json`、`OFFICE-COMPATIBILITY.json`、`INTEGRATION-CONTRACTS.json`。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 
@@ -1373,3 +1488,5 @@ jobs:
             release-assets/*
             CHECKSUMS.md
             release-manifest.json
+            OFFICE-COMPATIBILITY.json
+            INTEGRATION-CONTRACTS.json

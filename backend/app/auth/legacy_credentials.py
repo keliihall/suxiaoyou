@@ -1,7 +1,7 @@
 """Fail-closed migration for credential artifacts written by v0.8.x.
 
 This migration deliberately runs before release feature gates are consulted.
-Remote access and messaging channels are disabled in v0.9.0, but disabling a
+Remote access and messaging channels remain disabled in v1.0, but disabling a
 consumer must not strand its old bearer tokens in plaintext indefinitely.
 
 Structured files that still have a supported schema are rewritten in place
@@ -167,19 +167,7 @@ def _decode_archive_tombstone(
     store: CredentialStore,
     path: Path,
 ) -> bytes:
-    reference = data.get("content_ref")
-    digest = data.get("sha256")
-    size = data.get("size")
-    if (
-        not is_credential_reference(reference)
-        or not isinstance(digest, str)
-        or len(digest) != 64
-        or not isinstance(size, int)
-        or size < 0
-    ):
-        raise LegacyCredentialMigrationError(
-            f"Legacy credential recovery tombstone is invalid: {path}"
-        )
+    reference, digest, size = _validate_archive_tombstone(data, path=path)
     try:
         encoded = store.resolve(reference)
     except CredentialStoreError as exc:
@@ -204,6 +192,29 @@ def _decode_archive_tombstone(
             f"Legacy credential archive integrity check failed: {path}"
         )
     return payload
+
+
+def _validate_archive_tombstone(
+    data: dict[str, Any],
+    *,
+    path: Path,
+) -> tuple[str, str, int]:
+    """Validate protected archive metadata without opening the credential vault."""
+
+    reference = data.get("content_ref")
+    digest = data.get("sha256")
+    size = data.get("size")
+    if (
+        not is_credential_reference(reference)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or not isinstance(size, int)
+        or size < 0
+    ):
+        raise LegacyCredentialMigrationError(
+            f"Legacy credential recovery tombstone is invalid: {path}"
+        )
+    return reference, digest, size
 
 
 def recover_archived_legacy_artifact(
@@ -244,7 +255,7 @@ def _archive_bytes(
 
     parsed = _parse_json_object(payload)
     if _is_archive_tombstone(parsed):
-        _decode_archive_tombstone(parsed, store=store, path=path)
+        _validate_archive_tombstone(parsed, path=path)
         _harden_owner_only(path)
         return False
 
@@ -405,7 +416,7 @@ def _migrate_json_secret_tree(
         return
     data = _parse_json_object(payload)
     if _is_archive_tombstone(data):
-        _decode_archive_tombstone(data, store=store, path=path)
+        _validate_archive_tombstone(data, path=path)
         _harden_owner_only(path)
         report.hardened.append(str(path))
         return
@@ -535,7 +546,7 @@ def _migrate_mcp_legacy_file(
         return
     legacy_data = _parse_json_object(legacy_payload)
     if _is_archive_tombstone(legacy_data):
-        _decode_archive_tombstone(legacy_data, store=store, path=legacy_path)
+        _validate_archive_tombstone(legacy_data, path=legacy_path)
         _harden_owner_only(legacy_path)
         report.hardened.append(str(legacy_path))
         return

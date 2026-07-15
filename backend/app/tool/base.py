@@ -72,6 +72,17 @@ class ToolDefinition(ABC):
         """
         return False
 
+    @property
+    def requires_approval(self) -> bool:
+        """Whether every invocation must pass interactive approval.
+
+        This is a tool-owned safety floor for destructive remote actions.  It
+        is intentionally separate from user rules so a newly discovered cloud
+        delete operation cannot inherit the global ``allow *`` default.
+        """
+
+        return False
+
     @abstractmethod
     def parameters_schema(self) -> dict[str, Any]:
         """Return JSON Schema for the tool's parameters."""
@@ -130,15 +141,22 @@ class ToolDefinition(ABC):
             if result.output:
                 # Check if agent has "task" tool for smarter hints
                 has_task = not ctx.agent.tools or "task" in ctx.agent.tools
+                # Output truncation is middleware, not a declared user file
+                # operation.  It must never gain an implicit workspace write,
+                # even when the originating tool had permission to mutate some
+                # other explicit path.  A future full-output store needs its own
+                # app-private, authenticated read contract.
                 tr = truncate_output(
                     result.output,
                     workspace=ctx.workspace,
                     has_task_tool=has_task,
+                    persist_full_output=False,
                 )
                 result.output = tr.content
                 if tr.truncated:
                     result.metadata["truncated"] = True
-                    result.metadata["output_path"] = tr.output_path
+                    if tr.output_path is not None:
+                        result.metadata["output_path"] = tr.output_path
             return result
         except Exception as e:
             logger.exception("Tool %s failed", self.id)

@@ -1,0 +1,220 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import { collectNativePackageEvidence } from "./native-package-evidence.mjs";
+
+const COMMIT = "a".repeat(40);
+const TAG = "v1.0.0-rc.7";
+const VERSION = TAG.slice(1);
+
+const FIXTURES = [
+  ["windows-x64-nsis", `suyo-${VERSION}-windows-x64-setup.exe`, "windows-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows", "win32"],
+  ["macos-arm64-dmg", `suyo-${VERSION}-macos-aarch64-ADHOC-NOT-NOTARIZED.dmg`, "macos-aarch64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-aarch64", "darwin"],
+  ["macos-x64-dmg", `suyo-${VERSION}-macos-x64-ADHOC-NOT-NOTARIZED.dmg`, "macos-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-x64", "darwin"],
+  ["linux-x64-deb", `suyo-${VERSION}-linux-amd64.deb`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux"],
+  ["linux-x64-rpm", `suyo-${VERSION}-linux-x86_64.rpm`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux"],
+  ["linux-arm64-deb", `suyo-${VERSION}-linux-arm64.deb`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux"],
+  ["linux-arm64-rpm", `suyo-${VERSION}-linux-aarch64.rpm`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux"],
+];
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function lifecycle(platform, seed, releaseTag = TAG, executableSeed = seed) {
+  return {
+    schema_version: 1,
+    status: "ok",
+    ok: true,
+    platform,
+    source_commit: COMMIT,
+    release_ref: releaseTag,
+    executable_path: `/opt/suyo/desktop-${executableSeed}`,
+    executable_size: 4096 + executableSeed,
+    executable_sha256: executableSeed.toString(16).padStart(64, "0"),
+    started_at: "2026-07-14T00:00:00Z",
+    completed_at: "2026-07-14T00:00:01Z",
+    desktopPid: 4100 + seed * 2,
+    backendPid: 4101 + seed * 2,
+    backendUrl: `http://127.0.0.1:${43000 + seed}`,
+    observedDescendantPids: [4101 + seed * 2],
+    exit: { code: 0, signal: null },
+    checks: {
+      backend_ready: true,
+      backend_healthy: true,
+      graceful_exit: true,
+      no_orphan_processes: true,
+      backend_stopped: true,
+    },
+  };
+}
+
+function fixture(t, { definitions = FIXTURES, releaseTag = TAG } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "suyo-native-package-evidence-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const assetsRoot = join(root, "release-assets");
+  const artifactsRoot = join(root, "artifacts");
+  mkdirSync(assetsRoot);
+  mkdirSync(artifactsRoot);
+  const checksumRows = [];
+  for (const [kind, name, artifactDirectory, lifecycleDirectory, platform] of definitions) {
+    const bytes = `installer:${kind}`;
+    writeFileSync(join(assetsRoot, name), bytes);
+    checksumRows.push(`| \`${name}\` | \`${sha256(bytes)}\` | 0.0 MiB |`);
+    const executableSeed = kind.startsWith("linux-x64-")
+      ? 40
+      : kind.startsWith("linux-arm64-")
+        ? 60
+        : checksumRows.length;
+    const reportDirectory = join(artifactsRoot, artifactDirectory, lifecycleDirectory);
+    mkdirSync(reportDirectory, { recursive: true });
+    writeFileSync(
+      join(reportDirectory, "result.json"),
+      `${JSON.stringify(
+        lifecycle(platform, checksumRows.length, releaseTag, executableSeed),
+        null,
+        2,
+      )}\n`,
+    );
+  }
+  const checksumFile = join(root, "CHECKSUMS.md");
+  writeFileSync(
+    checksumFile,
+    ["## SHA-256 Checksums", "", "| File | SHA-256 | Size |", "|---|---|---|", ...checksumRows].join("\n"),
+  );
+  return { root, assetsRoot, artifactsRoot, checksumFile };
+}
+
+async function collect(paths, overrides = {}) {
+  return collectNativePackageEvidence({
+    ...paths,
+    releaseCommit: COMMIT,
+    releaseTag: TAG,
+    releaseChannel: "prerelease",
+    ...overrides,
+  });
+}
+
+test("aggregates seven checksum-bound installed lifecycle records", async (t) => {
+  const result = await collect(fixture(t));
+  assert.equal(result.schema_version, 1);
+  assert.equal(result.release_commit, COMMIT);
+  assert.equal(result.release_tag, TAG);
+  assert.deepEqual(result.packages.map((item) => item.kind), FIXTURES.map(([kind]) => kind));
+  assert.ok(result.packages.every((item) => item.checksum_verified));
+  assert.ok(result.packages.every((item) => item.no_orphan_processes));
+  assert.match(result.packages[0].artifact_sha256, /^[0-9a-f]{64}$/u);
+  assert.match(result.packages[0].lifecycle_report_sha256, /^[0-9a-f]{64}$/u);
+  assert.match(result.packages[0].executable_sha256, /^[0-9a-f]{64}$/u);
+  assert.ok(result.packages[0].executable_size > 0);
+  assert.equal(result.packages[1].artifact_profile, "rc-adhoc");
+  assert.equal(result.packages[1].trust_boundary_verified, true);
+});
+
+test("CLI writes the same scorecard-ready evidence contract", (t) => {
+  const paths = fixture(t);
+  const output = join(paths.root, "PACKAGE-LIFECYCLE.json");
+  const result = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./native-package-evidence.mjs", import.meta.url)),
+      "aggregate",
+      paths.assetsRoot,
+      paths.artifactsRoot,
+      paths.checksumFile,
+      COMMIT,
+      TAG,
+      "prerelease",
+      output,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const evidence = JSON.parse(readFileSync(output, "utf8"));
+  assert.equal(evidence.packages.length, 7);
+  assert.equal(evidence.release_commit, COMMIT);
+  assert.equal(evidence.release_tag, TAG);
+});
+
+test("stable package evidence records the completed macOS trust gates", async (t) => {
+  const stableTag = "v1.0.0";
+  const stableVersion = stableTag.slice(1);
+  const definitions = FIXTURES.map((entry) => {
+    const copy = [...entry];
+    copy[1] = copy[1]
+      .replace(VERSION, stableVersion)
+      .replace("-ADHOC-NOT-NOTARIZED", "");
+    return copy;
+  });
+  const paths = fixture(t, { definitions, releaseTag: stableTag });
+  const result = await collect(paths, {
+    releaseTag: stableTag,
+    releaseChannel: "stable",
+  });
+  const macPackages = result.packages.filter((item) => item.kind.startsWith("macos-"));
+  assert.equal(macPackages.length, 2);
+  assert.ok(macPackages.every((item) => item.artifact_profile === "release"));
+  assert.ok(macPackages.every((item) => item.developer_id_signed === true));
+  assert.ok(macPackages.every((item) => item.notarized === true));
+});
+
+test("rejects installer tampering after CHECKSUMS.md was generated", async (t) => {
+  const paths = fixture(t);
+  writeFileSync(join(paths.assetsRoot, FIXTURES[0][1]), "tampered installer");
+  await assert.rejects(() => collect(paths), /CHECKSUMS\.md does not match/u);
+});
+
+test("rejects lifecycle evidence that omits the orphan-process proof", async (t) => {
+  const paths = fixture(t);
+  const reportPath = join(paths.artifactsRoot, FIXTURES[0][2], FIXTURES[0][3], "result.json");
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+  report.checks.no_orphan_processes = false;
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  await assert.rejects(() => collect(paths), /no_orphan_processes/u);
+});
+
+test("rejects a lifecycle report replayed from another tag or commit", async (t) => {
+  const paths = fixture(t);
+  const reportPath = join(paths.artifactsRoot, FIXTURES[0][2], FIXTURES[0][3], "result.json");
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+  report.release_ref = "v1.0.0-rc.6";
+  report.source_commit = "b".repeat(40);
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  await assert.rejects(
+    () => collect(paths),
+    /source_commit.*expected|release_ref.*expected/u,
+  );
+});
+
+test("rejects duplicate or unexpected native lifecycle results", async (t) => {
+  const paths = fixture(t);
+  const extra = join(
+    paths.artifactsRoot,
+    "linux-x64-lifecycle-diagnostics-2",
+    "suxiaoyou-desktop-lifecycle-linux-deb",
+  );
+  mkdirSync(extra, { recursive: true });
+  writeFileSync(join(extra, "result.json"), `${JSON.stringify(lifecycle("linux", 99))}\n`);
+  await assert.rejects(() => collect(paths), /expected one lifecycle result/u);
+});
+
+test("rejects DEB and RPM evidence that launched different desktop bytes", async (t) => {
+  const paths = fixture(t);
+  const reportPath = join(paths.artifactsRoot, FIXTURES[3][2], FIXTURES[3][3], "result.json");
+  const report = JSON.parse(readFileSync(reportPath, "utf8"));
+  report.executable_sha256 = "f".repeat(64);
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  await assert.rejects(() => collect(paths), /identity differs between DEB and RPM/u);
+});

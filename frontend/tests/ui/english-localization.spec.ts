@@ -69,7 +69,7 @@ test.describe("English localization guard", () => {
     await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
     await expect(page.getByRole("button", { name: "English" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Chinese" })).toBeVisible();
-    await expect(page.getByText(/suyo v0\.9\.0/)).toBeVisible();
+    await expect(page.getByText(/suyo v1\.0\.0/)).toBeVisible();
     await expectNoVisibleCjk(page, "English general settings");
 
     await page.getByRole("button", { name: "Chinese", exact: true }).click();

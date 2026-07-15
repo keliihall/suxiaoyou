@@ -17,6 +17,15 @@ MODEL_REFRESH_TIMEOUT_SECONDS = 45.0
 _AGGREGATOR_PROVIDERS = {"openrouter"}
 
 
+def _external_runtime_stopped() -> bool:
+    try:
+        from app.security.control import get_security_control
+
+        return get_security_control().emergency_stop
+    except RuntimeError:
+        return False
+
+
 def _provider_priority(provider_id: str) -> int:
     """Lower is better when deduplicating model IDs across providers."""
     if provider_id in _AGGREGATOR_PROVIDERS:
@@ -79,6 +88,11 @@ class ProviderRegistry:
 
     async def refresh_models(self) -> dict[str, list[ModelInfo]]:
         """Refresh every provider, joining any already in-flight refresh."""
+        if _external_runtime_stopped():
+            return {
+                provider_id: list(self._provider_models.get(provider_id, []))
+                for provider_id in self._providers
+            }
         async with self._refresh_task_lock:
             task = self._refresh_task
             if task is None or task.done():
@@ -212,6 +226,8 @@ class ProviderRegistry:
         Returns the provider's model list, or ``[]`` if the provider is
         absent or refresh failed.
         """
+        if _external_runtime_stopped():
+            return list(self._provider_models.get(provider_id, []))
         async with self._refresh_operation_lock:
             provider = self._providers.get(provider_id)
             if provider is None:

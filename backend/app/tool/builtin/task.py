@@ -80,6 +80,10 @@ class TaskTool(ToolDefinition):
         task_id = args.get("task_id")
 
         # Import here to avoid circular imports
+        from app.agent.permission import (
+            parse_permission_policy_baseline,
+            parse_permission_snapshot,
+        )
         from app.schemas.chat import PromptRequest
         from app.session.processor import run_generation
         from app.streaming.manager import GenerationJob
@@ -153,7 +157,12 @@ class TaskTool(ToolDefinition):
             stream_id=child_stream_id,
             session_id=child_session_id,
             language=ctx.language,
+            invocation_source=ctx.invocation_source,
+            invocation_source_id=ctx.invocation_source_id,
         )
+        parent_job = getattr(ctx, "_job", None)
+        if parent_job is not None:
+            child_job.inherit_goal_context(parent_job)
         # The child is headless: it shares cancellation with its parent and
         # cannot auto-approve an inherited `ask` rule. Explicit parent `allow`
         # rules continue to work because they are copied into the request.
@@ -173,6 +182,16 @@ class TaskTool(ToolDefinition):
             permission_rules=[dict(rule) for rule in ctx.permission_rules],
         )
         child_request._permission_rules_authoritative = True
+        if ctx.goal_id is not None and ctx.permission_snapshot is not None:
+            trusted_ceiling = parse_permission_snapshot(
+                ctx.permission_snapshot
+            )
+            if trusted_ceiling is not None:
+                child_request._trusted_permission_ruleset = trusted_ceiling
+                child_request._enforce_current_permission_ceiling = True
+                child_request._goal_permission_baseline = (
+                    parse_permission_policy_baseline(ctx.permission_snapshot)
+                )
 
         # Publish subtask start to parent stream
         if ctx._publish_fn:
@@ -185,6 +204,7 @@ class TaskTool(ToolDefinition):
                 "resumed": resuming,
             })
 
+        timed_out = False
         try:
             # Run with timeout + abort propagation
             await asyncio.wait_for(
@@ -199,11 +219,11 @@ class TaskTool(ToolDefinition):
                 timeout=SUBTASK_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            timed_out = True
             child_job.abort()
             logger.warning(
                 "Subtask timed out after %.0fs: %s", SUBTASK_TIMEOUT, description,
             )
-            # Still extract whatever output was produced before timeout
         except Exception as e:
             logger.exception("SubAgent error")
             return ToolResult(error=f"SubAgent failed: {e}")
@@ -243,19 +263,38 @@ class TaskTool(ToolDefinition):
             output += ctx.tr("\n\n--- 关键工具结果 ---\n", "\n\n--- Key tool results ---\n")
             output += "\n\n".join(recent_results)
 
+        result_metadata = {
+            "task_id": child_session_id,
+            "session_id": child_session_id,
+            "parent_id": ctx.session_id,
+            "agent": agent_name,
+            "depth": parent_depth + 1,
+            "resumed": resuming,
+            "events": len(child_job.events),
+            "tool_calls": len(tool_results),
+        }
+
+        if timed_out:
+            result_metadata.update({
+                "timeout": True,
+                "timeout_seconds": SUBTASK_TIMEOUT,
+            })
+            if output.strip():
+                # Preserve bounded diagnostic context without representing the
+                # incomplete child response as a successful tool output.
+                result_metadata["partial_output"] = output[:4000]
+            return ToolResult(
+                error=ctx.tr(
+                    f"子任务在 {SUBTASK_TIMEOUT:g} 秒后超时",
+                    f"Subtask timed out after {SUBTASK_TIMEOUT:g} seconds",
+                ),
+                metadata=result_metadata,
+            )
+
         if error_parts:
             return ToolResult(
                 error=ctx.tr("子任务失败：", "Subtask failed: ") + "; ".join(error_parts),
-                metadata={
-                    "task_id": child_session_id,
-                    "session_id": child_session_id,
-                    "parent_id": ctx.session_id,
-                    "agent": agent_name,
-                    "depth": parent_depth + 1,
-                    "resumed": resuming,
-                    "events": len(child_job.events),
-                    "tool_calls": len(tool_results),
-                },
+                metadata=result_metadata,
             )
         if not output.strip():
             output = ctx.tr("（子任务没有产生文本输出）", "(The subtask produced no text output)")
@@ -263,14 +302,5 @@ class TaskTool(ToolDefinition):
         return ToolResult(
             output=output,
             title=ctx.tr(f"子任务（{agent_name}）：{description}", f"Subtask ({agent_name}): {description}"),
-            metadata={
-                "task_id": child_session_id,
-                "session_id": child_session_id,
-                "parent_id": ctx.session_id,
-                "agent": agent_name,
-                "depth": parent_depth + 1,
-                "resumed": resuming,
-                "events": len(child_job.events),
-                "tool_calls": len(tool_results),
-            },
+            metadata=result_metadata,
         )

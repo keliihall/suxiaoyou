@@ -299,6 +299,72 @@ test("local desktop menu opens, reveals, copies, and saves the output file", asy
   expect(mockState.binaryReads).not.toContain(outputPath);
 });
 
+test("local file history lists durable versions and restores without discarding current contents", async ({
+  page,
+}) => {
+  await installLocalTauriMock(page, "macos");
+  let restoreBody: unknown = null;
+
+  await page.route("**/api/file-versions?**", async (route) => {
+    const url = new URL(route.request().url());
+    expect(url.searchParams.get("session_id")).toBe("session-artifacts");
+    expect(url.searchParams.get("file_path")).toBe(outputPath);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workspace: "/Users/alex/suxiaoyou-demo",
+        versions: [
+          {
+            id: "version-before-edit",
+            relative_path: "slides/office-deck.pptx",
+            sha256: "a".repeat(64),
+            size: 1536,
+            created_at: "2026-07-11T11:59:00.000Z",
+            created_at_ns: 1,
+            operation: "office.edit",
+            session_id: "session-artifacts",
+            message_id: "message-one",
+            call_id: "call-one",
+            original_mode: 420,
+          },
+        ],
+      }),
+    });
+  });
+  await page.route("**/api/file-versions/version-before-edit/restore", async (route) => {
+    restoreBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        file_path: outputPath,
+        restored_version: { id: "version-before-edit" },
+        recovery_version: { id: "version-current" },
+      }),
+    });
+  });
+
+  await page.goto("/c/session-artifacts");
+  const card = page.getByTestId("file-artifact-card").filter({ hasText: "Office deck" });
+  await card.getByRole("button", { name: "Open with" }).click();
+  await page.getByRole("menuitem", { name: "Version history" }).click();
+
+  await expect(page.getByRole("heading", { name: "Version history for office-deck.pptx" })).toBeVisible();
+  await expect(page.getByTestId("file-version-list")).toContainText("office.edit");
+  await expect(page.getByTestId("file-version-list")).toContainText("1.5 KiB");
+  await expect(page.getByTestId("file-version-list")).toContainText("aaaaaaaaaaaa…");
+
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("current contents will be saved as a recovery version");
+    await dialog.accept();
+  });
+  await page.getByRole("button", { name: "Restore" }).click();
+
+  await expect(page.getByText("File version restored; the previous contents were saved as a recovery version")).toBeVisible();
+  expect(restoreBody).toEqual({ session_id: "session-artifacts" });
+});
+
 test("local native save failures have a specific recoverable message", async ({ page }) => {
   await installLocalTauriMock(page, "macos", {
     command: "save_authorized_file_as",

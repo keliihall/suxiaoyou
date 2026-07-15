@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { SuxiaoyouLogo } from "@/components/ui/suxiaoyou-logo";
 import { useActivityStore, type ActivityData } from "@/stores/activity-store";
 import { formatElapsedDuration } from "@/lib/duration";
+import { isActivityComplete } from "@/lib/activity-state";
 
 interface ActivitySummaryProps {
   data: ActivityData;
@@ -19,15 +20,7 @@ export function ActivitySummary({ data }: ActivitySummaryProps) {
 
   const hasReasoning = data.reasoningTexts.length > 0;
   const hasTools = data.toolParts.length > 0;
-  const lastStepFinish = [...data.stepParts]
-    .reverse()
-    .find((part) => part.type === "step-finish");
-  const hasRunningTools = data.toolParts.some(
-    (tool) => tool.state.status === "running" || tool.state.status === "pending",
-  );
-  const isCompleted =
-    (!!lastStepFinish && lastStepFinish.reason !== "tool_use") ||
-    (!!data.hasVisibleOutput && !hasRunningTools);
+  const isCompleted = isActivityComplete(data);
 
   if (!hasReasoning && !hasTools) return null;
 

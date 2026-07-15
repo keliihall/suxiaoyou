@@ -139,6 +139,24 @@ class Settings(BaseSettings):
     loop_warn_threshold: int = 3  # warn after N repeated identical tool calls
     loop_hard_limit: int = 5  # hard-block after N repeated identical tool calls
 
+    # --- Persistent Goals ---
+    # Token budgets are optional.  Provider-reported token usage is still
+    # recorded durably, but an omitted budget no longer stops useful long
+    # running Goals at an arbitrary product-wide token ceiling.  Cost, active
+    # time, continuation and no-progress guards remain finite by default.
+    # Deployments that need a token policy can set either value explicitly.
+    goal_default_token_budget: int | None = None
+    goal_max_token_budget: int | None = None
+    goal_default_cost_budget_microusd: int = 5_000_000  # US$5.00
+    goal_max_cost_budget_microusd: int = 100_000_000  # US$100.00
+    goal_default_active_time_seconds: int = 14_400  # four hours
+    goal_max_active_time_seconds: int = 86_400  # one day
+    goal_default_max_continuations: int = 64
+    goal_max_continuations: int = 512
+    goal_no_progress_limit: int = 3
+    goal_consecutive_error_limit: int = 3
+    goal_budget_warning_ratio: float = 0.8
+
     # --- Scheduler ---
     scheduler_poll_interval: int = 30  # seconds between task schedule checks
     scheduler_max_concurrent: int = 3  # max concurrent scheduled tasks
@@ -184,14 +202,6 @@ class Settings(BaseSettings):
     # at ``backend/`` and the file needs to land under ``backend/data/``
     # to match what Tauri dev mode reads).
     session_token_path: str = "session_token.json"
-
-    def model_post_init(self, __context: Any) -> None:
-        """Resolve opaque credential references after settings validation."""
-
-        from app.auth.credential_store import resolve_settings_references
-
-        resolve_settings_references(self)
-
 
 @lru_cache
 def get_settings() -> Settings:

@@ -9,12 +9,13 @@ from app.tool.builtin.edit import EditTool
 from app.tool.context import ToolContext
 
 
-def _make_ctx() -> ToolContext:
+def _make_ctx(workspace: str | None = None) -> ToolContext:
     return ToolContext(
         session_id="test-session",
         message_id="test-msg",
         agent=AgentInfo(name="test", description="", mode="primary"),
         call_id="test-call",
+        workspace=workspace,
     )
 
 
@@ -34,7 +35,7 @@ class TestEditToolSingle:
             "file_path": str(f),
             "old_string": "return 'hello'",
             "new_string": "return 'world'",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert result.success
         assert f.read_text() == "def hello():\n    return 'world'\n"
@@ -48,7 +49,7 @@ class TestEditToolSingle:
             "file_path": str(f),
             "old_string": "foo",
             "new_string": "baz",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert not result.success
         assert "2 times" in result.error
@@ -63,7 +64,7 @@ class TestEditToolSingle:
             "old_string": "foo",
             "new_string": "baz",
             "replace_all": True,
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert result.success
         assert f.read_text() == "baz\nbar\nbaz\n"
@@ -77,7 +78,7 @@ class TestEditToolSingle:
             "file_path": str(f),
             "old_string": "nonexistent",
             "new_string": "replacement",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert not result.success
         assert "not found" in result.error.lower()
@@ -91,7 +92,7 @@ class TestEditToolSingle:
             "file_path": str(f),
             "old_string": "hello",
             "new_string": "hello",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert not result.success
         assert "identical" in result.error.lower()
@@ -105,7 +106,7 @@ class TestEditToolSingle:
             "file_path": str(f),
             "old_string": "beta",
             "new_string": "BETA",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert result.success
         assert "-beta" in result.output or "- beta" in result.output
@@ -119,7 +120,7 @@ class TestEditToolSingle:
         result = await tool.execute({
             "file_path": str(f),
             "old_string": "hello",
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert not result.success
         assert "new_string" in result.error
@@ -143,7 +144,7 @@ class TestEditToolBatch:
                 {"old_string": "return 'hello'", "new_string": "return 'hi'"},
                 {"old_string": "return 'world'", "new_string": "return 'earth'"},
             ],
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert result.success
         content = f.read_text()
@@ -164,7 +165,7 @@ class TestEditToolBatch:
                 {"old_string": "beta", "new_string": "BETA"},
                 {"old_string": "nonexistent", "new_string": "fail"},
             ],
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert not result.success
         # File was written partially because edits are validated during application.
@@ -196,10 +197,29 @@ class TestEditToolBatch:
                 {"old_string": "hello", "new_string": "hi"},
                 {"old_string": "hi world", "new_string": "hi earth"},
             ],
-        }, _make_ctx())
+        }, _make_ctx(workspace=str(tmp_path)))
 
         assert result.success
         assert f.read_text() == "hi earth\n"
+
+    @pytest.mark.asyncio
+    async def test_missing_workspace_fails_before_editing(
+        self,
+        tool: EditTool,
+        tmp_path: Path,
+    ):
+        target = tmp_path / "must-not-change.txt"
+        target.write_text("before", encoding="utf-8")
+
+        result = await tool.execute({
+            "file_path": str(target),
+            "old_string": "before",
+            "new_string": "after",
+        }, _make_ctx())
+
+        assert not result.success
+        assert "工作区" in result.error
+        assert target.read_text(encoding="utf-8") == "before"
 
 
 class TestEditToolModeValidation:

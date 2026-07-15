@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 
 from app.schemas.agent import AgentInfo
-from app.tool.builtin import bash as bash_module
+from app.storage.file_versions import FileVersionStore
 from app.tool.builtin.bash import BashTool
 from app.tool.context import ToolContext
 from app.tool.sandbox_self_test import _detached_probe_code
 from app.tool.subprocess_compat import IS_WINDOWS
+from app.tool.workspace import get_default_output_dir
 
 
 def _make_ctx(workspace: Path) -> ToolContext:
@@ -27,8 +28,8 @@ def _make_ctx(workspace: Path) -> ToolContext:
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="v0.9 command execution is enabled only under Linux bubblewrap",
+    sys.platform not in {"linux", "darwin"},
+    reason="POSIX sandbox execution contract",
 )
 class TestBashTool:
     @pytest.fixture
@@ -40,7 +41,70 @@ class TestBashTool:
         result = await tool.execute({"command": "echo hello"}, _make_ctx(tmp_path))
         assert "hello" in result.output
         assert result.metadata["filesystem_isolated"] is True
-        assert result.metadata["network_isolated"] is True
+        assert result.metadata["network_isolated"] is False
+
+    @pytest.mark.asyncio
+    async def test_pipeline_propagates_nonzero_producer_status(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+    ) -> None:
+        result = await tool.execute(
+            {"command": "(exit 17) | cat"},
+            _make_ctx(tmp_path),
+        )
+
+        assert result.success is False
+        assert result.metadata["exit_code"] == 17
+
+    @pytest.mark.asyncio
+    async def test_home_and_user_cli_path_persist_across_calls(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+    ) -> None:
+        ctx = _make_ctx(tmp_path)
+        first = await tool.execute(
+            {
+                "command": (
+                    "mkdir -p \"$HOME/.local/bin\"; "
+                    "printf '#!/bin/sh\\nprintf session-home-ok\\n' "
+                    "> \"$HOME/.local/bin/session-home-probe\"; "
+                    "chmod +x \"$HOME/.local/bin/session-home-probe\"; "
+                    "printf '%s' \"$HOME\""
+                )
+            },
+            ctx,
+        )
+        second = await tool.execute(
+            {"command": "session-home-probe; printf '\\n%s' \"$HOME\""},
+            ctx,
+        )
+
+        assert first.success, first.error or first.output
+        assert second.success, second.error or second.output
+        assert "session-home-ok" in second.output
+        assert first.output.strip() == second.output.splitlines()[-1]
+        assert second.metadata["execution_environment_scope"] == "session"
+        assert second.metadata["home_persistent"] is True
+
+    @pytest.mark.asyncio
+    async def test_output_maps_stage_to_logical_workspace_and_hides_scratch(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+    ) -> None:
+        result = await tool.execute(
+            {"command": "printf '%s\\n%s' \"$PWD\" \"$TMPDIR\""},
+            _make_ctx(tmp_path),
+        )
+
+        assert result.success, result.error or result.output
+        assert str(Path(get_default_output_dir(str(tmp_path)))) in result.output
+        assert "execution-transactions" not in result.output
+        assert "tx-" not in result.output
+        assert ".suxiaoyou/sandbox/" not in result.output
+        assert "<temporary-execution-directory>" in result.output
 
     @pytest.mark.asyncio
     async def test_private_data_overlap_is_rejected_before_scratch_creation(
@@ -70,10 +134,61 @@ class TestBashTool:
         assert result.error is not None
 
     @pytest.mark.asyncio
+    async def test_nonzero_exit_discards_staged_workspace_writes(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        private = tmp_path / "private"
+        workspace.mkdir()
+        target = workspace / "report.txt"
+        target.write_text("before", encoding="utf-8")
+        monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+        command = f"printf after > {shlex.quote(str(target))}; exit 7"
+
+        result = await tool.execute({"command": command}, _make_ctx(workspace))
+
+        assert result.error == "Command failed with exit code 7"
+        assert result.metadata["workspace_changes_committed"] is False
+        assert target.read_text(encoding="utf-8") == "before"
+        assert FileVersionStore(workspace).list_versions() == []
+
+    @pytest.mark.asyncio
+    async def test_successful_write_is_versioned_then_committed(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        private = tmp_path / "private"
+        workspace.mkdir()
+        target = workspace / "report.txt"
+        target.write_text("before", encoding="utf-8")
+        monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+        command = f"printf after > {shlex.quote(str(target))}"
+
+        result = await tool.execute({"command": command}, _make_ctx(workspace))
+
+        assert result.success
+        assert result.metadata["workspace_changes_committed"] is True
+        assert result.metadata["written_files"] == [str(target)]
+        assert target.read_text(encoding="utf-8") == "after"
+        version = FileVersionStore(workspace).list_versions(file_path=target)[0]
+        assert version.operation == "bash"
+
+    @pytest.mark.asyncio
     async def test_timeout(self, tool: BashTool, tmp_path: Path):
         ready = tmp_path / "timeout.ready"
         survived = tmp_path / "timeout.survived"
-        code = _detached_probe_code(ready, survived, keep_parent_alive=True)
+        code = _detached_probe_code(
+            ready,
+            survived,
+            keep_parent_alive=True,
+            workspace_root=tmp_path,
+        )
         command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
         result = await tool.execute(
@@ -82,7 +197,9 @@ class TestBashTool:
         )
 
         assert "timed out" in (result.error or "").lower()
-        assert ready.exists()
+        # Timed-out commands ran only in the private transaction view; none of
+        # their partial files become visible in the selected workspace.
+        assert not ready.exists()
         await asyncio.sleep(2.25)
         assert not survived.exists()
 
@@ -94,7 +211,12 @@ class TestBashTool:
     ):
         ready = tmp_path / "normal.ready"
         survived = tmp_path / "normal.survived"
-        code = _detached_probe_code(ready, survived, keep_parent_alive=False)
+        code = _detached_probe_code(
+            ready,
+            survived,
+            keep_parent_alive=False,
+            workspace_root=tmp_path,
+        )
         command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
         result = await tool.execute({"command": command}, _make_ctx(tmp_path))
@@ -129,7 +251,12 @@ class TestBashTool:
     ):
         ready = tmp_path / "abort.ready"
         survived = tmp_path / "abort.survived"
-        code = _detached_probe_code(ready, survived, keep_parent_alive=True)
+        code = _detached_probe_code(
+            ready,
+            survived,
+            keep_parent_alive=True,
+            workspace_root=tmp_path,
+        )
         command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
         ctx = _make_ctx(tmp_path)
         task = asyncio.create_task(
@@ -137,11 +264,10 @@ class TestBashTool:
         )
 
         try:
-            for _ in range(100):
-                if ready.exists():
-                    break
-                await asyncio.sleep(0.02)
-            assert ready.exists()
+            # Staged writes are intentionally invisible while the command is
+            # running, so abort after the child has had time to create them in
+            # its private view instead of polling the real workspace.
+            await asyncio.sleep(0.25)
 
             started = time.monotonic()
             ctx.abort_event.set()
@@ -149,6 +275,7 @@ class TestBashTool:
 
             assert result.metadata.get("aborted") is True
             assert time.monotonic() - started < 5
+            assert not ready.exists()
             await asyncio.sleep(2.25)
             assert not survived.exists()
         finally:
@@ -168,9 +295,32 @@ class TestBashTool:
     async def test_unicode_output(self, tool: BashTool, tmp_path: Path):
         """Non-ASCII output should not be garbled."""
         result = await tool.execute(
-            {"command": '/usr/bin/python3 -c "print(\'hello world\')"'}, _make_ctx(tmp_path)
+            {
+                "command": (
+                    f"{shlex.quote(sys.executable)} -c \"print('hello world')\""
+                )
+            },
+            _make_ctx(tmp_path),
         )
         assert "hello" in result.output
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS xcode-select runtime")
+    @pytest.mark.asyncio
+    async def test_macos_system_python3_runtime_is_readable(
+        self,
+        tool: BashTool,
+        tmp_path: Path,
+    ) -> None:
+        if not Path("/usr/bin/python3").exists():
+            pytest.skip("/usr/bin/python3 is unavailable")
+
+        result = await tool.execute(
+            {"command": "/usr/bin/python3 --version"},
+            _make_ctx(tmp_path),
+        )
+
+        assert result.success, result.error or result.output
+        assert "Python 3" in result.output
 
     @pytest.mark.asyncio
     async def test_outside_read_write_and_environment_are_denied(
@@ -197,34 +347,8 @@ class TestBashTool:
         assert outside.read_text(encoding="utf-8") == "secret"
         assert not escaped.exists()
 
-def test_windows_job_close_is_used_even_after_parent_exit(monkeypatch):
-    class Process:
-        pid = 123
-
-        def poll(self):
-            return 0
-
-    class Job:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    job = Job()
-    monkeypatch.setattr(bash_module, "IS_WINDOWS", True)
-
-    def unexpected_taskkill(*_args, **_kwargs):
-        raise AssertionError("taskkill fallback should not run when a Job exists")
-
-    monkeypatch.setattr(bash_module.subprocess, "run", unexpected_taskkill)
-
-    bash_module._terminate_process_tree(Process(), job)
-
-    assert job.closed is True
-
-
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="Windows command execution is disabled pending AppContainer")
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows Job integration")
 async def test_windows_shell_exit_cannot_leave_detached_child(
     tmp_path: Path,
 ) -> None:
@@ -264,17 +388,18 @@ async def test_windows_shell_exit_cannot_leave_detached_child(
 
 @pytest.mark.skipif(
     sys.platform not in {"darwin", "win32"},
-    reason="macOS/Windows fail-closed contract",
+    reason="native macOS/Windows execution contract",
 )
 @pytest.mark.asyncio
-async def test_unsupported_platform_bash_execution_is_disabled(tmp_path: Path) -> None:
+async def test_native_desktop_bash_execution_is_available(tmp_path: Path) -> None:
     result = await BashTool().execute(
-        {"command": "echo must-not-run"},
+        {"command": "echo native-shell-ok"},
         _make_ctx(tmp_path),
     )
-    expected = "macOS" if sys.platform == "darwin" else "Windows"
-    assert f"disabled on {expected}" in (result.error or "")
-    assert not (tmp_path / ".suxiaoyou").exists()
+    assert result.success, result.error or result.output
+    assert "native-shell-ok" in result.output
+    expected_backend = "macos-seatbelt" if sys.platform == "darwin" else "windows-job-object"
+    assert result.metadata["sandbox"] == expected_backend
 
 
 @pytest.mark.asyncio

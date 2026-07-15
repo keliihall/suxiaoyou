@@ -4,6 +4,7 @@ import { ShieldCheck, ShieldX, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { useSettingsStore, type SavedPermissionRule } from "@/stores/settings-store";
+import { savedPermissionRuleKey } from "@/lib/saved-permissions";
 import { cn } from "@/lib/utils";
 
 function formatTime(timestamp: number) {
@@ -82,7 +83,7 @@ export function PermissionsTab() {
             const Icon = rule.allow ? ShieldCheck : ShieldX;
             return (
               <div
-                key={`${rule.tool}-${rule.timestamp}`}
+                key={savedPermissionRuleKey(rule)}
                 className={cn(
                   "flex items-center gap-3 px-4 py-3",
                   index > 0 && "border-t border-[var(--border-default)]",
@@ -114,17 +115,38 @@ export function PermissionsTab() {
                       {rule.allow ? t("permissionsAllow") : t("permissionsDeny")}
                     </span>
                   </div>
-                  <p className="mt-1 truncate text-xs text-[var(--text-secondary)]">
-                    {t("permissionsScopeAll", { tool: rule.tool })}
+                  <p
+                    className="mt-1 truncate text-xs text-[var(--text-secondary)]"
+                    title={rule.pattern}
+                  >
+                    {t(
+                      rule.pattern === "*"
+                        ? "permissionsScopeAll"
+                        : "permissionsScopeExact",
+                      { tool: rule.tool, pattern: rule.pattern },
+                    )}
+                  </p>
+                  <p
+                    className="mt-0.5 truncate text-[11px] text-[var(--text-tertiary)]"
+                    title={rule.workspace ?? rule.sessionId ?? undefined}
+                  >
+                    {t("permissionsSourceDesktop")}
+                    {" · "}
+                    {rule.workspace
+                      ? t("permissionsWorkspace", { workspace: rule.workspace })
+                      : t("permissionsSession", { session: rule.sessionId })}
                     {formatTime(rule.timestamp) ? ` · ${formatTime(rule.timestamp)}` : ""}
                   </p>
                 </div>
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => clearPermissionRule(rule.tool)}
+                  onClick={() => clearPermissionRule(rule)}
                   title={t("permissionsRevoke")}
-                  aria-label={t("permissionsRevokeRule", { tool: rule.tool })}
+                  aria-label={t("permissionsRevokeRule", {
+                    tool: rule.tool,
+                    pattern: rule.pattern,
+                  })}
                   className="shrink-0 text-[var(--text-secondary)]"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
