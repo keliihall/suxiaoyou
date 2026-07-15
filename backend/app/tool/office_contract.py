@@ -432,6 +432,10 @@ async def run_office_contract(
             workspace = root / "workspace"
             private = root / "private"
             workspace.mkdir()
+            # Mirror the managed-workspace invariant before the first Office
+            # operation. Windows targeted transactions intentionally reject a
+            # missing output parent instead of creating it after validation.
+            (workspace / "suxiaoyou_written").mkdir()
             private.mkdir()
             os.environ["SUXIAOYOU_PRIVATE_DATA_DIR"] = str(private)
             for format_name, exercise in exercises:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +80,44 @@ async def test_contract_creates_edits_reopens_and_versions_all_formats():
         assert result["initial_sha256"] != result["final_sha256"]
         assert result["final_size"] > 0
         assert result["previous_version_id"]
+
+
+@pytest.mark.asyncio
+async def test_windows_contract_precreates_guarded_output_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_output_parents: list[Path] = []
+
+    async def exercise(workspace: Path) -> dict[str, bool]:
+        output_parent = workspace / "suxiaoyou_written"
+        assert output_parent.is_dir()
+        assert not output_parent.is_symlink()
+        observed_output_parents.append(output_parent)
+        return {
+            "created": True,
+            "edited": True,
+            "reopened_and_validated": True,
+            "independent_reopen_validated": True,
+            "atomic_install": True,
+            "version_snapshot_verified": True,
+        }
+
+    monkeypatch.setattr(
+        office_contract_module,
+        "native_platform_id",
+        lambda: "windows-x64",
+    )
+    for name in ("_exercise_docx", "_exercise_xlsx", "_exercise_pptx"):
+        monkeypatch.setattr(office_contract_module, name, exercise)
+
+    report = await run_office_contract(
+        expected_platform="windows-x64",
+        source_commit="a" * 40,
+        release_ref="main",
+    )
+
+    assert report["all_passed"] is True
+    assert len(observed_output_parents) == 3
 
 
 @pytest.mark.asyncio
