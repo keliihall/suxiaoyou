@@ -360,6 +360,19 @@ def test_sanitized_environment_drops_backend_secrets(tmp_path, monkeypatch):
     assert env["HOME"].startswith(str(tmp_path))
 
 
+def test_macos_sanitized_environment_redirects_xcrun_database_to_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setenv("xcrun_db", "/var/folders/host-cache/xcrun_db")
+
+    env = sandbox._sanitized_environment(tmp_path)
+
+    assert env["xcrun_db"] == str(tmp_path / "tmp" / "xcrun_db")
+    assert not Path(env["xcrun_db"]).exists()
+
+
 def test_workspace_containing_app_private_root_is_rejected_before_preparation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

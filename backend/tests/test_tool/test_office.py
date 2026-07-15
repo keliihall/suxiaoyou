@@ -400,6 +400,30 @@ class TestDocx:
         assert accepted.success, accepted.error
         assert [paragraph.text for paragraph in Document(target).paragraphs] == ["new", "new"]
 
+    @pytest.mark.asyncio
+    async def test_edit_accepts_replacements_without_empty_document_payload(
+        self,
+        workspace: Path,
+    ):
+        target = workspace / "replacement-only.docx"
+        document = Document()
+        office_module._drop_default_docx_custom_xml(document)
+        document.add_paragraph("Before")
+        document.save(target)
+
+        edited = await OfficeTool().execute(
+            {
+                "file_path": str(target),
+                "operation": "edit",
+                "replacements": [{"old_text": "Before", "new_text": "After"}],
+            },
+            _context(workspace),
+        )
+
+        assert edited.success, edited.error
+        assert edited.metadata["replacements"] == 1
+        assert [paragraph.text for paragraph in Document(target).paragraphs] == ["After"]
+
 
 class TestXlsx:
     @pytest.mark.asyncio
@@ -641,6 +665,36 @@ class TestPptx:
         )
         assert "Phase 1" in first_slide_text
         assert presentation.slides[1].shapes.title.text == "Next"
+
+    @pytest.mark.asyncio
+    async def test_edit_accepts_replacements_without_empty_presentation_payload(
+        self,
+        workspace: Path,
+    ):
+        tool = OfficeTool()
+        created = await tool.execute(
+            {
+                "file_path": "replacement-only.pptx",
+                "operation": "create",
+                "presentation": {"slides": [{"title": "Before"}]},
+            },
+            _context(workspace),
+        )
+        assert created.success, created.error
+
+        edited = await tool.execute(
+            {
+                "file_path": created.metadata["file_path"],
+                "operation": "edit",
+                "replacements": [{"old_text": "Before", "new_text": "After"}],
+            },
+            _context(workspace),
+        )
+
+        assert edited.success, edited.error
+        assert edited.metadata["replacements"] == 1
+        presentation = Presentation(edited.metadata["file_path"])
+        assert presentation.slides[0].shapes.title.text == "After"
 
     @pytest.mark.asyncio
     async def test_rejects_ambiguous_subtitle_and_bullets(self, workspace: Path):

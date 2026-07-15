@@ -7,7 +7,24 @@ from pathlib import Path
 
 import pytest
 
-from app.tool.sandbox_self_test import _run
+from app.tool.sandbox_self_test import _has_python_import_smoke_output, _run
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "6\nFalse\n",
+        "6\r\nFalse\r\n",
+        "diagnostic\r\n6\r\nFalse\r\ncomplete\r\n",
+    ],
+)
+def test_python_import_smoke_output_accepts_native_line_endings(output: str) -> None:
+    assert _has_python_import_smoke_output(output)
+
+
+@pytest.mark.parametrize("output", ["6\nTrue\n", "16\nFalse\n", "6 False\n"])
+def test_python_import_smoke_output_rejects_changed_probe_values(output: str) -> None:
+    assert not _has_python_import_smoke_output(output)
 
 
 @pytest.mark.asyncio

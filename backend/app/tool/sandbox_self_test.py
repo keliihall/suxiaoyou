@@ -29,6 +29,16 @@ def _context(workspace: Path, call_id: str) -> ToolContext:
     )
 
 
+def _has_python_import_smoke_output(output: str) -> bool:
+    """Match the two probe lines without assuming an OS newline convention."""
+
+    lines = output.splitlines()
+    return any(
+        lines[index : index + 2] == ["6", "False"]
+        for index in range(len(lines) - 1)
+    )
+
+
 def _detached_probe_code(
     ready_path: Path,
     survived_path: Path,
@@ -122,7 +132,9 @@ async def _run(workspace: Path) -> dict[str, object]:
             },
             _context(workspace, "python-positive"),
         )
-        if not python_result.success or "6\nFalse" not in python_result.output:
+        if not python_result.success or not _has_python_import_smoke_output(
+            python_result.output
+        ):
             raise RuntimeError(f"sandboxed Python/import smoke failed: {python_result.error or python_result.output}")
 
         shell_command = (

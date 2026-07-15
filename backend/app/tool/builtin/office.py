@@ -829,7 +829,13 @@ def _run_office_operation(
 
     expected_payload = _FORMATS[suffix]
     present_payloads = [name for name in _FORMATS.values() if args.get(name) is not None]
-    if present_payloads != [expected_payload]:
+    replacements_only_edit = (
+        operation == "edit"
+        and suffix in {".docx", ".pptx"}
+        and args.get("replacements") is not None
+        and not present_payloads
+    )
+    if present_payloads != [expected_payload] and not replacements_only_edit:
         raise OfficeInputError(
             f"{suffix} 必须且只能提供 {expected_payload} 内容。",
             f"{suffix} requires exactly one {expected_payload} payload.",
@@ -951,7 +957,12 @@ def _write_docx(
     document = Document(str(target)) if operation == "edit" else Document()
     if operation == "create":
         _drop_default_docx_custom_xml(document)
-    payload = _mapping(args.get("document"), "document")
+    raw_payload = args.get("document")
+    payload = (
+        {}
+        if operation == "edit" and raw_payload is None
+        else _mapping(raw_payload, "document")
+    )
     replacements = _parse_replacements(args.get("replacements"))
     paragraphs = _parse_docx_paragraphs(payload.get("paragraphs"))
     tables = _parse_tables(payload.get("tables"))
@@ -1269,7 +1280,12 @@ def _write_pptx(
     from pptx import Presentation
 
     presentation = Presentation(str(target)) if operation == "edit" else Presentation()
-    payload = _mapping(args.get("presentation"), "presentation")
+    raw_payload = args.get("presentation")
+    payload = (
+        {}
+        if operation == "edit" and raw_payload is None
+        else _mapping(raw_payload, "presentation")
+    )
     raw_slides = _sequence(payload.get("slides", []), "presentation.slides")
     replacements = _parse_replacements(args.get("replacements"))
     if len(raw_slides) > MAX_SLIDES:

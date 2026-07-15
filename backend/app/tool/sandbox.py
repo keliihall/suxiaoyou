@@ -157,6 +157,15 @@ def _sanitized_environment(
         # A transient HOME has no intentional user packages. Keep the host's
         # user-site disabled when callers use the lower-level helper directly.
         env["PYTHONNOUSERSITE"] = "1"
+    if sys.platform == "darwin":
+        # Apple's /usr/bin developer-tool shims use xcrun internally. On a
+        # fresh account xcrun otherwise creates its database in the host's
+        # Darwin user-temp directory (outside our private workspace), which a
+        # deny-by-default Seatbelt profile must reject. Redirect the database
+        # itself into this invocation's writable scratch instead. This keeps
+        # /usr/bin/python3 and sibling shims usable without granting any host
+        # cache write access; the ephemeral database disappears with scratch.
+        env["xcrun_db"] = str(temp / "xcrun_db")
     return env
 
 

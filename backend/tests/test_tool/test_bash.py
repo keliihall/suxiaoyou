@@ -315,12 +315,14 @@ class TestBashTool:
             pytest.skip("/usr/bin/python3 is unavailable")
 
         result = await tool.execute(
-            {"command": "/usr/bin/python3 --version"},
+            {"command": "xcrun_verbose=1 /usr/bin/python3 --version"},
             _make_ctx(tmp_path),
         )
 
         assert result.success, result.error or result.output
         assert "Python 3" in result.output
+        assert "couldn't create cache file" not in result.output
+        assert "couldn't replace cache file" not in result.output
 
     @pytest.mark.asyncio
     async def test_outside_read_write_and_environment_are_denied(
