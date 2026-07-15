@@ -332,6 +332,9 @@ def _append_bwrap_bind_at_logical_path(argv: list[str], source: Path) -> None:
     argv.extend(("--ro-bind", str(resolved), str(logical)))
 
 
+_MACOS_XCODE_SELECT_LINK = Path("/var/db/xcode_select_link")
+
+
 _MACOS_SYSTEM_READ_ROOTS = (
     Path("/System"),
     Path("/usr"),
@@ -354,11 +357,11 @@ _MACOS_SYSTEM_READ_ROOTS = (
     # /usr/bin/python3 consults xcode-select before entering the selected
     # Developer runtime. The canonical target is added as a read-only root;
     # the logical symlink itself is granted separately below.
-    Path("/var/db/xcode_select_link"),
+    _MACOS_XCODE_SELECT_LINK,
 )
 
 _MACOS_LOGICAL_READ_PATHS = (
-    Path("/var/db/xcode_select_link"),
+    _MACOS_XCODE_SELECT_LINK,
     Path("/private/var/db/xcode_select_link"),
 )
 
@@ -386,6 +389,44 @@ def _existing_logical_paths(paths: Iterable[Path]) -> list[Path]:
         if os.path.lexists(logical) and logical not in result:
             result.append(logical)
     return result
+
+
+def _selected_xcode_metadata_paths() -> list[Path]:
+    """Return exact metadata files required by Apple's developer-tool shims.
+
+    ``/usr/bin/python3`` enters the selected developer runtime through xcrun.
+    When xcode-select points at a full Xcode installation, xcrun also stats the
+    enclosing ``Contents/Info.plist`` before launching the tool.  Derive that
+    file only from the canonical, system-owned selection link and require the
+    standard ``Contents/Developer`` layout.  Never expose the enclosing Xcode
+    bundle (or ``/Applications``) as a recursive Seatbelt read root.
+    """
+
+    try:
+        developer_root = _MACOS_XCODE_SELECT_LINK.resolve(strict=True)
+    except OSError:
+        return []
+    if (
+        developer_root.name != "Developer"
+        or developer_root.parent.name != "Contents"
+    ):
+        return []
+    xcode_bundle = developer_root.parent.parent
+    if xcode_bundle.suffix.casefold() != ".app" or not xcode_bundle.is_dir():
+        return []
+
+    info_plist = developer_root.parent / "Info.plist"
+    try:
+        # Xcode ships a regular Info.plist. Reject a redirected final component
+        # instead of silently widening the trusted read set to its target.
+        if info_plist.is_symlink() or not info_plist.is_file():
+            return []
+        canonical_info = info_plist.resolve(strict=True)
+    except OSError:
+        return []
+    if canonical_info != info_plist:
+        return []
+    return [canonical_info]
 
 
 def _map_workspace_text(
@@ -708,7 +749,9 @@ def prepare_sandbox_launch(
                 *mapped_runtime_paths,
             )
         )
-        literal_read_paths = _existing_logical_paths(_MACOS_LOGICAL_READ_PATHS)
+        literal_read_paths = _existing_logical_paths(
+            (*_MACOS_LOGICAL_READ_PATHS, *_selected_xcode_metadata_paths())
+        )
 
         traversal_roots: list[Path] = []
         for read_root in (*read_roots, *literal_read_paths):

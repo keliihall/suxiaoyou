@@ -260,7 +260,11 @@ test.describe("long-task follow-up queue", () => {
       "Runs in order after the current task",
     );
 
-    await page.clock.runFor(65_000);
+    // Jump directly beyond the 60-second product threshold. Running every
+    // intermediate interval also drives the unrelated async SSE recovery
+    // loop, which lets dev-server HMR from another Playwright worker race the
+    // assertion without changing the user-visible no-progress semantics.
+    await page.clock.fastForward(65_000);
 
     const stalled = page.getByTestId("progress-stalled-notice");
     await expect(stalled).toBeVisible();

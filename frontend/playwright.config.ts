@@ -6,7 +6,12 @@ const headless =
   process.env.SUXIAOYOU_UI_HEADLESS !== undefined
     ? process.env.SUXIAOYOU_UI_HEADLESS === "true"
     : Boolean(process.env.CI);
-const workers = Number(process.env.SUXIAOYOU_UI_WORKERS ?? 2);
+// A shared Next dev server can broadcast lazy-compilation Fast Refresh events
+// across Playwright workers. Keep CI serial so a page under fake-clock control
+// cannot be refreshed by another worker; local runs retain two workers.
+const workers = Number(
+  process.env.SUXIAOYOU_UI_WORKERS ?? (process.env.CI ? 1 : 2),
+);
 
 export default defineConfig({
   testDir: "./tests/ui",

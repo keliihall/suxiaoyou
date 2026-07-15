@@ -276,12 +276,15 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     scratch = staged / ".suxiaoyou" / "sandbox" / "call"
     logical = tmp_path / "var" / "db" / "xcode_select_link"
     developer = tmp_path / "Applications" / "Xcode.app" / "Contents" / "Developer"
+    info_plist = developer.parent / "Info.plist"
     workspace.mkdir()
     scratch.mkdir(parents=True)
     developer.mkdir(parents=True)
+    info_plist.write_text("xcode metadata", encoding="utf-8")
     logical.parent.mkdir(parents=True)
     logical.symlink_to(developer, target_is_directory=True)
     monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
     monkeypatch.setattr(sandbox, "_MACOS_SYSTEM_READ_ROOTS", (logical,))
     monkeypatch.setattr(sandbox, "_MACOS_LOGICAL_READ_PATHS", (logical,))
     monkeypatch.setattr(
@@ -303,10 +306,53 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     profile = launch.argv[launch.argv.index("-p") + 1]
     assert any(value == f"LITERAL_READ_0={logical.absolute()}" for value in launch.argv)
     assert any(
+        value.startswith("LITERAL_READ_") and value.endswith(f"={info_plist}")
+        for value in launch.argv
+    )
+    assert any(
         value.startswith("READ_ROOT_") and value.endswith(f"={developer.resolve()}")
         for value in launch.argv
     )
     assert '(literal (param "LITERAL_READ_0"))' in profile
+    read_root_values = {
+        value.split("=", 1)[1]
+        for value in launch.argv
+        if value.startswith("READ_ROOT_")
+    }
+    assert str(developer.resolve()) in read_root_values
+    assert str(developer.parent) not in read_root_values
+    assert str(developer.parent.parent) not in read_root_values
+    assert str(developer.parents[2]) not in read_root_values
+
+
+def test_macos_xcode_metadata_requires_full_xcode_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_line_tools = tmp_path / "Library" / "Developer" / "CommandLineTools"
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    command_line_tools.mkdir(parents=True)
+    (command_line_tools / "Info.plist").write_text("metadata", encoding="utf-8")
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(command_line_tools, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+
+    assert sandbox._selected_xcode_metadata_paths() == []
+
+
+def test_macos_xcode_metadata_requires_app_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    developer = tmp_path / "Applications" / "Xcode" / "Contents" / "Developer"
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer.mkdir(parents=True)
+    (developer.parent / "Info.plist").write_text("metadata", encoding="utf-8")
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+
+    assert sandbox._selected_xcode_metadata_paths() == []
 
 
 @pytest.mark.skipif(

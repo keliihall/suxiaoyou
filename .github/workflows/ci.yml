@@ -387,7 +387,7 @@ jobs:
 
       - name: Run Chromium UI suite
         env:
-          SUXIAOYOU_UI_WORKERS: "2"
+          SUXIAOYOU_UI_WORKERS: "1"
         run: npm run test:ui:core
 
       - name: Upload Playwright diagnostics
