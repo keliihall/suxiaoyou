@@ -277,14 +277,20 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     logical = tmp_path / "var" / "db" / "xcode_select_link"
     developer = tmp_path / "Applications" / "Xcode.app" / "Contents" / "Developer"
     info_plist = developer.parent / "Info.plist"
+    license_plist = (
+        tmp_path / "Library" / "Preferences" / "com.apple.dt.Xcode.plist"
+    )
     workspace.mkdir()
     scratch.mkdir(parents=True)
     developer.mkdir(parents=True)
     info_plist.write_text("xcode metadata", encoding="utf-8")
+    license_plist.parent.mkdir(parents=True)
+    license_plist.write_text("accepted license", encoding="utf-8")
     logical.parent.mkdir(parents=True)
     logical.symlink_to(developer, target_is_directory=True)
     monkeypatch.setattr(sandbox.sys, "platform", "darwin")
     monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_LICENSE_PLIST", license_plist)
     monkeypatch.setattr(sandbox, "_MACOS_SYSTEM_READ_ROOTS", (logical,))
     monkeypatch.setattr(sandbox, "_MACOS_LOGICAL_READ_PATHS", (logical,))
     monkeypatch.setattr(
@@ -310,6 +316,10 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
         for value in launch.argv
     )
     assert any(
+        value.startswith("LITERAL_READ_") and value.endswith(f"={license_plist}")
+        for value in launch.argv
+    )
+    assert any(
         value.startswith("READ_ROOT_") and value.endswith(f"={developer.resolve()}")
         for value in launch.argv
     )
@@ -323,6 +333,7 @@ def test_macos_policy_reads_xcode_select_symlink_and_resolved_runtime(
     assert str(developer.parent) in read_root_values
     assert str(developer.parent.parent) not in read_root_values
     assert str(developer.parents[2]) not in read_root_values
+    assert str(license_plist.parent) not in read_root_values
 
 
 def test_macos_xcode_metadata_requires_full_xcode_layout(
@@ -339,6 +350,7 @@ def test_macos_xcode_metadata_requires_full_xcode_layout(
 
     assert sandbox._selected_xcode_metadata_paths() == []
     assert sandbox._selected_xcode_runtime_roots() == []
+    assert sandbox._macos_xcode_license_paths() == []
 
 
 def test_macos_xcode_metadata_requires_app_bundle(
@@ -403,6 +415,30 @@ def test_macos_xcode_runtime_root_rejects_redirected_info_plist(
     monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
 
     assert sandbox._selected_xcode_runtime_roots() == []
+
+
+def test_macos_xcode_license_path_rejects_redirected_plist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirected = tmp_path / "redirected-license.plist"
+    contents = tmp_path / "Applications" / "Xcode.app" / "Contents"
+    developer = contents / "Developer"
+    license_plist = (
+        tmp_path / "Library" / "Preferences" / "com.apple.dt.Xcode.plist"
+    )
+    logical = tmp_path / "var" / "db" / "xcode_select_link"
+    developer.mkdir(parents=True)
+    (contents / "Info.plist").write_text("xcode metadata", encoding="utf-8")
+    redirected.write_text("outside preferences", encoding="utf-8")
+    license_plist.parent.mkdir(parents=True)
+    license_plist.symlink_to(redirected)
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(developer, target_is_directory=True)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_SELECT_LINK", logical)
+    monkeypatch.setattr(sandbox, "_MACOS_XCODE_LICENSE_PLIST", license_plist)
+
+    assert sandbox._macos_xcode_license_paths() == []
 
 
 @pytest.mark.skipif(

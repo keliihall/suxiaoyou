@@ -333,6 +333,9 @@ def _append_bwrap_bind_at_logical_path(argv: list[str], source: Path) -> None:
 
 
 _MACOS_XCODE_SELECT_LINK = Path("/var/db/xcode_select_link")
+_MACOS_XCODE_LICENSE_PLIST = Path(
+    "/Library/Preferences/com.apple.dt.Xcode.plist"
+)
 
 
 _MACOS_SYSTEM_READ_ROOTS = (
@@ -443,6 +446,34 @@ def _selected_xcode_metadata_paths() -> list[Path]:
     if canonical_info != info_plist:
         return []
     return [canonical_info]
+
+
+def _macos_xcode_license_paths() -> list[Path]:
+    """Return the exact system-wide Xcode license state file when canonical.
+
+    GitHub-hosted macOS images accept the Xcode license while preparing the
+    runner.  Xcode's prerequisite framework reads that state from one global
+    plist before allowing developer-tool shims to continue.  Grant only that
+    regular file, never the enclosing ``/Library/Preferences`` directory.
+    """
+
+    contents = _selected_xcode_contents()
+    if (
+        contents is None
+        or _selected_xcode_metadata_paths() != [contents / "Info.plist"]
+    ):
+        return []
+
+    license_plist = _MACOS_XCODE_LICENSE_PLIST
+    try:
+        if license_plist.is_symlink() or not license_plist.is_file():
+            return []
+        canonical_license = license_plist.resolve(strict=True)
+    except OSError:
+        return []
+    if canonical_license != license_plist:
+        return []
+    return [canonical_license]
 
 
 def _selected_xcode_runtime_roots() -> list[Path]:
@@ -785,7 +816,11 @@ def prepare_sandbox_launch(
             )
         )
         literal_read_paths = _existing_logical_paths(
-            (*_MACOS_LOGICAL_READ_PATHS, *_selected_xcode_metadata_paths())
+            (
+                *_MACOS_LOGICAL_READ_PATHS,
+                *_selected_xcode_metadata_paths(),
+                *_macos_xcode_license_paths(),
+            )
         )
 
         traversal_roots: list[Path] = []
