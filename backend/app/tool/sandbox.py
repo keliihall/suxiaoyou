@@ -392,7 +392,7 @@ def _existing_logical_paths(paths: Iterable[Path]) -> list[Path]:
 
 
 def _selected_xcode_contents() -> Path | None:
-    """Resolve a full selected Xcode bundle without trusting lookalike paths."""
+    """Resolve the selected Xcode Contents tree without trusting lookalikes."""
 
     try:
         developer_root = _MACOS_XCODE_SELECT_LINK.resolve(strict=True)
@@ -405,9 +405,16 @@ def _selected_xcode_contents() -> Path | None:
     ):
         return None
     xcode_bundle = developer_root.parent.parent
-    if xcode_bundle.suffix.casefold() != ".app" or not xcode_bundle.is_dir():
+    contents = developer_root.parent
+    if (
+        xcode_bundle.suffix.casefold() != ".app"
+        or not xcode_bundle.is_dir()
+        or xcode_bundle.is_symlink()
+        or not contents.is_dir()
+        or contents.is_symlink()
+    ):
         return None
-    return developer_root.parent
+    return contents
 
 
 def _selected_xcode_metadata_paths() -> list[Path]:
@@ -439,32 +446,21 @@ def _selected_xcode_metadata_paths() -> list[Path]:
 
 
 def _selected_xcode_runtime_roots() -> list[Path]:
-    """Return only the Xcode framework proven necessary for tool shims.
+    """Return the canonical runtime tree for the system-selected Xcode.
 
-    On a full Xcode selection, Apple's ``/usr/bin/python3`` shim loads
-    ``DVTSystemPrerequisites.framework`` before entering the Developer runtime.
-    Grant that one signed framework as a recursive read root so dyld can read
-    its binary, bundle metadata, and internal symlinks without exposing sibling
-    frameworks or the enclosing Xcode application.
+    Apple's command shims can enter xcrun and xcodebuild, whose private runtime
+    closure spans Developer, Frameworks, SharedFrameworks, PlugIns, resources,
+    and bundle metadata and changes between Xcode releases.  Read only the
+    canonical ``Contents`` tree selected through the system-owned xcode-select
+    link.  Never expose the parent ``*.app`` object or ``/Applications``.
     """
 
     contents = _selected_xcode_contents()
     if contents is None:
         return []
-    framework = contents / "SharedFrameworks" / "DVTSystemPrerequisites.framework"
-    try:
-        if framework.is_symlink() or not framework.is_dir():
-            return []
-        canonical_framework = framework.resolve(strict=True)
-        binary = framework / "Versions" / "A" / "DVTSystemPrerequisites"
-        if binary.is_symlink() or not binary.is_file():
-            return []
-        canonical_binary = binary.resolve(strict=True)
-    except OSError:
+    if _selected_xcode_metadata_paths() != [contents / "Info.plist"]:
         return []
-    if canonical_framework != framework or canonical_binary != binary:
-        return []
-    return [canonical_framework]
+    return [contents]
 
 
 def _map_workspace_text(
