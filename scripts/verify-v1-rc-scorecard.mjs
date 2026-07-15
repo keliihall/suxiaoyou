@@ -127,6 +127,21 @@ function evaluatePackages(scorecard, gates, ga) {
         String(item[field] ?? "missing"),
       );
     }
+    if (kind.startsWith("linux-")) {
+      const expectedBundleType = kind.endsWith("-deb") ? "deb" : "rpm";
+      addGate(
+        gates,
+        `package.${kind}.tauri_bundle_type`,
+        item.tauri_bundle_type === expectedBundleType,
+        String(item.tauri_bundle_type ?? "missing"),
+      );
+      addGate(
+        gates,
+        `package.${kind}.executable_unpatched_sha256`,
+        SHA256_PATTERN.test(String(item.executable_unpatched_sha256 ?? "")),
+        String(item.executable_unpatched_sha256 ?? "missing"),
+      );
+    }
     addGate(
       gates,
       `package.${kind}.executable_size`,
@@ -164,6 +179,26 @@ function evaluatePackages(scorecard, gates, ga) {
         );
       }
     }
+  }
+  for (const architecture of ["x64", "arm64"]) {
+    const deb = byKind.get(`linux-${architecture}-deb`);
+    const rpm = byKind.get(`linux-${architecture}-rpm`);
+    const sameUnpatchedExecutable =
+      deb !== undefined &&
+      rpm !== undefined &&
+      SHA256_PATTERN.test(String(deb.executable_unpatched_sha256 ?? "")) &&
+      deb.executable_unpatched_sha256 === rpm.executable_unpatched_sha256 &&
+      Number.isSafeInteger(deb.executable_size) &&
+      deb.executable_size > 0 &&
+      deb.executable_size === rpm.executable_size;
+    addGate(
+      gates,
+      `package.linux-${architecture}.deb_rpm_executable_identity`,
+      sameUnpatchedExecutable,
+      sameUnpatchedExecutable
+        ? String(deb.executable_unpatched_sha256)
+        : "DEB/RPM executable identity differs after restoring the Tauri bundle marker",
+    );
   }
 }
 

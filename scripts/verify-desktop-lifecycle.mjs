@@ -37,10 +37,57 @@ import { resolveCheckoutCommit } from "./office-contract-evidence.mjs";
 const DEFAULT_STARTUP_TIMEOUT_MS = 120_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 200;
+const TAURI_BUNDLE_MARKER_PREFIX = Buffer.from("__TAURI_BUNDLE_TYPE_VAR_", "ascii");
+const TAURI_BUNDLE_MARKER_PLACEHOLDER = Buffer.from(
+  "__TAURI_BUNDLE_TYPE_VAR_UNK",
+  "ascii",
+);
+const TAURI_LINUX_BUNDLE_MARKERS = Object.freeze({
+  deb: Buffer.from("__TAURI_BUNDLE_TYPE_VAR_DEB", "ascii"),
+  rpm: Buffer.from("__TAURI_BUNDLE_TYPE_VAR_RPM", "ascii"),
+});
+if (
+  Object.values(TAURI_LINUX_BUNDLE_MARKERS).some(
+    (marker) => marker.length !== TAURI_BUNDLE_MARKER_PLACEHOLDER.length,
+  )
+) {
+  throw new Error("Tauri bundle markers must have identical byte lengths");
+}
 const WINDOWS_RESERVED_PATH_SEGMENT =
   /^(?:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/iu;
 
 export const DESKTOP_LIFECYCLE_SCHEMA_VERSION = 1;
+
+function normalizedTauriBundleDigest(bytes, expectedBundleType) {
+  const expectedMarker = TAURI_LINUX_BUNDLE_MARKERS[expectedBundleType];
+  if (!expectedMarker) {
+    throw new Error(`unsupported Tauri Linux bundle type: ${String(expectedBundleType)}`);
+  }
+  const firstMarker = bytes.indexOf(TAURI_BUNDLE_MARKER_PREFIX);
+  const secondMarker =
+    firstMarker < 0
+      ? -1
+      : bytes.indexOf(TAURI_BUNDLE_MARKER_PREFIX, firstMarker + 1);
+  if (firstMarker < 0 || secondMarker >= 0) {
+    throw new Error(
+      `desktop executable must contain exactly one Tauri bundle marker; found ${
+        firstMarker < 0 ? 0 : "multiple"
+      }`,
+    );
+  }
+  const actualMarker = bytes.subarray(
+    firstMarker,
+    firstMarker + TAURI_BUNDLE_MARKER_PLACEHOLDER.length,
+  );
+  if (!actualMarker.equals(expectedMarker)) {
+    throw new Error(
+      `desktop executable Tauri bundle marker does not match ${expectedBundleType}`,
+    );
+  }
+  const normalized = Buffer.from(bytes);
+  TAURI_BUNDLE_MARKER_PLACEHOLDER.copy(normalized, firstMarker);
+  return createHash("sha256").update(normalized).digest("hex");
+}
 
 function isCanonicalAbsoluteExecutablePath(value, platform) {
   if (typeof value !== "string" || value.length === 0 || /[\0\r\n]/u.test(value)) {
@@ -86,7 +133,7 @@ function isCanonicalAbsoluteExecutablePath(value, platform) {
 
 export function validateDesktopLifecycleReport(
   value,
-  { expectedPlatform, expectedCommit, expectedReleaseRef } = {},
+  { expectedPlatform, expectedCommit, expectedReleaseRef, expectedBundleType } = {},
 ) {
   const report = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const failures = [];
@@ -128,6 +175,32 @@ export function validateDesktopLifecycleReport(
   }
   if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(String(report.executable_sha256 ?? ""))) {
     failures.push("executable_sha256 must be a non-zero SHA-256 digest");
+  }
+  const hasBundleEvidence =
+    report.tauri_bundle_type !== undefined ||
+    report.executable_unpatched_sha256 !== undefined ||
+    expectedBundleType !== undefined;
+  if (hasBundleEvidence) {
+    if (report.platform !== "linux") {
+      failures.push("Tauri bundle evidence is only valid for linux reports");
+    }
+    if (!Object.hasOwn(TAURI_LINUX_BUNDLE_MARKERS, report.tauri_bundle_type)) {
+      failures.push("tauri_bundle_type must be deb or rpm");
+    }
+    if (expectedBundleType && report.tauri_bundle_type !== expectedBundleType) {
+      failures.push(
+        `tauri_bundle_type is ${String(report.tauri_bundle_type ?? "missing")}, expected ${expectedBundleType}`,
+      );
+    }
+    if (
+      !/^(?!0{64}$)[0-9a-f]{64}$/u.test(
+        String(report.executable_unpatched_sha256 ?? ""),
+      )
+    ) {
+      failures.push(
+        "executable_unpatched_sha256 must be a non-zero SHA-256 digest",
+      );
+    }
   }
   const startedAt = Date.parse(String(report.started_at ?? ""));
   const completedAt = Date.parse(String(report.completed_at ?? ""));
@@ -319,7 +392,13 @@ export function resolveDesktopExecutable(executable) {
   return realpathSync(requested);
 }
 
-export function hashStableExecutable(executable) {
+export function hashStableExecutable(executable, { expectedBundleType } = {}) {
+  if (
+    expectedBundleType !== undefined &&
+    !Object.hasOwn(TAURI_LINUX_BUNDLE_MARKERS, expectedBundleType)
+  ) {
+    throw new Error(`unsupported Tauri Linux bundle type: ${String(expectedBundleType)}`);
+  }
   const path = resolveDesktopExecutable(executable);
   const before = statSync(path, { bigint: false });
   let descriptor = -1;
@@ -331,11 +410,14 @@ export function hashStableExecutable(executable) {
     }
     const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(1024 * 1024);
+    const chunks = expectedBundleType ? [] : null;
     let total = 0;
     while (true) {
       const count = readSync(descriptor, buffer, 0, buffer.length, null);
       if (count === 0) break;
-      hash.update(buffer.subarray(0, count));
+      const chunk = buffer.subarray(0, count);
+      hash.update(chunk);
+      if (chunks) chunks.push(Buffer.from(chunk));
       total += count;
     }
     const openedAfter = fstatSync(descriptor, { bigint: false });
@@ -354,11 +436,19 @@ export function hashStableExecutable(executable) {
     if (total !== before.size) {
       throw new Error(`desktop executable changed while it was hashed: ${path}`);
     }
-    return {
+    const evidence = {
       path,
       size: total,
       sha256: hash.digest("hex"),
     };
+    if (chunks) {
+      evidence.tauriBundleType = expectedBundleType;
+      evidence.unpatchedSha256 = normalizedTauriBundleDigest(
+        Buffer.concat(chunks, total),
+        expectedBundleType,
+      );
+    }
+    return evidence;
   } finally {
     if (descriptor >= 0) closeSync(descriptor);
   }
@@ -372,10 +462,16 @@ export async function verifyDesktopLifecycle({
   shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
   sourceCommit = resolveCheckoutCommit(),
   releaseRef = process.env.GITHUB_REF_NAME || "local",
+  expectedBundleType,
 }) {
   const startedAt = new Date().toISOString();
   const application = resolveDesktopExecutable(executable);
-  const executableEvidence = hashStableExecutable(application);
+  if (expectedBundleType && platform !== "linux") {
+    throw new Error("Tauri Linux bundle evidence is only valid on linux");
+  }
+  const executableEvidence = hashStableExecutable(application, {
+    expectedBundleType,
+  });
   const work = resolve(workDirectory);
   if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) {
     throw new Error("startup timeout must be a positive integer");
@@ -479,6 +575,12 @@ export async function verifyDesktopLifecycle({
       executable_path: executableEvidence.path,
       executable_size: executableEvidence.size,
       executable_sha256: executableEvidence.sha256,
+      ...(expectedBundleType
+        ? {
+            tauri_bundle_type: executableEvidence.tauriBundleType,
+            executable_unpatched_sha256: executableEvidence.unpatchedSha256,
+          }
+        : {}),
       started_at: startedAt,
       completed_at: new Date().toISOString(),
       desktopPid: child.pid,
@@ -498,6 +600,7 @@ export async function verifyDesktopLifecycle({
       expectedPlatform: platform,
       expectedCommit: sourceCommit,
       expectedReleaseRef: releaseRef,
+      expectedBundleType,
     });
     if (!validation.ok) {
       throw new Error(
@@ -524,6 +627,12 @@ export async function verifyDesktopLifecycle({
           executable_path: executableEvidence.path,
           executable_size: executableEvidence.size,
           executable_sha256: executableEvidence.sha256,
+          ...(expectedBundleType
+            ? {
+                tauri_bundle_type: executableEvidence.tauriBundleType,
+                executable_unpatched_sha256: executableEvidence.unpatchedSha256,
+              }
+            : {}),
           started_at: startedAt,
           completed_at: new Date().toISOString(),
           error: error instanceof Error ? error.message : String(error),
@@ -700,7 +809,7 @@ function parseArguments(argv) {
     const value = argv[index + 1];
     if (!key?.startsWith("--") || value === undefined) {
       throw new Error(
-        "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path>",
+        "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path> [--bundle-type deb|rpm]",
       );
     }
     values.set(key.slice(2), value);
@@ -709,10 +818,17 @@ function parseArguments(argv) {
   const workDirectory = values.get("work-dir");
   if (!executable || !workDirectory) {
     throw new Error(
-      "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path>",
+      "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path> [--bundle-type deb|rpm]",
     );
   }
-  return { executable, workDirectory };
+  const expectedBundleType = values.get("bundle-type");
+  if (
+    expectedBundleType !== undefined &&
+    !Object.hasOwn(TAURI_LINUX_BUNDLE_MARKERS, expectedBundleType)
+  ) {
+    throw new Error("--bundle-type must be deb or rpm");
+  }
+  return { executable, workDirectory, expectedBundleType };
 }
 
 async function main() {

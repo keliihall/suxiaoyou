@@ -806,6 +806,8 @@ test("launches every installed desktop, waits for backend ready, and proves clea
   assert.match(linux, /sudo rpm -i --nodeps/);
   assert.match(linux, /xvfb-run -a dbus-run-session/);
   assert.equal((linux.match(/verify-desktop-lifecycle\.mjs/g) ?? []).length, 2);
+  assert.equal((linux.match(/--bundle-type deb/g) ?? []).length, 1);
+  assert.equal((linux.match(/--bundle-type rpm/g) ?? []).length, 1);
   assert.match(linux, /sudo dpkg --purge/);
   assert.match(linux, /sudo rpm -e/);
 

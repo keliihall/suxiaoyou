@@ -23,17 +23,23 @@ const FIXTURES = [
   ["windows-x64-nsis", `suyo-${VERSION}-windows-x64-setup.exe`, "windows-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows", "win32"],
   ["macos-arm64-dmg", `suyo-${VERSION}-macos-aarch64-ADHOC-NOT-NOTARIZED.dmg`, "macos-aarch64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-aarch64", "darwin"],
   ["macos-x64-dmg", `suyo-${VERSION}-macos-x64-ADHOC-NOT-NOTARIZED.dmg`, "macos-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-x64", "darwin"],
-  ["linux-x64-deb", `suyo-${VERSION}-linux-amd64.deb`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux"],
-  ["linux-x64-rpm", `suyo-${VERSION}-linux-x86_64.rpm`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux"],
-  ["linux-arm64-deb", `suyo-${VERSION}-linux-arm64.deb`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux"],
-  ["linux-arm64-rpm", `suyo-${VERSION}-linux-aarch64.rpm`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux"],
+  ["linux-x64-deb", `suyo-${VERSION}-linux-amd64.deb`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux", "deb"],
+  ["linux-x64-rpm", `suyo-${VERSION}-linux-x86_64.rpm`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux", "rpm"],
+  ["linux-arm64-deb", `suyo-${VERSION}-linux-arm64.deb`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux", "deb"],
+  ["linux-arm64-rpm", `suyo-${VERSION}-linux-aarch64.rpm`, "linux-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-rpm", "linux", "rpm"],
 ];
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function lifecycle(platform, seed, releaseTag = TAG, executableSeed = seed) {
+function lifecycle(
+  platform,
+  seed,
+  releaseTag = TAG,
+  executableSeed = seed,
+  bundleType,
+) {
   return {
     schema_version: 1,
     status: "ok",
@@ -46,7 +52,15 @@ function lifecycle(platform, seed, releaseTag = TAG, executableSeed = seed) {
         ? `D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop-${executableSeed}.exe`
         : `/opt/suyo/desktop-${executableSeed}`,
     executable_size: 4096 + executableSeed,
-    executable_sha256: executableSeed.toString(16).padStart(64, "0"),
+    executable_sha256: seed.toString(16).padStart(64, "0"),
+    ...(bundleType
+      ? {
+          tauri_bundle_type: bundleType,
+          executable_unpatched_sha256: executableSeed
+            .toString(16)
+            .padStart(64, "0"),
+        }
+      : {}),
     started_at: "2026-07-14T00:00:00Z",
     completed_at: "2026-07-14T00:00:01Z",
     desktopPid: 4100 + seed * 2,
@@ -72,7 +86,7 @@ function fixture(t, { definitions = FIXTURES, releaseTag = TAG } = {}) {
   mkdirSync(assetsRoot);
   mkdirSync(artifactsRoot);
   const checksumRows = [];
-  for (const [kind, name, artifactDirectory, lifecycleDirectory, platform] of definitions) {
+  for (const [kind, name, artifactDirectory, lifecycleDirectory, platform, bundleType] of definitions) {
     const bytes = `installer:${kind}`;
     writeFileSync(join(assetsRoot, name), bytes);
     checksumRows.push(`| \`${name}\` | \`${sha256(bytes)}\` | 0.0 MiB |`);
@@ -86,7 +100,13 @@ function fixture(t, { definitions = FIXTURES, releaseTag = TAG } = {}) {
     writeFileSync(
       join(reportDirectory, "result.json"),
       `${JSON.stringify(
-        lifecycle(platform, checksumRows.length, releaseTag, executableSeed),
+        lifecycle(
+          platform,
+          checksumRows.length,
+          releaseTag,
+          executableSeed,
+          bundleType,
+        ),
         null,
         2,
       )}\n`,
@@ -124,6 +144,12 @@ test("aggregates seven checksum-bound installed lifecycle records", async (t) =>
   assert.ok(result.packages[0].executable_size > 0);
   assert.equal(result.packages[1].artifact_profile, "rc-adhoc");
   assert.equal(result.packages[1].trust_boundary_verified, true);
+  const linuxX64 = result.packages.filter((item) => item.kind.startsWith("linux-x64-"));
+  assert.notEqual(linuxX64[0].executable_sha256, linuxX64[1].executable_sha256);
+  assert.equal(
+    linuxX64[0].executable_unpatched_sha256,
+    linuxX64[1].executable_unpatched_sha256,
+  );
 });
 
 test("aggregates canonical Windows lifecycle evidence with win32 semantics", async (t) => {
@@ -231,11 +257,14 @@ test("rejects duplicate or unexpected native lifecycle results", async (t) => {
   await assert.rejects(() => collect(paths), /expected one lifecycle result/u);
 });
 
-test("rejects DEB and RPM evidence that launched different desktop bytes", async (t) => {
+test("rejects DEB and RPM evidence that differs beyond the Tauri bundle marker", async (t) => {
   const paths = fixture(t);
   const reportPath = join(paths.artifactsRoot, FIXTURES[3][2], FIXTURES[3][3], "result.json");
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
-  report.executable_sha256 = "f".repeat(64);
+  report.executable_unpatched_sha256 = "f".repeat(64);
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-  await assert.rejects(() => collect(paths), /identity differs between DEB and RPM/u);
+  await assert.rejects(
+    () => collect(paths),
+    /identity differs after restoring the Tauri bundle marker/u,
+  );
 });

@@ -53,6 +53,14 @@ function passingScorecard() {
       executable_path: `/opt/suyo/${kind}`,
       executable_size: 4096,
       executable_sha256: "8".repeat(64),
+      ...(kind.startsWith("linux-")
+        ? {
+            tauri_bundle_type: kind.endsWith("-deb") ? "deb" : "rpm",
+            executable_unpatched_sha256: kind.startsWith("linux-x64-")
+              ? "6".repeat(64)
+              : "7".repeat(64),
+          }
+        : {}),
       checksum_verified: true,
       installed: true,
       launched: true,
@@ -219,6 +227,22 @@ test("package evidence identifies the exact executable used by lifecycle smoke",
   assert.ok(ids.has(`package.${REQUIRED_PACKAGE_KINDS[0]}.executable_sha256`));
   assert.ok(ids.has(`package.${REQUIRED_PACKAGE_KINDS[1]}.executable_size`));
   assert.ok(ids.has(`package.${REQUIRED_PACKAGE_KINDS[2]}.executable_path`));
+});
+
+test("Linux package evidence must match after restoring only the Tauri marker", () => {
+  const scorecard = passingScorecard();
+  const linuxX64Deb = scorecard.packages.find(
+    (item) => item.kind === "linux-x64-deb",
+  );
+  const linuxArm64Rpm = scorecard.packages.find(
+    (item) => item.kind === "linux-arm64-rpm",
+  );
+  linuxX64Deb.tauri_bundle_type = "rpm";
+  linuxArm64Rpm.executable_unpatched_sha256 = "5".repeat(64);
+  const result = evaluateV1RcScorecard(scorecard);
+  const ids = new Set(result.failures.map((gate) => gate.id));
+  assert.ok(ids.has("package.linux-x64-deb.tauri_bundle_type"));
+  assert.ok(ids.has("package.linux-arm64.deb_rpm_executable_identity"));
 });
 
 test("the primary scorecard cannot ignore or detach integration evidence", () => {

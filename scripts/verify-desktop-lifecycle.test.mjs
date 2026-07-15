@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -224,6 +225,105 @@ test("hashes the canonical executable and rejects empty files", (t) => {
   const empty = join(directory, "empty");
   writeFileSync(empty, "");
   assert.throws(() => hashStableExecutable(empty), /non-empty regular file/u);
+});
+
+test("restores exactly one expected Tauri Linux bundle marker before hashing", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "suxiaoyou-bundle-marker-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const deb = join(directory, "desktop-deb");
+  const prefix = Buffer.from("desktop-prefix\0", "utf8");
+  const suffix = Buffer.from("\0desktop-suffix", "utf8");
+  const marker = Buffer.from("__TAURI_BUNDLE_TYPE_VAR_DEB", "ascii");
+  const placeholder = Buffer.from("__TAURI_BUNDLE_TYPE_VAR_UNK", "ascii");
+  const bytes = Buffer.concat([prefix, marker, suffix]);
+  writeFileSync(deb, bytes);
+
+  const evidence = hashStableExecutable(deb, { expectedBundleType: "deb" });
+  assert.equal(evidence.tauriBundleType, "deb");
+  assert.equal(
+    evidence.sha256,
+    createHash("sha256").update(bytes).digest("hex"),
+  );
+  assert.equal(
+    evidence.unpatchedSha256,
+    createHash("sha256")
+      .update(Buffer.concat([prefix, placeholder, suffix]))
+      .digest("hex"),
+  );
+
+  assert.throws(
+    () => hashStableExecutable(deb, { expectedBundleType: "rpm" }),
+    /bundle marker does not match rpm/u,
+  );
+  const duplicate = join(directory, "desktop-duplicate");
+  writeFileSync(duplicate, Buffer.concat([bytes, marker]));
+  assert.throws(
+    () => hashStableExecutable(duplicate, { expectedBundleType: "deb" }),
+    /exactly one Tauri bundle marker/u,
+  );
+  const missing = join(directory, "desktop-missing");
+  writeFileSync(missing, "desktop without a bundle marker");
+  assert.throws(
+    () => hashStableExecutable(missing, { expectedBundleType: "deb" }),
+    /exactly one Tauri bundle marker/u,
+  );
+});
+
+test("validates release-bound Tauri bundle evidence", () => {
+  const report = {
+    schema_version: 1,
+    status: "ok",
+    ok: true,
+    platform: "linux",
+    source_commit: "a".repeat(40),
+    release_ref: "v1.0.0-rc.7",
+    executable_path: "/usr/bin/suxiaoyou-desktop",
+    executable_size: 4096,
+    executable_sha256: "c".repeat(64),
+    tauri_bundle_type: "deb",
+    executable_unpatched_sha256: "d".repeat(64),
+    started_at: "2026-07-14T00:00:00Z",
+    completed_at: "2026-07-14T00:00:01Z",
+    desktopPid: 4100,
+    backendPid: 4101,
+    backendUrl: "http://127.0.0.1:43123",
+    observedDescendantPids: [4101],
+    exit: { code: 0, signal: null },
+    checks: {
+      backend_ready: true,
+      backend_healthy: true,
+      graceful_exit: true,
+      no_orphan_processes: true,
+      backend_stopped: true,
+    },
+  };
+  assert.equal(
+    validateDesktopLifecycleReport(report, {
+      expectedPlatform: "linux",
+      expectedBundleType: "deb",
+    }).ok,
+    true,
+  );
+  assert.ok(
+    validateDesktopLifecycleReport(report, {
+      expectedPlatform: "linux",
+      expectedBundleType: "rpm",
+    }).failures.some((failure) => failure.includes("expected rpm")),
+  );
+  assert.ok(
+    validateDesktopLifecycleReport(
+      { ...report, executable_unpatched_sha256: undefined },
+      { expectedPlatform: "linux", expectedBundleType: "deb" },
+    ).failures.includes(
+      "executable_unpatched_sha256 must be a non-zero SHA-256 digest",
+    ),
+  );
+  assert.ok(
+    validateDesktopLifecycleReport(
+      { ...report, platform: "win32" },
+      { expectedPlatform: "win32", expectedBundleType: "deb" },
+    ).failures.includes("Tauri bundle evidence is only valid for linux reports"),
+  );
 });
 
 test(

@@ -1206,7 +1206,8 @@ jobs:
           xvfb-run -a dbus-run-session -- \
             node scripts/verify-desktop-lifecycle.mjs \
               --executable "$DEB_LAUNCHER" \
-              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-deb"
+              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-deb" \
+              --bundle-type deb
           sudo dpkg --purge "$DEB_PACKAGE"
           deb_installed=0
 
@@ -1216,7 +1217,8 @@ jobs:
           xvfb-run -a dbus-run-session -- \
             node scripts/verify-desktop-lifecycle.mjs \
               --executable "$RPM_LAUNCHER" \
-              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-rpm"
+              --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-rpm" \
+              --bundle-type rpm
           sudo rpm -e "$RPM_PACKAGE"
           rpm_installed=0
           trap - EXIT

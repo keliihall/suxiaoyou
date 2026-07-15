@@ -48,6 +48,7 @@ const PACKAGE_DEFINITIONS = Object.freeze([
   {
     kind: "linux-x64-deb",
     platform: "linux",
+    bundleType: "deb",
     artifactName: (version) => `suyo-${version}-linux-amd64.deb`,
     lifecycleArtifact: /^linux-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-deb",
@@ -55,6 +56,7 @@ const PACKAGE_DEFINITIONS = Object.freeze([
   {
     kind: "linux-x64-rpm",
     platform: "linux",
+    bundleType: "rpm",
     artifactName: (version) => `suyo-${version}-linux-x86_64.rpm`,
     lifecycleArtifact: /^linux-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-rpm",
@@ -62,6 +64,7 @@ const PACKAGE_DEFINITIONS = Object.freeze([
   {
     kind: "linux-arm64-deb",
     platform: "linux",
+    bundleType: "deb",
     artifactName: (version) => `suyo-${version}-linux-arm64.deb`,
     lifecycleArtifact: /^linux-arm64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-deb",
@@ -69,6 +72,7 @@ const PACKAGE_DEFINITIONS = Object.freeze([
   {
     kind: "linux-arm64-rpm",
     platform: "linux",
+    bundleType: "rpm",
     artifactName: (version) => `suyo-${version}-linux-aarch64.rpm`,
     lifecycleArtifact: /^linux-arm64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-rpm",
@@ -243,6 +247,7 @@ export async function collectNativePackageEvidence({
       expectedPlatform: definition.platform,
       expectedCommit: commit,
       expectedReleaseRef: releaseTag,
+      expectedBundleType: definition.bundleType,
     });
     if (!lifecycle.ok) {
       throw new Error(
@@ -261,6 +266,13 @@ export async function collectNativePackageEvidence({
       executable_path: lifecycle.report.executable_path,
       executable_size: lifecycle.report.executable_size,
       executable_sha256: lifecycle.report.executable_sha256,
+      ...(definition.bundleType
+        ? {
+            tauri_bundle_type: lifecycle.report.tauri_bundle_type,
+            executable_unpatched_sha256:
+              lifecycle.report.executable_unpatched_sha256,
+          }
+        : {}),
       checksum_verified: true,
       installed: true,
       launched: lifecycle.report.checks.backend_ready,
@@ -306,11 +318,11 @@ export async function collectNativePackageEvidence({
     const deb = packagesByKind.get(debKind);
     const rpm = packagesByKind.get(rpmKind);
     if (
-      deb.executable_sha256 !== rpm.executable_sha256 ||
+      deb.executable_unpatched_sha256 !== rpm.executable_unpatched_sha256 ||
       deb.executable_size !== rpm.executable_size
     ) {
       throw new Error(
-        `${debKind}/${rpmKind}: installed executable identity differs between DEB and RPM`,
+        `${debKind}/${rpmKind}: installed executable identity differs after restoring the Tauri bundle marker`,
       );
     }
   }
