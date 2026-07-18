@@ -93,6 +93,7 @@ def test_local_command_cannot_escape_its_project_or_plugin_root(tmp_path: Path) 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = _write_executable(tmp_path / "outside")
+    outside_interpreter = _write_executable(tmp_path / "outside-interpreter")
     registry = HookRegistry(workspace)
 
     with pytest.raises(ValueError, match="inside its source root"):
@@ -101,7 +102,7 @@ def test_local_command_cannot_escape_its_project_or_plugin_root(tmp_path: Path) 
         ])
     with pytest.raises(ValueError, match="inside its source root"):
         registry.register_project_commands([
-            _declaration([sys.executable, str(workspace / "policy.py")]),
+            _declaration([str(outside_interpreter), str(workspace / "policy.py")]),
         ])
 
 
