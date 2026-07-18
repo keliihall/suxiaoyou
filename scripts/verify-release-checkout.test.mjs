@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -41,7 +47,12 @@ function fixture() {
     "frontend/public/manifest.json": "{}\n",
     "desktop-tauri/src-tauri/src/main.rs": "fn main() {}\n",
     "scripts/release.mjs": "export {};\n",
-    "release-licenses/NOTICE.txt": "notice\n",
+    "release-licenses/NOTICE.txt": "notice\r\n",
+    ".gitattributes": [
+      "* text=auto eol=lf",
+      "/release-licenses/** -text -whitespace",
+      "",
+    ].join("\n"),
     ".gitignore": [
       ".env*",
       "frontend/out/",
@@ -80,6 +91,36 @@ test("accepts one clean checkout while allowing ignored build outputs", () => {
     );
     const report = verifyReleaseCheckout({ root, expectedRevision: commit });
     assert.equal(report.commit, commit);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("stays clean after an autocrlf checkout while rejecting real drift", () => {
+  const { root, commit } = fixture();
+  try {
+    git(root, "config", "core.autocrlf", "true");
+    git(root, "checkout-index", "--all", "--force");
+    git(root, "config", "--unset", "core.autocrlf");
+
+    assert.equal(
+      readFileSync(join(root, "backend/run.py"), "utf8"),
+      "print('clean')\n",
+    );
+    assert.equal(
+      readFileSync(join(root, "release-licenses/NOTICE.txt"), "utf8"),
+      "notice\r\n",
+    );
+    assert.equal(
+      verifyReleaseCheckout({ root, expectedRevision: commit }).commit,
+      commit,
+    );
+
+    writeFileSync(join(root, "backend/run.py"), "print('changed')\n");
+    assert.throws(
+      () => verifyReleaseCheckout({ root, expectedRevision: commit }),
+      /tracked files or index are dirty/,
+    );
   } finally {
     cleanup(root);
   }
