@@ -2345,6 +2345,12 @@ jobs:
               v11GateMode: "released",
               officeRendererProfile: "unsigned-degraded",
             },
+            dataIntegrity: {
+              workspaceIdentityScheme: "stat-v1",
+              deletedDirectoryIdentifierReuse: "not-detectable",
+              mitigation:
+                "close-app-and-do-not-rewind-after-recreating-workspace-path",
+            },
             office: {
               authoritativeRenderer: "absent",
               restrictedCompatibilityReport:
@@ -2436,6 +2442,7 @@ jobs:
           ## 已知边界
 
           - Windows Bash/Python 使用 Job Object 回收进程树，但直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动；不得将其理解为 Linux/macOS 的私有事务执行。
+          - checkpoint/rewind 的 `stat-v1` 工作区身份不能识别文件系统在删除目录后立即复用同一对象标识的情况。删除并重建已选择的工作区路径前应退出应用，且不得把旧 checkpoint rewind 到重建后的目录；后续权威版本将迁移到 marker 驱动的 v2 身份。
 
           EOF
               if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then

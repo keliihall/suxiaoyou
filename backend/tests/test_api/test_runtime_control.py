@@ -230,9 +230,11 @@ async def test_runtime_context_resolves_only_server_owned_workspace_identity(
     }
     assert response.headers["cache-control"] == "no-store"
 
-    # Replacing the directory at the same path does not inherit the durable
-    # identity of the original workspace instance.
-    shutil.rmtree(workspace)
+    # Keep the original directory alive under a different name while creating
+    # its replacement.  An immediate remove-then-mkdir may legally reuse the
+    # just-freed inode on Linux, which would not actually create a different
+    # stat-v1 filesystem identity for this assertion.
+    workspace.rename(tmp_path / "retired-workspace")
     workspace.mkdir()
     replaced = await app_client.get(
         "/api/runtime/context",

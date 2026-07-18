@@ -52,6 +52,10 @@
 > 在 macOS 使用 Seatbelt，并先在应用私有事务副本执行；Windows 使用 Job Object 回收进程树，但命令
 > 直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动，因此界面和发布说明不会把
 > Windows 命令描述为隔离或可回滚执行。
+>
+> checkpoint/rewind 当前使用 `stat-v1` 工作区身份。若文件系统在目录被删除后立即复用同一对象标识，
+> 同路径重建可能无法被识别为新工作区；删除并重建已选择的工作区路径前请退出应用，也不要把旧
+> checkpoint rewind 到重建后的目录。
 
 系统要求：macOS 11.0 或更高版本（Apple Silicon 与 Intel 分别提供原生安装包）；Windows x64、Linux x64 与 Linux ARM64 安装包由对应平台的原生 CI runner 构建与验证。
 

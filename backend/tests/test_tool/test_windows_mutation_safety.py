@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+from app import release_features
 from app.schemas.agent import AgentInfo
 from app.storage.file_versions import FileVersionError, FileVersionStore
 from app.tool import workspace_transaction as transaction_module
@@ -372,6 +373,11 @@ async def test_windows_production_office_create_uses_guarded_transaction(
     workspace.mkdir()
     target = workspace / "report.docx"
     monkeypatch.setenv(APP_PRIVATE_DIR_ENV, str(private))
+    # This contract isolates the restricted Office writer's Win32 transaction
+    # boundary.  The v1.1 authoring path has separate tests with an
+    # authoritative precommit coordinator and intentionally fails closed when
+    # that runtime is absent.
+    monkeypatch.setattr(release_features, "V11_OFFICE_V2_RELEASED", False)
 
     result = await OfficeTool().execute(
         {
@@ -553,6 +559,10 @@ async def test_windows_office_create_and_edit_use_guarded_transaction(
     private = tmp_path / "private"
     workspace.mkdir()
     monkeypatch.setenv(APP_PRIVATE_DIR_ENV, str(private))
+    # Keep this native safety test on the legacy/restricted writer so it tests
+    # guarded create/edit transactions rather than the v1.1 coordinator
+    # availability boundary.
+    monkeypatch.setattr(release_features, "V11_OFFICE_V2_RELEASED", False)
     target = workspace / "report.docx"
     tool = OfficeTool()
     created = await tool.execute(

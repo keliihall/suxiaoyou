@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -1893,18 +1894,28 @@ test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
     .split("\n")
     .map((line) => line.replace(/^ {10}/u, ""))
     .join("\n");
-  const resolved = spawnSync("bash", ["-c", contextScript], {
-    cwd: root,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GITHUB_EVENT_NAME: "push",
-      GITHUB_REF: "refs/tags/v1.1.0",
-      GITHUB_REF_NAME: "v1.1.0",
-      GITHUB_OUTPUT: "/dev/stdout",
-    },
-  });
-  assert.equal(resolved.status, 0, resolved.stderr);
+  const outputDirectory = mkdtempSync(
+    join(tmpdir(), "suxiaoyou-release-workflow-"),
+  );
+  let resolvedOutput;
+  try {
+    const githubOutput = join(outputDirectory, "github-output");
+    const resolved = spawnSync("bash", ["-c", contextScript], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_REF: "refs/tags/v1.1.0",
+        GITHUB_REF_NAME: "v1.1.0",
+        GITHUB_OUTPUT: githubOutput,
+      },
+    });
+    assert.equal(resolved.status, 0, resolved.stderr);
+    resolvedOutput = readFileSync(githubOutput, "utf8");
+  } finally {
+    rmSync(outputDirectory, { recursive: true, force: true });
+  }
   for (const output of [
     "app_version=1.1.0",
     "release_version=1.1.0",
@@ -1914,7 +1925,7 @@ test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
     "is_stable=false",
     "macos_artifact_profile=UNSIGNED-DEGRADED",
   ]) {
-    assert.match(resolved.stdout, new RegExp(`^${output}$`, "mu"));
+    assert.match(resolvedOutput, new RegExp(`^${output}$`, "mu"));
   }
 
   const preflight = step(
@@ -2021,6 +2032,8 @@ test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
   assert.match(disclosure, /draft:\s*false/);
   assert.match(disclosure, /installerCount:\s*7/);
   assert.match(disclosure, /metadataCount:\s*4/);
+  assert.match(disclosure, /workspaceIdentityScheme:\s*"stat-v1"/);
+  assert.match(disclosure, /deletedDirectoryIdentifierReuse:\s*"not-detectable"/);
   assert.match(disclosure, /authoritativeRenderer:\s*"absent"/);
   assert.match(disclosure, /highFidelityPreview:\s*"unavailable"/);
   assert.match(disclosure, /macosAppSignature:\s*"adhoc"/);
@@ -2033,6 +2046,7 @@ test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
   assert.match(trust, /Windows NSIS 未配置 Authenticode/);
   assert.match(trust, /macOS 应用仅使用 ad-hoc 签名/);
   assert.match(trust, /Release 公开为 prerelease/);
+  assert.match(trust, /stat-v1.*不能识别文件系统在删除目录后立即复用/u);
 
   const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /name:[^\n]*UNSIGNED-DEGRADED/);
