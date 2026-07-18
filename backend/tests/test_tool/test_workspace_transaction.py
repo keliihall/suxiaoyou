@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import stat
+import threading
 
 import pytest
 
@@ -60,11 +61,23 @@ def _checkpoint_context(workspace: Path, *, checkpoint_id: str) -> ToolContext:
     )
 
 
-def _office_seal(staged: Path, source: Path) -> OfficeDraftSeal:
+def _office_seal(
+    transaction: WorkspaceMutationTransaction,
+    staged: Path,
+    source: Path,
+    *,
+    bind: bool = True,
+) -> OfficeDraftSeal:
     root_info = staged.stat(follow_symlinks=False)
     source_info = source.stat(follow_symlinks=False)
     content = source.read_bytes()
     digest = hashlib.sha256(content).hexdigest()
+    validation_generation = None
+    if bind:
+        logical_target = transaction.workspace / source.relative_to(staged)
+        validation_generation = transaction.arm_office_precommit_validation(
+            logical_target
+        ).validation_generation
     return OfficeDraftSeal(
         relative_path=source.relative_to(staged).as_posix(),
         source_sha256=digest,
@@ -72,6 +85,7 @@ def _office_seal(staged: Path, source: Path) -> OfficeDraftSeal:
         source_size=len(content),
         root_identity=(root_info.st_dev, root_info.st_ino),
         source_identity=(source_info.st_dev, source_info.st_ino),
+        validation_generation=validation_generation,
         renderer_id="test-authoritative-renderer",
         renderer_version="1",
         font_digest="f" * 64,
@@ -98,7 +112,7 @@ def test_authoritative_office_seal_commits_exact_hidden_replacement(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     result = transaction.commit_with_precommit_office_seal(seal)
 
@@ -106,6 +120,137 @@ def test_authoritative_office_seal_commits_exact_hidden_replacement(
     assert result.written_files == (str(target),)
     assert "office_seal" not in result.metadata
     assert "precommit_seal" not in result.metadata
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_unarmed_office_seal_cannot_match_an_absent_generation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"candidate")
+    unbound_seal = _office_seal(
+        transaction,
+        staged,
+        staged_target,
+        bind=False,
+    )
+
+    with pytest.raises(WorkspacePrecommitSealError, match="not armed"):
+        transaction.commit_with_precommit_office_seal(unbound_seal)
+
+    assert target.read_bytes() == b"before"
+
+
+def test_office_reset_is_serialized_by_the_transaction_state_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    transaction = _transaction(workspace, private)
+    worker_started = threading.Event()
+    reset_body_entered = threading.Event()
+    worker_finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def guarded_reset_body(logical_target: object) -> object:
+        del logical_target
+        reset_body_entered.set()
+        return object()
+
+    monkeypatch.setattr(
+        transaction,
+        "_reset_office_precommit_target",
+        guarded_reset_body,
+    )
+
+    def reset_worker() -> None:
+        worker_started.set()
+        try:
+            transaction.reset_office_precommit_target(workspace / "report.docx")
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            failures.append(exc)
+        finally:
+            worker_finished.set()
+
+    worker = threading.Thread(target=reset_worker)
+    with transaction._office_state_lock:
+        worker.start()
+        assert worker_started.wait(timeout=1)
+        assert not reset_body_entered.wait(timeout=0.1)
+        assert not worker_finished.is_set()
+
+    assert reset_body_entered.wait(timeout=1)
+    worker.join(timeout=1)
+    assert worker_finished.is_set()
+    assert failures == []
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_plain_commit_rechecks_armed_state_inside_transaction_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"candidate")
+    outer_check_passed = threading.Event()
+    continue_commit = threading.Event()
+    worker_finished = threading.Event()
+    failures: list[BaseException] = []
+    real_commit = transaction._commit
+
+    def pause_after_plain_commit_outer_check(
+        *,
+        office_seal: OfficeDraftSeal | None,
+    ) -> object:
+        outer_check_passed.set()
+        assert continue_commit.wait(timeout=1)
+        return real_commit(office_seal=office_seal)
+
+    monkeypatch.setattr(transaction, "_commit", pause_after_plain_commit_outer_check)
+
+    def commit_worker() -> None:
+        try:
+            transaction.commit()
+        except BaseException as exc:  # expected and asserted below
+            failures.append(exc)
+        finally:
+            worker_finished.set()
+
+    worker = threading.Thread(target=commit_worker)
+    worker.start()
+    assert outer_check_passed.wait(timeout=1)
+    transaction.arm_office_precommit_validation(target)
+    continue_commit.set()
+    worker.join(timeout=1)
+
+    assert worker_finished.is_set()
+    assert len(failures) == 1
+    assert isinstance(failures[0], WorkspacePrecommitSealError)
+    assert "requires its precommit seal" in str(failures[0])
+    assert target.read_bytes() == b"before"
+    transaction.abort()
 
 
 @pytest.mark.skipif(
@@ -124,7 +269,7 @@ def test_office_sealed_create_builds_fresh_workspace_output_parent(
     staged_target = transaction.staged_path(target)
     staged_target.parent.mkdir()
     staged_target.write_bytes(b"validated create")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     result = transaction.commit_with_precommit_office_seal(seal)
 
@@ -151,7 +296,7 @@ def test_office_sealed_create_builds_only_nested_missing_ancestor_chain(
     staged_target = transaction.staged_path(target)
     staged_target.parent.mkdir(parents=True)
     staged_target.write_bytes(b"nested validated create")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     transaction.commit_with_precommit_office_seal(seal)
 
@@ -184,7 +329,7 @@ def test_office_sealed_create_rejects_unrelated_extra_directory(
     staged_target.parent.mkdir()
     staged_target.write_bytes(b"candidate")
     (staged / "unrelated").mkdir()
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
         transaction.commit_with_precommit_office_seal(seal)
@@ -210,7 +355,7 @@ def test_office_sealed_create_rejects_sibling_directory_below_new_parent(
     staged_target.parent.mkdir(parents=True)
     staged_target.write_bytes(b"candidate")
     (staged / "reports" / "sibling").mkdir()
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
         transaction.commit_with_precommit_office_seal(seal)
@@ -238,7 +383,7 @@ def test_office_sealed_edit_rejects_existing_parent_metadata_mutation(
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"candidate")
     (staged / "reports").chmod(0o700)
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
 
     with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
         transaction.commit_with_precommit_office_seal(seal)
@@ -264,7 +409,7 @@ def test_office_sealed_create_rolls_back_ancestors_after_precommit_fault(
     staged_target = transaction.staged_path(target)
     staged_target.parent.mkdir(parents=True)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     real_prepare = transaction_module._prepare_regular_replacement_at
     exchange_calls = 0
 
@@ -322,6 +467,7 @@ def test_office_sealed_create_rolls_back_ancestors_after_precommit_fault(
         ("quality", "approximate"),
         ("root_identity", (0, 0)),
         ("source_identity", (0, 0)),
+        ("validation_generation", "0" * 64),
     ),
 )
 def test_wrong_office_seal_aborts_without_changing_original(
@@ -338,7 +484,7 @@ def test_wrong_office_seal_aborts_without_changing_original(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     if field == "source_mode":
         value = seal.source_mode ^ stat.S_IXUSR
     seal = replace(seal, **{field: value})
@@ -371,7 +517,7 @@ def test_office_seal_rejects_an_unsealed_second_write(
     staged_second = transaction.staged_path(second)
     staged_first.write_bytes(b"first candidate")
     staged_second.write_bytes(b"second unsealed candidate")
-    seal = _office_seal(staged, staged_first)
+    seal = _office_seal(transaction, staged, staged_first, bind=False)
 
     with pytest.raises(WorkspacePrecommitSealError, match="exact file write"):
         transaction.commit_with_precommit_office_seal(seal)
@@ -397,7 +543,7 @@ def test_office_seal_rejects_staged_tamper_after_validation(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     staged_target.write_bytes(b"tampered after validation")
 
     with pytest.raises(WorkspacePrecommitSealError, match="changed after validation"):
@@ -423,7 +569,7 @@ def test_office_seal_preserves_concurrent_visible_edit(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     target.write_bytes(b"concurrent user edit")
 
     with pytest.raises(WorkspaceMutationError, match="changed outside"):
@@ -450,7 +596,7 @@ def test_office_seal_detects_hidden_replacement_tamper_before_exchange(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     real_prepare = transaction_module._prepare_regular_replacement_at
     exchange_calls = 0
 
@@ -511,7 +657,7 @@ def test_office_seal_detects_source_copy_toctou_before_exchange(
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
     staged_target.write_bytes(b"validated candidate")
-    seal = _office_seal(staged, staged_target)
+    seal = _office_seal(transaction, staged, staged_target)
     real_prepare = transaction_module._prepare_regular_replacement_at
     exchange_calls = 0
 

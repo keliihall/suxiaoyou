@@ -2667,7 +2667,7 @@ class OfficeTool(ToolDefinition):
                             return ToolResult(
                                 error=ctx.tr("操作已取消。", "Operation cancelled.")
                             )
-                        await _await_transaction_thread(
+                        view = await _await_transaction_thread(
                             transaction.reset_office_precommit_target,
                             file_path,
                         )

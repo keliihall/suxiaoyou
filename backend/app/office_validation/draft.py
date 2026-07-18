@@ -155,6 +155,7 @@ class OfficeDraftSeal:
     source_size: int
     root_identity: tuple[int, int]
     source_identity: tuple[int, int]
+    validation_generation: str | None
     renderer_id: str
     renderer_version: str
     font_digest: str
@@ -220,6 +221,13 @@ class OfficeDraftSeal:
                 raise OfficeValidationContractError(
                     "draft seal filesystem identity is invalid"
                 )
+        if self.validation_generation is not None and (
+            not isinstance(self.validation_generation, str)
+            or _SHA256.fullmatch(self.validation_generation) is None
+        ):
+            raise OfficeValidationContractError(
+                "draft seal validation generation is invalid"
+            )
 
 @dataclass(frozen=True, slots=True)
 class OfficeDraftArtifact:
@@ -319,7 +327,11 @@ class OfficeDraftValidationResult:
     def commit_seal(self) -> OfficeDraftSeal | None:
         """Expose a commit credential only for an authoritative full pass."""
 
-        if self.report.verdict != "pass" or self.candidate.quality != "authoritative":
+        if (
+            self.report.verdict != "pass"
+            or self.candidate.quality != "authoritative"
+            or self.candidate.validation_generation is None
+        ):
             return None
         return self.candidate
 
@@ -712,6 +724,7 @@ def _candidate_seal(candidate: OfficeDraftArtifact) -> OfficeDraftSeal:
         source_size=candidate.source_size,
         root_identity=candidate.root_identity,
         source_identity=candidate.source_identity,
+        validation_generation=None,
         renderer_id=candidate.manifest.renderer_id,
         renderer_version=candidate.manifest.renderer_version,
         font_digest=candidate.manifest.font_digest,

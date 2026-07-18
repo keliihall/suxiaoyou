@@ -81,6 +81,7 @@ class _TrustedTestPrecommitSession:
             source_size=source_info.st_size,
             root_identity=(root_info.st_dev, root_info.st_ino),
             source_identity=(source_info.st_dev, source_info.st_ino),
+            validation_generation=self._view.validation_generation,
             renderer_id=report.renderer_id,
             renderer_version=report.renderer_version,
             font_digest=report.font_digest,

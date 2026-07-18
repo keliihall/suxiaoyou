@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import fields
+from dataclasses import fields, replace
 import hashlib
 import json
 import os
@@ -129,6 +129,7 @@ def _candidate_result(
         source_size=source_info.st_size,
         root_identity=(root_info.st_dev, root_info.st_ino),
         source_identity=(source_info.st_dev, source_info.st_ino),
+        validation_generation=view.validation_generation,
         renderer_id=report.renderer_id,
         renderer_version=report.renderer_version,
         font_digest=report.font_digest,
@@ -699,7 +700,12 @@ async def test_create_repairs_once_in_private_staging(
     assert "fixed content" in _document_text(_target(workspace))
     assert len(coordinator.sessions) == 2
     assert [item.state for item in coordinator.sessions] == ["aborted", "committed"]
-    assert coordinator.views[0] is coordinator.views[1]
+    assert coordinator.views[0] is not coordinator.views[1]
+    assert coordinator.views[0].staged_root == coordinator.views[1].staged_root
+    assert (
+        coordinator.views[0].validation_generation
+        != coordinator.views[1].validation_generation
+    )
     assert result.metadata["office_validation_repair_attempts"] == 1
     request = repairer.requests[0]
     assert request.attempt == 1
@@ -748,6 +754,10 @@ async def test_edit_reset_replays_repair_from_visible_baseline(
     assert len(coordinator.sessions) == 2
     assert coordinator.views[0].staged_root_identity == (
         coordinator.views[1].staged_root_identity
+    )
+    assert (
+        coordinator.views[0].validation_generation
+        != coordinator.views[1].validation_generation
     )
 
 
@@ -1133,7 +1143,12 @@ def _transaction_context(workspace: Path) -> ToolContext:
     )
 
 
-def _raw_seal(staged: Path, target: Path) -> OfficeDraftSeal:
+def _raw_seal(
+    staged: Path,
+    target: Path,
+    *,
+    validation_generation: str,
+) -> OfficeDraftSeal:
     root_info = staged.lstat()
     source_info = target.lstat()
     payload = target.read_bytes()
@@ -1144,6 +1159,7 @@ def _raw_seal(staged: Path, target: Path) -> OfficeDraftSeal:
         source_size=source_info.st_size,
         root_identity=(root_info.st_dev, root_info.st_ino),
         source_identity=(source_info.st_dev, source_info.st_ino),
+        validation_generation=validation_generation,
         renderer_id="renderer",
         renderer_version="1",
         font_digest="f" * 64,
@@ -1169,12 +1185,13 @@ def test_wmt_create_reset_preserves_armed_root_and_deletes_candidate(
     view.staged_target.parent.mkdir()
     view.staged_target.write_bytes(b"candidate")
 
-    transaction.reset_office_precommit_target(target)
+    reset_view = transaction.reset_office_precommit_target(target)
 
     assert not view.staged_target.exists()
     assert view.staged_target.parent.is_dir()
     root_info = staged.lstat()
     assert view.staged_root_identity == (root_info.st_dev, root_info.st_ino)
+    assert reset_view.validation_generation != view.validation_generation
     transaction.abort()
 
 
@@ -1192,13 +1209,101 @@ def test_wmt_edit_reset_rejects_old_seal_even_for_identical_candidate_bytes(
     staged = transaction.prepare_paths([target])
     view = transaction.arm_office_precommit_validation(target)
     view.staged_target.write_bytes(b"candidate")
-    stale_seal = _raw_seal(staged, view.staged_target)
+    stale_seal = _raw_seal(
+        staged,
+        view.staged_target,
+        validation_generation=view.validation_generation,
+    )
 
-    transaction.reset_office_precommit_target(target)
+    reset_view = transaction.reset_office_precommit_target(target)
     assert view.staged_target.read_bytes() == b"baseline"
     view.staged_target.write_bytes(b"candidate")
+    # Make every filesystem/content field in the stale seal match the new
+    # candidate explicitly.  The transaction generation alone must still
+    # reject it, even on filesystems that immediately reuse the old inode.
+    source_info = view.staged_target.lstat()
+    stale_seal = replace(
+        stale_seal,
+        source_identity=(source_info.st_dev, source_info.st_ino),
+    )
+    assert reset_view.validation_generation != view.validation_generation
 
-    with pytest.raises(WorkspacePrecommitSealError, match="changed after validation"):
+    with pytest.raises(WorkspacePrecommitSealError, match="generation is stale"):
+        transaction.commit_with_precommit_office_seal(stale_seal)
+    assert target.read_bytes() == b"baseline"
+
+
+def test_wmt_edit_reset_accepts_only_a_new_generation_seal(
+    workspace: Path,
+) -> None:
+    target = workspace / "report.docx"
+    target.write_bytes(b"baseline")
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _transaction_context(workspace),
+        operation="office.edit",
+        storage_root=workspace.parent / "private",
+    )
+    staged = transaction.prepare_paths([target])
+    view = transaction.arm_office_precommit_validation(target)
+    view.staged_target.write_bytes(b"first candidate")
+
+    reset_view = transaction.reset_office_precommit_target(target)
+    reset_view.staged_target.write_bytes(b"second candidate")
+    fresh_seal = _raw_seal(
+        staged,
+        reset_view.staged_target,
+        validation_generation=reset_view.validation_generation,
+    )
+
+    transaction.commit_with_precommit_office_seal(fresh_seal)
+
+    assert target.read_bytes() == b"second candidate"
+
+
+def test_wmt_failed_edit_reset_retires_old_generation(
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = workspace / "report.docx"
+    target.write_bytes(b"baseline")
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _transaction_context(workspace),
+        operation="office.edit",
+        storage_root=workspace.parent / "private",
+    )
+    staged = transaction.prepare_paths([target])
+    view = transaction.arm_office_precommit_validation(target)
+    view.staged_target.write_bytes(b"candidate")
+    stale_seal = _raw_seal(
+        staged,
+        view.staged_target,
+        validation_generation=view.validation_generation,
+    )
+
+    def fail_after_candidate_retirement(
+        workspace_fd: int,
+        relative: str,
+        destination: Path,
+    ) -> tuple[object, int]:
+        del workspace_fd, relative, destination
+        raise WorkspacePrecommitSealError("injected reset copy failure")
+
+    monkeypatch.setattr(
+        "app.tool.workspace_transaction._copy_regular_file_at_relative",
+        fail_after_candidate_retirement,
+    )
+    with pytest.raises(WorkspacePrecommitSealError, match="injected"):
+        transaction.reset_office_precommit_target(target)
+
+    view.staged_target.write_bytes(b"candidate")
+    source_info = view.staged_target.lstat()
+    stale_seal = replace(
+        stale_seal,
+        source_identity=(source_info.st_dev, source_info.st_ino),
+    )
+    with pytest.raises(WorkspacePrecommitSealError, match="generation is retired"):
         transaction.commit_with_precommit_office_seal(stale_seal)
     assert target.read_bytes() == b"baseline"
 

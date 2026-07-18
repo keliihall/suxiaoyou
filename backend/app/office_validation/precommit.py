@@ -578,6 +578,10 @@ class _ValidationSessionBase:
             )
             _validate_candidate_identity(self._request, self._view, candidate)
             raw_result = self._compare(candidate)
+            bound_candidate = replace(
+                raw_result.candidate,
+                validation_generation=self._view.validation_generation,
+            )
             report = replace(
                 raw_result.report,
                 checkpoint_id=self._request.checkpoint_id,
@@ -585,7 +589,7 @@ class _ValidationSessionBase:
             )
             result = OfficeDraftValidationResult(
                 report=report,
-                candidate=raw_result.candidate,
+                candidate=bound_candidate,
             )
         except BaseException:
             self._state = "aborted"
@@ -621,6 +625,7 @@ class _ValidationSessionBase:
         if (
             seal.relative_path != self._view.relative_path
             or seal.root_identity != self._view.staged_root_identity
+            or seal.validation_generation != self._view.validation_generation
         ):
             self._state = "aborted"
             raise OfficePrecommitRejectedError(
@@ -735,6 +740,17 @@ def _validate_request_view(
     ):
         raise OfficeValidationContractError(
             "Office precommit request or transaction view is invalid"
+        )
+    if (
+        not isinstance(view.validation_generation, str)
+        or len(view.validation_generation) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in view.validation_generation
+        )
+    ):
+        raise OfficeValidationContractError(
+            "Office precommit validation generation is invalid"
         )
     expected = (
         request.relative_path,

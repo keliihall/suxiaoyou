@@ -126,6 +126,7 @@ async def test_staged_edit_passes_authoritative_gates_without_touching_original(
     )
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
+    view = transaction.arm_office_precommit_validation(target)
     staged_target.write_bytes(candidate_bytes)
     service = _service(tmp_path, DraftProvider())
 
@@ -148,11 +149,16 @@ async def test_staged_edit_passes_authoritative_gates_without_touching_original(
     assert report.verdict == "pass"
     assert target.read_bytes() == baseline_bytes
     assert transaction.collect_changes().writes == ("report.docx",)
-    assert result.commit_seal is not None
-    assert result.commit_seal.source_sha256 == hashlib.sha256(
+    assert result.commit_seal is None
+    assert result.candidate.source_sha256 == hashlib.sha256(
         candidate_bytes
     ).hexdigest()
-    commit = transaction.commit_with_precommit_office_seal(result.commit_seal)
+    commit = transaction.commit_with_precommit_office_seal(
+        replace(
+            result.candidate,
+            validation_generation=view.validation_generation,
+        )
+    )
     assert commit.written_files == (str(target),)
     assert target.read_bytes() == candidate_bytes
 
@@ -182,6 +188,7 @@ async def test_staged_create_requires_explicit_golden_and_remains_private(
     )
     staged = transaction.prepare_paths([target])
     staged_target = transaction.staged_path(target)
+    view = transaction.arm_office_precommit_validation(target)
     staged_target.parent.mkdir()
     staged_target.write_bytes(candidate_bytes)
     service = _service(tmp_path, DraftProvider())
@@ -232,8 +239,13 @@ async def test_staged_create_requires_explicit_golden_and_remains_private(
             policy=replace(policy, renderer_version="different"),
             template_manifest=template_manifest,
         )
-    assert result.commit_seal is not None
-    transaction.commit_with_precommit_office_seal(result.commit_seal)
+    assert result.commit_seal is None
+    transaction.commit_with_precommit_office_seal(
+        replace(
+            result.candidate,
+            validation_generation=view.validation_generation,
+        )
+    )
     assert target.read_bytes() == candidate_bytes
 
 

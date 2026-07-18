@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from app.office_validation import (
     OfficePrecommitRejectedError,
     OfficePrecommitRequest,
     OfficePrecommitStateError,
+    OfficeValidationContractError,
     VisualDiffPolicy,
 )
 from app.schemas.agent import AgentInfo
@@ -254,6 +256,35 @@ async def test_request_identity_cannot_be_mixed_with_another_transaction_view(
         await coordinator.begin(request=request, view=view)
     transaction.abort()
     assert target.read_bytes() == make_docx_template()
+
+
+async def test_invalid_transaction_validation_generation_is_rejected_early(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(make_docx_template())
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _context(workspace),
+        operation="office.edit",
+        storage_root=tmp_path / "private",
+    )
+    transaction.prepare_paths([target])
+    view = transaction.arm_office_precommit_validation(target)
+    coordinator = DeterministicOfficePrecommitCoordinator(
+        service=_service(tmp_path),
+        policies=_Policies(),
+    )
+
+    with pytest.raises(OfficeValidationContractError, match="generation is invalid"):
+        await coordinator.begin(
+            request=_request(view, operation="edit"),
+            view=replace(view, validation_generation="not-a-generation"),
+        )
+
+    transaction.abort()
 
 
 async def test_signed_golden_create_can_publish_nested_target(

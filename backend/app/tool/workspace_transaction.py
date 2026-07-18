@@ -121,6 +121,7 @@ class WorkspaceOfficePrecommitView:
     relative_path: str
     workspace_identity: tuple[int, int]
     staged_root_identity: tuple[int, int]
+    validation_generation: str
     baseline: WorkspaceEntry | None
     baseline_identity: tuple[int, int] | None
     operation: str
@@ -156,6 +157,7 @@ class _OfficePrecommitGuard:
     created_directories: tuple[tuple[str, WorkspaceEntry], ...]
     staged_root_identity: tuple[int, int]
     staged_source_identity: tuple[int, int]
+    validation_generation: str
 
 
 @dataclass(slots=True)
@@ -354,6 +356,7 @@ class WorkspaceMutationTransaction:
         self.storage_root = Path(os.path.abspath(private_base)) / "execution-transactions"
         self._workspace_key = hashlib.sha256(os.fsencode(str(self.workspace))).hexdigest()
         self._commit_lock = _workspace_commit_lock(self._workspace_key)
+        self._office_state_lock = threading.RLock()
         self.transaction_root: Path | None = None
         self.staged_workspace: Path | None = None
         self._baseline: dict[str, WorkspaceEntry] | None = None
@@ -367,6 +370,7 @@ class WorkspaceMutationTransaction:
         self._targeted_source_identities: dict[str, tuple[int, int] | None] | None = None
         self._office_precommit_relative: str | None = None
         self._office_precommit_root_identity: tuple[int, int] | None = None
+        self._office_precommit_generation: str | None = None
         self._finished = False
         self._preserve_for_recovery = False
         self._journal_payload: dict[str, object] | None = None
@@ -643,6 +647,15 @@ class WorkspaceMutationTransaction:
         self,
         logical_target: str | os.PathLike[str],
     ) -> WorkspaceOfficePrecommitView:
+        """Serialize arming with reset and commit for this workspace."""
+
+        with self._office_state_lock:
+            return self._arm_office_precommit_validation(logical_target)
+
+    def _arm_office_precommit_validation(
+        self,
+        logical_target: str | os.PathLike[str],
+    ) -> WorkspaceOfficePrecommitView:
         """Bind the prepared single-file target to the sealed commit path.
 
         Once armed, ``commit()`` is mechanically unavailable.  The transaction
@@ -680,8 +693,10 @@ class WorkspaceMutationTransaction:
             )
         staged_target = staged / relative
         staged_root_identity = _path_identity(staged, directory=True)
+        validation_generation = secrets.token_hex(32)
         self._office_precommit_relative = relative
         self._office_precommit_root_identity = staged_root_identity
+        self._office_precommit_generation = validation_generation
         return WorkspaceOfficePrecommitView(
             workspace_root=self.workspace,
             visible_target=self.workspace / relative,
@@ -690,6 +705,7 @@ class WorkspaceMutationTransaction:
             relative_path=relative,
             workspace_identity=workspace_identity,
             staged_root_identity=staged_root_identity,
+            validation_generation=validation_generation,
             baseline=baseline.get(relative),
             baseline_identity=identities[relative],
             operation=self.operation,
@@ -705,14 +721,24 @@ class WorkspaceMutationTransaction:
     def reset_office_precommit_target(
         self,
         logical_target: str | os.PathLike[str],
-    ) -> None:
-        """Reset one armed Office candidate without replacing its transaction view.
+    ) -> WorkspaceOfficePrecommitView:
+        """Serialize candidate reset with arming and visible commit."""
+
+        with self._office_state_lock:
+            return self._reset_office_precommit_target(logical_target)
+
+    def _reset_office_precommit_target(
+        self,
+        logical_target: str | os.PathLike[str],
+    ) -> WorkspaceOfficePrecommitView:
+        """Reset one candidate and return its newly authorized validation view.
 
         Create candidates are removed.  Edit candidates are replaced with a new
         private copy only while the visible baseline still has the exact entry,
         inode identity, and SHA-256 captured by ``prepare_paths()``.  The armed
-        relative path, staged root, and staged-root identity are preserved, so a
-        later validation result must seal a newly captured candidate inode.
+        relative path, staged root, and staged-root identity are preserved.  A
+        fresh transaction-owned validation generation is returned, so neither
+        inode reuse nor identical candidate bytes can revive an earlier seal.
         """
 
         if self._finished:
@@ -729,6 +755,7 @@ class WorkspaceMutationTransaction:
         if (
             self._office_precommit_relative != relative
             or expected_root_identity is None
+            or self._office_precommit_generation is None
         ):
             raise WorkspacePrecommitSealError(
                 "Office precommit target is not armed for reset"
@@ -741,6 +768,14 @@ class WorkspaceMutationTransaction:
             raise WorkspacePrecommitSealError(
                 "Office precommit reset operation is invalid"
             )
+
+        # Reserve the next capability before changing the candidate, then
+        # publish it only after the reset has completed.  This prevents an
+        # old seal from becoming current again if a filesystem immediately
+        # reuses the removed candidate's inode for identical replacement
+        # bytes (a normal possibility on Linux).
+        next_validation_generation = secrets.token_hex(32)
+        self._office_precommit_generation = None
 
         visible_identity = self._workspace_identity
         source_identities = self._targeted_source_identities
@@ -814,6 +849,28 @@ class WorkspaceMutationTransaction:
             raise WorkspacePrecommitSealError(
                 "Office precommit transaction identity changed during reset"
             )
+
+        self._office_precommit_generation = next_validation_generation
+        return WorkspaceOfficePrecommitView(
+            workspace_root=self.workspace,
+            visible_target=self.workspace / relative,
+            staged_root=staged,
+            staged_target=staged / relative,
+            relative_path=relative,
+            workspace_identity=visible_identity,
+            staged_root_identity=expected_root_identity,
+            validation_generation=next_validation_generation,
+            baseline=baseline.get(relative),
+            baseline_identity=source_identities[relative],
+            operation=self.operation,
+            session_id=self.ctx.session_id,
+            message_id=self.ctx.message_id,
+            call_id=self.ctx.call_id,
+            root_turn_id=self.ctx.root_turn_id,
+            turn_run_id=self.ctx.turn_run_id,
+            checkpoint_id=self.ctx.checkpoint_id,
+            workspace_instance_id=self.ctx.workspace_instance_id,
+        )
 
     def _assert_office_reset_visible_baseline(
         self,
@@ -1007,15 +1064,24 @@ class WorkspaceMutationTransaction:
         office_seal: OfficeDraftSeal | None,
     ) -> WorkspaceCommitResult:
         _require_guarded_workspace_mutation_support()
-        with self._commit_lock:
-            with _open_workspace_root_fd(
-                self.workspace,
-                expected_identity=self._workspace_identity,
-            ) as workspace_fd:
-                return self._commit_with_fd(
-                    workspace_fd,
-                    office_seal=office_seal,
+        with self._office_state_lock:
+            # ``commit()`` performs the same check as an early fast-fail, but
+            # arming may race between that observation and acquisition of this
+            # transaction-local lock.  Recheck at the serialized boundary so
+            # a plain commit can never publish an armed Office candidate.
+            if office_seal is None and self._office_precommit_relative is not None:
+                raise WorkspacePrecommitSealError(
+                    "An armed Office transaction requires its precommit seal"
                 )
+            with self._commit_lock:
+                with _open_workspace_root_fd(
+                    self.workspace,
+                    expected_identity=self._workspace_identity,
+                ) as workspace_fd:
+                    return self._commit_with_fd(
+                        workspace_fd,
+                        office_seal=office_seal,
+                    )
 
     def _commit_with_fd(
         self,
@@ -1519,6 +1585,33 @@ class WorkspaceMutationTransaction:
             raise WorkspacePrecommitSealError(
                 "Office precommit seal is outside the declared mutation set"
             )
+        armed_relative = self._office_precommit_relative
+        armed_root_identity = self._office_precommit_root_identity
+        validation_generation = self._office_precommit_generation
+        if (
+            armed_relative is None
+            or armed_root_identity is None
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit transaction is not armed"
+            )
+        if validation_generation is None:
+            raise WorkspacePrecommitSealError(
+                "Office precommit validation generation is retired"
+            )
+        if (
+            seal.relative_path != armed_relative
+            or seal.root_identity != armed_root_identity
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal targets a different armed view"
+            )
+        if (
+            seal.validation_generation != validation_generation
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal validation generation is stale"
+            )
         if self._workspace_identity is None:
             raise WorkspacePrecommitSealError(
                 "Office precommit transaction identity is unavailable"
@@ -1553,6 +1646,7 @@ class WorkspaceMutationTransaction:
             created_directories=tuple(created_entries),
             staged_root_identity=seal.root_identity,
             staged_source_identity=seal.source_identity,
+            validation_generation=validation_generation,
         )
         self._assert_office_precommit_source(staged=staged, guard=guard)
         return guard
@@ -1587,6 +1681,7 @@ class WorkspaceMutationTransaction:
 
         if (
             self._workspace_identity != guard.workspace_identity
+            or self._office_precommit_generation != guard.validation_generation
             or self._require_baseline().get(guard.relative) != guard.baseline
         ):
             raise WorkspacePrecommitSealError(
@@ -1633,6 +1728,7 @@ class WorkspaceMutationTransaction:
             self._targeted_source_identities = None
             self._office_precommit_relative = None
             self._office_precommit_root_identity = None
+            self._office_precommit_generation = None
             self._journal_payload = None
         self._finished = True
 
@@ -1671,6 +1767,7 @@ class WorkspaceMutationTransaction:
         self._targeted_source_identities = None
         self._office_precommit_relative = None
         self._office_precommit_root_identity = None
+        self._office_precommit_generation = None
         self._journal_payload = None
         self._finished = True
 
