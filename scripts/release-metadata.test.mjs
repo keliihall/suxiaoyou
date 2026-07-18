@@ -18,6 +18,7 @@ const RELEASE_METADATA_SOURCES = [
   "frontend/package-lock.json top-level version",
   "frontend/package-lock.json root entry",
   "backend/pyproject.toml [project].version",
+  "backend/app/version.py APP_VERSION",
   "desktop-tauri/src-tauri/tauri.conf.json",
   "desktop-tauri/src-tauri/Cargo.toml [package].version",
   "desktop-tauri/src-tauri/Cargo.lock suxiaoyou-desktop",
@@ -50,6 +51,7 @@ function createFixture(overrides = {}) {
     frontendLockTopLevel: VERSION,
     frontendLockRootEntry: VERSION,
     backend: VERSION,
+    backendApp: VERSION,
     tauri: VERSION,
     cargo: VERSION,
     cargoLock: VERSION,
@@ -84,6 +86,11 @@ function createFixture(overrides = {}) {
     rootDir,
     "backend/pyproject.toml",
     `[project]\nname = "suxiaoyou"\nversion = "${values.backend}"\n`,
+  );
+  writeText(
+    rootDir,
+    "backend/app/version.py",
+    `from typing import Final\n\nAPP_VERSION: Final = "${values.backendApp}"\n`,
   );
   writeJson(rootDir, "desktop-tauri/src-tauri/tauri.conf.json", {
     productName: "苏小有",
@@ -148,6 +155,7 @@ test("reports every mismatched release consumer in one error", (t) => {
     frontendLockTopLevel: "5.0.0",
     frontendLockRootEntry: "6.0.0",
     backend: "7.0.0",
+    backendApp: "7.1.0",
     tauri: "8.0.0",
     cargo: "9.0.0",
     cargoLock: "10.0.0",

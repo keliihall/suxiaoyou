@@ -1,6 +1,6 @@
 {
   "name": "suxiaoyou",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "license": "Apache-2.0",
   "description": "suyo — local-first AI agent for desktop work",
@@ -19,6 +19,8 @@
     "test:v1-integration-live": "node scripts/v1-real-integration-gates.mjs live",
     "verify:v1-integration-evidence": "node scripts/v1-real-integration-gates.mjs verify",
     "verify:v1-scorecard-integration-link": "node scripts/v1-real-integration-gates.mjs verify-scorecard-link",
+    "verify:v11-acp-soak-evidence": "node scripts/v11-acp-soak-evidence.mjs aggregate",
+    "verify:v11-office-corpus-evidence": "node scripts/v11-office-corpus-evidence.mjs aggregate",
     "build:desktop": "npm run sync:desktop-meta && cd desktop-tauri && cargo tauri build",
     "preflight": "npm run preflight:ui",
     "preflight:ui": "cd frontend && npm run preflight:ui"

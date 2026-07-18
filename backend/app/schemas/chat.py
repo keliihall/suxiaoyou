@@ -34,12 +34,24 @@ class PromptRequest(BaseModel):
     _goal_permission_baseline: tuple[Ruleset, Ruleset] | None = PrivateAttr(
         default=None
     )
+    # Server-created specialist runtimes (currently the validation Agent) can
+    # impose a smaller Provider output ceiling than the interactive UI's
+    # normal minimum. PrivateAttr keeps request JSON from changing spend.
+    _max_output_tokens_ceiling: int | None = PrivateAttr(default=None)
+    # ACP supplies a UUID that is acknowledged only after SessionPrompt stores
+    # it on the real user Message. PrivateAttr prevents HTTP clients from
+    # forging this protocol-owned binding.
+    _external_user_message_id: str | None = PrivateAttr(default=None)
     reasoning: bool | None = None  # Explicitly enable/disable reasoning
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}
     # Request-scoped backend display language.  API handlers derive this from
     # Accept-Language; exclude it from wire serialization/idempotency hashes.
     language: Literal["zh", "en"] = Field("zh", exclude=True)
+
+    @property
+    def external_user_message_id(self) -> str | None:
+        return self._external_user_message_id
 
 
 class PromptResponse(BaseModel):

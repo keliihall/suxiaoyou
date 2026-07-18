@@ -21,16 +21,19 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { argv, env, exit, platform } from "node:process";
 import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   BackendSmokeError,
   resolveStartupTimeoutMs,
@@ -40,9 +43,14 @@ import {
   resolveCheckoutCommit,
   validateOfficeContractReport,
 } from "./office-contract-evidence.mjs";
+import {
+  verifyAcpClosedGate,
+  verifyAcpProtocolSmoke,
+} from "./verify-acp-bundle.mjs";
 
 const distArg = argv[2] ?? "backend/dist/suxiaoyou-backend";
 const dist = resolve(distArg);
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 if (!existsSync(dist)) {
   fail(`bundle directory does not exist: ${dist}`);
@@ -50,11 +58,38 @@ if (!existsSync(dist)) {
 
 const internal = join(dist, "_internal");
 const exeName = platform === "win32" ? "suxiaoyou-backend.exe" : "suxiaoyou-backend";
+const OFFICE_REPAIR_PROMPT_SHA256 =
+  "7c9cd1613c47761539cd04fa22634e467881bac9917f5c88018454d5b91b5272";
+const V11_GATE_NAMES = Object.freeze([
+  "V11_CHECKPOINTS_RELEASED",
+  "V11_REWIND_RELEASED",
+  "V11_HOOKS_RELEASED",
+  "V11_ACP_RELEASED",
+  "V11_WORKTREES_RELEASED",
+  "V11_VALIDATION_AGENT_RELEASED",
+  "V11_OFFICE_V2_RELEASED",
+  "V11_USER_OFFICE_TEMPLATES_BETA_RELEASED",
+]);
+const V11_CAPABILITY_NAMES = Object.freeze([
+  "checkpoints",
+  "rewind",
+  "hooks",
+  "acp",
+  "worktrees",
+  "validator",
+  "office_preview",
+  "office_authoring",
+  "user_office_templates",
+]);
+const SIGNED_AUTHORITATIVE_PROFILE = "signed-authoritative";
+const UNSIGNED_DEGRADED_PROFILE = "unsigned-degraded";
 
 /**
  * Each entry describes one required asset. `kind` is "file" | "dir"
- * | "nonempty-dir". Add new entries as new resources are bundled —
- * CI will start failing until reality matches the contract.
+ * | "nonempty-dir". Text policies may additionally carry an
+ * `expectedTextSha256` over canonical LF UTF-8. Add new entries as new
+ * resources are bundled — CI will start failing until reality matches the
+ * contract.
  */
 const required = [
   { kind: "file", path: join(dist, exeName), why: "backend launcher" },
@@ -64,12 +99,43 @@ const required = [
   // Alembic (DB migrations run at startup)
   { kind: "nonempty-dir", path: join(internal, "alembic"), why: "DB migrations" },
   { kind: "file", path: join(internal, "alembic.ini"), why: "alembic config" },
+  {
+    kind: "file",
+    path: join(
+      internal,
+      "alembic",
+      "versions",
+      "0010_v110_checkpoint_ledger.py",
+    ),
+    why: "v1.1 checkpoint ledger migration",
+  },
+  {
+    kind: "file",
+    path: join(
+      internal,
+      "alembic",
+      "versions",
+      "0011_v110_user_office_templates.py",
+    ),
+    why: "v1.1 user Office template migration",
+  },
 
   // Agent prompt templates
   {
     kind: "nonempty-dir",
     path: join(internal, "app", "agent", "prompts"),
     why: "agent prompt templates",
+  },
+  {
+    kind: "file",
+    path: join(internal, "app", "agent", "prompts", "validator.txt"),
+    why: "server-owned read-only Validator policy",
+  },
+  {
+    kind: "file",
+    path: join(internal, "app", "agent", "prompts", "office_repair.txt"),
+    why: "hash-locked capability-free Office repair policy",
+    expectedTextSha256: OFFICE_REPAIR_PROMPT_SHA256,
   },
 
   // Bundled data (skills/plugins/connectors)
@@ -109,6 +175,41 @@ const required = [
     path: join(internal, "app", "data", "fonts", "PROVENANCE.md"),
     why: "embedded PDF font provenance",
   },
+
+  // Signed first-party Office templates. Check every release-bound file so a
+  // partial catalog can never pass the desktop bundle gate.
+  {
+    kind: "file",
+    path: join(internal, "app", "office_templates", "assets", "catalog.json"),
+    why: "signed Office template catalog",
+  },
+  {
+    kind: "file",
+    path: join(
+      internal,
+      "app",
+      "office_templates",
+      "assets",
+      "catalog.sig.json",
+    ),
+    why: "Office template catalog signature",
+  },
+  ...[
+    "business-brief.docx",
+    "project-tracker.xlsx",
+    "status-update.pptx",
+  ].map((filename) => ({
+    kind: "file",
+    path: join(
+      internal,
+      "app",
+      "office_templates",
+      "assets",
+      "templates",
+      filename,
+    ),
+    why: `first-party Office template ${filename}`,
+  })),
 
   // Frontend static export — served by FastAPI at /m for mobile PWA.
   // Without these files, cloudflare-tunnel remote access is broken
@@ -218,6 +319,11 @@ for (const req of required) {
   const st = statSync(req.path);
   if (req.kind === "file" && !st.isFile()) {
     problems.push(`not a file: ${req.path}  (${req.why})`);
+  } else if (req.kind === "file" && req.expectedTextSha256) {
+    const actualSha256 = canonicalTextSha256(req.path);
+    if (actualSha256 !== req.expectedTextSha256) {
+      problems.push(`file digest mismatch: ${req.path}  (${req.why})`);
+    }
   } else if ((req.kind === "dir" || req.kind === "nonempty-dir") && !st.isDirectory()) {
     problems.push(`not a directory: ${req.path}  (${req.why})`);
   } else if (req.kind === "nonempty-dir" && readdirSync(req.path).length === 0) {
@@ -272,7 +378,42 @@ console.log(`[verify-bundle] static: ${required.length} required assets present 
 // the target binary (e.g. cross-compiled artifacts inspected on a
 // different OS).
 
+const expectedV11GateMode = String(
+  env.VERIFY_BUNDLE_V11_GATE_MODE ?? "closed",
+).trim();
+if (!new Set(["closed", "released"]).has(expectedV11GateMode)) {
+  fail(
+    `VERIFY_BUNDLE_V11_GATE_MODE must be closed or released, got ${expectedV11GateMode || "empty"}`,
+  );
+}
+const configuredOfficeRendererProfile = String(
+  env.VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE ?? "",
+).trim();
+let expectedOfficeRendererProfile = null;
+if (expectedV11GateMode === "released") {
+  expectedOfficeRendererProfile =
+    configuredOfficeRendererProfile || SIGNED_AUTHORITATIVE_PROFILE;
+  if (
+    !new Set([
+      SIGNED_AUTHORITATIVE_PROFILE,
+      UNSIGNED_DEGRADED_PROFILE,
+    ]).has(expectedOfficeRendererProfile)
+  ) {
+    fail(
+      "VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE must be " +
+        `${SIGNED_AUTHORITATIVE_PROFILE} or ${UNSIGNED_DEGRADED_PROFILE}`,
+    );
+  }
+} else if (configuredOfficeRendererProfile) {
+  fail("closed v1.1 bundle verification must not select an Office renderer profile");
+}
+
 if (env.VERIFY_BUNDLE_SKIP_SMOKE === "1") {
+  if (expectedV11GateMode === "released") {
+    fail(
+      "released v1.1 bundle verification cannot skip runtime smoke tests",
+    );
+  }
   console.log("[verify-bundle] smoke test skipped (VERIFY_BUNDLE_SKIP_SMOKE=1)");
   exit(0);
 }
@@ -280,10 +421,61 @@ if (env.VERIFY_BUNDLE_SKIP_SMOKE === "1") {
 const binary = join(dist, exeName);
 const port = 17000 + Math.floor(Math.random() * 500);
 
+if (expectedV11GateMode === "closed") {
+  acpClosedGateSmokeTest(binary);
+} else {
+  console.log(
+    "[verify-bundle] ACP smoke: released production gate; closed-gate probe not applicable",
+  );
+}
+await acpProtocolSmokeTest(binary);
+v11FrozenSmokeTest(
+  binary,
+  expectedV11GateMode,
+  expectedOfficeRendererProfile,
+);
 providerSmokeTest(binary);
 officeSmokeTest(binary);
 sandboxSmokeTest(binary);
 await smokeTest(binary, port);
+
+function acpClosedGateSmokeTest(bin) {
+  console.log("[verify-bundle] ACP smoke: production stdio entry fails closed");
+  try {
+    verifyAcpClosedGate({
+      command: bin,
+      args: ["--acp-stdio"],
+      cwd: dist,
+      environment: env,
+    });
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function acpProtocolSmokeTest(bin) {
+  console.log(
+    "[verify-bundle] ACP smoke: initialize, synthetic session, and cancellation over stdio",
+  );
+  try {
+    const report = await verifyAcpProtocolSmoke({
+      command: bin,
+      args: ["--acp-self-test"],
+      cwd: dist,
+      environment: env,
+    });
+    if (
+      report.protocolVersion !== 1 ||
+      report.sessionId !== "bundle-smoke-session" ||
+      report.stopReason !== "cancelled" ||
+      report.frameCount < 4
+    ) {
+      fail(`ACP protocol smoke returned an invalid report: ${JSON.stringify(report)}`);
+    }
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
 
 function providerSmokeTest(bin) {
   console.log("[verify-bundle] provider smoke: official Anthropic/Gemini constructors");
@@ -294,6 +486,460 @@ function providerSmokeTest(bin) {
   ) {
     fail(`provider smoke returned an invalid report: ${JSON.stringify(report)}`);
   }
+}
+
+function v11FrozenSmokeTest(bin, expectedGateMode, expectedRendererProfile) {
+  console.log(
+    `[verify-bundle] v1.1 smoke: ${expectedGateMode} gate graph, modules, and signed assets`,
+  );
+  const report = runJsonCommand(bin, ["--v11-self-test"], 60_000);
+  const expectedTemplates = [
+    "business-brief@1.0.0",
+    "project-tracker@1.0.0",
+    "status-update@1.0.0",
+  ];
+  const expectedReleased = expectedGateMode === "released";
+  const gateValues =
+    report.gate_values && typeof report.gate_values === "object"
+      ? report.gate_values
+      : {};
+  const capabilities =
+    report.capabilities && typeof report.capabilities === "object"
+      ? report.capabilities
+      : {};
+  const gateKeys = Object.keys(gateValues).sort();
+  const capabilityKeys = Object.keys(capabilities).sort();
+  const gatesMatch =
+    JSON.stringify(gateKeys) === JSON.stringify([...V11_GATE_NAMES].sort()) &&
+    V11_GATE_NAMES.every((name) => gateValues[name] === expectedReleased);
+  const capabilitiesMatch =
+    JSON.stringify(capabilityKeys) ===
+      JSON.stringify([...V11_CAPABILITY_NAMES].sort()) &&
+    V11_CAPABILITY_NAMES.every((name) => {
+      const status = capabilities[name];
+      return (
+        status &&
+        typeof status === "object" &&
+        status.code_gate === expectedReleased &&
+        status.released === expectedReleased &&
+        Array.isArray(status.dependencies) &&
+        Array.isArray(status.missing_dependencies) &&
+        (!expectedReleased || status.missing_dependencies.length === 0)
+      );
+    });
+  if (
+    report.status !== "ok" ||
+    report.gate_mode !== expectedGateMode ||
+    report.gates_closed !== !expectedReleased ||
+    report.gates_released !== expectedReleased ||
+    !gatesMatch ||
+    !capabilitiesMatch ||
+    !Number.isInteger(report.module_count) ||
+    report.module_count < 50 ||
+    JSON.stringify(report.templates) !== JSON.stringify(expectedTemplates) ||
+    report.office_repair_prompt_sha256 !== OFFICE_REPAIR_PROMPT_SHA256
+  ) {
+    fail(`v1.1 frozen smoke returned an invalid report: ${JSON.stringify(report)}`);
+  }
+  if (!expectedReleased) return;
+  verifyOfficeRendererProfileMarker(expectedRendererProfile);
+  if (expectedRendererProfile === SIGNED_AUTHORITATIVE_PROFILE) {
+    authoritativeOfficeRendererSmokeTest(bin);
+  } else {
+    unsignedDegradedOfficeRendererSmokeTest(bin);
+  }
+}
+
+function expectedOfficePlatformTarget() {
+  const officePlatform = String(env.VERIFY_BUNDLE_OFFICE_PLATFORM ?? "").trim();
+  const platformTargets = {
+    "windows-x64": "windows-x64",
+    "macos-arm64": "darwin-arm64",
+    "macos-x64": "darwin-x64",
+    "linux-x64": "linux-x64",
+    "linux-arm64": "linux-arm64",
+  };
+  const expectedTarget = platformTargets[officePlatform];
+  if (!expectedTarget) {
+    fail(
+      "released v1.1 bundle verification requires an exact " +
+        "VERIFY_BUNDLE_OFFICE_PLATFORM target",
+    );
+  }
+  return expectedTarget;
+}
+
+function expectedReleaseIdentity() {
+  const packageMetadata = JSON.parse(
+    readFileSync(join(repositoryRoot, "package.json"), "utf8"),
+  );
+  const appVersion = String(packageMetadata.version ?? "");
+  if (!/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(appVersion)) {
+    fail("released v1.1 bundle verification requires an X.Y.Z package version");
+  }
+  return {
+    appVersion,
+    releaseCommit: resolveCheckoutCommit({
+      cwd: repositoryRoot,
+      environment: {},
+    }),
+  };
+}
+
+function verifyOfficeRendererProfileMarker(expectedProfile) {
+  const markerPath = join(
+    internal,
+    "app",
+    "data",
+    "office-renderer-profile.json",
+  );
+  let raw;
+  let marker;
+  try {
+    raw = readFileSync(markerPath, "utf8");
+    marker = JSON.parse(raw);
+  } catch {
+    fail("released v1.1 bundle has no valid Office renderer profile marker");
+  }
+  const { appVersion, releaseCommit } = expectedReleaseIdentity();
+  const authoritativeRendererBundled =
+    expectedProfile === SIGNED_AUTHORITATIVE_PROFILE;
+  const expected = {
+    app_version: appVersion,
+    authoritative_authoring_available: false,
+    authoritative_renderer_bundled: authoritativeRendererBundled,
+    contract: "suxiaoyou-office-renderer-profile-v1",
+    profile: expectedProfile,
+    release_commit: releaseCommit,
+    schema_version: 1,
+  };
+  const canonical = `${JSON.stringify(expected)}\n`;
+  if (raw !== canonical || JSON.stringify(marker) !== JSON.stringify(expected)) {
+    fail("Office renderer profile marker does not match this release checkout");
+  }
+  return {
+    ...expected,
+    marker_sha256: createHash("sha256").update(raw).digest("hex"),
+  };
+}
+
+function parseLastJsonLine(stdout, label) {
+  const lines = String(stdout || "")
+    .trim()
+    .split(/\r?\n/u)
+    .reverse();
+  for (const line of lines) {
+    try {
+      const report = JSON.parse(line);
+      if (report && typeof report === "object" && !Array.isArray(report)) {
+        return report;
+      }
+    } catch {
+      // Frozen/native dependencies may emit non-JSON diagnostics before the report.
+    }
+  }
+  fail(`${label} did not emit a JSON report`);
+}
+
+function unsignedDegradedOfficeRendererSmokeTest(bin) {
+  const expectedTarget = expectedOfficePlatformTarget();
+  const marker = verifyOfficeRendererProfileMarker(UNSIGNED_DEGRADED_PROFILE);
+  const rendererRoot = join(internal, "app", "data", "office-renderer");
+  if (existsSync(rendererRoot)) {
+    fail("unsigned-degraded bundle unexpectedly contains an Office renderer tree");
+  }
+  console.log(
+    `[verify-bundle] Office renderer smoke: ${UNSIGNED_DEGRADED_PROFILE}; authoritative authoring unavailable`,
+  );
+  const result = spawnSync(bin, ["--office-renderer-self-test"], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env,
+    windowsHide: true,
+  });
+  if (result.error) {
+    fail(`degraded Office renderer self-test failed to launch: ${result.error.message}`);
+  }
+  const selfTest = parseLastJsonLine(
+    result.stdout,
+    "degraded Office renderer self-test",
+  );
+  if (
+    result.status !== 1 ||
+    JSON.stringify(selfTest) !==
+      JSON.stringify({ schema_version: 2, status: "unavailable" })
+  ) {
+    fail(
+      "unsigned-degraded Office renderer self-test did not prove unavailability: " +
+        JSON.stringify(selfTest),
+    );
+  }
+  const report = {
+    app_version: marker.app_version,
+    authoritative_authoring_available: false,
+    authoritative_renderer_bundled: false,
+    available: false,
+    marker_sha256: marker.marker_sha256,
+    platform_target: expectedTarget,
+    profile: UNSIGNED_DEGRADED_PROFILE,
+    quality: "unavailable",
+    release_commit: marker.release_commit,
+    schema_version: 1,
+    status: "degraded",
+  };
+  writeJsonEvidenceReport(
+    report,
+    "VERIFY_BUNDLE_OFFICE_RENDERER_REPORT",
+    "degraded Office renderer evidence",
+  );
+}
+
+function authoritativeOfficeRendererSmokeTest(bin) {
+  const expectedTarget = expectedOfficePlatformTarget();
+  console.log(
+    `[verify-bundle] Office renderer smoke: signed authoritative ${expectedTarget} deployment`,
+  );
+  const {
+    appVersion: expectedAppVersion,
+    releaseCommit: expectedReleaseCommit,
+  } = expectedReleaseIdentity();
+  // Release identity is derived from the checkout itself. In particular, an
+  // environment override accepted by legacy evidence tooling must not decide
+  // which frozen application identity can authorize Office writes.
+  const report = runJsonCommand(bin, ["--office-renderer-self-test"], 180_000);
+  const expectedFields = [
+    "app_version",
+    "attestation_sha256",
+    "available",
+    "bundle_tree_sha256",
+    "component_count",
+    "components",
+    "execution_probe",
+    "font_digest",
+    "font_tree_sha256",
+    "native_closure_sha256",
+    "native_dependency_count",
+    "native_file_count",
+    "native_sandbox_behavior",
+    "native_sandbox_contract",
+    "platform_target",
+    "quality",
+    "release_commit",
+    "renderer_id",
+    "renderer_version",
+    "schema_version",
+    "status",
+  ];
+  const expectedComponents = [
+    "bundle-tree",
+    "dependency-manifest",
+    "font-manifest",
+    "license-manifest",
+    "pdftoppm",
+    "sandbox-manifest",
+    "soffice",
+  ];
+  const sha256 = /^(?!0{64}$)[0-9a-f]{64}$/;
+  const sandboxByFamily = {
+    darwin: {
+      contractId: "suxiaoyou.office-sandbox.macos-app-sandbox-xpc.v1",
+      capabilities: [
+        "app_sandbox",
+        "host_filesystem_read_only",
+        "network_denied",
+        "private_input_read_only",
+        "private_output_write_only",
+        "process_tree_contained",
+        "xpc_service",
+      ],
+    },
+    linux: {
+      contractId: "suxiaoyou.office-sandbox.linux-namespaces-seccomp-cgroup.v1",
+      capabilities: [
+        "cgroup",
+        "host_filesystem_read_only",
+        "mount_namespace",
+        "network_denied",
+        "network_namespace",
+        "private_input_read_only",
+        "private_output_write_only",
+        "process_tree_contained",
+        "seccomp",
+        "user_namespace",
+      ],
+    },
+    windows: {
+      contractId: "suxiaoyou.office-sandbox.windows-appcontainer-restricted-token.v1",
+      capabilities: [
+        "app_container",
+        "host_filesystem_read_only",
+        "kill_on_close_job",
+        "network_denied",
+        "private_input_read_only",
+        "private_output_write_only",
+        "process_tree_contained",
+        "restricted_token",
+      ],
+    },
+  };
+  const expectedSandbox = sandboxByFamily[expectedTarget.split("-", 1)[0]];
+  const nativeSandboxContract = report.native_sandbox_contract;
+  const expectedNativeSandboxContractFields = [
+    "adversarial_evidence_required",
+    "bundle_tree_sha256",
+    "capabilities",
+    "contract_id",
+    "dependency_manifest_sha256",
+    "launcher_sha256",
+    "native_behavior_proven",
+    "platform_target",
+    "sandbox_manifest_sha256",
+    "schema_version",
+    "status",
+  ];
+  const nativeSandboxBehavior = report.native_sandbox_behavior;
+  const expectedNativeSandboxBehaviorFields = [
+    "attempts_sha256",
+    "bundle_tree_sha256",
+    "capabilities",
+    "contract_id",
+    "dependency_manifest_sha256",
+    "evidence_sha256",
+    "helper_sha256",
+    "launcher_sha256",
+    "native_behavior_proven",
+    "nonce_sha256",
+    "output_proof_sha256",
+    "platform_target",
+    "sandbox_manifest_sha256",
+    "schema_version",
+    "status",
+  ];
+  const observedNativeSandboxCapabilities = new Set([
+    "host_filesystem_read_only",
+    "network_denied",
+    "private_input_read_only",
+    "private_output_write_only",
+    "process_tree_contained",
+  ]);
+  const executionProbe = report.execution_probe;
+  const expectedExecutionProbeFields = [
+    "bundle_tree_sha256",
+    "embedded_font_count",
+    "page_count",
+    "pages",
+    "pdf_sha256",
+    "probe_manifest_sha256",
+    "probe_source_sha256",
+    "render_manifest_sha256",
+    "schema_version",
+  ];
+  if (
+    JSON.stringify(Object.keys(report).sort()) !== JSON.stringify(expectedFields) ||
+    report.schema_version !== 2 ||
+    report.status !== "ok" ||
+    report.available !== true ||
+    report.quality !== "authoritative" ||
+    report.app_version !== expectedAppVersion ||
+    report.release_commit !== expectedReleaseCommit ||
+    report.platform_target !== expectedTarget ||
+    report.renderer_id !== "suxiaoyou-attested-office" ||
+    !sha256.test(report.font_digest) ||
+    !sha256.test(report.font_tree_sha256) ||
+    !sha256.test(report.attestation_sha256) ||
+    !sha256.test(report.bundle_tree_sha256) ||
+    !sha256.test(report.native_closure_sha256) ||
+    !Number.isInteger(report.native_file_count) ||
+    report.native_file_count < 2 ||
+    !Number.isInteger(report.native_dependency_count) ||
+    report.native_dependency_count < 0 ||
+    report.renderer_version !== `attestation-${report.attestation_sha256}` ||
+    report.component_count !== expectedComponents.length ||
+    JSON.stringify(report.components) !== JSON.stringify(expectedComponents) ||
+    !nativeSandboxContract ||
+    JSON.stringify(Object.keys(nativeSandboxContract).sort()) !==
+      JSON.stringify(expectedNativeSandboxContractFields) ||
+    nativeSandboxContract.schema_version !== 1 ||
+    nativeSandboxContract.status !== "declared-not-proven" ||
+    nativeSandboxContract.platform_target !== expectedTarget ||
+    nativeSandboxContract.contract_id !== expectedSandbox.contractId ||
+    JSON.stringify(nativeSandboxContract.capabilities) !==
+      JSON.stringify(expectedSandbox.capabilities) ||
+    !sha256.test(nativeSandboxContract.sandbox_manifest_sha256) ||
+    !sha256.test(nativeSandboxContract.dependency_manifest_sha256) ||
+    !sha256.test(nativeSandboxContract.launcher_sha256) ||
+    nativeSandboxContract.bundle_tree_sha256 !== report.bundle_tree_sha256 ||
+    nativeSandboxContract.native_behavior_proven !== false ||
+    nativeSandboxContract.adversarial_evidence_required !== true ||
+    !nativeSandboxBehavior ||
+    JSON.stringify(Object.keys(nativeSandboxBehavior).sort()) !==
+      JSON.stringify(expectedNativeSandboxBehaviorFields) ||
+    nativeSandboxBehavior.schema_version !== 1 ||
+    nativeSandboxBehavior.status !== "proven" ||
+    nativeSandboxBehavior.native_behavior_proven !== true ||
+    nativeSandboxBehavior.platform_target !== nativeSandboxContract.platform_target ||
+    nativeSandboxBehavior.contract_id !== nativeSandboxContract.contract_id ||
+    nativeSandboxBehavior.bundle_tree_sha256 !== report.bundle_tree_sha256 ||
+    nativeSandboxBehavior.bundle_tree_sha256 !==
+      nativeSandboxContract.bundle_tree_sha256 ||
+    nativeSandboxBehavior.sandbox_manifest_sha256 !==
+      nativeSandboxContract.sandbox_manifest_sha256 ||
+    nativeSandboxBehavior.dependency_manifest_sha256 !==
+      nativeSandboxContract.dependency_manifest_sha256 ||
+    nativeSandboxBehavior.launcher_sha256 !==
+      nativeSandboxContract.launcher_sha256 ||
+    !sha256.test(nativeSandboxBehavior.helper_sha256) ||
+    !sha256.test(nativeSandboxBehavior.nonce_sha256) ||
+    !sha256.test(nativeSandboxBehavior.attempts_sha256) ||
+    !sha256.test(nativeSandboxBehavior.output_proof_sha256) ||
+    !sha256.test(nativeSandboxBehavior.evidence_sha256) ||
+    !nativeSandboxBehavior.capabilities ||
+    typeof nativeSandboxBehavior.capabilities !== "object" ||
+    Array.isArray(nativeSandboxBehavior.capabilities) ||
+    JSON.stringify(Object.keys(nativeSandboxBehavior.capabilities).sort()) !==
+      JSON.stringify([...expectedSandbox.capabilities].sort()) ||
+    expectedSandbox.capabilities.some(
+      (name) =>
+        nativeSandboxBehavior.capabilities[name] !==
+        observedNativeSandboxCapabilities.has(name),
+    ) ||
+    !executionProbe ||
+    JSON.stringify(Object.keys(executionProbe).sort()) !==
+      JSON.stringify(expectedExecutionProbeFields) ||
+    executionProbe.schema_version !== 1 ||
+    executionProbe.bundle_tree_sha256 !== report.bundle_tree_sha256 ||
+    !sha256.test(executionProbe.probe_manifest_sha256) ||
+    !sha256.test(executionProbe.probe_source_sha256) ||
+    !sha256.test(executionProbe.render_manifest_sha256) ||
+    !sha256.test(executionProbe.pdf_sha256) ||
+    !Number.isInteger(executionProbe.page_count) ||
+    executionProbe.page_count < 1 ||
+    !Number.isInteger(executionProbe.embedded_font_count) ||
+    executionProbe.embedded_font_count < 1 ||
+    !Array.isArray(executionProbe.pages) ||
+    executionProbe.pages.length !== executionProbe.page_count ||
+    executionProbe.pages.some(
+      (page, index) =>
+        !page ||
+        JSON.stringify(Object.keys(page).sort()) !==
+          JSON.stringify(["height_px", "page_number", "pixel_sha256", "width_px"]) ||
+        page.page_number !== index + 1 ||
+        !Number.isInteger(page.width_px) ||
+        page.width_px < 1 ||
+        !Number.isInteger(page.height_px) ||
+        page.height_px < 1 ||
+        !sha256.test(page.pixel_sha256),
+    )
+  ) {
+    fail(
+      `authoritative Office renderer smoke returned an invalid report: ${JSON.stringify(report)}`,
+    );
+  }
+  writeJsonEvidenceReport(
+    report,
+    "VERIFY_BUNDLE_OFFICE_RENDERER_REPORT",
+    "Office renderer evidence",
+  );
 }
 
 function officeSmokeTest(bin) {
@@ -319,7 +965,15 @@ function officeSmokeTest(bin) {
     fail(`Office smoke returned invalid evidence:\n- ${validation.failures.join("\n- ")}`);
   }
 
-  const outputPath = String(env.VERIFY_BUNDLE_OFFICE_REPORT ?? "").trim();
+  writeJsonEvidenceReport(
+    report,
+    "VERIFY_BUNDLE_OFFICE_REPORT",
+    "Office evidence",
+  );
+}
+
+function writeJsonEvidenceReport(report, environmentName, label) {
+  const outputPath = String(env[environmentName] ?? "").trim();
   if (outputPath) {
     const destination = resolve(outputPath);
     mkdirSync(dirname(destination), { recursive: true });
@@ -329,7 +983,7 @@ function officeSmokeTest(bin) {
       mode: 0o600,
     });
     renameSync(temporary, destination);
-    console.log(`[verify-bundle] Office evidence: ${destination}`);
+    console.log(`[verify-bundle] ${label}: ${destination}`);
   }
 }
 
@@ -451,6 +1105,11 @@ async function smokeTest(bin, port) {
 function fail(msg) {
   console.error(`[verify-bundle] ${msg}`);
   exit(1);
+}
+
+function canonicalTextSha256(path) {
+  const canonicalText = readFileSync(path, "utf8").replace(/\r\n?/g, "\n");
+  return createHash("sha256").update(canonicalText, "utf8").digest("hex");
 }
 
 function findEntryByName(directory, pattern) {

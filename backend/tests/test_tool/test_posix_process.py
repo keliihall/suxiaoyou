@@ -56,6 +56,24 @@ def test_returns_exit_and_both_output_streams(tmp_path: Path) -> None:
     assert result.truncated is False
 
 
+def test_bounded_runner_can_deliver_stdin_without_using_argv_or_env(
+    tmp_path: Path,
+) -> None:
+    payload = b'{"version":1,"event":"PreToolUse"}\n'
+    result = run_posix_process(
+        [sys.executable, "-I", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        timeout_seconds=5,
+        should_abort=lambda: False,
+        max_output_bytes=4096,
+        stdin_bytes=payload,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == payload
+
+
 def test_nonzero_exit_is_returned_without_becoming_a_termination(tmp_path: Path) -> None:
     result = _run_python("raise SystemExit(17)", tmp_path)
 

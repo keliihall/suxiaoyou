@@ -3,28 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from app.auth.local import require_local_session
 from app.config import get_custom_endpoints
 from app.dependencies import DbDep, SessionFactoryDep
+from app.hooks.config import (
+    ProjectHookConfigError,
+    register_project_hook_config,
+)
+from app.hooks.registry import CommandHook, HookRegistry
+from app.hooks.trust import HookTrustStore, HookTrustStoreError
 from app.models.scheduled_task import ScheduledTask
 from app.models.security_audit_event import SecurityAuditEvent
+from app.models.session import Session
+from app.models.workspace_instance import WorkspaceInstance
 from app.provider.catalog import PROVIDER_CATALOG
-from app.release_features import (
-    AUTONOMOUS_GOALS_RELEASED,
-    GOALS_RELEASED,
-    MESSAGING_CHANNELS_RELEASED,
-    REMOTE_ACCESS_RELEASED,
-)
+from app import release_features
 from app.i18n import request_language
-from app.security.audit import record_security_event
+from app.security.audit import AuditPersistenceError, record_security_event
 from app.security.capabilities import describe_tool_source, source_capability_profiles
 from app.security.control import TOGGLEABLE_BUILTIN_TOOLS
+from app.storage.checkpoints import inspect_workspace_identity
 
 router = APIRouter(
     prefix="/security",
@@ -38,6 +44,85 @@ class ToolToggleBody(BaseModel):
 
 class EmergencyStopBody(BaseModel):
     active: bool
+
+
+class HookControlBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1, max_length=128)
+    hook_id: str = Field(min_length=1, max_length=128)
+
+
+def _hook_error(*, status_code: int, code: str, detail: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail, "code": code},
+    )
+
+
+def _hooks_unavailable() -> JSONResponse:
+    return _hook_error(
+        status_code=404,
+        code="v11_hooks_not_available",
+        detail="Project Hooks are not available in this release",
+    )
+
+
+async def _project_hook_control(
+    session_factory: SessionFactoryDep,
+    *,
+    session_id: str,
+) -> tuple[tuple[CommandHook, ...], HookTrustStore]:
+    """Resolve project Hooks only from a durable server-owned workspace."""
+
+    async with session_factory() as db:
+        session = await db.get(Session, session_id)
+        if session is None or not session.directory or session.directory == ".":
+            raise LookupError("session_workspace_not_found")
+        try:
+            canonical, identity = await asyncio.to_thread(
+                inspect_workspace_identity,
+                session.directory,
+            )
+        except Exception as exc:
+            raise LookupError("session_workspace_not_found") from exc
+        instance = (
+            await db.execute(
+                select(WorkspaceInstance)
+                .where(
+                    WorkspaceInstance.root_path == canonical,
+                    WorkspaceInstance.identity_token == identity,
+                    WorkspaceInstance.status == "active",
+                    WorkspaceInstance.project_id == session.project_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if instance is None:
+            raise LookupError("session_workspace_not_found")
+
+    registry = HookRegistry(Path(canonical))
+    hooks = register_project_hook_config(registry)
+    return hooks, HookTrustStore(Path(canonical))
+
+
+def _public_hook(
+    hook: CommandHook,
+    *,
+    approval_state: str,
+) -> dict[str, Any]:
+    """Return an intentionally path-, command-, and environment-free view."""
+
+    declaration = hook.declaration
+    return {
+        "hook_id": declaration.hook_id,
+        "event": declaration.event.value,
+        "source": hook.source.value,
+        "failure_policy": declaration.failure_policy.value,
+        "timeout_seconds": declaration.timeout_seconds,
+        "fingerprint": hook.fingerprint,
+        "approval_state": approval_state,
+    }
 
 
 async def _build_overview(request: Request, db: DbDep) -> dict[str, Any]:
@@ -111,6 +196,10 @@ async def _build_overview(request: Request, db: DbDep) -> dict[str, Any]:
         and not scheduler._task.done()
     )
 
+    from app.runtime.v11_readiness import v11_runtime_readiness
+
+    v11_readiness = v11_runtime_readiness(request.app.state)
+
     return {
         "state": control.snapshot(),
         "source_profiles": source_capability_profiles(),
@@ -126,10 +215,43 @@ async def _build_overview(request: Request, db: DbDep) -> dict[str, Any]:
             "max_token_budget": settings.goal_max_token_budget,
         },
         "release_gates": {
-            "remote_access": REMOTE_ACCESS_RELEASED,
-            "messaging_channels": MESSAGING_CHANNELS_RELEASED,
-            "goals": GOALS_RELEASED,
-            "autonomous_goals": AUTONOMOUS_GOALS_RELEASED,
+            "remote_access": release_features.REMOTE_ACCESS_RELEASED,
+            "messaging_channels": release_features.MESSAGING_CHANNELS_RELEASED,
+            "goals": release_features.GOALS_RELEASED,
+            "autonomous_goals": release_features.AUTONOMOUS_GOALS_RELEASED,
+            "v11_checkpoints": release_features.V11_CHECKPOINTS_RELEASED,
+            "v11_rewind": release_features.V11_REWIND_RELEASED,
+            "v11_hooks": release_features.V11_HOOKS_RELEASED,
+            "v11_acp": release_features.V11_ACP_RELEASED,
+            "v11_worktrees": release_features.V11_WORKTREES_RELEASED,
+            "v11_validation_agent": release_features.V11_VALIDATION_AGENT_RELEASED,
+            "v11_office_v2": release_features.V11_OFFICE_V2_RELEASED,
+            "v11_user_office_templates_beta": bool(
+                getattr(
+                    release_features,
+                    "V11_USER_OFFICE_TEMPLATES_BETA_RELEASED",
+                    False,
+                )
+            ),
+        },
+        "v11_readiness": v11_readiness,
+        "v11_runtime_capabilities": {
+            "checkpoint_rewind": {
+                "released": bool(v11_readiness["rewind"]["released"]),
+                "local_session_only": True,
+                "server_owned_workspace_identity_required": True,
+                "pre_action_audit_required": True,
+                "external_side_effects_reverted": False,
+                "raw_runtime_payloads_exposed": False,
+            },
+            "managed_worktrees": {
+                "released": bool(v11_readiness["worktrees"]["released"]),
+                "local_session_only": True,
+                "repository_derived_from_database": True,
+                "force_remove_supported": False,
+                "pre_action_audit_required": True,
+                "raw_runtime_payloads_exposed": False,
+            },
         },
     }
 
@@ -181,6 +303,156 @@ async def security_audit(
             for event in events
         ]
     }
+
+
+@router.get("/hooks")
+async def project_hooks(
+    session_factory: SessionFactoryDep,
+    session_id: str = Query(min_length=1, max_length=128),
+) -> JSONResponse:
+    if not release_features.V11_HOOKS_RELEASED:
+        return _hooks_unavailable()
+    try:
+        hooks, trust = await _project_hook_control(
+            session_factory,
+            session_id=session_id,
+        )
+    except LookupError:
+        return _hook_error(
+            status_code=404,
+            code="hook_workspace_not_found",
+            detail="The session does not have a verified active workspace",
+        )
+    except (ProjectHookConfigError, ValueError):
+        return _hook_error(
+            status_code=409,
+            code="hook_configuration_invalid",
+            detail="The project Hook configuration could not be loaded safely",
+        )
+
+    approval_states = [
+        "approved" if await asyncio.to_thread(trust.is_approved, hook) else "required"
+        for hook in hooks
+    ]
+    if trust.degraded_reason is not None:
+        approval_states = ["unavailable" for _hook in hooks]
+    return JSONResponse(
+        content={
+            "session_id": session_id,
+            "trust_store_available": trust.degraded_reason is None,
+            "hooks": [
+                _public_hook(hook, approval_state=approval_state)
+                for hook, approval_state in zip(hooks, approval_states)
+            ],
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/hooks/revoke")
+async def revoke_project_hook(
+    body: HookControlBody,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    if not release_features.V11_HOOKS_RELEASED:
+        return _hooks_unavailable()
+    try:
+        hooks, trust = await _project_hook_control(
+            session_factory,
+            session_id=body.session_id,
+        )
+    except LookupError:
+        return _hook_error(
+            status_code=404,
+            code="hook_workspace_not_found",
+            detail="The session does not have a verified active workspace",
+        )
+    except (ProjectHookConfigError, ValueError):
+        return _hook_error(
+            status_code=409,
+            code="hook_configuration_invalid",
+            detail="The project Hook configuration could not be loaded safely",
+        )
+
+    hook = next(
+        (item for item in hooks if item.declaration.hook_id == body.hook_id),
+        None,
+    )
+    if hook is None:
+        return _hook_error(
+            status_code=404,
+            code="hook_not_found",
+            detail="The project Hook was not found",
+        )
+
+    audit_details = {
+        "hook_id": hook.declaration.hook_id,
+        "event": hook.declaration.event.value,
+        "source": hook.source.value,
+        "fingerprint": hook.fingerprint,
+    }
+    try:
+        await record_security_event(
+            session_factory,
+            source_kind="security_center",
+            source_id="desktop",
+            invocation_source_kind="desktop",
+            capability="hook_trust",
+            action="revoke",
+            decision="system",
+            outcome="started",
+            session_id=body.session_id,
+            details=audit_details,
+            required=True,
+        )
+    except AuditPersistenceError:
+        return _hook_error(
+            status_code=503,
+            code="hook_audit_unavailable",
+            detail="Hook trust was not changed because audit persistence is unavailable",
+        )
+
+    try:
+        revoked = await asyncio.to_thread(trust.revoke, hook)
+    except HookTrustStoreError:
+        await record_security_event(
+            session_factory,
+            source_kind="security_center",
+            source_id="desktop",
+            invocation_source_kind="desktop",
+            capability="hook_trust",
+            action="revoke",
+            decision="system",
+            outcome="error",
+            session_id=body.session_id,
+            details={**audit_details, "reason": "trust_store_unavailable"},
+        )
+        return _hook_error(
+            status_code=503,
+            code="hook_trust_unavailable",
+            detail="Hook trust could not be changed safely",
+        )
+
+    await record_security_event(
+        session_factory,
+        source_kind="security_center",
+        source_id="desktop",
+        invocation_source_kind="desktop",
+        capability="hook_trust",
+        action="revoke",
+        decision="system",
+        outcome="success",
+        session_id=body.session_id,
+        details={**audit_details, "changed": revoked},
+    )
+    return JSONResponse(
+        content={
+            "session_id": body.session_id,
+            "hook_id": body.hook_id,
+            "revoked": revoked,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.put("/tools/{tool_id}")

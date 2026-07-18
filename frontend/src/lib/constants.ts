@@ -291,6 +291,43 @@ export const API = {
     RESTORE: (versionId: string) =>
       `/api/file-versions/${encodeURIComponent(versionId)}/restore` as const,
   },
+  OFFICE_V2: {
+    CONTEXT: (sessionId: string) =>
+      `/api/office-v2/context?session_id=${encodeURIComponent(sessionId)}` as const,
+    RENDER: "/api/office-v2/render",
+    VALIDATION: "/api/office-v2/validation",
+    PAGE: "/api/office-v2/page",
+    USER_TEMPLATES: {
+      LIST: (sessionId: string, workspaceInstanceId: string) =>
+        `/api/office-v2/user-templates?session_id=${encodeURIComponent(sessionId)}&workspace_instance_id=${encodeURIComponent(workspaceInstanceId)}` as const,
+      IMPORT: "/api/office-v2/user-templates/import",
+      APPROVE: (templateRef: string) =>
+        `/api/office-v2/user-templates/${encodeURIComponent(templateRef)}/approve` as const,
+      DELETE: (templateRef: string) =>
+        `/api/office-v2/user-templates/${encodeURIComponent(templateRef)}` as const,
+      PAGE: (
+        templateRef: string,
+        sessionId: string,
+        workspaceInstanceId: string,
+        revision: number,
+        expectedStateVersion: number,
+        pageNumber: number,
+      ) =>
+        `/api/office-v2/user-templates/${encodeURIComponent(templateRef)}/page?session_id=${encodeURIComponent(sessionId)}&workspace_instance_id=${encodeURIComponent(workspaceInstanceId)}&revision=${revision}&expected_state_version=${expectedStateVersion}&page_number=${pageNumber}` as const,
+    },
+  },
+  RUNTIME: {
+    CONTEXT: (sessionId: string) =>
+      `/api/runtime/context?session_id=${encodeURIComponent(sessionId)}` as const,
+    CHECKPOINTS: (sessionId: string, workspaceInstanceId: string) =>
+      `/api/runtime/checkpoints?session_id=${encodeURIComponent(sessionId)}&workspace_instance_id=${encodeURIComponent(workspaceInstanceId)}` as const,
+    REWIND_PREVIEW: "/api/runtime/rewind/preview",
+    REWIND_EXECUTE: "/api/runtime/rewind/execute",
+    WORKTREE_INSPECT: (sessionId: string, workspaceInstanceId: string) =>
+      `/api/runtime/worktrees/inspect?session_id=${encodeURIComponent(sessionId)}&workspace_instance_id=${encodeURIComponent(workspaceInstanceId)}` as const,
+    WORKTREE_CREATE: "/api/runtime/worktrees/create-bind",
+    WORKTREE_RELEASE: "/api/runtime/worktrees/release",
+  },
   ARTIFACTS: {
     EXPORT_PDF: "/api/artifacts/export-pdf",
   },

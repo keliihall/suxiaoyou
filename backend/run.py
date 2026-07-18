@@ -437,6 +437,25 @@ def _handle_database_recovery(args: argparse.Namespace) -> bool:
 
 
 def main() -> None:
+    # ACP owns stdin/stdout, so dispatch before crash reporters, desktop parent
+    # watchdogs, argument parsing, data-directory mutation, or Uvicorn setup can
+    # touch either pipe or start the HTTP process lifecycle.
+    if len(sys.argv) == 2 and sys.argv[1] == "--acp-stdio":
+        from app.acp.cli import main as acp_main
+
+        acp_main()
+        return
+
+    # Frozen-bundle protocol probe.  This bridge has no application, provider,
+    # tool, credential, workspace, or database authority; it only proves that
+    # the packaged ACP SDK and real process stdio transport can negotiate and
+    # cancel one bounded synthetic session while the production gate stays
+    # closed.
+    if len(sys.argv) == 2 and sys.argv[1] == "--acp-self-test":
+        from app.acp.self_test import main as acp_self_test
+
+        raise SystemExit(acp_self_test())
+
     # The frozen backend executable doubles as the isolated Python worker.
     # Dispatch before server lifecycle setup so arbitrary code can never run in
     # the long-lived API process or inherit its watchdog/job state.
@@ -475,6 +494,78 @@ def main() -> None:
             flush=True,
         )
         raise SystemExit(0)
+
+    if len(sys.argv) == 2 and sys.argv[1] == "--v11-self-test":
+        # Import and asset-integrity probe for high-value v1.1 code paths that
+        # normal startup cannot execute while their code-owned gates are closed.
+        import json
+
+        from app.runtime.frozen_self_test import run_frozen_v11_self_test
+
+        report = run_frozen_v11_self_test()
+        print(json.dumps(report, ensure_ascii=False, separators=(",", ":")), flush=True)
+        raise SystemExit(0)
+
+    if len(sys.argv) == 2 and sys.argv[1] == "--office-renderer-self-test":
+        # Release-only proof that the executing bundle contains the exact
+        # signed renderer/font tree and that it remains available.  Never emit
+        # exception text here: deployment failures may contain private paths.
+        import json
+
+        try:
+            import asyncio
+
+            from app.office_rendering.deployment import (
+                authoritative_office_renderer_self_test,
+                bind_attested_native_sandbox_contract,
+                build_attested_office_render_provider,
+            )
+            from app.office_rendering.native_sandbox_behavior import (
+                run_native_sandbox_behavior_probe,
+            )
+            from app.office_rendering.probe import (
+                run_attested_authoritative_office_renderer_probe,
+            )
+            from app.office_rendering.release_identity import (
+                load_frozen_renderer_release_identity,
+            )
+
+            release_identity = load_frozen_renderer_release_identity()
+            report = authoritative_office_renderer_self_test(
+                release_identity=release_identity,
+            )
+            authoritative = build_attested_office_render_provider(
+                release_identity=release_identity,
+            )
+            native_sandbox_contract = bind_attested_native_sandbox_contract(
+                authoritative
+            )
+
+            async def execute_release_probes():
+                native_sandbox_behavior = await run_native_sandbox_behavior_probe(
+                    native_sandbox_contract
+                )
+                execution_probe = (
+                    await run_attested_authoritative_office_renderer_probe(
+                        authoritative
+                    )
+                )
+                return native_sandbox_behavior, execution_probe
+
+            native_sandbox_behavior, execution_probe = asyncio.run(
+                execute_release_probes()
+            )
+            report = {
+                **report,
+                "native_sandbox_behavior": native_sandbox_behavior.to_dict(),
+                "execution_probe": execution_probe.to_dict(),
+            }
+            exit_code = 0
+        except Exception:
+            report = {"schema_version": 2, "status": "unavailable"}
+            exit_code = 1
+        print(json.dumps(report, ensure_ascii=True, separators=(",", ":")), flush=True)
+        raise SystemExit(exit_code)
 
     if len(sys.argv) in {2, 3} and sys.argv[1] == "--office-self-test":
         # Exercise the exact frozen Office implementation and its bundled

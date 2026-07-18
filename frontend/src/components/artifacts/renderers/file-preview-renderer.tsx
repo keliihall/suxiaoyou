@@ -19,6 +19,7 @@ import { PptxRenderer } from "./pptx-renderer";
 import { CsvRenderer } from "./csv-renderer";
 import { ImageRenderer } from "./image-renderer";
 import { MediaRenderer } from "./media-renderer";
+import { OfficeV2Renderer } from "./office-v2-renderer";
 
 interface FilePreviewRendererProps {
   /** Disk path of the file. */
@@ -32,10 +33,10 @@ interface FilePreviewRendererProps {
 /** Wrapper for binary formats that handle their own fetching. */
 function BinaryFilePreview({ filePath }: { filePath?: string }) {
   const type = filePath ? artifactTypeFromExtension(filePath) : null;
-  if (type === "docx") return <DocxRenderer filePath={filePath} />;
-  if (type === "xlsx") return <XlsxRenderer filePath={filePath} />;
+  if (type === "docx" && filePath) return <OfficeV2Renderer filePath={filePath} fallback={<DocxRenderer filePath={filePath} />} />;
+  if (type === "xlsx" && filePath) return <OfficeV2Renderer filePath={filePath} fallback={<XlsxRenderer filePath={filePath} />} />;
   if (type === "pdf") return <PdfRenderer filePath={filePath} />;
-  if (type === "pptx") return <PptxRenderer filePath={filePath} />;
+  if (type === "pptx" && filePath) return <OfficeV2Renderer filePath={filePath} fallback={<PptxRenderer filePath={filePath} />} />;
   if (type === "image") return <ImageRenderer filePath={filePath} />;
   if (type === "audio" || type === "video") {
     return <MediaRenderer filePath={filePath} kind={type} />;

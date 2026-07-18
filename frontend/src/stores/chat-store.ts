@@ -131,6 +131,13 @@ interface ChatStore {
    * whether a completed background generation deserves a notification.
    */
   focusedSessionId: string | null;
+  /**
+   * Most recently viewed persisted task. Unlike `focusedSessionId`, this is
+   * retained while Settings is open so task-scoped read-only control panels
+   * can resolve their server-owned session context without changing the
+   * background-generation notification semantics.
+   */
+  lastFocusedSessionId: string | null;
 
   // ─── Bucket lifecycle ───
   ensureSession: (sessionId: string) => void;
@@ -232,6 +239,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   sessions: {},
   draftSession: null,
   focusedSessionId: null,
+  lastFocusedSessionId: null,
 
   ensureSession: (sessionId) =>
     set((s) => {
@@ -239,7 +247,11 @@ export const useChatStore = create<ChatStore>((set) => ({
       return { sessions: { ...s.sessions, [sessionId]: EMPTY_SESSION_STATE } };
     }),
 
-  setFocusedSession: (sessionId) => set({ focusedSessionId: sessionId }),
+  setFocusedSession: (sessionId) =>
+    set((state) => ({
+      focusedSessionId: sessionId,
+      lastFocusedSessionId: sessionId ?? state.lastFocusedSessionId,
+    })),
 
   removeSession: (sessionId) => {
     clearSeenStepFinishIds(sessionId);
@@ -258,7 +270,12 @@ export const useChatStore = create<ChatStore>((set) => ({
 
   resetAll: () => {
     SEEN_STEP_FINISH_IDS.clear();
-    set({ sessions: {}, draftSession: null, focusedSessionId: null });
+    set({
+      sessions: {},
+      draftSession: null,
+      focusedSessionId: null,
+      lastFocusedSessionId: null,
+    });
   },
 
   beginSending: (sessionId, text, attachments) =>

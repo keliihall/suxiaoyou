@@ -690,17 +690,6 @@ async def edit_and_resend(
     """Edit a user message, delete all subsequent messages, and re-generate."""
     _ensure_security_not_stopped(request)
     body.language = request_language(request)
-    active = sm.active_job_for_session(body.session_id)
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "session_busy",
-                "message": "Stop the running task before editing conversation history.",
-                "session_id": body.session_id,
-                "active_stream_id": active.stream_id,
-            },
-        )
     _ensure_image_attachments_supported(
         attachments=body.attachments,
         provider_registry=provider_registry,
@@ -709,69 +698,99 @@ async def edit_and_resend(
     )
 
     stream_id = generate_ulid()
-
-    # Atomic DB operation: update message text + delete subsequent messages
-    async with session_factory() as db:
-        async with db.begin():
-            from app.session.goal_manager import get_session_goal
-
-            goal = await get_session_goal(db, body.session_id)
-            if goal is not None and goal.status not in {"paused", "complete"}:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "goal_history_edit_blocked",
-                        "message": (
-                            "Pause or complete the Goal before editing conversation history."
-                        ),
-                        "goal_id": goal.id,
-                        "goal_status": goal.status,
-                        "goal_revision": goal.revision,
-                    },
-                )
-            await update_message_text(db, body.message_id, body.text)
-            await update_message_file_parts(
-                db, body.message_id, body.session_id, body.attachments or []
+    # History mutation, ACP-ledger invalidation, and replacement-job admission
+    # are one process-wide critical section. An ACP turn can therefore happen
+    # wholly before this edit or observe the reserved replacement job after it;
+    # it cannot persist a Message in the history slice being deleted.
+    async with sm.job_admission_lock:
+        active = sm.active_job_for_session(body.session_id)
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "session_busy",
+                    "message": "Stop the running task before editing conversation history.",
+                    "session_id": body.session_id,
+                    "active_stream_id": active.stream_id,
+                },
             )
-            await delete_messages_after(db, body.session_id, body.message_id)
-            # Clear stale todos so re-fetches return empty until new generation populates them
-            await db.execute(sa_delete(Todo).where(Todo.session_id == body.session_id))
+        job = _create_session_job(
+            sm,
+            stream_id=stream_id,
+            session_id=body.session_id,
+        )
+        try:
+            # Atomic DB operation: edit the target, invalidate any bound ACP
+            # replay, delete the suffix, and clear stale todos.
+            async with session_factory() as db:
+                async with db.begin():
+                    from app.session.goal_manager import get_session_goal
 
-    job = _create_session_job(sm, stream_id=stream_id, session_id=body.session_id)
-    job.language = body.language
-    job.interactive = True
+                    goal = await get_session_goal(db, body.session_id)
+                    if goal is not None and goal.status not in {"paused", "complete"}:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "goal_history_edit_blocked",
+                                "message": (
+                                    "Pause or complete the Goal before editing "
+                                    "conversation history."
+                                ),
+                                "goal_id": goal.id,
+                                "goal_status": goal.status,
+                                "goal_revision": goal.revision,
+                            },
+                        )
+                    await update_message_text(db, body.message_id, body.text)
+                    await update_message_file_parts(
+                        db,
+                        body.message_id,
+                        body.session_id,
+                        body.attachments or [],
+                    )
+                    await delete_messages_after(
+                        db,
+                        body.session_id,
+                        body.message_id,
+                    )
+                    await db.execute(
+                        sa_delete(Todo).where(Todo.session_id == body.session_id)
+                    )
 
-    # Build a PromptRequest for run_generation (reuses existing flow)
-    edit_request = PromptRequest(
-        session_id=body.session_id,
-        text=body.text,
-        model=body.model,
-        provider_id=body.provider_id,
-        agent=body.agent,
-        attachments=body.attachments,
-        permission_presets=body.permission_presets,
-        permission_rules=body.permission_rules,
-        reasoning=body.reasoning,
-        workspace=body.workspace,
-        language=body.language,
-    )
-
-    coro = run_generation(
-        job,
-        edit_request,
-        session_factory=session_factory,
-        provider_registry=provider_registry,
-        agent_registry=agent_registry,
-        tool_registry=tool_registry,
-        index_manager=index_manager,
-        skip_user_message=True,
-    )
-    task = asyncio.create_task(
-        _run_with_semaphore(sm, job, coro),
-        name=f"gen-edit-{stream_id}",
-    )
-    task.add_done_callback(functools.partial(_on_task_done, job=job))
-    job.task = task
+            job.language = body.language
+            job.interactive = True
+            edit_request = PromptRequest(
+                session_id=body.session_id,
+                text=body.text,
+                model=body.model,
+                provider_id=body.provider_id,
+                agent=body.agent,
+                attachments=body.attachments,
+                permission_presets=body.permission_presets,
+                permission_rules=body.permission_rules,
+                reasoning=body.reasoning,
+                workspace=body.workspace,
+                language=body.language,
+            )
+            coro = run_generation(
+                job,
+                edit_request,
+                session_factory=session_factory,
+                provider_registry=provider_registry,
+                agent_registry=agent_registry,
+                tool_registry=tool_registry,
+                index_manager=index_manager,
+                skip_user_message=True,
+            )
+            task = asyncio.create_task(
+                _run_with_semaphore(sm, job, coro),
+                name=f"gen-edit-{stream_id}",
+            )
+            task.add_done_callback(functools.partial(_on_task_done, job=job))
+            job.task = task
+        except BaseException:
+            sm.remove_job(stream_id)
+            raise
 
     return PromptResponse(stream_id=stream_id, session_id=body.session_id)
 

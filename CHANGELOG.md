@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.1.0 — 2026-07-18
+
+本版本以公开、非 latest 的 `UNSIGNED-DEGRADED` 预发布配置交付。七个安装包全部带有明确的降级文件名；
+发布不宣称已具备发行方签名、Apple 公证、冻结 authoritative Office renderer、真实集成或受控 Beta 证据。
+完整边界见 [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md) 和随 Release 提供的机器可读清单。
+
+### Runtime、ACP 与恢复
+
+- 新增统一运行时事件、持久 turn checkpoint、mutation ledger 与 workspace instance；受控文件变更可以
+  预检并 rewind，冲突时 fail-closed，外部不可逆副作用保持显式可见。
+- 新增 stdio ACP Beta、受控 detached Git worktree、来源受限 Hooks，以及独立只读验证 Agent；权限、
+  审计、急停、取消和预算继续由同一安全边界约束。
+- 桌面端加入 runtime/checkpoint 控制面、Hook 撤销与来源状态、Validator 结果和用户 Office 模板管理。
+
+### Office 编辑与视觉闭环
+
+- 扩展 DOCX、XLSX、PPTX 的模板、图表和复杂格式安全子集，加入签名第一方模板与受审批的用户模板导入。
+- 新增 checkpoint-bound 预览、结构与视觉差异、只读验证、最多两轮修复和 rewind 联动；Office 提交继续
+  经过事务 seal、独立重开、确定性检查和原子提交。
+- 公开包不包含项目冻结的 authoritative renderer。权威 Office authoring/视觉提交在 renderer 缺失时
+  保持不可用；仅当主机存在兼容 LibreOffice 时提供明确标为 approximate 的预览。
+
+### 发布信任边界
+
+- Windows 与 Linux 安装包未做发行方签名；macOS 应用仅为 ad-hoc 签名，DMG 未做 Developer ID
+  签名、Apple 公证或 staple，Gatekeeper 可能阻止直接启动。
+- Release 为 prerelease、非 latest。七个安装包、校验和、release manifest、Office restricted
+  compatibility 和 degraded capabilities 共同绑定同一 `v1.1.0` tag 与 commit。
+
 ## v1.0.0-rc.1 — 2026-07-15
 
 本版本聚焦“安全可交付的本地办公 Agent”，不以复制 WorkBuddy 的生态、团队协作或云端运行时为目标。

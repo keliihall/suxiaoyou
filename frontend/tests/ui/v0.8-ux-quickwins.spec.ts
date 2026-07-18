@@ -339,7 +339,7 @@ test("About shows product information without a GitHub download entry", async ({
   await page.goto("/settings");
 
   await expect(page.getByRole("heading", { name: "About" })).toBeVisible();
-  await expect(page.getByText(/suyo v1\.0\.0/)).toBeVisible();
+  await expect(page.getByText(/suyo v1\.1\.0/)).toBeVisible();
   await expect(
     page.getByRole("button", { name: "View latest version and downloads" }),
   ).toHaveCount(0);

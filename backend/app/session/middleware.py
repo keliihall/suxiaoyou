@@ -54,6 +54,7 @@ class ToolAction:
 
     action: str  # "allow" | "warn" | "block"
     message: str | None = None  # Warning/block message
+    code: str | None = None  # Stable machine-readable reason for a block
 
 
 class Middleware:
@@ -141,11 +142,38 @@ class MiddlewareChain:
         tool_args: dict[str, Any],
         ctx: MiddlewareContext,
     ) -> ToolAction:
-        """Run before_tool_exec on all middlewares. First non-allow result wins."""
+        """Run every pre-tool hook, accumulating warnings and stopping on block.
+
+        A middleware is only allowed to preserve or narrow execution.  Unknown
+        actions therefore fail closed instead of being treated as an implicit
+        allow.  Warnings do not prevent later middleware from applying a block.
+        """
+        warnings: list[str] = []
         for mw in self._middlewares:
             result = await mw.before_tool_exec(tool_name, tool_args, ctx)
-            if result.action != "allow":
+            if not isinstance(result, ToolAction):
+                return ToolAction(
+                    action="block",
+                    message="Middleware returned an invalid pre-tool decision",
+                    code="middleware_contract_error",
+                )
+            if result.action == "block":
                 return result
+            if result.action == "warn":
+                if result.message:
+                    warnings.append(result.message)
+                continue
+            if result.action != "allow":
+                return ToolAction(
+                    action="block",
+                    message=(
+                        "Middleware returned an unsupported pre-tool action: "
+                        f"{result.action}"
+                    ),
+                    code="middleware_contract_error",
+                )
+        if warnings:
+            return ToolAction(action="warn", message="\n\n".join(warnings))
         return ToolAction(action="allow")
 
     async def run_after_tool_exec(
@@ -166,3 +194,19 @@ class MiddlewareChain:
     @property
     def middlewares(self) -> list[Middleware]:
         return list(self._middlewares)
+
+    @property
+    def has_after_llm_response_hooks(self) -> bool:
+        """Whether any middleware overrides the response transformation hook.
+
+        A transforming hook requires the processor to defer visible text and
+        tool dispatch until the provider stream completes.  Detecting that
+        requirement up front preserves ordinary streaming performance when the
+        chain contains only the built-in no-op implementation.
+        """
+
+        return any(
+            getattr(type(middleware), "after_llm_response", None)
+            is not Middleware.after_llm_response
+            for middleware in self._middlewares
+        )

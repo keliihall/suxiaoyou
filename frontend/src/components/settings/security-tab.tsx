@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Clock3,
   Cpu,
+  Fingerprint,
   KeyRound,
   Loader2,
   Plug,
@@ -35,10 +36,13 @@ import {
   useEmergencyStopToggle,
   useSecurityAudit,
   useSecurityOverview,
+  useSecurityProjectHookRevocation,
+  useSecurityProjectHooks,
   useSecurityToolToggle,
 } from "@/hooks/use-security";
 import { apiErrorMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useChatStore } from "@/stores/chat-store";
 import type { SecurityAuditEvent, SecurityTool } from "@/types/security";
 
 const TOOLS_PAGE_SIZE = 6;
@@ -281,8 +285,16 @@ export function SecurityTab() {
     useState<SecurityAuditEvent[] | null>(null);
   const overviewQuery = useSecurityOverview();
   const auditQuery = useSecurityAudit(100);
+  const taskSessionId = useChatStore(
+    (state) => state.focusedSessionId ?? state.lastFocusedSessionId,
+  );
+  const hooksQuery = useSecurityProjectHooks(
+    taskSessionId,
+    Boolean(overviewQuery.data?.release_gates.v11_hooks),
+  );
   const toolToggle = useSecurityToolToggle();
   const emergencyToggle = useEmergencyStopToggle();
+  const hookRevocation = useSecurityProjectHookRevocation(taskSessionId);
 
   const overview = overviewQuery.data;
   const sortedTools = useMemo(
@@ -340,6 +352,9 @@ export function SecurityTab() {
     setAuditSnapshot(null);
     auditPage.setPage(1);
     void Promise.all([overviewQuery.refetch(), auditQuery.refetch()]);
+    if (taskSessionId && overview?.release_gates.v11_hooks) {
+      void hooksQuery.refetch();
+    }
   };
 
   const selectSectionByIndex = (index: number) => {
@@ -409,6 +424,20 @@ export function SecurityTab() {
     }
   };
 
+  const revokeHook = async (hookId: string) => {
+    if (!window.confirm(t("securityHookRevokeConfirm", { hook: hookId }))) return;
+    try {
+      const result = await hookRevocation.mutateAsync(hookId);
+      toast.success(
+        result.revoked
+          ? t("securityHookRevoked", { hook: hookId })
+          : t("securityHookAlreadyRevoked", { hook: hookId }),
+      );
+    } catch (error) {
+      toast.error(apiErrorMessage(error, t("securityHookRevokeFailed")));
+    }
+  };
+
   if (overviewQuery.isLoading && !overview) return <SecurityLoading />;
 
   if (!overview) {
@@ -435,6 +464,20 @@ export function SecurityTab() {
 
   const updatedAt = formatTime(overview.state.updated_at, i18n.language);
   const refreshing = overviewQuery.isFetching || auditQuery.isFetching;
+  const readiness = overview.v11_readiness;
+  const featureState = (name: keyof NonNullable<typeof readiness>, fallback: boolean) => ({
+    released: readiness?.[name]?.released ?? fallback,
+    ready: readiness?.[name]?.runtime_ready ?? fallback,
+  });
+  const v11Features = [
+    { id: "rewind", label: t("securityV11Rewind"), ...featureState("rewind", Boolean(overview.release_gates.v11_checkpoints && overview.release_gates.v11_rewind)), beta: false },
+    { id: "hooks", label: t("securityV11Hooks"), ...featureState("hooks", Boolean(overview.release_gates.v11_hooks)), beta: false },
+    { id: "office", label: t("securityV11Office"), ...featureState("office_authoring", false), beta: false },
+    { id: "acp", label: t("securityV11Acp"), ...featureState("acp", Boolean(overview.release_gates.v11_acp)), beta: true },
+    { id: "worktrees", label: t("securityV11Worktrees"), ...featureState("worktrees", Boolean(overview.release_gates.v11_checkpoints && overview.release_gates.v11_worktrees)), beta: true },
+    { id: "validator", label: t("securityV11Validator"), ...featureState("validator", Boolean(overview.release_gates.v11_checkpoints && overview.release_gates.v11_validation_agent)), beta: true },
+    { id: "user-office-templates", label: t("securityV11UserOfficeTemplates"), ...featureState("user_office_templates", false), beta: true },
+  ];
 
   return (
     <div className="space-y-6">
@@ -572,6 +615,46 @@ export function SecurityTab() {
               {t("securityReleaseGateDesc")}
             </p>
           </div>
+        </div>
+
+        <div className="mt-3 rounded-xl border border-[var(--border-default)] bg-[var(--surface-secondary)]/30 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-[var(--text-primary)]">{t("securityV11Features")}</h3>
+              <p className="mt-1 text-xs text-[var(--text-secondary)]">{t("securityV11FeaturesDesc")}</p>
+            </div>
+            <Badge variant="outline">v1.1</Badge>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {v11Features.map((feature) => (
+              <div key={feature.id} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--surface-primary)]/50 px-3 py-2">
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium text-[var(--text-primary)]">{feature.label}</p>
+                  <p className="mt-0.5 text-[10px] text-[var(--text-tertiary)]">
+                    {feature.beta ? "Beta" : "GA"} · {feature.ready ? t("securityRuntimeReady") : feature.released ? t("securityRuntimePending") : t("securityClosed")}
+                  </p>
+                </div>
+                <BinaryStatus active={feature.ready} activeLabel={t("securityExposed")} inactiveLabel={feature.released ? t("securityRuntimePending") : t("securityClosed")} warning={feature.beta || (feature.released && !feature.ready)} />
+              </div>
+            ))}
+          </div>
+          {(overview.source_profiles?.length ?? 0) > 0 && (
+            <div className="mt-4 border-t border-[var(--border-default)] pt-3">
+              <p className="text-xs font-medium text-[var(--text-primary)]">{t("securitySourceCeilings")}</p>
+              <p className="mt-1 text-[11px] text-[var(--text-secondary)]">{t("securitySourceCeilingsDesc")}</p>
+              <div className="mt-2 space-y-2">
+                {overview.source_profiles?.map((profile) => (
+                  <div key={profile.source} className="rounded-lg border border-[var(--border-default)] px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <code className="text-[11px] font-semibold text-[var(--text-primary)]">{profile.source}</code>
+                      <Badge variant="secondary" className="text-[9px]">{profile.deny_unknown ? t("securityDenyUnknown") : t("securityExposed")}</Badge>
+                    </div>
+                    <div className="mt-2"><Capabilities values={profile.allowed_capabilities} /></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -851,6 +934,88 @@ export function SecurityTab() {
               />
             </div>
           </div>
+
+          {overview.release_gates.v11_hooks && (
+            <div className="overflow-hidden rounded-xl border border-[var(--border-default)]">
+              <div className="flex items-start gap-3 border-b border-[var(--border-default)] bg-[var(--surface-secondary)]/50 px-4 py-3">
+                <Fingerprint className="mt-0.5 h-4 w-4 shrink-0 text-[var(--text-secondary)]" />
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                    {t("securityProjectHooksTitle")}
+                  </h3>
+                  <p className="mt-1 text-[11px] text-[var(--text-secondary)]">
+                    {t("securityProjectHooksDesc")}
+                  </p>
+                </div>
+                <Badge variant="outline">GA</Badge>
+              </div>
+
+              {!taskSessionId ? (
+                <p className="px-4 py-8 text-center text-xs text-[var(--text-tertiary)]">
+                  {t("securityProjectHooksNoSession")}
+                </p>
+              ) : hooksQuery.isLoading ? (
+                <div className="flex items-center justify-center gap-2 px-4 py-8 text-xs text-[var(--text-secondary)]">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t("securityProjectHooksLoading")}
+                </div>
+              ) : hooksQuery.isError ? (
+                <div className="px-4 py-6 text-center">
+                  <p className="text-xs text-[var(--color-destructive)]">
+                    {apiErrorMessage(hooksQuery.error, t("securityProjectHooksLoadFailed"))}
+                  </p>
+                  <Button className="mt-3" size="sm" variant="outline" onClick={() => void hooksQuery.refetch()}>
+                    {t("securityRetry")}
+                  </Button>
+                </div>
+              ) : (hooksQuery.data?.hooks.length ?? 0) === 0 ? (
+                <p className="px-4 py-8 text-center text-xs text-[var(--text-tertiary)]">
+                  {t("securityProjectHooksEmpty")}
+                </p>
+              ) : (
+                <div className="divide-y divide-[var(--border-default)]">
+                  {hooksQuery.data?.hooks.map((hook) => {
+                    const approved = hook.approval_state === "approved";
+                    const unavailable = hook.approval_state === "unavailable";
+                    const changing = hookRevocation.isPending && hookRevocation.variables === hook.hook_id;
+                    return (
+                      <article key={hook.hook_id} className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="break-all font-mono text-xs font-semibold text-[var(--text-primary)]">
+                              {hook.hook_id}
+                            </p>
+                            <Badge variant={approved ? "success" : unavailable ? "warning" : "secondary"}>
+                              {approved
+                                ? t("securityHookApproved")
+                                : unavailable
+                                  ? t("securityHookTrustUnavailable")
+                                  : t("securityApprovalRequired")}
+                            </Badge>
+                          </div>
+                          <p className="mt-1.5 text-[11px] text-[var(--text-secondary)]">
+                            {hook.event} · {hook.failure_policy} · {t("securityHookTimeout", { seconds: hook.timeout_seconds })}
+                          </p>
+                          <p className="mt-1 break-all font-mono text-[10px] text-[var(--text-tertiary)]">
+                            {t("securityHookFingerprint")}: {shortId(hook.fingerprint)}
+                          </p>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={!approved || changing || unavailable || hookRevocation.isPending}
+                          onClick={() => void revokeHook(hook.hook_id)}
+                        >
+                          {changing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                          {t("securityHookRevoke")}
+                        </Button>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 

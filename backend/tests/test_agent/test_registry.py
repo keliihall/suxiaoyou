@@ -8,7 +8,16 @@ class TestAgentRegistry:
         r = AgentRegistry()
         agents = r.list_agents(include_hidden=True)
         names = {a.name for a in agents}
-        assert names == {"build", "plan", "explore", "general", "compaction", "title", "summary"}
+        assert names == {
+            "build",
+            "plan",
+            "explore",
+            "general",
+            "compaction",
+            "title",
+            "summary",
+            "validator",
+        }
 
     def test_default_agent_is_build(self):
         r = AgentRegistry()
@@ -33,6 +42,7 @@ class TestAgentRegistry:
         assert "compaction" not in names
         assert "title" not in names
         assert "summary" not in names
+        assert "validator" not in names
         assert "build" in names
 
     def test_primary_agents(self):

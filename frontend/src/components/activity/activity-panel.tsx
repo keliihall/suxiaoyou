@@ -4,9 +4,11 @@ import { useMemo, useState } from "react";
 import {
   X,
   CheckCircle2,
-  XCircle,
+  CircleAlert,
+  CircleMinus,
   ChevronDown,
   Loader2,
+  RefreshCw,
   FileText,
   Play,
   Search,
@@ -47,6 +49,7 @@ import { ToolMetadataSummary } from "@/components/parts/tool-metadata-summary";
 import {
   hasRunningActivityTools,
   isActivityComplete,
+  isActivityFailed,
 } from "@/lib/activity-state";
 
 // -- Helpers --
@@ -79,11 +82,16 @@ function getElapsed(tool: ToolPart, language: string): string {
 
 type TimelineItem =
   | { kind: "thinking-group"; texts: string[] }
-  | { kind: "tool"; tool: ToolPart };
+  | { kind: "tool"; tool: ToolPart }
+  | { kind: "adjustment-group"; tools: ToolPart[] };
 
-function buildTimelineItems(chain: ChainItem[]): TimelineItem[] {
+function buildTimelineItems(
+  chain: ChainItem[],
+  collapseRecoveredIssues: boolean,
+): TimelineItem[] {
   const items: TimelineItem[] = [];
   let thinkingBuf: string[] = [];
+  let issueBuf: ToolPart[] = [];
 
   const flushThinking = () => {
     if (thinkingBuf.length > 0) {
@@ -92,15 +100,31 @@ function buildTimelineItems(chain: ChainItem[]): TimelineItem[] {
     }
   };
 
+  const flushIssues = () => {
+    if (issueBuf.length >= 2) {
+      items.push({ kind: "adjustment-group", tools: [...issueBuf] });
+    } else if (issueBuf.length === 1) {
+      items.push({ kind: "tool", tool: issueBuf[0] });
+    }
+    issueBuf = [];
+  };
+
   for (const c of chain) {
     if (c.type === "reasoning") {
+      flushIssues();
       thinkingBuf.push(c.text);
     } else {
       flushThinking();
-      items.push({ kind: "tool", tool: c.data });
+      if (collapseRecoveredIssues && c.data.state.status === "error") {
+        issueBuf.push(c.data);
+      } else {
+        flushIssues();
+        items.push({ kind: "tool", tool: c.data });
+      }
     }
   }
   flushThinking();
+  flushIssues();
 
   return items;
 }
@@ -164,14 +188,43 @@ function ThinkingGroup({ texts }: { texts: string[] }) {
 }
 
 /** Individual tool row in the timeline */
-function ToolRow({ tool, terminal = false }: { tool: ToolPart; terminal?: boolean }) {
+function ToolRow({
+  tool,
+  terminal = false,
+  activityFailed = false,
+  nested = false,
+}: {
+  tool: ToolPart;
+  terminal?: boolean;
+  activityFailed?: boolean;
+  nested?: boolean;
+}) {
   const { t, i18n } = useTranslation("chat");
   const [isOpen, setIsOpen] = useState(false);
   const ToolIcon = TOOL_ICONS[tool.tool] ?? Plug;
   const wasLeftRunning =
     tool.state.status === "running" || tool.state.status === "pending";
   const isRunning = wasLeftRunning && !terminal;
-  const isError = tool.state.status === "error" || (terminal && wasLeftRunning);
+  const isIssue = tool.state.status === "error";
+  const isUnreported = terminal && wasLeftRunning;
+  const issueLabel = isIssue
+    ? terminal
+      ? activityFailed
+        ? t("toolAttemptIncomplete")
+        : t("toolAttemptRecovered")
+      : t("toolAttemptNeedsAdjustment")
+    : isUnreported
+      ? t("toolResultNotReturned")
+      : "";
+  const presentationStatus = isRunning
+    ? "running"
+    : isIssue
+      ? terminal && !activityFailed
+        ? "adjusted"
+        : "needs-adjustment"
+      : isUnreported
+        ? "unreported"
+        : "completed";
   const elapsed = getElapsed(tool, i18n.language);
   const title = getToolDisplayTitle(tool, t, i18n.language);
   const output = translatePersistedToolOutput(
@@ -191,27 +244,45 @@ function ToolRow({ tool, terminal = false }: { tool: ToolPart; terminal?: boolea
   const moreCount = sources.length - MAX_VISIBLE_SOURCES;
 
   return (
-    <div className="relative pl-7">
+    <div
+      className={cn("relative", nested ? "pl-6" : "pl-7")}
+      data-activity-status={presentationStatus}
+    >
       {/* Timeline dot */}
       <div className="absolute left-0 top-1 flex items-center justify-center">
         {isRunning ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--text-tertiary)]" />
-        ) : isError ? (
-          <XCircle className="h-3.5 w-3.5 text-[var(--tool-error)]" />
+          <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin text-[var(--text-tertiary)]" />
+        ) : isIssue ? (
+          <CircleAlert aria-hidden="true" className="h-3.5 w-3.5 text-[var(--tool-adjusted)]" />
+        ) : isUnreported ? (
+          <CircleMinus aria-hidden="true" className="h-3.5 w-3.5 text-[var(--text-tertiary)]" />
         ) : (
-          <CheckCircle2 className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
+          <CheckCircle2 aria-hidden="true" className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
         )}
       </div>
 
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
         className="w-full text-left group flex items-center gap-2"
       >
         <ToolIcon className="h-3.5 w-3.5 text-[var(--text-tertiary)] shrink-0" />
         <span className="flex-1 text-xs text-[var(--text-secondary)] truncate group-hover:text-[var(--text-primary)] transition-colors">
           {title}
         </span>
+        {issueLabel && (
+          <span
+            className={cn(
+              "shrink-0 rounded-full px-1.5 py-0.5 text-[10px] leading-none",
+              isIssue
+                ? "bg-[var(--tool-adjusted)]/10 text-[var(--tool-adjusted)]"
+                : "bg-[var(--surface-secondary)] text-[var(--text-tertiary)]",
+            )}
+          >
+            {issueLabel}
+          </span>
+        )}
         {elapsed && (
           <span className="text-[10px] text-[var(--text-tertiary)] shrink-0">
             {elapsed}
@@ -276,9 +347,13 @@ function ToolRow({ tool, terminal = false }: { tool: ToolPart; terminal?: boolea
                 <div>
                   <p className={cn(
                     "px-3 py-1 text-[10px] font-semibold uppercase tracking-wider bg-[var(--surface-tertiary)]",
-                    isError ? "text-[var(--tool-error)]" : "text-[var(--tool-completed)]",
+                    isIssue
+                      ? "text-[var(--tool-adjusted)]"
+                      : isUnreported
+                        ? "text-[var(--text-tertiary)]"
+                        : "text-[var(--tool-completed)]",
                   )}>
-                    {t("output")}
+                    {isIssue || isUnreported ? t("details") : t("output")}
                   </p>
                   <pre className="p-2 text-[11px] text-[var(--text-secondary)] overflow-x-auto font-mono leading-relaxed max-h-[200px] overflow-y-auto">
                     {output.length > 3000
@@ -295,16 +370,83 @@ function ToolRow({ tool, terminal = false }: { tool: ToolPart; terminal?: boolea
   );
 }
 
+/** Consecutive recoverable misses are one route adjustment, not many failures. */
+function AdjustmentGroup({ tools }: { tools: ToolPart[] }) {
+  const { t } = useTranslation("chat");
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className="relative pl-7" data-activity-status="adjusted">
+      <div className="absolute left-0 top-1 flex items-center justify-center">
+        <RefreshCw
+          aria-hidden="true"
+          className="h-3.5 w-3.5 text-[var(--tool-adjusted)]"
+        />
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
+        className="group flex w-full items-center gap-2 text-left"
+      >
+        <span className="flex-1 text-xs font-medium text-[var(--text-secondary)] transition-colors group-hover:text-[var(--text-primary)]">
+          {t("activityAdjustmentGroup", { count: tools.length })}
+        </span>
+        <ChevronDown
+          aria-hidden="true"
+          className={cn(
+            "h-3 w-3 shrink-0 text-[var(--text-tertiary)] transition-transform duration-200",
+            isOpen && "rotate-180",
+          )}
+        />
+      </button>
+      <p className="mt-1 text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+        {t("activityAdjustmentGroupDesc")}
+      </p>
+
+      <AnimatePresence initial={false}>
+        {isOpen && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2, ease: "easeInOut" }}
+            className="overflow-hidden"
+          >
+            <div className="mt-3 space-y-3 border-l border-[var(--border-default)] pl-3">
+              {tools.map((tool) => (
+                <ToolRow
+                  key={tool.call_id}
+                  tool={tool}
+                  terminal
+                  nested
+                />
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 // -- Main panel content --
 
 function ActivityPanelContent() {
   const { t, i18n } = useTranslation("chat");
   const activeData = useActivityStore((s) => s.activeData);
   const close = useActivityStore((s) => s.close);
+  const isComplete = activeData ? isActivityComplete(activeData) : false;
+  const activityFailed = isComplete && activeData
+    ? isActivityFailed(activeData)
+    : false;
 
   const timelineItems = useMemo(
-    () => (activeData?.chain ? buildTimelineItems(activeData.chain) : []),
-    [activeData],
+    () => activeData?.chain
+      ? buildTimelineItems(activeData.chain, isComplete && !activityFailed)
+      : [],
+    [activeData, activityFailed, isComplete],
   );
 
   if (!activeData) return null;
@@ -335,7 +477,6 @@ function ActivityPanelContent() {
     ? formatElapsedDuration(duration, i18n.language)
     : "";
   const hasRunningTools = hasRunningActivityTools(activeData);
-  const isComplete = isActivityComplete(activeData);
 
   return (
     <div className="flex flex-col h-full">
@@ -364,22 +505,51 @@ function ActivityPanelContent() {
       {/* Scrollable chain timeline */}
       <div className="flex-1 overflow-y-auto px-4 py-4 scrollbar-auto">
         <div className="relative space-y-4">
-          {timelineItems.map((item, i) =>
-            item.kind === "thinking-group" ? (
-              <ThinkingGroup key={`thinking-${i}`} texts={item.texts} />
-            ) : (
+          {timelineItems.map((item, i) => {
+            if (item.kind === "thinking-group") {
+              return (
+                <ThinkingGroup key={`thinking-${i}`} texts={item.texts} />
+              );
+            }
+            if (item.kind === "adjustment-group") {
+              return (
+                <AdjustmentGroup
+                  key={`adjustment-${item.tools[0]?.call_id ?? i}`}
+                  tools={item.tools}
+                />
+              );
+            }
+            return (
               <ToolRow
                 key={`tool-${item.tool.call_id}-${i}`}
                 tool={item.tool}
                 terminal={isComplete}
+                activityFailed={activityFailed}
               />
-            ),
-          )}
+            );
+          })}
 
-          {isComplete ? (
-            <div className="relative pl-7">
+          {activityFailed ? (
+            <div className="relative pl-7" role="status" data-activity-status="failed">
               <div className="absolute left-0 top-0.5 flex items-center justify-center">
-                <CheckCircle2 className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
+                <CircleAlert
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5 text-[var(--color-destructive)]"
+                />
+              </div>
+              {durationLabel && (
+                <p className="text-[11px] text-[var(--text-tertiary)]">
+                  {t("thoughtFor", { duration: durationLabel })}
+                </p>
+              )}
+              <p className="text-[13px] font-medium text-[var(--color-destructive)]">
+                {t("activityNotCompleted")}
+              </p>
+            </div>
+          ) : isComplete ? (
+            <div className="relative pl-7" data-activity-status="completed">
+              <div className="absolute left-0 top-0.5 flex items-center justify-center">
+                <CheckCircle2 aria-hidden="true" className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
               </div>
               {durationLabel && (
                 <p className="text-[11px] text-[var(--text-tertiary)]">

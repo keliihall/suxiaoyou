@@ -17,10 +17,13 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from app import release_features
 from app.schemas.agent import AgentInfo
 from app.storage.file_versions import FileVersionStore
 from app.tool.builtin.office import OfficeTool
@@ -43,6 +46,30 @@ _COMMIT_PATTERN = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 
 class OfficeContractError(RuntimeError):
     """The release Office contract did not satisfy an asserted postcondition."""
+
+
+@contextmanager
+def _restricted_v1_contract_mode() -> Iterator[None]:
+    """Exercise the v1 compatibility engine without weakening normal authoring.
+
+    ``--office-self-test`` runs in a dedicated process before the API server is
+    started.  The compatibility contract is intentionally versioned as the
+    restricted v1 contract, so it must not accidentally enter the v1.1
+    authoritative-precommit path merely because the shipping source gate is
+    open.  Restore the code-owned gate even when a format probe fails so calls
+    from the Python test process cannot affect subsequent v1.1 checks.
+    """
+
+    office_v2_released = release_features.V11_OFFICE_V2_RELEASED
+    setattr(release_features, "V11_OFFICE_V2_RELEASED", False)
+    try:
+        yield
+    finally:
+        setattr(
+            release_features,
+            "V11_OFFICE_V2_RELEASED",
+            office_v2_released,
+        )
 
 
 def native_platform_id(
@@ -438,20 +465,21 @@ async def run_office_contract(
             (workspace / "suxiaoyou_written").mkdir()
             private.mkdir()
             os.environ["SUXIAOYOU_PRIVATE_DATA_DIR"] = str(private)
-            for format_name, exercise in exercises:
-                try:
-                    results[format_name] = await exercise(workspace)
-                except Exception as exc:
-                    results[format_name] = {
-                        "created": False,
-                        "edited": False,
-                        "reopened_and_validated": False,
-                        "independent_reopen_validated": False,
-                        "atomic_install": False,
-                        "version_snapshot_verified": False,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
+            with _restricted_v1_contract_mode():
+                for format_name, exercise in exercises:
+                    try:
+                        results[format_name] = await exercise(workspace)
+                    except Exception as exc:
+                        results[format_name] = {
+                            "created": False,
+                            "edited": False,
+                            "reopened_and_validated": False,
+                            "independent_reopen_validated": False,
+                            "atomic_install": False,
+                            "version_snapshot_verified": False,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
     finally:
         if previous_private_dir is None:
             os.environ.pop("SUXIAOYOU_PRIVATE_DATA_DIR", None)

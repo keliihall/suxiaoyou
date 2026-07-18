@@ -7,6 +7,7 @@ Build with:
     pyinstaller suxiaoyou.spec
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ croniter_datas, croniter_binaries, croniter_hiddenimports = collect_all('cronite
 anthropic_datas, anthropic_binaries, anthropic_hiddenimports = collect_all('anthropic')
 google_genai_datas, google_genai_binaries, google_genai_hiddenimports = collect_all('google.genai')
 keyring_datas, keyring_binaries, keyring_hiddenimports = collect_all('keyring')
+acp_datas, acp_binaries, acp_hiddenimports = collect_all('acp')
 
 
 def production_package_only(datas, hiddenimports):
@@ -68,6 +70,9 @@ google_genai_datas, google_genai_hiddenimports = production_package_only(
 keyring_datas, keyring_hiddenimports = production_package_only(
     keyring_datas, keyring_hiddenimports
 )
+acp_datas, acp_hiddenimports = production_package_only(
+    acp_datas, acp_hiddenimports
+)
 
 # Resolve paths
 backend_dir = os.path.abspath('.')
@@ -77,10 +82,143 @@ frontend_out = os.environ.get(
     'SUXIAOYOU_FRONTEND_OUT',
     os.path.join(repo_root, 'frontend', 'out'),
 )
+from release_packaging.release_identity import (  # noqa: E402
+    ReleaseIdentityPackagingError,
+    prepare_frozen_release_identity,
+)
+from release_packaging.office_renderer_stage import (  # noqa: E402
+    OFFICE_RENDERER_PROFILE_ENV,
+    SIGNED_AUTHORITATIVE_PROFILE,
+    UNSIGNED_DEGRADED_PROFILE,
+    OfficeRendererPackagingError,
+    bind_office_renderer_analysis_assets,
+    prepare_office_renderer_assets,
+    verify_office_renderer_analysis_assets,
+)
+
+try:
+    _release_identity_build = prepare_frozen_release_identity(
+        repository_root=repo_root,
+        work_root=os.path.join(workpath, 'release-identity'),
+    )
+except ReleaseIdentityPackagingError as exc:
+    sys.stderr.write(
+        f'\n[suxiaoyou.spec] FATAL: frozen release identity refused: {exc}\n'
+    )
+    raise SystemExit(1) from exc
+
+try:
+    # ``office_renderer_datas`` remains a compatibility API, but release
+    # builds retain the richer snapshot identity so Analysis cannot expand or
+    # substitute renderer sources without a post-Analysis verification.
+    _office_renderer_build = prepare_office_renderer_assets(
+        app_dir=app_dir,
+        repo_root=repo_root,
+        work_root=os.path.join(workpath, 'office-renderer'),
+        release_identity=_release_identity_build.identity,
+    )
+    _required_office_renderer_assets = list(_office_renderer_build.datas)
+except OfficeRendererPackagingError as exc:
+    sys.stderr.write(
+        f'\n[suxiaoyou.spec] FATAL: Office renderer packaging refused: {exc}\n'
+    )
+    raise SystemExit(1) from exc
+
+_office_renderer_profile_datas = []
+_release_version_parts = tuple(
+    int(part) for part in _release_identity_build.identity.app_version.split('.')
+)
+if _release_version_parts >= (1, 1, 0):
+    _office_renderer_profile = os.environ.get(
+        OFFICE_RENDERER_PROFILE_ENV,
+        SIGNED_AUTHORITATIVE_PROFILE,
+    )
+    _renderer_bundled = _office_renderer_build.snapshot_root is not None
+    if (
+        (_office_renderer_profile == SIGNED_AUTHORITATIVE_PROFILE and not _renderer_bundled)
+        or (_office_renderer_profile == UNSIGNED_DEGRADED_PROFILE and _renderer_bundled)
+    ):
+        sys.stderr.write(
+            '\n[suxiaoyou.spec] FATAL: Office renderer profile does not match '
+            'the admitted bundle inputs\n'
+        )
+        raise SystemExit(1)
+    _office_renderer_profile_marker = os.path.join(
+        workpath,
+        'office-renderer-profile.json',
+    )
+    _office_renderer_profile_payload = {
+        'app_version': _release_identity_build.identity.app_version,
+        'authoritative_authoring_available': False,
+        'authoritative_renderer_bundled': _renderer_bundled,
+        'contract': 'suxiaoyou-office-renderer-profile-v1',
+        'profile': _office_renderer_profile,
+        'release_commit': _release_identity_build.identity.release_commit,
+        'schema_version': 1,
+    }
+    with open(_office_renderer_profile_marker, 'w', encoding='ascii', newline='\n') as marker:
+        json.dump(
+            _office_renderer_profile_payload,
+            marker,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        marker.write('\n')
+    os.chmod(_office_renderer_profile_marker, 0o600)
+    _office_renderer_profile_datas.append(
+        (_office_renderer_profile_marker, os.path.join('app', 'data'))
+    )
+
 _required_pdf_font_files = [
     os.path.join(app_dir, 'data', 'fonts', 'SuxiaoyouCJK-Regular.ttf'),
     os.path.join(app_dir, 'data', 'fonts', 'OFL-1.1.txt'),
     os.path.join(app_dir, 'data', 'fonts', 'PROVENANCE.md'),
+]
+_required_agent_prompt_files = [
+    os.path.join(app_dir, 'agent', 'prompts', 'validator.txt'),
+    os.path.join(app_dir, 'agent', 'prompts', 'office_repair.txt'),
+]
+_required_office_template_assets = [
+    (
+        os.path.join(app_dir, 'office_templates', 'assets', 'catalog.json'),
+        os.path.join('app', 'office_templates', 'assets'),
+    ),
+    (
+        os.path.join(app_dir, 'office_templates', 'assets', 'catalog.sig.json'),
+        os.path.join('app', 'office_templates', 'assets'),
+    ),
+    (
+        os.path.join(
+            app_dir,
+            'office_templates',
+            'assets',
+            'templates',
+            'business-brief.docx',
+        ),
+        os.path.join('app', 'office_templates', 'assets', 'templates'),
+    ),
+    (
+        os.path.join(
+            app_dir,
+            'office_templates',
+            'assets',
+            'templates',
+            'project-tracker.xlsx',
+        ),
+        os.path.join('app', 'office_templates', 'assets', 'templates'),
+    ),
+    (
+        os.path.join(
+            app_dir,
+            'office_templates',
+            'assets',
+            'templates',
+            'status-update.pptx',
+        ),
+        os.path.join('app', 'office_templates', 'assets', 'templates'),
+    ),
 ]
 
 # Data files to include.
@@ -98,15 +236,33 @@ _required_datas = [
     (os.path.join(backend_dir, 'alembic.ini'), '.'),
     # Bundled data (skills, plugins, connectors)
     (os.path.join(app_dir, 'data'), os.path.join('app', 'data')),
+    # v1.1+ binds the signed renderer to the frozen app version and exact
+    # clean Git checkout. This resource is generated inside PyInstaller's
+    # private work tree and has no source-tree or environment fallback.
+    *_release_identity_build.datas,
+    # v1.1+ carries a generated, commit-bound declaration of whether this is a
+    # signed authoritative renderer build or the explicitly unsupported
+    # unsigned-degraded profile. The marker never grants Office write authority.
+    *_office_renderer_profile_datas,
+    # The signed-authoritative profile receives exactly one lock-bound native
+    # renderer from the external atomic staging chain; unsigned-degraded
+    # receives none. ``*_required_office_renderer_assets`` are deliberately
+    # NOT Analysis inputs: PyInstaller would reclassify real ELF/PE/Mach-O data
+    # as BINARY and rewrite signed bytes. Any admitted bytes are attached to
+    # ``a.datas`` only after Analysis has completed all binary processing.
     # Frontend static export — served by FastAPI at /m for the mobile PWA
     # when a phone connects through the cloudflare tunnel. Without this,
     # remote access is effectively broken even though the desktop UI works
     # (Tauri reads the frontend from its own resources).
     (frontend_out, 'frontend_out'),
+    # Signed first-party Office catalog and its immutable OOXML assets. Keep
+    # this list explicit so unrelated files cannot silently enter a release.
+    *_required_office_template_assets,
 ]
 
 _missing = [src for src, _ in _required_datas if not os.path.exists(src)]
 _missing.extend(path for path in _required_pdf_font_files if not os.path.isfile(path))
+_missing.extend(path for path in _required_agent_prompt_files if not os.path.isfile(path))
 if _missing:
     sys.stderr.write(
         '\n[suxiaoyou.spec] FATAL: required build inputs are missing:\n'
@@ -115,9 +271,11 @@ if _missing:
         sys.stderr.write(f'  - {p}\n')
     sys.stderr.write(
         '\nBuild the frontend (DESKTOP_BUILD=true next build) and make sure\n'
-        'backend/alembic, backend/app/agent/prompts and backend/app/data all\n'
-        'exist before running pyinstaller. The app/data check includes the\n'
-        'bundled PDF CJK font, OFL notice, and provenance record. Aborting\n'
+        'backend/alembic, both required backend/app/agent/prompts,\n'
+        'backend/app/data, and\n'
+        'backend/app/office_templates/assets all exist before running\n'
+        'pyinstaller. The app/data check includes the bundled PDF CJK font,\n'
+        'OFL notice, and provenance record. Aborting\n'
         'so we never ship a half-baked bundle.\n'
     )
     raise SystemExit(1)
@@ -221,6 +379,13 @@ hiddenimports = [
     'anyio',
     'anyio._backends',
     'anyio._backends._asyncio',
+    # ACP SDK and the two frozen entry paths. ``collect_all('acp')`` below
+    # covers SDK-internal dynamic imports; these explicit roots make the
+    # shipping surface reviewable and keep the application bridge reachable.
+    'acp',
+    'acp.meta',
+    'acp.schema',
+    'acp.stdio',
     'wcmatch',
     'wcmatch.glob',
     'wcmatch.fnmatch',
@@ -289,6 +454,81 @@ hiddenimports = [
     'app.tool.builtin.web_search',
     'app.tool.builtin.plan',
     'app.tool.builtin.invalid',
+    'app.acp',
+    'app.acp.bridge',
+    'app.acp.cli',
+    'app.acp.self_test',
+    'app.acp.server',
+    'app.acp.session_bridge',
+    'app.acp.stdio',
+    # v1.1 gated modules are explicit even when PyInstaller can currently
+    # discover them through nested imports. Released bundle smoke exercises
+    # the open gate graph, while explicit collection keeps every entrypoint
+    # independently auditable inside PYZ.
+    'app.api.runtime_control',
+    'app.api.office_user_templates',
+    'app.api.office_v2',
+    'app.hooks',
+    'app.hooks.config',
+    'app.hooks.dispatcher',
+    'app.hooks.models',
+    'app.hooks.registry',
+    'app.hooks.runner',
+    'app.hooks.runtime',
+    'app.hooks.trust',
+    'app.models.checkpoint_change',
+    'app.models.office_user_template',
+    'app.models.session_checkpoint',
+    'app.models.turn_run',
+    'app.models.workspace_instance',
+    'app.office_rendering',
+    'app.office_rendering.attested',
+    'app.office_rendering.cache',
+    'app.office_rendering.deployment',
+    'app.office_rendering.libreoffice',
+    'app.office_rendering.native_bundle',
+    'app.office_rendering.native_sandbox',
+    'app.office_rendering.native_sandbox_behavior',
+    'app.office_rendering.probe',
+    'app.office_rendering.process_runner',
+    'app.office_rendering.release_identity',
+    'app.office_rendering.runtime',
+    'app.office_rendering.sandbox',
+    'app.office_rendering.service',
+    'release_packaging.office_renderer_trust',
+    'app.office_templates',
+    'app.office_templates.bundled',
+    'app.office_templates.instantiation',
+    'app.office_templates.policies',
+    'app.office_templates.registry',
+    'app.office_templates.substitution',
+    'app.office_templates.user',
+    'app.office_templates.validation',
+    'app.office_validation',
+    'app.office_validation.draft',
+    'app.office_validation.orchestrator',
+    'app.office_validation.precommit',
+    'app.office_validation.precommit_repair',
+    'app.office_validation.repair_agent',
+    'app.office_validation.runtime',
+    'app.office_validation.startup',
+    'app.office_validation.structure',
+    'app.office_validation.visual',
+    'app.release_readiness',
+    'app.runtime.checkpoint_runtime',
+    'app.runtime.events',
+    'app.runtime.frozen_self_test',
+    'app.runtime.rewind',
+    'app.runtime.v11_readiness',
+    'app.storage.checkpoints',
+    'app.validation_agent',
+    'app.validation_agent.contracts',
+    'app.validation_agent.persistence',
+    'app.validation_agent.scheduler',
+    'app.validation_agent.service',
+    'app.worktree',
+    'app.worktree.runtime',
+    'app.worktree.service',
     'app.skill.registry',
     'app.storage.database',
     'app.schemas',
@@ -296,7 +536,11 @@ hiddenimports = [
 
 a = Analysis(
     ['run.py'],
-    pathex=[backend_dir],
+    pathex=(
+        [backend_dir, str(_release_identity_build.binding_module_root)]
+        if _release_identity_build.binding_module_root is not None
+        else [backend_dir]
+    ),
     binaries=(
         uvicorn_binaries
         + wcmatch_binaries
@@ -304,6 +548,7 @@ a = Analysis(
         + anthropic_binaries
         + google_genai_binaries
         + keyring_binaries
+        + acp_binaries
     ),
     datas=(
         datas
@@ -313,6 +558,7 @@ a = Analysis(
         + anthropic_datas
         + google_genai_datas
         + keyring_datas
+        + acp_datas
     ),
     hiddenimports=(
         hiddenimports
@@ -322,6 +568,8 @@ a = Analysis(
         + anthropic_hiddenimports
         + google_genai_hiddenimports
         + keyring_hiddenimports
+        + acp_hiddenimports
+        + list(_release_identity_build.hiddenimports)
     ),
     hookspath=[],
     hooksconfig={},
@@ -456,6 +704,57 @@ a = Analysis(
     noarchive=False,
 )
 
+
+def _verify_office_renderer_analysis(stage, *, attach=False):
+    try:
+        if attach:
+            bind_office_renderer_analysis_assets(
+                _office_renderer_build,
+                a.datas,
+                a.binaries,
+            )
+        else:
+            verify_office_renderer_analysis_assets(
+                _office_renderer_build,
+                a.datas,
+                a.binaries,
+            )
+    except OfficeRendererPackagingError as exc:
+        sys.stderr.write(
+            f'\n[suxiaoyou.spec] FATAL: Office renderer {stage} '
+            f'verification refused: {exc}\n'
+        )
+        raise SystemExit(1) from exc
+
+
+# Keep native renderer bytes outside Analysis' automatic BINARY
+# reclassification and dependency rewriting. After Analysis fully returns,
+# reject any ambient collision and inject each admitted source as exact DATA.
+_verify_office_renderer_analysis('post-Analysis attach', attach=True)
+
+# PyInstaller prepends the entry-script directory to module search paths.  A
+# source-root or installed module with this reserved name must never replace
+# the generated digest binding, irrespective of ``pathex`` ordering.
+if _release_identity_build.binding_module_path is not None:
+    _identity_binding_entries = [
+        entry
+        for entry in a.pure
+        if entry[0] == _release_identity_build.hiddenimports[0]
+    ]
+    _expected_identity_binding = os.path.realpath(
+        _release_identity_build.binding_module_path
+    )
+    if (
+        len(_identity_binding_entries) != 1
+        or os.path.realpath(_identity_binding_entries[0][1])
+        != _expected_identity_binding
+    ):
+        sys.stderr.write(
+            '\n[suxiaoyou.spec] FATAL: frozen release identity binding '
+            'module origin was shadowed or omitted\n'
+        )
+        raise SystemExit(1)
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
@@ -473,6 +772,10 @@ exe = EXE(
     # CREATE_NO_WINDOW, so users still never see a console window.
     console=sys.platform == 'win32',
 )
+
+# COLLECT performs the actual source-file reads. Recheck both the Analysis TOC
+# and every captured inode/digest immediately before final assembly.
+_verify_office_renderer_analysis('pre-COLLECT')
 
 coll = COLLECT(
     exe,

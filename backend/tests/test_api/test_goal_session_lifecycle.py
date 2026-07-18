@@ -7,14 +7,16 @@ import pytest
 from sqlalchemy import select
 
 from app import release_features
+from app.api import chat as chat_api
 from app.api import goals as goals_api
-from app.dependencies import get_stream_manager
+from app.dependencies import get_stream_manager, set_stream_manager
 from app.models.idempotency_record import IdempotencyRecord
 from app.models.message import Message, Part
 from app.models.session import Session
 from app.models.session_goal import SessionGoal
 from app.schemas.goal import GoalCreateRequest
 from app.session.goal_manager import create_session_goal, get_session_goal
+from app.streaming.manager import StreamManager
 
 pytestmark = pytest.mark.asyncio
 
@@ -288,3 +290,114 @@ async def test_edit_and_resend_rejects_non_paused_goal_without_mutating_history(
         part = await db.get(Part, part_id)
         assert part is not None
         assert part.data["text"] == "original"
+
+
+async def test_edit_and_resend_holds_admission_lock_through_history_transaction(
+    app_client,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = StreamManager()
+    set_stream_manager(manager)
+    session_id = await _create_api_session(app_client, "Atomic edit admission")
+    message_id = "atomic-edit-message"
+    async with session_factory() as db:
+        async with db.begin():
+            db.add(
+                Message(
+                    id=message_id,
+                    session_id=session_id,
+                    data={"role": "user"},
+                )
+            )
+            db.add(
+                Part(
+                    id="atomic-edit-part",
+                    message_id=message_id,
+                    session_id=session_id,
+                    data={"type": "text", "text": "original"},
+                )
+            )
+
+    mutation_entered = asyncio.Event()
+    allow_transaction_to_finish = asyncio.Event()
+    contender_attempted = asyncio.Event()
+    contender_entered = asyncio.Event()
+    original_update = chat_api.update_message_text
+
+    async def gated_update(db, requested_message_id: str, text: str) -> None:
+        await original_update(db, requested_message_id, text)
+        mutation_entered.set()
+        await allow_transaction_to_finish.wait()
+
+    async def fake_generation(job, _request, **_kwargs) -> None:
+        job.complete()
+
+    async def competing_admission() -> None:
+        contender_attempted.set()
+        async with manager.job_admission_lock:
+            contender_entered.set()
+
+    monkeypatch.setattr(chat_api, "update_message_text", gated_update)
+    monkeypatch.setattr(chat_api, "run_generation", fake_generation)
+    edit_task = asyncio.create_task(
+        app_client.post(
+            "/api/chat/edit",
+            json={
+                "session_id": session_id,
+                "message_id": message_id,
+                "text": "rewritten",
+                "attachments": [],
+            },
+        ),
+        name="atomic-history-edit",
+    )
+    contender_task: asyncio.Task[None] | None = None
+    admitted_stream_id: str | None = None
+    try:
+        await asyncio.wait_for(mutation_entered.wait(), timeout=1)
+        assert manager.job_admission_lock.locked()
+
+        contender_task = asyncio.create_task(
+            competing_admission(),
+            name="competing-chat-admission",
+        )
+        await asyncio.wait_for(contender_attempted.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert contender_entered.is_set() is False
+        assert contender_task.done() is False
+
+        allow_transaction_to_finish.set()
+        response = await asyncio.wait_for(edit_task, timeout=1)
+        assert response.status_code == 200
+        admitted_stream_id = response.json()["stream_id"]
+        await asyncio.wait_for(contender_task, timeout=1)
+        assert contender_entered.is_set()
+
+        job = manager.get_job(admitted_stream_id)
+        assert job is not None and job.task is not None
+        await asyncio.wait_for(job.task, timeout=1)
+        async with session_factory() as db:
+            part = await db.get(Part, "atomic-edit-part")
+        assert part is not None and part.data["text"] == "rewritten"
+    finally:
+        allow_transaction_to_finish.set()
+        if not edit_task.done():
+            edit_task.cancel()
+        if contender_task is not None and not contender_task.done():
+            contender_task.cancel()
+        await asyncio.gather(
+            edit_task,
+            *(() if contender_task is None else (contender_task,)),
+            return_exceptions=True,
+        )
+        for job in tuple(manager.active_jobs()):
+            if job.task is not None and not job.task.done():
+                job.task.cancel()
+                await asyncio.gather(job.task, return_exceptions=True)
+            job.complete()
+            manager.remove_job(job.stream_id)
+        if admitted_stream_id is not None:
+            completed = manager.get_job(admitted_stream_id)
+            if completed is not None:
+                manager.remove_job(admitted_stream_id)

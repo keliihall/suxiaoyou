@@ -16,6 +16,22 @@ export function hasTerminalStepFinish(data: ActivityCompletionState): boolean {
   );
 }
 
+/**
+ * A completed activity is not necessarily a successful one. Keep this
+ * separate from `isActivityComplete` so individual tool detours never inherit
+ * task-level failure styling, while a genuinely failed response still does.
+ */
+export function isActivityFailed(data: ActivityCompletionState): boolean {
+  for (let index = data.stepParts.length - 1; index >= 0; index -= 1) {
+    const part = data.stepParts[index];
+    if (part.type !== "step-finish") continue;
+    const reason = (part as StepFinishPart).reason;
+    if (reason === "tool_use") continue;
+    return reason === "error";
+  }
+  return false;
+}
+
 export function hasRunningActivityTools(data: ActivityCompletionState): boolean {
   return data.toolParts.some(
     (tool) => tool.state.status === "running" || tool.state.status === "pending",

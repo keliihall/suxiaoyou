@@ -28,6 +28,8 @@ jobs:
       app_version: ${{ steps.release-context.outputs.app_version }}
       release_version: ${{ steps.release-context.outputs.release_version }}
       release_channel: ${{ steps.release-context.outputs.release_channel }}
+      release_profile: ${{ steps.release-context.outputs.release_profile }}
+      evidence_contract: ${{ steps.release-context.outputs.evidence_contract }}
       is_stable: ${{ steps.release-context.outputs.is_stable }}
       macos_artifact_profile: ${{ steps.release-context.outputs.macos_artifact_profile }}
     steps:
@@ -59,14 +61,43 @@ jobs:
             exit 1
           fi
 
+          case "$APP_VERSION" in
+            1.0.0)
+              EVIDENCE_CONTRACT="v1.0"
+              RELEASE_PROFILE="authoritative"
+              ;;
+            1.1.0)
+              EVIDENCE_CONTRACT="v1.1"
+              RELEASE_PROFILE="unsigned-degraded"
+              ;;
+            *)
+              EVIDENCE_CONTRACT="unsupported"
+              RELEASE_PROFILE="authoritative"
+              ;;
+          esac
+
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$EVIDENCE_CONTRACT" == "unsupported" ]]; then
+              echo "::error::tagged releases require a reviewed evidence contract for app version $APP_VERSION"
+              exit 1
+            fi
             APP_VERSION_REGEX="${APP_VERSION//./\\.}"
             if [[ "$GITHUB_REF_NAME" == "v$APP_VERSION" ]]; then
               RELEASE_VERSION="$APP_VERSION"
-              RELEASE_CHANNEL="stable"
-              IS_STABLE="true"
-              MACOS_ARTIFACT_PROFILE="release"
+              if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+                RELEASE_CHANNEL="stable"
+                IS_STABLE="false"
+                MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"
+              else
+                RELEASE_CHANNEL="stable"
+                IS_STABLE="true"
+                MACOS_ARTIFACT_PROFILE="release"
+              fi
             elif [[ "$GITHUB_REF_NAME" =~ ^v${APP_VERSION_REGEX}-rc\.([1-9][0-9]*)$ ]]; then
+              if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+                echo "::error::the unsigned-degraded v1.1 release uses the exact v$APP_VERSION tag, not an rc tag"
+                exit 1
+              fi
               RELEASE_VERSION="${GITHUB_REF_NAME#v}"
               RELEASE_CHANNEL="prerelease"
               IS_STABLE="false"
@@ -85,11 +116,79 @@ jobs:
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
           echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "release_profile=$RELEASE_PROFILE" >> "$GITHUB_OUTPUT"
+          echo "evidence_contract=$EVIDENCE_CONTRACT" >> "$GITHUB_OUTPUT"
           echo "is_stable=$IS_STABLE" >> "$GITHUB_OUTPUT"
           echo "macos_artifact_profile=$MACOS_ARTIFACT_PROFILE" >> "$GITHUB_OUTPUT"
 
+      - name: Preflight v1.1 Office renderer CI configuration
+        if: startsWith(steps.release-context.outputs.app_version, '1.1.') && steps.release-context.outputs.release_profile == 'authoritative'
+        env:
+          RELEASE_TARGET: ${{ inputs.target }}
+          SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY }}
+          SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
+          SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64 }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64 }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64 }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64 }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_X64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_X64 }}
+        run: |
+          set -euo pipefail
+          invalid=()
+
+          if [[ ! "$SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$ ]]; then
+            invalid+=("SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY")
+          fi
+          if [[ ! "$SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            invalid+=("SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID")
+          fi
+          if [[ ! "$SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN" =~ [^[:space:]] ]]; then
+            invalid+=("SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN")
+          fi
+
+          required_lock_names=()
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            required_lock_names=(
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64"
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64"
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64"
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64"
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_X64"
+            )
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$RELEASE_TARGET" in
+              windows-x64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64") ;;
+              macos-aarch64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64") ;;
+              macos-x64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64") ;;
+              linux-arm64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64") ;;
+              linux-x64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_X64") ;;
+              *) invalid+=("workflow_dispatch.inputs.target") ;;
+            esac
+          else
+            invalid+=("GITHUB_EVENT_NAME")
+          fi
+
+          zero_sha256="0000000000000000000000000000000000000000000000000000000000000000"
+          # Bash 3.2 treats expansion of an empty array as an unbound
+          # variable under `set -u`. Unknown event/target paths intentionally
+          # leave this array empty so they can report the reviewed field name.
+          if (( ${#required_lock_names[@]} > 0 )); then
+            for name in "${required_lock_names[@]}"; do
+              value="${!name}"
+              if [[ ! "$value" =~ ^[0-9a-f]{64}$ || "$value" == "$zero_sha256" ]]; then
+                invalid+=("$name")
+              fi
+            done
+          fi
+
+          if (( ${#invalid[@]} > 0 )); then
+            echo "::error::invalid v1.1 Office renderer CI configuration: ${invalid[*]}"
+            exit 1
+          fi
+
       - name: Require Apple credentials for a stable tag
-        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true' && steps.release-context.outputs.release_profile == 'authoritative'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -127,7 +226,10 @@ jobs:
           npm --prefix desktop-tauri ci
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
           python -m pip install -e ./backend --no-deps
-          python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pip-audit==2.10.1
+          RELEASE_TOOL_LOCK="backend/requirements-release-tools-linux-x64.txt"
+          RELEASE_TOOL_LOCK_SHA256="208305ef117280fed096c83876895872110ac23aa4df34b579f5b73f8236d6f3"
+          python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
+          python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
           cargo install cargo-audit --locked --version 0.22.2
 
       - name: Install Chromium validation runtime
@@ -144,7 +246,7 @@ jobs:
           node --test scripts/*.test.mjs
 
       - name: Capture v1 integration contract evidence
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v1.0.0')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && steps.release-context.outputs.evidence_contract == 'v1.0'
         run: |
           set -euo pipefail
           node scripts/v1-real-integration-gates.mjs contract \
@@ -152,7 +254,7 @@ jobs:
             --evidence-dir "$RUNNER_TEMP/v1-integration-evidence"
 
       - name: Require real integration credentials for stable tag
-        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true' && steps.release-context.outputs.evidence_contract == 'v1.0'
         env:
           TENCENT_DOCS_E2E_TOKEN: ${{ secrets.TENCENT_DOCS_E2E_TOKEN }}
           TENCENT_DOCS_E2E_TEST_DOCUMENT_ID: ${{ secrets.TENCENT_DOCS_E2E_TEST_DOCUMENT_ID }}
@@ -187,7 +289,7 @@ jobs:
           fi
 
       - name: Capture stable real integration evidence
-        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && steps.release-context.outputs.is_stable == 'true' && steps.release-context.outputs.evidence_contract == 'v1.0'
         env:
           TENCENT_DOCS_E2E_TOKEN: ${{ secrets.TENCENT_DOCS_E2E_TOKEN }}
           TENCENT_DOCS_E2E_ALLOW_WRITE: I_UNDERSTAND_THIS_MODIFIES_A_DEDICATED_TEST_DOCUMENT
@@ -210,7 +312,7 @@ jobs:
             --evidence-dir "$RUNNER_TEMP/v1-integration-evidence"
 
       - name: Upload v1 integration evidence
-        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v1.0.0')
+        if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && steps.release-context.outputs.evidence_contract == 'v1.0'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: v1-integration-evidence-${{ github.run_attempt }}
@@ -274,6 +376,7 @@ jobs:
         with:
           name: cargo-audit-summary
           path: release-validation/cargo-audit-summary.json
+          overwrite: true
           if-no-files-found: error
           retention-days: 1
 
@@ -282,6 +385,10 @@ jobs:
     needs: validate-release
     if: github.event_name == 'push' || inputs.target == 'windows-x64'
     runs-on: windows-latest
+    env:
+      VERIFY_BUNDLE_V11_GATE_MODE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && 'released' || 'closed' }}
+      VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+      VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -301,22 +408,207 @@ jobs:
         with:
           toolchain: "1.96.1"
 
+      - name: Verify release checkout before dependency installation
+        shell: bash
+        run: node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+
       - name: Install locked JavaScript dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           npm ci
           npm --prefix frontend ci --legacy-peer-deps
           npm --prefix desktop-tauri ci
 
       - name: Build and sanitize frontend
-        run: npm run build:frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          npm run build:frontend
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+
+      - name: Materialize authenticated Office renderer source for v1.1
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: suxiaoyou-office-renderer-windows-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/suxiaoyou-office-renderer-source-windows-x64
+          repository: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY }}
+          run-id: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
+
+      - name: Stage immutable Office renderer for v1.1
+        id: office-renderer
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        shell: bash
+        env:
+          OFFICE_RENDERER_SOURCE: ${{ runner.temp }}/suxiaoyou-office-renderer-source-windows-x64
+          OFFICE_RENDERER_LOCK_SHA256: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$OFFICE_RENDERER_LOCK_SHA256" ]]; then
+            echo "::error::v1.1 windows-x64 requires an authenticated per-commit Office renderer artifact and its reviewed lock SHA-256"
+            exit 1
+          fi
+          TARGET="windows-x64"
+          umask 077
+          STAGING_PARENT="$RUNNER_TEMP/suxiaoyou-office-renderer-$TARGET-$GITHUB_RUN_ATTEMPT"
+          mkdir "$STAGING_PARENT"
+          STAGE="$STAGING_PARENT/stage"
+          node scripts/stage-office-renderer.mjs stage \
+            "$OFFICE_RENDERER_SOURCE" "$TARGET" "$OFFICE_RENDERER_LOCK_SHA256" "$STAGE"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=$OFFICE_RENDERER_LOCK_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Build backend with locked PyInstaller
+        shell: bash
+        env:
+          SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && '1' || '0' }}
+          SUXIAOYOU_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+          SUXIAOYOU_OFFICE_RENDERER_STAGE: ${{ steps.office-renderer.outputs.stage }}
+          SUXIAOYOU_OFFICE_RENDERER_TARGET: ${{ steps.office-renderer.outputs.target }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256: ${{ steps.office-renderer.outputs.lock_sha256 }}
         run: |
+          set -euo pipefail
+          if [[ -z "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" ]]; then
+            unset SUXIAOYOU_OFFICE_RENDERER_PROFILE
+          fi
+          verify_release_checkout() {
+            node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+            local expected_commit actual_commit tracked_status untracked_backend_sources
+            expected_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+            actual_commit="$(git rev-parse --verify "HEAD^{commit}")"
+            if [[ "$actual_commit" != "$expected_commit" ]]; then
+              echo "::error::release checkout HEAD $actual_commit does not match GITHUB_SHA commit $expected_commit" >&2
+              return 1
+            fi
+            if ! git diff --quiet --ignore-submodules=none -- || \
+              ! git diff --cached --quiet --ignore-submodules=none --; then
+              echo "::error::tracked release checkout or index changed around PyInstaller" >&2
+              git status --short --untracked-files=no >&2
+              return 1
+            fi
+            tracked_status="$(git status --porcelain=v1 --untracked-files=no --ignore-submodules=none)"
+            if [[ -n "$tracked_status" ]]; then
+              echo "::error::tracked release checkout is not clean around PyInstaller" >&2
+              printf '%s\n' "$tracked_status" >&2
+              return 1
+            fi
+            untracked_backend_sources="$(git ls-files --others --exclude-standard -- backend)"
+            if [[ -n "$untracked_backend_sources" ]]; then
+              echo "::error::untracked backend source could shadow frozen imports" >&2
+              printf '%s\n' "$untracked_backend_sources" >&2
+              return 1
+            fi
+          }
+          renderer_stage_fingerprint() {
+            if [[ "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" == "unsigned-degraded" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::unsigned-degraded build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "unsigned-degraded-no-renderer"
+              return
+            fi
+            if [[ "${SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED:-}" != "1" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::pre-v1.1 build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "not-required"
+              return
+            fi
+            python - \
+              "$SUXIAOYOU_OFFICE_RENDERER_STAGE" \
+              "$SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256" \
+              "$SUXIAOYOU_OFFICE_RENDERER_TARGET" <<'PY'
+          import hashlib
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          expected_lock = sys.argv[2]
+          target = sys.argv[3]
+          if not root.is_absolute() or not root.is_dir():
+              raise SystemExit("Office renderer stage must be an absolute directory")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_lock) is None:
+              raise SystemExit("Office renderer lock SHA-256 is invalid")
+          lock_path = root / "office-renderer.lock.json"
+          try:
+              lock_bytes = lock_path.read_bytes()
+          except OSError as exc:
+              raise SystemExit("Office renderer lock is unavailable") from exc
+          if hashlib.sha256(lock_bytes).hexdigest() != expected_lock:
+              raise SystemExit("Office renderer lock changed after staging")
+
+          digest = hashlib.sha256()
+          digest.update(target.encode("ascii") + b"\0")
+          paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+          for path in paths:
+              relative = path.relative_to(root).as_posix().encode("utf-8", "surrogateescape")
+              before = path.lstat()
+              if stat.S_ISLNK(before.st_mode):
+                  raise SystemExit("Office renderer stage contains a symbolic link")
+              if stat.S_ISDIR(before.st_mode):
+                  kind = b"D"
+                  content_digest = b""
+                  size = 0
+              elif stat.S_ISREG(before.st_mode):
+                  kind = b"F"
+                  file_digest = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          file_digest.update(chunk)
+                  after = path.lstat()
+                  if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns) != (
+                      after.st_dev,
+                      after.st_ino,
+                      after.st_mode,
+                      after.st_size,
+                      after.st_mtime_ns,
+                  ):
+                      raise SystemExit("Office renderer stage changed while fingerprinting")
+                  content_digest = file_digest.digest()
+                  size = before.st_size
+              else:
+                  raise SystemExit("Office renderer stage contains a non-file entry")
+              digest.update(kind)
+              digest.update(len(relative).to_bytes(4, "big"))
+              digest.update(relative)
+              digest.update(stat.S_IMODE(before.st_mode).to_bytes(4, "big"))
+              digest.update(size.to_bytes(8, "big"))
+              digest.update(content_digest)
+          print(digest.hexdigest())
+          PY
+          }
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pytest-asyncio==1.4.0 pip-audit==2.10.1
+          RELEASE_TOOL_LOCK="backend/requirements-release-tools-windows-x64.txt"
+          RELEASE_TOOL_LOCK_SHA256="f2e389ca75cf41fe8a45bc40ab5eaffaa4808c3a572f49bccc419c93450c8f9b"
+          python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
+          python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
           python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py backend/tests/test_tool/test_windows_process.py backend/tests/test_tool/test_windows_mutation_safety.py backend/tests/test_tool/test_sandbox.py backend/tests/test_tool/test_sandbox_self_test.py backend/tests/test_tool/test_bash.py backend/tests/test_tool/test_code_execute.py backend/tests/test_tool/test_registry.py
-          cd backend
-          python -m PyInstaller suxiaoyou.spec --noconfirm
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          verify_release_checkout
+          RENDERER_STAGE_BEFORE="$(renderer_stage_fingerprint)"
+          (cd backend && python -m PyInstaller suxiaoyou.spec --noconfirm)
+          verify_release_checkout
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          RENDERER_STAGE_AFTER="$(renderer_stage_fingerprint)"
+          if [[ "$RENDERER_STAGE_AFTER" != "$RENDERER_STAGE_BEFORE" ]]; then
+            echo "::error::Office renderer stage changed while PyInstaller was packaging it" >&2
+            exit 1
+          fi
 
       - name: Audit Windows backend production dependency graph
         run: python -m pip_audit --strict --require-hashes -r backend/requirements.txt
@@ -334,11 +626,33 @@ jobs:
       - name: Verify bundled Node.js toolchain
         run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
 
+      - name: Seal verified Tauri build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" \
+            frontend/out \
+            backend/dist/suxiaoyou-backend \
+            backend/resources/nodejs
+
       - name: Build Tauri NSIS installer
         shell: bash
         run: |
-          cd desktop-tauri
-          npm exec tauri build -- --config src-tauri/build.windows.json --no-sign
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          (cd desktop-tauri && npm exec tauri build -- --config src-tauri/build.windows.json --no-sign)
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
 
       - name: Verify Windows artifact completeness
         shell: bash
@@ -348,10 +662,10 @@ jobs:
           [[ ${#installers[@]} -eq 1 ]]
 
       - name: Install NSIS package and verify packaged Node.js toolchain
-        id: install-windows
         env:
           VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
           VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-windows/office-contract.json
+          VERIFY_BUNDLE_OFFICE_RENDERER_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-windows/office-renderer.json
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -359,6 +673,16 @@ jobs:
           if ($installer.Count -ne 1) {
             throw "Expected exactly one NSIS installer, found $($installer.Count)"
           }
+          $preinstallArtifactSizeBefore = $installer[0].Length
+          $preinstallArtifactSha256 = (Get-FileHash `
+            -Algorithm SHA256 `
+            -LiteralPath $installer[0].FullName).Hash.ToLowerInvariant()
+          $installer[0].Refresh()
+          $preinstallArtifactSize = $installer[0].Length
+          if ($preinstallArtifactSize -ne $preinstallArtifactSizeBefore) {
+            throw "Windows installer changed while creating the preinstall seal"
+          }
+          $preinstallCommit = $env:GITHUB_SHA.ToLowerInvariant()
           $expectedVersion = (& node -p "require('./package.json').version").Trim()
           if ($installer[0].Name -notmatch [regex]::Escape($expectedVersion)) {
             throw "NSIS installer name does not contain version ${expectedVersion}: $($installer[0].Name)"
@@ -548,6 +872,9 @@ jobs:
           }
           $nodeRuntime = $nodeBinaries[0].Directory.FullName
           node scripts/verify-node-runtime.mjs $nodeRuntime
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged Node.js runtime verification failed with code $LASTEXITCODE"
+          }
           foreach ($launcher in @("npm.cmd", "npx.cmd")) {
             & (Join-Path $nodeRuntime $launcher) --version
             if ($LASTEXITCODE -ne 0) {
@@ -563,23 +890,18 @@ jobs:
             throw "Expected one packaged suxiaoyou-backend.exe, found $($backendBinaries.Count)"
           }
           node scripts/verify-bundle.mjs $backendBinaries[0].Directory.FullName
-          "installed_app=$appBinary" | Out-File `
-            -FilePath $env:GITHUB_OUTPUT `
-            -Encoding utf8 `
-            -Append
-
-      - name: Launch installed Windows desktop and verify clean shutdown
-        shell: pwsh
-        env:
-          WINDOWS_INSTALLED_APP: ${{ steps.install-windows.outputs.installed_app }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installedApp = $env:WINDOWS_INSTALLED_APP
-          if (-not (Test-Path -LiteralPath $installedApp -PathType Leaf)) {
-            throw "Installed Windows desktop is missing: $installedApp"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed backend bundle verification failed with code $LASTEXITCODE"
+          }
+          if (-not (Test-Path -LiteralPath $installer[0].FullName -PathType Leaf)) {
+            throw "Windows installer is missing before lifecycle verification"
           }
           node scripts/verify-desktop-lifecycle.mjs `
-            --executable $installedApp `
+            --executable $appBinary `
+            --artifact $installer[0].FullName `
+            --artifact-size $preinstallArtifactSize `
+            --artifact-sha256 $preinstallArtifactSha256 `
+            --release-commit $preinstallCommit `
             --work-dir (Join-Path $env:RUNNER_TEMP "suxiaoyou-desktop-lifecycle-windows")
           if ($LASTEXITCODE -ne 0) {
             throw "Installed Windows desktop lifecycle smoke failed with code $LASTEXITCODE"
@@ -596,12 +918,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Verify release checkout before artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe)
+          [[ ${#installers[@]} -eq 1 ]]
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          node scripts/verify-desktop-lifecycle.mjs verify-artifact \
+            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-windows/result.json" \
+            --artifact "${installers[0]}" \
+            --release-commit "$GITHUB_SHA"
+
       - name: Upload Windows artifact
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
           path: desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe
+          overwrite: true
           if-no-files-found: error
           retention-days: 1
 
@@ -626,6 +965,9 @@ jobs:
       BUILD_CONFIG: ${{ matrix.target == 'aarch64-apple-darwin' && 'src-tauri/build.macos-aarch64.json' || 'src-tauri/build.macos-x64.json' }}
       IS_STABLE_RELEASE: ${{ needs.validate-release.outputs.is_stable }}
       MACOS_ARTIFACT_PROFILE: ${{ needs.validate-release.outputs.macos_artifact_profile }}
+      VERIFY_BUNDLE_V11_GATE_MODE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && 'released' || 'closed' }}
+      VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+      VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-arm64' || 'macos-x64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -655,6 +997,10 @@ jobs:
           toolchain: "1.96.1"
           targets: ${{ matrix.target }}
 
+      - name: Verify release checkout before dependency installation
+        shell: bash
+        run: node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+
       - name: Install locked JavaScript dependencies
         run: |
           npm ci
@@ -662,12 +1008,185 @@ jobs:
           npm --prefix desktop-tauri ci
 
       - name: Build and sanitize frontend
-        run: npm run build:frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          npm run build:frontend
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+
+      - name: Materialize authenticated Office renderer source for v1.1
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: suxiaoyou-office-renderer-${{ matrix.target == 'aarch64-apple-darwin' && 'darwin-arm64' || 'darwin-x64' }}-${{ github.sha }}
+          path: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target == 'aarch64-apple-darwin' && 'darwin-arm64' || 'darwin-x64' }}
+          repository: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY }}
+          run-id: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
+
+      - name: Stage immutable Office renderer for v1.1
+        id: office-renderer
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        env:
+          OFFICE_RENDERER_SOURCE: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target == 'aarch64-apple-darwin' && 'darwin-arm64' || 'darwin-x64' }}
+          OFFICE_RENDERER_LOCK_SHA256: ${{ matrix.target == 'aarch64-apple-darwin' && vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64 || vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64 }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target == 'aarch64-apple-darwin' && 'darwin-arm64' || 'darwin-x64' }}"
+          if [[ -z "$OFFICE_RENDERER_LOCK_SHA256" ]]; then
+            echo "::error::v1.1 $TARGET requires an authenticated per-commit, nested-code-signed Office renderer artifact and its reviewed lock SHA-256; attestation must be generated after signing"
+            exit 1
+          fi
+          umask 077
+          STAGING_PARENT="$RUNNER_TEMP/suxiaoyou-office-renderer-$TARGET-$GITHUB_RUN_ATTEMPT"
+          mkdir "$STAGING_PARENT"
+          STAGE="$STAGING_PARENT/stage"
+          node scripts/stage-office-renderer.mjs stage \
+            "$OFFICE_RENDERER_SOURCE" "$TARGET" "$OFFICE_RENDERER_LOCK_SHA256" "$STAGE"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=$OFFICE_RENDERER_LOCK_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Build native backend with locked PyInstaller
+        shell: bash
+        env:
+          SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && '1' || '0' }}
+          SUXIAOYOU_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+          SUXIAOYOU_OFFICE_RENDERER_STAGE: ${{ steps.office-renderer.outputs.stage }}
+          SUXIAOYOU_OFFICE_RENDERER_TARGET: ${{ steps.office-renderer.outputs.target }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256: ${{ steps.office-renderer.outputs.lock_sha256 }}
         run: |
+          set -euo pipefail
+          if [[ -z "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" ]]; then
+            unset SUXIAOYOU_OFFICE_RENDERER_PROFILE
+          fi
+          verify_release_checkout() {
+            node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+            local expected_commit actual_commit tracked_status untracked_backend_sources
+            expected_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+            actual_commit="$(git rev-parse --verify "HEAD^{commit}")"
+            if [[ "$actual_commit" != "$expected_commit" ]]; then
+              echo "::error::release checkout HEAD $actual_commit does not match GITHUB_SHA commit $expected_commit" >&2
+              return 1
+            fi
+            if ! git diff --quiet --ignore-submodules=none -- || \
+              ! git diff --cached --quiet --ignore-submodules=none --; then
+              echo "::error::tracked release checkout or index changed around PyInstaller" >&2
+              git status --short --untracked-files=no >&2
+              return 1
+            fi
+            tracked_status="$(git status --porcelain=v1 --untracked-files=no --ignore-submodules=none)"
+            if [[ -n "$tracked_status" ]]; then
+              echo "::error::tracked release checkout is not clean around PyInstaller" >&2
+              printf '%s\n' "$tracked_status" >&2
+              return 1
+            fi
+            untracked_backend_sources="$(git ls-files --others --exclude-standard -- backend)"
+            if [[ -n "$untracked_backend_sources" ]]; then
+              echo "::error::untracked backend source could shadow frozen imports" >&2
+              printf '%s\n' "$untracked_backend_sources" >&2
+              return 1
+            fi
+          }
+          renderer_stage_fingerprint() {
+            if [[ "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" == "unsigned-degraded" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::unsigned-degraded build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "unsigned-degraded-no-renderer"
+              return
+            fi
+            if [[ "${SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED:-}" != "1" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::pre-v1.1 build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "not-required"
+              return
+            fi
+            python - \
+              "$SUXIAOYOU_OFFICE_RENDERER_STAGE" \
+              "$SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256" \
+              "$SUXIAOYOU_OFFICE_RENDERER_TARGET" <<'PY'
+          import hashlib
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          expected_lock = sys.argv[2]
+          target = sys.argv[3]
+          if not root.is_absolute() or not root.is_dir():
+              raise SystemExit("Office renderer stage must be an absolute directory")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_lock) is None:
+              raise SystemExit("Office renderer lock SHA-256 is invalid")
+          lock_path = root / "office-renderer.lock.json"
+          try:
+              lock_bytes = lock_path.read_bytes()
+          except OSError as exc:
+              raise SystemExit("Office renderer lock is unavailable") from exc
+          if hashlib.sha256(lock_bytes).hexdigest() != expected_lock:
+              raise SystemExit("Office renderer lock changed after staging")
+
+          digest = hashlib.sha256()
+          digest.update(target.encode("ascii") + b"\0")
+          paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+          for path in paths:
+              relative = path.relative_to(root).as_posix().encode("utf-8", "surrogateescape")
+              before = path.lstat()
+              if stat.S_ISLNK(before.st_mode):
+                  raise SystemExit("Office renderer stage contains a symbolic link")
+              if stat.S_ISDIR(before.st_mode):
+                  kind = b"D"
+                  content_digest = b""
+                  size = 0
+              elif stat.S_ISREG(before.st_mode):
+                  kind = b"F"
+                  file_digest = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          file_digest.update(chunk)
+                  after = path.lstat()
+                  if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns) != (
+                      after.st_dev,
+                      after.st_ino,
+                      after.st_mode,
+                      after.st_size,
+                      after.st_mtime_ns,
+                  ):
+                      raise SystemExit("Office renderer stage changed while fingerprinting")
+                  content_digest = file_digest.digest()
+                  size = before.st_size
+              else:
+                  raise SystemExit("Office renderer stage contains a non-file entry")
+              digest.update(kind)
+              digest.update(len(relative).to_bytes(4, "big"))
+              digest.update(relative)
+              digest.update(stat.S_IMODE(before.st_mode).to_bytes(4, "big"))
+              digest.update(size.to_bytes(8, "big"))
+              digest.update(content_digest)
+          print(digest.hexdigest())
+          PY
+          }
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0 pytest==9.1.1 pytest-asyncio==1.4.0
+          if [[ "$BUNDLE_ARCH" == "arm64" ]]; then
+            RELEASE_TOOL_LOCK="backend/requirements-release-tools-macos-arm64.txt"
+            RELEASE_TOOL_LOCK_SHA256="332b2249dfe9403ddc7fa1b23b2646e18777ebfd668d8543b022ff8a69b9a5d6"
+          elif [[ "$BUNDLE_ARCH" == "x86_64" ]]; then
+            RELEASE_TOOL_LOCK="backend/requirements-release-tools-macos-x64.txt"
+            RELEASE_TOOL_LOCK_SHA256="e31a1f9bd91c64ad7805badd3d1a71d1cfc37211b28263d6930b0c3d154af5a7"
+          else
+            echo "::error::unsupported macOS release tool lock architecture: $BUNDLE_ARCH" >&2
+            exit 1
+          fi
+          python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
+          python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
           python -m pytest -q \
             backend/tests/test_tool/test_posix_process.py \
             backend/tests/test_tool/test_sandbox.py \
@@ -676,12 +1195,23 @@ jobs:
             backend/tests/test_tool/test_code_execute.py \
             backend/tests/test_tool/test_code_execute_written_files.py \
             backend/tests/test_tool/test_registry.py
-          cd backend
-          python -m PyInstaller suxiaoyou.spec --noconfirm --distpath "$BACKEND_DIST" --workpath "build-$BUNDLE_ARCH"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          verify_release_checkout
+          RENDERER_STAGE_BEFORE="$(renderer_stage_fingerprint)"
+          (cd backend && python -m PyInstaller suxiaoyou.spec --noconfirm --distpath "$BACKEND_DIST" --workpath "build-$BUNDLE_ARCH")
+          verify_release_checkout
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          RENDERER_STAGE_AFTER="$(renderer_stage_fingerprint)"
+          if [[ "$RENDERER_STAGE_AFTER" != "$RENDERER_STAGE_BEFORE" ]]; then
+            echo "::error::Office renderer stage changed while PyInstaller was packaging it" >&2
+            exit 1
+          fi
 
       - name: Verify backend bundle with full smoke
-        env:
-          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-arm64' || 'macos-x64' }}
         run: node scripts/verify-bundle.mjs "backend/$BACKEND_DIST/suxiaoyou-backend"
 
       - name: Download verified native Node.js runtime
@@ -692,10 +1222,33 @@ jobs:
       - name: Verify bundled Node.js toolchain
         run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
 
-      - name: Build Tauri app for post-copy repair
+      - name: Seal verified Tauri build inputs
+        shell: bash
         run: |
-          cd desktop-tauri
-          npm exec tauri build -- --target ${{ matrix.target }} --config "$BUILD_CONFIG" --bundles app --no-sign
+          set -euo pipefail
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" \
+            frontend/out \
+            backend/dist/suxiaoyou-backend \
+            backend/resources/nodejs
+
+      - name: Build Tauri app for post-copy repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          (cd desktop-tauri && npm exec tauri build -- --target ${{ matrix.target }} --config "$BUILD_CONFIG" --bundles app --no-sign)
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
 
       - name: Repair Python.framework symlinks
         run: |
@@ -735,7 +1288,7 @@ jobs:
 
       - name: Import Apple certificate and discover signing identity
         id: apple-signing
-        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true' && needs.validate-release.outputs.release_profile == 'authoritative'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -843,7 +1396,7 @@ jobs:
           hdiutil verify "$DMG_PATH"
 
       - name: Sign final DMG
-        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true' && needs.validate-release.outputs.release_profile == 'authoritative'
         env:
           SIGNING_IDENTITY: ${{ steps.apple-signing.outputs.identity }}
         run: |
@@ -852,7 +1405,7 @@ jobs:
           codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$DMG_PATH"
 
       - name: Notarize and staple final DMG
-        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true' && needs.validate-release.outputs.release_profile == 'authoritative'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -866,7 +1419,7 @@ jobs:
           xcrun stapler validate "$DMG_PATH"
 
       - name: Verify official signatures and Gatekeeper
-        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
+        if: github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true' && needs.validate-release.outputs.release_profile == 'authoritative'
         run: |
           set -euo pipefail
           APP_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/苏小有.app"
@@ -896,10 +1449,14 @@ jobs:
         env:
           VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-arm64' || 'macos-x64' }}
           VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-macos-${{ env.DMG_ARCH }}/office-contract.json
+          VERIFY_BUNDLE_OFFICE_RENDERER_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-macos-${{ env.DMG_ARCH }}/office-renderer.json
         run: |
           set -euo pipefail
           VERSION="$(node -p "require('./package.json').version")"
           DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
+          DMG_PREINSTALL_SIZE="$(stat -f %z "$DMG_PATH")"
+          DMG_PREINSTALL_SHA256="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
+          DMG_PREINSTALL_COMMIT="$GITHUB_SHA"
           MOUNT_DIRECTORY="$(mktemp -d)"
           INSTALL_TEST_DIRECTORY="$(mktemp -d)"
           cleanup() {
@@ -916,13 +1473,17 @@ jobs:
           APP_EXECUTABLE="$(plutil -extract CFBundleExecutable raw "$INSTALL_TEST_DIRECTORY/苏小有.app/Contents/Info.plist")"
           node scripts/verify-desktop-lifecycle.mjs \
             --executable "$INSTALL_TEST_DIRECTORY/苏小有.app/Contents/MacOS/$APP_EXECUTABLE" \
+            --artifact "$DMG_PATH" \
+            --artifact-size "$DMG_PREINSTALL_SIZE" \
+            --artifact-sha256 "$DMG_PREINSTALL_SHA256" \
+            --release-commit "$DMG_PREINSTALL_COMMIT" \
             --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-macos-$DMG_ARCH"
           hdiutil detach "$MOUNT_DIRECTORY"
           trap - EXIT
           rm -rf "$MOUNT_DIRECTORY" "$INSTALL_TEST_DIRECTORY"
 
       - name: Remove temporary Apple keychain
-        if: always() && github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true'
+        if: always() && github.event_name == 'push' && needs.validate-release.outputs.is_stable == 'true' && needs.validate-release.outputs.release_profile == 'authoritative'
         run: |
           security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/apple-certificate.p12"
@@ -938,12 +1499,28 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Verify release checkout before artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          DMG_PATH="desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/suyo_${VERSION}_${DMG_ARCH}.dmg"
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          node scripts/verify-desktop-lifecycle.mjs verify-artifact \
+            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-macos-$DMG_ARCH/result.json" \
+            --artifact "$DMG_PATH" \
+            --release-commit "$GITHUB_SHA"
+
       - name: Upload macOS artifact
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-${{ env.DMG_ARCH }}-${{ env.MACOS_ARTIFACT_PROFILE }}
           path: desktop-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          overwrite: true
           if-no-files-found: error
           retention-days: 1
 
@@ -960,6 +1537,9 @@ jobs:
       BUILD_CONFIG: ${{ matrix.target == 'linux-arm64' && 'src-tauri/build.linux-arm64.json' || 'src-tauri/build.linux-x64.json' }}
       EXPECTED_DEB_ARCH: ${{ matrix.target == 'linux-arm64' && 'arm64' || 'amd64' }}
       EXPECTED_RPM_ARCH: ${{ matrix.target == 'linux-arm64' && 'aarch64' || 'x86_64' }}
+      VERIFY_BUNDLE_V11_GATE_MODE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && 'released' || 'closed' }}
+      VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+      VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -982,6 +1562,10 @@ jobs:
         with:
           toolchain: "1.96.1"
 
+      - name: Verify release checkout before dependency installation
+        shell: bash
+        run: node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+
       - name: Install locked JavaScript dependencies
         run: |
           npm ci
@@ -989,14 +1573,200 @@ jobs:
           npm --prefix desktop-tauri ci
 
       - name: Build and sanitize frontend
-        run: npm run build:frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          npm run build:frontend
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+
+      - name: Materialize authenticated Office renderer source for v1.1
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: suxiaoyou-office-renderer-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target }}
+          repository: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY }}
+          run-id: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
+
+      - name: Stage immutable Office renderer for v1.1
+        id: office-renderer
+        if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
+        env:
+          OFFICE_RENDERER_SOURCE: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target }}
+          OFFICE_RENDERER_LOCK_SHA256: ${{ matrix.target == 'linux-arm64' && vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64 || vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_X64 }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          if [[ -z "$OFFICE_RENDERER_LOCK_SHA256" ]]; then
+            echo "::error::v1.1 $TARGET requires an authenticated per-commit Office renderer artifact and its reviewed lock SHA-256"
+            exit 1
+          fi
+          umask 077
+          STAGING_PARENT="$RUNNER_TEMP/suxiaoyou-office-renderer-$TARGET-$GITHUB_RUN_ATTEMPT"
+          mkdir "$STAGING_PARENT"
+          STAGE="$STAGING_PARENT/stage"
+          node scripts/stage-office-renderer.mjs stage \
+            "$OFFICE_RENDERER_SOURCE" "$TARGET" "$OFFICE_RENDERER_LOCK_SHA256" "$STAGE"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=$OFFICE_RENDERER_LOCK_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Build backend with locked PyInstaller
+        shell: bash
+        env:
+          SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && '1' || '0' }}
+          SUXIAOYOU_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
+          SUXIAOYOU_OFFICE_RENDERER_STAGE: ${{ steps.office-renderer.outputs.stage }}
+          SUXIAOYOU_OFFICE_RENDERER_TARGET: ${{ steps.office-renderer.outputs.target }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256: ${{ steps.office-renderer.outputs.lock_sha256 }}
         run: |
+          set -euo pipefail
+          if [[ -z "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" ]]; then
+            unset SUXIAOYOU_OFFICE_RENDERER_PROFILE
+          fi
+          verify_release_checkout() {
+            node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+            local expected_commit actual_commit tracked_status untracked_backend_sources
+            expected_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+            actual_commit="$(git rev-parse --verify "HEAD^{commit}")"
+            if [[ "$actual_commit" != "$expected_commit" ]]; then
+              echo "::error::release checkout HEAD $actual_commit does not match GITHUB_SHA commit $expected_commit" >&2
+              return 1
+            fi
+            if ! git diff --quiet --ignore-submodules=none -- || \
+              ! git diff --cached --quiet --ignore-submodules=none --; then
+              echo "::error::tracked release checkout or index changed around PyInstaller" >&2
+              git status --short --untracked-files=no >&2
+              return 1
+            fi
+            tracked_status="$(git status --porcelain=v1 --untracked-files=no --ignore-submodules=none)"
+            if [[ -n "$tracked_status" ]]; then
+              echo "::error::tracked release checkout is not clean around PyInstaller" >&2
+              printf '%s\n' "$tracked_status" >&2
+              return 1
+            fi
+            untracked_backend_sources="$(git ls-files --others --exclude-standard -- backend)"
+            if [[ -n "$untracked_backend_sources" ]]; then
+              echo "::error::untracked backend source could shadow frozen imports" >&2
+              printf '%s\n' "$untracked_backend_sources" >&2
+              return 1
+            fi
+          }
+          renderer_stage_fingerprint() {
+            if [[ "${SUXIAOYOU_OFFICE_RENDERER_PROFILE:-}" == "unsigned-degraded" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::unsigned-degraded build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "unsigned-degraded-no-renderer"
+              return
+            fi
+            if [[ "${SUXIAOYOU_V11_OFFICE_RENDERER_REQUIRED:-}" != "1" ]]; then
+              if [[ -n "${SUXIAOYOU_OFFICE_RENDERER_STAGE:-}${SUXIAOYOU_OFFICE_RENDERER_TARGET:-}${SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256:-}" ]]; then
+                echo "::error::pre-v1.1 build received an unexpected Office renderer input" >&2
+                return 1
+              fi
+              printf '%s\n' "not-required"
+              return
+            fi
+            python - \
+              "$SUXIAOYOU_OFFICE_RENDERER_STAGE" \
+              "$SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256" \
+              "$SUXIAOYOU_OFFICE_RENDERER_TARGET" <<'PY'
+          import hashlib
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          expected_lock = sys.argv[2]
+          target = sys.argv[3]
+          if not root.is_absolute() or not root.is_dir():
+              raise SystemExit("Office renderer stage must be an absolute directory")
+          if re.fullmatch(r"[0-9a-f]{64}", expected_lock) is None:
+              raise SystemExit("Office renderer lock SHA-256 is invalid")
+          lock_path = root / "office-renderer.lock.json"
+          try:
+              lock_bytes = lock_path.read_bytes()
+          except OSError as exc:
+              raise SystemExit("Office renderer lock is unavailable") from exc
+          if hashlib.sha256(lock_bytes).hexdigest() != expected_lock:
+              raise SystemExit("Office renderer lock changed after staging")
+
+          digest = hashlib.sha256()
+          digest.update(target.encode("ascii") + b"\0")
+          paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+          for path in paths:
+              relative = path.relative_to(root).as_posix().encode("utf-8", "surrogateescape")
+              before = path.lstat()
+              if stat.S_ISLNK(before.st_mode):
+                  raise SystemExit("Office renderer stage contains a symbolic link")
+              if stat.S_ISDIR(before.st_mode):
+                  kind = b"D"
+                  content_digest = b""
+                  size = 0
+              elif stat.S_ISREG(before.st_mode):
+                  kind = b"F"
+                  file_digest = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          file_digest.update(chunk)
+                  after = path.lstat()
+                  if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns) != (
+                      after.st_dev,
+                      after.st_ino,
+                      after.st_mode,
+                      after.st_size,
+                      after.st_mtime_ns,
+                  ):
+                      raise SystemExit("Office renderer stage changed while fingerprinting")
+                  content_digest = file_digest.digest()
+                  size = before.st_size
+              else:
+                  raise SystemExit("Office renderer stage contains a non-file entry")
+              digest.update(kind)
+              digest.update(len(relative).to_bytes(4, "big"))
+              digest.update(relative)
+              digest.update(stat.S_IMODE(before.st_mode).to_bytes(4, "big"))
+              digest.update(size.to_bytes(8, "big"))
+              digest.update(content_digest)
+          print(digest.hexdigest())
+          PY
+          }
           python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          python -m pip install pyinstaller==6.21.0
-          cd backend
-          python -m PyInstaller suxiaoyou.spec --noconfirm
+          if [[ "${{ matrix.target }}" == "linux-arm64" ]]; then
+            RELEASE_TOOL_LOCK="backend/requirements-release-tools-linux-arm64.txt"
+            RELEASE_TOOL_LOCK_SHA256="773f5855f7b5d6a4395adc095064e0f7abb16067d7fba0b9d7af3343be290d5b"
+          elif [[ "${{ matrix.target }}" == "linux-x64" ]]; then
+            RELEASE_TOOL_LOCK="backend/requirements-release-tools-linux-x64.txt"
+            RELEASE_TOOL_LOCK_SHA256="208305ef117280fed096c83876895872110ac23aa4df34b579f5b73f8236d6f3"
+          else
+            echo "::error::unsupported Linux release tool lock target: ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
+          python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          verify_release_checkout
+          RENDERER_STAGE_BEFORE="$(renderer_stage_fingerprint)"
+          (cd backend && python -m PyInstaller suxiaoyou.spec --noconfirm)
+          verify_release_checkout
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          RENDERER_STAGE_AFTER="$(renderer_stage_fingerprint)"
+          if [[ "$RENDERER_STAGE_AFTER" != "$RENDERER_STAGE_BEFORE" ]]; then
+            echo "::error::Office renderer stage changed while PyInstaller was packaging it" >&2
+            exit 1
+          fi
 
       - name: Verify backend bundle
         env:
@@ -1011,15 +1781,39 @@ jobs:
       - name: Verify bundled Node.js toolchain
         run: node scripts/verify-node-runtime.mjs backend/resources/nodejs
 
-      - name: Build Tauri Linux installers
+      - name: Seal verified Tauri build inputs
+        shell: bash
         run: |
-          cd desktop-tauri
-          npm exec tauri build -- --config "$BUILD_CONFIG" --no-sign
+          set -euo pipefail
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
+            "$GITHUB_SHA" frontend/out
+          node scripts/release-input-seal.mjs create \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" \
+            frontend/out \
+            backend/dist/suxiaoyou-backend \
+            backend/resources/nodejs
+
+      - name: Build Tauri Linux installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          (cd desktop-tauri && npm exec tauri build -- --config "$BUILD_CONFIG" --no-sign)
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
 
       - name: Verify Linux installers and packaged Node.js toolchain
         env:
           VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
           VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}/office-contract.json
+          VERIFY_BUNDLE_OFFICE_RENDERER_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}/office-renderer.json
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -1161,6 +1955,12 @@ jobs:
           debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
           rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
           [[ ${#debs[@]} -eq 1 && ${#rpms[@]} -eq 1 ]]
+          DEB_PREINSTALL_SIZE="$(stat -c %s "${debs[0]}")"
+          DEB_PREINSTALL_SHA256="$(sha256sum "${debs[0]}" | awk '{print $1}')"
+          DEB_PREINSTALL_COMMIT="$GITHUB_SHA"
+          RPM_PREINSTALL_SIZE="$(stat -c %s "${rpms[0]}")"
+          RPM_PREINSTALL_SHA256="$(sha256sum "${rpms[0]}" | awk '{print $1}')"
+          RPM_PREINSTALL_COMMIT="$GITHUB_SHA"
 
           DEB_INSPECT_ROOT="$RUNNER_TEMP/suxiaoyou-deb-launcher"
           RPM_INSPECT_ROOT="$RUNNER_TEMP/suxiaoyou-rpm-launcher"
@@ -1206,6 +2006,10 @@ jobs:
           xvfb-run -a dbus-run-session -- \
             node scripts/verify-desktop-lifecycle.mjs \
               --executable "$DEB_LAUNCHER" \
+              --artifact "${debs[0]}" \
+              --artifact-size "$DEB_PREINSTALL_SIZE" \
+              --artifact-sha256 "$DEB_PREINSTALL_SHA256" \
+              --release-commit "$DEB_PREINSTALL_COMMIT" \
               --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-deb" \
               --bundle-type deb
           sudo dpkg --purge "$DEB_PACKAGE"
@@ -1217,6 +2021,10 @@ jobs:
           xvfb-run -a dbus-run-session -- \
             node scripts/verify-desktop-lifecycle.mjs \
               --executable "$RPM_LAUNCHER" \
+              --artifact "${rpms[0]}" \
+              --artifact-size "$RPM_PREINSTALL_SIZE" \
+              --artifact-sha256 "$RPM_PREINSTALL_SHA256" \
+              --release-commit "$RPM_PREINSTALL_COMMIT" \
               --work-dir "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-rpm" \
               --bundle-type rpm
           sudo rpm -e "$RPM_PACKAGE"
@@ -1235,21 +2043,47 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: Verify release checkout before artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(desktop-tauri/src-tauri/target/release/bundle/deb/*.deb)
+          rpms=(desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm)
+          [[ ${#debs[@]} -eq 1 && ${#rpms[@]} -eq 1 ]]
+          node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+          node scripts/release-input-seal.mjs verify \
+            "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
+            "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
+          node scripts/verify-desktop-lifecycle.mjs verify-artifact \
+            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-deb/result.json" \
+            --artifact "${debs[0]}" \
+            --release-commit "$GITHUB_SHA"
+          node scripts/verify-desktop-lifecycle.mjs verify-artifact \
+            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-linux-rpm/result.json" \
+            --artifact "${rpms[0]}" \
+            --release-commit "$GITHUB_SHA"
+
       - name: Upload Linux artifacts
-        if: always()
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
           path: |
             desktop-tauri/src-tauri/target/release/bundle/deb/*.deb
             desktop-tauri/src-tauri/target/release/bundle/rpm/*.rpm
+          overwrite: true
           if-no-files-found: error
           retention-days: 1
 
   publish:
     name: Prepare GitHub Release
     needs: [validate-release, build-windows, build-macos, build-linux]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      (needs.validate-release.outputs.evidence_contract == 'v1.0' ||
+      needs.validate-release.outputs.release_profile == 'unsigned-degraded')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1257,7 +2091,11 @@ jobs:
       APP_VERSION: ${{ needs.validate-release.outputs.app_version }}
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
       RELEASE_CHANNEL: ${{ needs.validate-release.outputs.release_channel }}
+      RELEASE_PROFILE: ${{ needs.validate-release.outputs.release_profile }}
+      RELEASE_EVIDENCE_CONTRACT: ${{ needs.validate-release.outputs.evidence_contract }}
       MACOS_ARTIFACT_PROFILE: ${{ needs.validate-release.outputs.macos_artifact_profile }}
+      OFFICE_COMPATIBILITY_ASSET: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'OFFICE-RESTRICTED-COMPATIBILITY.json' || 'OFFICE-COMPATIBILITY.json' }}
+      RELEASE_CAPABILITIES_ASSET: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'DEGRADED-CAPABILITIES.json' || 'INTEGRATION-CONTRACTS.json' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -1274,6 +2112,41 @@ jobs:
       - name: List artifacts
         run: find artifacts -type f -print | sort
 
+      - name: Select latest evidence attempt per native target
+        run: |
+          set -euo pipefail
+          retain_latest_attempt() {
+            local prefix="$1"
+            local candidates=()
+            mapfile -t candidates < <(
+              find artifacts -mindepth 1 -maxdepth 1 -type d \
+                -name "${prefix}-[1-9]*" -print | sort -V
+            )
+            if (( ${#candidates[@]} <= 1 )); then
+              return
+            fi
+            local latest="${candidates[$(( ${#candidates[@]} - 1 ))]}"
+            local candidate
+            for candidate in "${candidates[@]}"; do
+              if [[ "$candidate" != "$latest" ]]; then
+                rm -rf -- "$candidate"
+              fi
+            done
+          }
+
+          for prefix in \
+            windows-lifecycle-diagnostics \
+            macos-aarch64-lifecycle-diagnostics \
+            macos-x64-lifecycle-diagnostics \
+            linux-x64-lifecycle-diagnostics \
+            linux-arm64-lifecycle-diagnostics \
+            v1-integration-evidence
+          do
+            retain_latest_attempt "$prefix"
+          done
+
+          find artifacts -mindepth 1 -maxdepth 1 -type d -print | sort
+
       - name: Verify native Office compatibility evidence
         run: |
           set -euo pipefail
@@ -1283,9 +2156,10 @@ jobs:
             artifacts \
             "$RELEASE_COMMIT" \
             "$GITHUB_REF_NAME" \
-            OFFICE-COMPATIBILITY.json
+            "$OFFICE_COMPATIBILITY_ASSET"
 
       - name: Verify and summarize v1 integration evidence
+        if: env.RELEASE_EVIDENCE_CONTRACT == 'v1.0'
         run: |
           set -euo pipefail
           mapfile -t evidence_directories < <(
@@ -1358,11 +2232,17 @@ jobs:
       - name: Stage release asset names
         run: |
           set -euo pipefail
-          case "$RELEASE_CHANNEL" in
-            stable) MACOS_TRUST_SUFFIX="" ;;
-            prerelease) MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED" ;;
-            *) echo "::error::unsupported publish channel $RELEASE_CHANNEL"; exit 1 ;;
-          esac
+          if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+            INSTALLER_TRUST_SUFFIX="-UNSIGNED-DEGRADED"
+            MACOS_TRUST_SUFFIX="$INSTALLER_TRUST_SUFFIX"
+          else
+            INSTALLER_TRUST_SUFFIX=""
+            case "$RELEASE_CHANNEL" in
+              stable) MACOS_TRUST_SUFFIX="" ;;
+              prerelease) MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED" ;;
+              *) echo "::error::unsupported publish channel $RELEASE_CHANNEL"; exit 1 ;;
+            esac
+          fi
           rm -rf release-assets
           mkdir release-assets
           copy_one() {
@@ -1374,13 +2254,13 @@ jobs:
             [[ -n "$source" ]]
             cp -- "$source" "release-assets/$destination"
           }
-          copy_one artifacts/windows-release "*.exe" "suyo-${RELEASE_VERSION}-windows-x64-setup.exe"
+          copy_one artifacts/windows-release "*.exe" "suyo-${RELEASE_VERSION}-windows-x64-setup${INSTALLER_TRUST_SUFFIX}.exe"
           copy_one "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-aarch64${MACOS_TRUST_SUFFIX}.dmg"
           copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
-          copy_one artifacts/linux-x64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-amd64.deb"
-          copy_one artifacts/linux-x64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-x86_64.rpm"
-          copy_one artifacts/linux-arm64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-arm64.deb"
-          copy_one artifacts/linux-arm64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-aarch64.rpm"
+          copy_one artifacts/linux-x64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-amd64${INSTALLER_TRUST_SUFFIX}.deb"
+          copy_one artifacts/linux-x64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-x86_64${INSTALLER_TRUST_SUFFIX}.rpm"
+          copy_one artifacts/linux-arm64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-arm64${INSTALLER_TRUST_SUFFIX}.deb"
+          copy_one artifacts/linux-arm64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-aarch64${INSTALLER_TRUST_SUFFIX}.rpm"
           [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
 
       - name: Generate SHA-256 checksums
@@ -1390,6 +2270,10 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          PROFILE_ARGUMENTS=()
+          if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+            PROFILE_ARGUMENTS=("$RELEASE_PROFILE")
+          fi
           node scripts/native-package-evidence.mjs \
             aggregate \
             release-assets \
@@ -1398,7 +2282,8 @@ jobs:
             "$RELEASE_COMMIT" \
             "$GITHUB_REF_NAME" \
             "$RELEASE_CHANNEL" \
-            PACKAGE-LIFECYCLE.json
+            PACKAGE-LIFECYCLE.json \
+            "${PROFILE_ARGUMENTS[@]}"
 
       - name: Retain native package evidence for RC scorecard
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1410,26 +2295,128 @@ jobs:
 
       - name: Generate and verify manual-download release manifest
         run: |
+          set -euo pipefail
           RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          PROFILE_ARGUMENTS=()
+          if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+            PROFILE_ARGUMENTS=("$RELEASE_PROFILE")
+          fi
           node scripts/generate-release-manifest.mjs \
             release-assets \
             "$GITHUB_REF_NAME" \
             "$RELEASE_COMMIT" \
             "$GITHUB_REPOSITORY" \
             CHECKSUMS.md \
-            release-manifest.json
+            release-manifest.json \
+            "${PROFILE_ARGUMENTS[@]}"
           node scripts/verify-release-manifest.mjs \
             release-manifest.json \
             release-assets \
             CHECKSUMS.md \
             "$GITHUB_REF_NAME" \
             "$RELEASE_COMMIT" \
-            "$GITHUB_REPOSITORY"
+            "$GITHUB_REPOSITORY" \
+            "${PROFILE_ARGUMENTS[@]}"
+
+      - name: Generate unsigned-degraded capability disclosure
+        if: env.RELEASE_PROFILE == 'unsigned-degraded'
+        run: |
+          set -euo pipefail
+          RELEASE_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          RELEASE_COMMIT="$RELEASE_COMMIT" node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+
+          const document = {
+            schemaVersion: 1,
+            kind: "suxiaoyou-degraded-capabilities",
+            releaseProfile: process.env.RELEASE_PROFILE,
+            releaseTag: process.env.GITHUB_REF_NAME,
+            releaseCommit: process.env.RELEASE_COMMIT,
+            appVersion: process.env.APP_VERSION,
+            distribution: {
+              publicationChannel: "prerelease",
+              publicPrerelease: true,
+              draft: false,
+              latest: false,
+              installerCount: 7,
+              metadataCount: 4,
+            },
+            runtime: {
+              v11GateMode: "released",
+              officeRendererProfile: "unsigned-degraded",
+            },
+            office: {
+              authoritativeRenderer: "absent",
+              restrictedCompatibilityReport:
+                "OFFICE-RESTRICTED-COMPATIBILITY.json",
+              highFidelityPreview: "unavailable",
+              authoringAndVisualCommit: "unavailable",
+              visualValidationLoop: "unavailable",
+              userTemplates: "unavailable",
+              chartsAndComplexFormatting: "not-claimed",
+              versionAndRewindIntegration: "restricted-compatibility-only",
+            },
+            signing: {
+              windowsAuthenticode: false,
+              macosAppSignature: "adhoc",
+              macosDeveloperId: false,
+              macosDmgSignature: false,
+              macosNotarized: false,
+              macosStapled: false,
+              linuxDebSignature: false,
+              linuxRpmSignature: false,
+              linuxRepositorySignature: false,
+            },
+            integrations: {
+              tencentDocsLiveEvidence: "not-run",
+              siliconFlowLiveEvidence: "not-run",
+            },
+          };
+
+          if (
+            document.releaseProfile !== "unsigned-degraded" ||
+            !/^v1\.1\.0$/.test(document.releaseTag ?? "") ||
+            !/^[0-9a-f]{40}$/.test(document.releaseCommit ?? "")
+          ) {
+            throw new Error("invalid unsigned-degraded release identity");
+          }
+          writeFileSync(
+            "DEGRADED-CAPABILITIES.json",
+            `${JSON.stringify(document, null, 2)}\n`,
+            { mode: 0o600 },
+          );
+          NODE
 
       - name: Record installer trust status
         run: |
+          set -euo pipefail
           {
-            if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+            if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+              printf '%s\n%s\n\n' \
+                '> [!WARNING]' \
+                "> v${RELEASE_VERSION} 是公开的 **UNSIGNED-DEGRADED** 预发布包，不是受信任的正式发布，也不会被标记为 latest。安装时 Windows SmartScreen、macOS Gatekeeper 或 Linux 包管理策略可能给出警告。"
+              cat <<'EOF'
+
+          ## v1.1 核心能力
+
+          - ACP 会话、隔离 worktree、checkpoint/rewind、Hooks 与验证 Agent 随包提供；冻结后端和原生安装包按 v1.1 `released` 门禁验证。
+          - 七个安装包均来自同一 tag/commit，文件名带有 `UNSIGNED-DEGRADED`，避免与未来的权威签名包混淆。
+
+          ## Office 降级边界
+
+          - 本包不含权威 Office renderer；高保真预览、高保真编辑与视觉提交、视觉验证闭环、用户模板，以及图表和复杂格式保真均不可用或不作承诺。
+          - 仅保留五个原生目标已验证的受限 Office 兼容能力；机器可复核结果见 `OFFICE-RESTRICTED-COMPATIBILITY.json`。
+          - 腾讯文档与 SiliconFlow 的 v1.0 live integration evidence 未在此 profile 中运行；不得从本 Release 推断其已通过。
+
+          ## 签名与发布状态
+
+          - Windows NSIS 未配置 Authenticode；macOS 应用仅使用 ad-hoc 签名，DMG 无 Developer ID 签名、无 Apple 公证、无 stapled ticket；Linux DEB/RPM 及仓库均未签名。
+          - Release 公开为 prerelease，固定包含七个安装包和四个元数据：`CHECKSUMS.md`、`release-manifest.json`、`OFFICE-RESTRICTED-COMPATIBILITY.json`、`DEGRADED-CAPABILITIES.json`。
+          - `DEGRADED-CAPABILITIES.json` 是本 profile 的机器可读能力与信任边界；`release-manifest.json` 仅用于可信版本发现与手动下载，不声明或执行自动更新。
+
+          EOF
+            else
+              if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
               cat <<EOF
           > [!WARNING]
           > 这是 v${RELEASE_VERSION} 候选测试版，不是正式 v${APP_VERSION}。macOS 应用仅使用 ad-hoc 临时签名，DMG 未使用 Developer ID 签名、未经过 Apple 公证，Gatekeeper 可能拦截。
@@ -1437,7 +2424,7 @@ jobs:
           候选版安装包内部版本仍为 ${APP_VERSION}。未来安装正式 v${APP_VERSION} 时，系统或包管理器可能不会将其识别为升级；请先卸载候选版，或显式执行覆盖安装。
 
           EOF
-            fi
+              fi
             cat <<'EOF'
           ## 版本重点
 
@@ -1451,9 +2438,9 @@ jobs:
           - Windows Bash/Python 使用 Job Object 回收进程树，但直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动；不得将其理解为 Linux/macOS 的私有事务执行。
 
           EOF
-            if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+              if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
               printf '%s\n\n' '- 公开 RC 前仍需在同一候选包上完成 macOS 旧凭据覆盖升级、首次实际请求至多一次系统密码提示，以及 20 人、200 个核心任务、连续 7 天的受控 Beta 计分卡；证据未完成时本 Release 保持草稿。'
-            fi
+              fi
             cat <<'EOF'
 
           ## 安装包信任与验证状态
@@ -1468,10 +2455,11 @@ jobs:
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 
           EOF
-            if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
+              if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
               printf '%s\n\n' '- macOS Apple Silicon 与 Intel：Developer ID 签名，已通过 Apple 公证并 stapled。'
-            else
+              else
               printf '%s\n\n' '- macOS Apple Silicon 与 Intel：应用仅使用 ad-hoc 临时签名；DMG 未使用 Developer ID 签名、未经过 Apple 公证，也没有 stapled ticket。'
+              fi
             fi
             cat RUST-AUDIT.md
             cat CHECKSUMS.md
@@ -1480,8 +2468,9 @@ jobs:
       - name: Prepare GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
-          draft: true
-          prerelease: ${{ needs.validate-release.outputs.release_channel == 'prerelease' }}
+          name: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' && format('suyo {0} UNSIGNED-DEGRADED', needs.validate-release.outputs.release_version) || format('suyo {0}', needs.validate-release.outputs.release_version) }}
+          draft: ${{ needs.validate-release.outputs.release_profile != 'unsigned-degraded' }}
+          prerelease: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' || needs.validate-release.outputs.release_channel == 'prerelease' }}
           make_latest: false
           generate_release_notes: true
           body_path: RELEASE-BODY.md
@@ -1490,5 +2479,5 @@ jobs:
             release-assets/*
             CHECKSUMS.md
             release-manifest.json
-            OFFICE-COMPATIBILITY.json
-            INTEGRATION-CONTRACTS.json
+            ${{ env.OFFICE_COMPATIBILITY_ASSET }}
+            ${{ env.RELEASE_CAPABILITIES_ASSET }}

@@ -14,9 +14,6 @@ import { CsvRenderer } from "./renderers/csv-renderer";
 // Heavy renderers - lazy loaded to reduce bundle size
 import {
   PdfRenderer,
-  PptxRenderer,
-  XlsxRenderer,
-  DocxRenderer,
   ReactRenderer,
 } from "./renderers/lazy-renderers";
 
@@ -64,13 +61,13 @@ export function ArtifactPanelContent() {
     case "react":
       return <ReactRenderer code={artifact.content} title={artifact.title} />;
     case "docx":
-      return <DocxRenderer filePath={artifact.filePath} />;
+      return <FilePreviewRenderer filePath={artifact.filePath} />;
     case "xlsx":
-      return <XlsxRenderer filePath={artifact.filePath} />;
+      return <FilePreviewRenderer filePath={artifact.filePath} />;
     case "pdf":
       return <PdfRenderer filePath={artifact.filePath} />;
     case "pptx":
-      return <PptxRenderer filePath={artifact.filePath} />;
+      return <FilePreviewRenderer filePath={artifact.filePath} />;
     case "csv":
       return <CsvRenderer content={artifact.content} title={artifact.title} />;
     case "file-preview":

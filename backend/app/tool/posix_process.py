@@ -21,6 +21,7 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import tempfile
 import time
 from typing import Literal
 
@@ -135,6 +136,7 @@ def run_posix_process(
     timeout_seconds: float,
     should_abort: Callable[[], bool],
     max_output_bytes: int,
+    stdin_bytes: bytes | None = None,
 ) -> PosixProcessResult:
     """Run an argv-form command with bounded output and process-group cleanup.
 
@@ -162,17 +164,31 @@ def run_posix_process(
             truncated=False,
         )
 
-    process = subprocess.Popen(
-        [os.fspath(value) for value in argv],
-        shell=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=os.fspath(Path(cwd)),
-        env=dict(env),
-        start_new_session=True,
-        bufsize=0,
-    )
+    if stdin_bytes is not None and not isinstance(stdin_bytes, bytes):
+        raise ValueError("stdin_bytes must be bytes or None")
+    stdin_stream = None
+    try:
+        if stdin_bytes is not None:
+            # An anonymous temporary file avoids pipe-capacity deadlocks before
+            # the supervision loop starts while keeping event data off argv and
+            # the child environment.
+            stdin_stream = tempfile.TemporaryFile()
+            stdin_stream.write(stdin_bytes)
+            stdin_stream.seek(0)
+        process = subprocess.Popen(
+            [os.fspath(value) for value in argv],
+            shell=False,
+            stdin=stdin_stream if stdin_stream is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=os.fspath(Path(cwd)),
+            env=dict(env),
+            start_new_session=True,
+            bufsize=0,
+        )
+    finally:
+        if stdin_stream is not None:
+            stdin_stream.close()
     process_group = process.pid
     stdout = _BoundedBytes(max_output_bytes)
     stderr = _BoundedBytes(max_output_bytes)

@@ -222,6 +222,40 @@ def test_private_store_persists_only_fingerprints_with_restrictive_mode(tmp_path
     assert os.stat(store.path.parent).st_mode & 0o777 == 0o700
 
 
+def test_private_store_revocation_is_durable_and_noop_for_absent_entry(tmp_path) -> None:
+    store = LocalMcpApprovalStore("/workspace/a", storage_root=tmp_path)
+    fingerprint = "sha256:" + "a" * 64
+    store.approve("local-server", fingerprint)
+
+    assert store.revoke("local-server") is True
+    assert store.revoke("local-server") is False
+    assert LocalMcpApprovalStore(
+        "/workspace/a",
+        storage_root=tmp_path,
+    ).get("local-server") is None
+
+
+def test_private_store_revocation_fails_closed_after_external_change(tmp_path) -> None:
+    store = LocalMcpApprovalStore("/workspace/a", storage_root=tmp_path)
+    store.approve("local-server", "sha256:" + "a" * 64)
+    store.path.write_text(
+        json.dumps({
+            "version": 1,
+            "approvals": {"local-server": "sha256:" + "b" * 64},
+        }),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        store.path.chmod(0o600)
+
+    with pytest.raises(LocalMcpApprovalStoreError):
+        store.revoke("local-server")
+    assert store.degraded_reason == "local_mcp_approval_state_unreadable"
+    assert json.loads(store.path.read_text(encoding="utf-8"))["approvals"] == {
+        "local-server": "sha256:" + "b" * 64,
+    }
+
+
 def test_malformed_private_store_fails_closed_without_overwrite(tmp_path) -> None:
     store = LocalMcpApprovalStore("/workspace/a", storage_root=tmp_path)
     store.path.parent.mkdir(parents=True, exist_ok=True)

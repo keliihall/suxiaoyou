@@ -27,3 +27,22 @@ test("local macOS signing does not weaken Node or backend release security", () 
     assert.match(script, new RegExp(forbidden.replaceAll(".", "\\.")));
   }
 });
+
+test("preserves the attested Office renderer's final signed byte tree", () => {
+  assert.match(
+    script,
+    /OFFICE_RENDERER_ROOT="\$APP_PATH\/Contents\/Resources\/backend\/_internal\/app\/data\/office-renderer"/,
+  );
+  assert.match(script, /verify_presigned_renderer_code/);
+  assert.match(
+    script,
+    /if \[\[ "\$candidate" == "\$OFFICE_RENDERER_ROOT\/"\* \]\]; then[\s\S]*verify_presigned_renderer_code "\$candidate"[\s\S]*elif \[\[ "\$candidate" == "\$NODE_BINARY"/,
+  );
+  assert.match(
+    script,
+    /if \[\[ "\$framework" == "\$OFFICE_RENDERER_ROOT\/"\* \]\]; then\s+verify_presigned_renderer_code "\$framework"/,
+  );
+  assert.match(script, /codesign --verify --strict --verbose=2 "\$candidate"/);
+  assert.match(script, /grep -Fxq "Authority=\$SIGNING_IDENTITY"/);
+  assert.match(script, /grep -Fxq "Signature=adhoc"/);
+});

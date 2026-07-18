@@ -9,7 +9,32 @@ import { basename, join, resolve } from "node:path";
 import { assertReleaseVersion, isMainModule } from "./release-metadata.mjs";
 
 export const RELEASE_MANIFEST_SCHEMA_VERSION = 2;
+export const UNSIGNED_DEGRADED_RELEASE_MANIFEST_SCHEMA_VERSION = 3;
 export const RELEASE_MANIFEST_KIND = "suxiaoyou-release-manifest";
+export const RELEASE_PROFILES = Object.freeze({
+  OFFICIAL: "official",
+  RC_ADHOC: "rc-adhoc",
+  UNSIGNED_DEGRADED: "unsigned-degraded",
+});
+
+export const UNSIGNED_DEGRADED_TRUST = Object.freeze({
+  windowsAuthenticodeSigned: false,
+  macosAppSignature: "adhoc",
+  macosDeveloperIdSigned: false,
+  macosDmgSigned: false,
+  macosNotarized: false,
+  macosStapled: false,
+  linuxDebSigned: false,
+  linuxRpmSigned: false,
+  linuxRepositorySigned: false,
+});
+
+export const UNSIGNED_DEGRADED_CAPABILITIES = Object.freeze({
+  v11Gates: "released",
+  officeRenderer: "absent",
+  officeAuthoring: "unavailable",
+  integrations: "not-run",
+});
 
 const RELEASE_ARTIFACT_VERSION_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.([1-9]\d*))?$/;
@@ -30,51 +55,125 @@ export function releaseIdentityFromVersion(version) {
   };
 }
 
-export function expectedReleaseAssets(version) {
+export function resolveReleaseProfile(version, requestedProfile) {
   const { channel } = releaseIdentityFromVersion(version);
-  const macosTrustSuffix = channel === "prerelease" ? "-ADHOC-NOT-NOTARIZED" : "";
+  const defaultProfile =
+    version === "1.1.0"
+      ? RELEASE_PROFILES.UNSIGNED_DEGRADED
+      : channel === "stable"
+        ? RELEASE_PROFILES.OFFICIAL
+        : RELEASE_PROFILES.RC_ADHOC;
+  const profile = String(requestedProfile ?? "").trim() || defaultProfile;
+  const expectedChannel =
+    profile === RELEASE_PROFILES.RC_ADHOC ? "prerelease" : "stable";
+  if (!Object.values(RELEASE_PROFILES).includes(profile)) {
+    throw new Error(
+      `unsupported release profile ${JSON.stringify(profile)}; expected official, rc-adhoc, or unsigned-degraded`,
+    );
+  }
+  if (channel !== expectedChannel) {
+    throw new Error(
+      `release profile ${profile} requires a ${expectedChannel} tag, got ${channel}`,
+    );
+  }
+  if (
+    profile === RELEASE_PROFILES.UNSIGNED_DEGRADED &&
+    version !== "1.1.0"
+  ) {
+    throw new Error(
+      `release profile ${profile} is defined only for v1.1.0, got v${version}`,
+    );
+  }
+  if (version === "1.1.0" && profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
+    throw new Error(
+      "v1.1.0 is defined by the unsigned-degraded release contract",
+    );
+  }
+  return profile;
+}
+
+function profiledInstallerName(stem, extension, profile) {
+  const suffix =
+    profile === RELEASE_PROFILES.UNSIGNED_DEGRADED
+      ? "-UNSIGNED-DEGRADED"
+      : "";
+  return `${stem}${suffix}.${extension}`;
+}
+
+export function expectedReleaseAssets(version, requestedProfile) {
+  const profile = resolveReleaseProfile(version, requestedProfile);
+  const macosTrustSuffix =
+    profile === RELEASE_PROFILES.RC_ADHOC ? "-ADHOC-NOT-NOTARIZED" : "";
   return [
     {
       platform: "windows",
       architecture: "x86_64",
       format: "nsis",
-      name: `suyo-${version}-windows-x64-setup.exe`,
+      name: profiledInstallerName(
+        `suyo-${version}-windows-x64-setup`,
+        "exe",
+        profile,
+      ),
     },
     {
       platform: "macos",
       architecture: "arm64",
       format: "dmg",
-      name: `suyo-${version}-macos-aarch64${macosTrustSuffix}.dmg`,
+      name: profiledInstallerName(
+        `suyo-${version}-macos-aarch64${macosTrustSuffix}`,
+        "dmg",
+        profile,
+      ),
     },
     {
       platform: "macos",
       architecture: "x86_64",
       format: "dmg",
-      name: `suyo-${version}-macos-x64${macosTrustSuffix}.dmg`,
+      name: profiledInstallerName(
+        `suyo-${version}-macos-x64${macosTrustSuffix}`,
+        "dmg",
+        profile,
+      ),
     },
     {
       platform: "linux",
       architecture: "x86_64",
       format: "deb",
-      name: `suyo-${version}-linux-amd64.deb`,
+      name: profiledInstallerName(
+        `suyo-${version}-linux-amd64`,
+        "deb",
+        profile,
+      ),
     },
     {
       platform: "linux",
       architecture: "x86_64",
       format: "rpm",
-      name: `suyo-${version}-linux-x86_64.rpm`,
+      name: profiledInstallerName(
+        `suyo-${version}-linux-x86_64`,
+        "rpm",
+        profile,
+      ),
     },
     {
       platform: "linux",
       architecture: "arm64",
       format: "deb",
-      name: `suyo-${version}-linux-arm64.deb`,
+      name: profiledInstallerName(
+        `suyo-${version}-linux-arm64`,
+        "deb",
+        profile,
+      ),
     },
     {
       platform: "linux",
       architecture: "arm64",
       format: "rpm",
-      name: `suyo-${version}-linux-aarch64.rpm`,
+      name: profiledInstallerName(
+        `suyo-${version}-linux-aarch64`,
+        "rpm",
+        profile,
+      ),
     },
   ];
 }
@@ -96,15 +195,17 @@ export function generateReleaseManifest({
   commit,
   repository,
   checksumFile,
+  releaseProfile,
 }) {
   const version = releaseVersionFromTag(tag);
   const { appVersion, channel } = releaseIdentityFromVersion(version);
+  const profile = resolveReleaseProfile(version, releaseProfile);
   assertCommit(commit);
   assertRepository(repository);
   const assetsRoot = resolve(assetsDirectory);
   const checksums = parseChecksumMarkdown(readFileSync(checksumFile, "utf8"));
   const releaseBase = `https://github.com/${repository}/releases`;
-  const assets = expectedReleaseAssets(version).map((specification) => {
+  const assets = expectedReleaseAssets(version, profile).map((specification) => {
     const path = join(assetsRoot, specification.name);
     const stat = statSync(path, { throwIfNoEntry: false });
     if (!stat?.isFile()) throw new Error(`release asset is missing: ${specification.name}`);
@@ -123,8 +224,7 @@ export function generateReleaseManifest({
     throw new Error(`CHECKSUMS.md must contain exactly ${assets.length} installer rows`);
   }
 
-  return {
-    schemaVersion: RELEASE_MANIFEST_SCHEMA_VERSION,
+  const common = {
     kind: RELEASE_MANIFEST_KIND,
     updateMode: "manual-download",
     channel,
@@ -136,6 +236,22 @@ export function generateReleaseManifest({
     releaseUrl: `${releaseBase}/tag/${tag}`,
     checksumUrl: `${releaseBase}/download/${tag}/CHECKSUMS.md`,
     assets,
+  };
+  if (profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
+    return {
+      schemaVersion: RELEASE_MANIFEST_SCHEMA_VERSION,
+      ...common,
+    };
+  }
+  return {
+    schemaVersion: UNSIGNED_DEGRADED_RELEASE_MANIFEST_SCHEMA_VERSION,
+    ...common,
+    releaseProfile: profile,
+    publicationChannel: "prerelease",
+    officialReleaseEligible: false,
+    latestEligible: false,
+    trust: { ...UNSIGNED_DEGRADED_TRUST },
+    capabilities: { ...UNSIGNED_DEGRADED_CAPABILITIES },
   };
 }
 
@@ -170,11 +286,18 @@ function assertRepository(repository) {
 }
 
 function main() {
-  const [assetsDirectory, tag, commit, repository, checksumFile, outputFile] =
-    process.argv.slice(2);
+  const [
+    assetsDirectory,
+    tag,
+    commit,
+    repository,
+    checksumFile,
+    outputFile,
+    releaseProfile,
+  ] = process.argv.slice(2);
   if (!assetsDirectory || !tag || !commit || !repository || !checksumFile || !outputFile) {
     throw new Error(
-      "usage: generate-release-manifest.mjs <assets-dir> <tag> <commit> <owner/repo> <checksums> <output>",
+      "usage: generate-release-manifest.mjs <assets-dir> <tag> <commit> <owner/repo> <checksums> <output> [official|rc-adhoc|unsigned-degraded]",
     );
   }
   const manifest = generateReleaseManifest({
@@ -183,6 +306,7 @@ function main() {
     commit,
     repository,
     checksumFile,
+    releaseProfile,
   });
   writeFileSync(outputFile, `${JSON.stringify(manifest, null, 2)}\n`);
   console.log(

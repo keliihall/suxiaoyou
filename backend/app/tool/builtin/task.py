@@ -162,6 +162,7 @@ class TaskTool(ToolDefinition):
         )
         parent_job = getattr(ctx, "_job", None)
         if parent_job is not None:
+            child_job.inherit_runtime_context(parent_job)
             child_job.inherit_goal_context(parent_job)
         # The child is headless: it shares cancellation with its parent and
         # cannot auto-approve an inherited `ask` rule. Explicit parent `allow`

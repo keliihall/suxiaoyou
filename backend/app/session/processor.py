@@ -15,12 +15,15 @@ Mirrors OpenCode's session/processor.ts.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import json
 import logging
 import re
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy.exc import IntegrityError
@@ -50,6 +53,7 @@ from app.session.manager import (
     get_messages,
     update_part_data,
 )
+from app.session.middleware import ToolAction
 from app.session.retry import (
     MAX_RETRIES,
     is_context_overflow,
@@ -91,6 +95,238 @@ if TYPE_CHECKING:
     from app.session.prompt import SessionPrompt
 
 logger = logging.getLogger(__name__)
+
+
+def _office_repair_admission_factory(prompt: SessionPrompt) -> object | None:
+    """Bind repair inference to the same Goal execution and budget gate."""
+
+    job = getattr(prompt, "job", None)
+    session_factory = getattr(prompt, "session_factory", None)
+    if job is None or session_factory is None:
+        return None
+
+    @asynccontextmanager
+    async def admission(max_output_tokens: int):
+        if job.goal_id is None:
+            yield max_output_tokens
+            return
+        from app.office_validation.repair_agent import (
+            OfficePrecommitRepairAgentError,
+        )
+        from app.session.goal_guard import (
+            read_goal_budget_gate,
+            read_goal_execution_gate,
+        )
+
+        async with job.execution_admission_lock:
+            if not job.execution_admission_open:
+                raise OfficePrecommitRepairAgentError(
+                    "Office repair agent admission was rejected"
+                )
+            root_session_id = job.goal_session_id or job.session_id
+            gate = await read_goal_execution_gate(
+                session_factory,
+                session_id=root_session_id,
+                goal_id=job.goal_id,
+                goal_run_id=job.goal_run_id,
+            )
+            if not gate.allowed:
+                raise OfficePrecommitRepairAgentError(
+                    "Office repair agent admission was rejected"
+                )
+            tokens_used, cost_used = job.goal_run_usage
+            budget = await read_goal_budget_gate(
+                session_factory,
+                session_id=root_session_id,
+                goal_id=job.goal_id,
+                local_tokens_used=tokens_used,
+                local_cost_microusd=cost_used,
+                local_active_seconds=max(
+                    0,
+                    round(
+                        time.monotonic()
+                        - prompt._goal_active_started_monotonic
+                        - (
+                            job.goal_wait_seconds
+                            - prompt._goal_wait_seconds_at_start
+                        )
+                    ),
+                ),
+                warning_ratio=_cfg().goal_budget_warning_ratio,
+            )
+            if not budget.allowed:
+                raise OfficePrecommitRepairAgentError(
+                    "Office repair agent budget is exhausted"
+                )
+            admitted = max_output_tokens
+            if budget.token_remaining is not None:
+                admitted = min(admitted, budget.token_remaining)
+            if admitted < 1:
+                raise OfficePrecommitRepairAgentError(
+                    "Office repair agent budget is exhausted"
+                )
+            # The executor creates the stream and consumes its first chunk
+            # inside this context, matching the main Provider admission race.
+            yield admitted
+
+    return admission
+
+
+def _office_repair_execution_observer(prompt: SessionPrompt) -> object | None:
+    """Persist path-free Repair usage and update the shared Goal ledger."""
+
+    job = getattr(prompt, "job", None)
+    session_factory = getattr(prompt, "session_factory", None)
+    assistant_msg_id = getattr(prompt, "assistant_msg_id", None)
+    if (
+        job is None
+        or session_factory is None
+        or not isinstance(assistant_msg_id, str)
+        or not assistant_msg_id
+    ):
+        return None
+    lock = getattr(prompt, "_office_repair_accounting_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        setattr(prompt, "_office_repair_accounting_lock", lock)
+
+    async def observe(receipt: object) -> None:
+        from app.office_validation.repair_agent import (
+            OfficeRepairExecutionReceipt,
+        )
+
+        if not isinstance(receipt, OfficeRepairExecutionReceipt):
+            raise TypeError("Office repair accounting receipt is invalid")
+        usage = {
+            name: max(0, int(receipt.usage.get(name, 0) or 0))
+            for name in (
+                "input",
+                "output",
+                "reasoning",
+                "cache_read",
+                "cache_write",
+                "total",
+            )
+        }
+        tokens = sum(
+            usage[name]
+            for name in ("input", "output", "reasoning", "cache_read")
+        )
+        cost = _calculate_step_cost(usage, receipt.model_info)
+        cost_microusd = max(0, round(cost * 1_000_000))
+        async with lock:
+            async with session_factory() as db:
+                async with db.begin():
+                    part = await create_part(
+                        db,
+                        message_id=assistant_msg_id,
+                        session_id=job.session_id,
+                        data={
+                            "type": "office-repair-usage",
+                            "goal_run_id": job.goal_run_id,
+                            "execution_id": receipt.execution_id,
+                            "provider_id": receipt.provider_id,
+                            "model_id": receipt.model_id,
+                            "outcome": receipt.outcome,
+                            "tokens": usage,
+                            "cost": cost,
+                        },
+                    )
+                    if job.goal_id is not None:
+                        if job.goal_run_id is None:
+                            raise RuntimeError(
+                                "Goal Office repair usage has no durable run identity"
+                            )
+                        from app.session.goal_manager import record_goal_run_usage
+
+                        await record_goal_run_usage(
+                            db,
+                            goal_run_id=job.goal_run_id,
+                            source_kind="office_repair",
+                            source_key=f"office_repair:{part.id}",
+                            tokens_used=tokens,
+                            cost_used_microusd=cost_microusd,
+                        )
+            prompt.total_cost += cost
+            for name in prompt.total_tokens_accumulated:
+                prompt.total_tokens_accumulated[name] += usage.get(name, 0)
+            if job.goal_id is not None:
+                job.record_goal_usage(
+                    tokens=tokens,
+                    cost_microusd=cost_microusd,
+                )
+                prompt._goal_usage_recorded_tokens += tokens
+                prompt._goal_usage_recorded_cost_microusd += cost_microusd
+
+    return observe
+
+
+def _office_precommit_repairer_for_prompt(
+    prompt: SessionPrompt,
+) -> object | None:
+    """Bind the current exact provider/model to the private Office repair lane.
+
+    This helper is deliberately dynamic: closing a source dependency or
+    removing the authoritative coordinator revokes repair injection on the
+    next tool call.  The cached instance is scoped to one SessionPrompt so
+    concurrent Office calls in that session share the repairer's single-flight
+    lock, while a provider/model switch creates a new binding.
+    """
+
+    from app.office_validation.precommit import (
+        get_office_precommit_coordinator,
+    )
+    from app.release_readiness import v11_capability_released
+
+    if (
+        not v11_capability_released("office_authoring")
+        or get_office_precommit_coordinator() is None
+    ):
+        setattr(prompt, "_office_repairer_binding", None)
+        return None
+
+    provider_id = getattr(getattr(prompt, "provider", None), "id", None)
+    model_id = getattr(prompt, "model_id", None)
+    capabilities = getattr(getattr(prompt, "model_info", None), "capabilities", None)
+    if (
+        not isinstance(provider_id, str)
+        or not provider_id
+        or not isinstance(model_id, str)
+        or not model_id
+        or not bool(getattr(capabilities, "json_output", False))
+    ):
+        setattr(prompt, "_office_repairer_binding", None)
+        return None
+
+    key = (id(prompt.provider_registry), provider_id, model_id)
+    cached = getattr(prompt, "_office_repairer_binding", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == key
+    ):
+        return cached[1]
+
+    try:
+        from app.office_validation.repair_agent import (
+            ProviderOfficePrecommitRepairer,
+        )
+        from app.office_validation.precommit_repair import (
+            OfficePrecommitRepairError,
+        )
+
+        repairer = ProviderOfficePrecommitRepairer(
+            provider_registry=prompt.provider_registry,
+            provider_id=provider_id,
+            model_id=model_id,
+            admission_factory=_office_repair_admission_factory(prompt),
+            observer=_office_repair_execution_observer(prompt),
+        )
+    except (OSError, TypeError, ValueError, OfficePrecommitRepairError):
+        setattr(prompt, "_office_repairer_binding", None)
+        return None
+    setattr(prompt, "_office_repairer_binding", (key, repairer))
+    return repairer
 
 
 async def _audit_tool_event(
@@ -594,6 +830,9 @@ async def run_generation(
 
             current_input_id = next_input.id
             current_skip_user_message = False
+            # The SSE transport remains open for queued input chaining, but a
+            # queued prompt is a distinct user root turn with its own checkpoint.
+            job.begin_root_turn(next_input.id)
             current_request = PromptRequest(
                 session_id=job.session_id,
                 text=next_input.text,
@@ -840,6 +1079,16 @@ class SessionProcessor:
         self._exec_metadata: dict[int, dict[str, Any]] = {}
         self._exec_index: int = 0
         self._exec_blocked: bool = False  # Set True if loop detection blocks
+        middleware_chain = getattr(self._sp, "middleware_chain", None)
+        self._defer_after_llm_response = bool(
+            self._mw_ctx is not None
+            and middleware_chain is not None
+            and getattr(
+                middleware_chain,
+                "has_after_llm_response_hooks",
+                False,
+            )
+        )
 
     async def _persist_step_start(self) -> None:
         """Persist the StepStart part (mirrors OpenCode's StepStartPart)."""
@@ -981,11 +1230,12 @@ class SessionProcessor:
                         case "text-delta":
                             text = chunk.data.get("text", "")
                             self._accumulated_text += text
-                            job.publish(SSEEvent(TEXT_DELTA, {
-                                "session_id": job.session_id,
-                                "message_id": self._assistant_msg_id,
-                                "text": text,
-                            }))
+                            if not self._defer_after_llm_response:
+                                job.publish(SSEEvent(TEXT_DELTA, {
+                                    "session_id": job.session_id,
+                                    "message_id": self._assistant_msg_id,
+                                    "text": text,
+                                }))
 
                         case "reasoning-delta":
                             text = chunk.data.get("text", "")
@@ -995,7 +1245,10 @@ class SessionProcessor:
                         case "tool-call":
                             self._has_tool_calls = True
                             self._tool_calls_in_step.append(chunk.data)
-                            if not self._exec_blocked:
+                            if (
+                                not self._defer_after_llm_response
+                                and not self._exec_blocked
+                            ):
                                 await self._handle_tool_call_chunk(chunk)
 
                         case "web-search-start":
@@ -1037,6 +1290,8 @@ class SessionProcessor:
                 provider_finished = True
 
                 self._stream_error = None
+                if not job.abort_event.is_set():
+                    await self._apply_after_llm_response_middleware()
                 logger.info(
                     "LLM stream completed: text=%d chars, reasoning=%d chars, "
                     "tool_calls=%d, finish=%s",
@@ -1106,6 +1361,87 @@ class SessionProcessor:
 
         return None
 
+    async def _apply_after_llm_response_middleware(self) -> None:
+        """Apply the full-response middleware without corrupting live streams.
+
+        Tool calls normally begin while the provider is still streaming.  A
+        middleware that overrides ``after_llm_response`` may rewrite or remove
+        those calls, so its presence is detected before streaming starts and
+        both visible text and tool dispatch are deferred until this method.
+        Chains containing only the base no-op keep the existing low-latency
+        streaming path; any attempted late mutation on that path fails closed.
+        """
+
+        if self._mw_ctx is None:
+            return
+        middleware_chain = getattr(self._sp, "middleware_chain", None)
+        if middleware_chain is None:
+            return
+
+        original_text = self._accumulated_text
+        original_tool_calls = copy.deepcopy(self._tool_calls_in_step)
+        try:
+            transformed_text, transformed_tool_calls = (
+                await middleware_chain.run_after_llm_response(
+                    original_text,
+                    copy.deepcopy(original_tool_calls),
+                    self._mw_ctx,
+                )
+            )
+            if not isinstance(transformed_text, str):
+                raise TypeError(
+                    "after_llm_response middleware must return text as a string"
+                )
+            if not isinstance(transformed_tool_calls, list) or any(
+                not isinstance(tool_call, dict)
+                for tool_call in transformed_tool_calls
+            ):
+                raise TypeError(
+                    "after_llm_response middleware must return tool_calls as a list of objects"
+                )
+        except Exception:
+            if self._defer_after_llm_response:
+                # Deferred provider output has never been made visible. Discard
+                # it atomically so the generic stream-error path cannot persist
+                # unapproved raw text or later dispatch unapproved tool calls.
+                self._accumulated_text = ""
+                self._tool_calls_in_step = []
+                self._has_tool_calls = False
+            raise
+
+        if not self._defer_after_llm_response and (
+            transformed_text != original_text
+            or transformed_tool_calls != original_tool_calls
+        ):
+            # Text may already be visible and concurrency-safe tools may already
+            # be running. Silently accepting a late rewrite would make the UI,
+            # persisted history, and actual side effects disagree.
+            raise RuntimeError(
+                "after_llm_response attempted to mutate an already-streamed response"
+            )
+
+        self._accumulated_text = transformed_text
+        self._tool_calls_in_step = copy.deepcopy(transformed_tool_calls)
+        self._has_tool_calls = bool(self._tool_calls_in_step)
+
+        if not self._defer_after_llm_response:
+            return
+
+        job = self._sp.job
+        if transformed_text:
+            job.publish(SSEEvent(TEXT_DELTA, {
+                "session_id": job.session_id,
+                "message_id": self._assistant_msg_id,
+                "text": transformed_text,
+            }))
+
+        for tool_call in self._tool_calls_in_step:
+            if job.abort_event.is_set() or self._exec_blocked:
+                break
+            await self._handle_tool_call_chunk(
+                SimpleNamespace(data=copy.deepcopy(tool_call))
+            )
+
     async def _build_stream_args(
         self,
     ) -> tuple[Any, int, set[str] | None, bool] | None:
@@ -1125,6 +1461,28 @@ class SessionProcessor:
                 sp.model_info.capabilities.max_output if sp.model_info else None
             ),
         )
+        server_output_ceiling = getattr(
+            sp.request,
+            "_max_output_tokens_ceiling",
+            None,
+        )
+        if server_output_ceiling is not None:
+            # This value lives in a Pydantic PrivateAttr and is assigned only
+            # by a server-owned runtime. It intentionally may be lower than
+            # the interactive request's normal minimum output allocation.
+            # Subtract already-accounted steps so a tool loop cannot reset the
+            # ceiling on every Provider request within the same specialist run.
+            already_used = sum(
+                max(0, int(value or 0))
+                for value in sp.total_tokens_accumulated.values()
+            )
+            safe_max_tokens = max(
+                1,
+                min(
+                    safe_max_tokens,
+                    int(server_output_ceiling) - already_used,
+                ),
+            )
         if sp.job.goal_id is not None:
             from app.session.goal_guard import (
                 read_goal_budget_gate,
@@ -1201,6 +1559,14 @@ class SessionProcessor:
             invocation_source=sp.job.invocation_source,
         )
         web_search_permission = evaluate("web_search", "*", sp.merged_permissions)
+
+        # Provider-native search begins inside the model request, before an
+        # individual query has a tool-admission boundary. While Hooks are
+        # active, keep web_search on the ordinary tool path so PreToolUse runs
+        # after permission and before the first network side effect.
+        hooks_active = getattr(sp, "hooks_runtime_active", None)
+        if callable(hooks_active) and hooks_active():
+            native_web_search_enabled = False
 
         # An explicit allow uses provider-native search.  An explicit deny is
         # hidden entirely, while ``ask`` deliberately keeps the custom tool so
@@ -1355,6 +1721,8 @@ class SessionProcessor:
             job.session_id,
             job.stream_id,
         )
+        hook_gate = getattr(sp, "hooks_runtime_active", None)
+        hooks_active = bool(callable(hook_gate) and hook_gate())
 
         # A run of different URLs can evade the generic identical-call loop
         # detector while repeatedly hitting the same SSRF policy boundary.
@@ -1390,6 +1758,7 @@ class SessionProcessor:
         # native search follows its separate per-step provider path.
         if (
             tn.lower() == "web_search"
+            and not hooks_active
             and not loop_detector.admit_custom_web_search(response_scope)
         ):
             job.publish(SSEEvent(
@@ -1411,21 +1780,28 @@ class SessionProcessor:
             )
             return
 
-        # Loop detection
-        lr: LoopCheckResult = loop_detector.check(job.session_id, tn, ta)
-        if lr.action == "block":
-            job.publish(SSEEvent(AGENT_ERROR, {
-                "error_type": "loop_detected",
-                "error_message": lr.message,
-                "tool": tn,
-            }))
-            await _persist_tool_error(
-                session_factory, self._assistant_msg_id,
-                job.session_id, tn, ci, ta,
-                lr.message or "Loop detected — hard stop",
-            )
-            self._exec_blocked = True
-            return
+        # Direct unit/embed callers may intentionally omit SessionPrompt's
+        # middleware context. Preserve loop protection for that compatibility
+        # path; production calls use the wired LoopDetectionMiddleware below.
+        lr = LoopCheckResult(action="allow")
+        if not hooks_active and (
+            self._mw_ctx is None
+            or getattr(sp, "middleware_chain", None) is None
+        ):
+            lr = loop_detector.check(job.session_id, tn, ta)
+            if lr.action == "block":
+                job.publish(SSEEvent(AGENT_ERROR, {
+                    "error_type": "loop_detected",
+                    "error_message": lr.message,
+                    "tool": tn,
+                }))
+                await _persist_tool_error(
+                    session_factory, self._assistant_msg_id,
+                    job.session_id, tn, ci, ta,
+                    lr.message or "Loop detected — hard stop",
+                )
+                self._exec_blocked = True
+                return
 
         # Resolve tool
         tool = sp.tool_registry.get(tn)
@@ -1516,6 +1892,54 @@ class SessionProcessor:
                 error,
             )
             return
+
+        # Middleware may only preserve or narrow authority. Run it before any
+        # permission prompt, durable tool-start record, ToolPart, or executor
+        # task; the ordinary permission engine still runs afterwards and an
+        # ``allow`` decision here can never override ask/deny.
+        if not hooks_active and self._mw_ctx is not None:
+            middleware_chain = getattr(sp, "middleware_chain", None)
+            if middleware_chain is not None:
+                try:
+                    middleware_action = await middleware_chain.run_before_tool_exec(
+                        tool.id,
+                        copy.deepcopy(ta),
+                        self._mw_ctx,
+                    )
+                except Exception:
+                    logger.exception("Pre-tool middleware failed for %s", tool.id)
+                    middleware_action = ToolAction(
+                        action="block",
+                        message="Pre-tool middleware failed; tool execution was blocked",
+                        code="middleware_error",
+                    )
+
+                if middleware_action.action == "block":
+                    error = middleware_action.message or (
+                        f"Tool blocked by middleware: {tool.id}"
+                    )
+                    job.publish(SSEEvent(AGENT_ERROR, {
+                        "error_type": middleware_action.code or "middleware_blocked",
+                        "error_message": error,
+                        "tool": tool.id,
+                        "call_id": ci,
+                    }))
+                    await _persist_tool_error(
+                        session_factory,
+                        self._assistant_msg_id,
+                        job.session_id,
+                        tool.id,
+                        ci,
+                        ta,
+                        error,
+                    )
+                    self._exec_blocked = True
+                    return
+                if middleware_action.action == "warn":
+                    lr = LoopCheckResult(
+                        action="warn",
+                        message=middleware_action.message,
+                    )
 
         # Permission check
         rp = "*"
@@ -1685,6 +2109,29 @@ class SessionProcessor:
                 )
                 return
 
+        # Ordinary permission is now fully resolved. Hook policy runs at the
+        # last boundary before durable start audit, ToolPart creation,
+        # TOOL_START, context construction, or executor submission. Passing
+        # ``allow`` reflects the effective post-confirmation authority; the
+        # Hook result can only narrow it to ask/deny.
+        if not await self._admit_pre_tool_hook(
+            tool=tool,
+            tool_args=ta,
+            call_id=ci,
+            resource_pattern=rp,
+        ):
+            return
+        if hooks_active:
+            guarded = await self._run_post_hook_tool_guards(
+                tool=tool,
+                tool_args=ta,
+                call_id=ci,
+                response_scope=response_scope,
+            )
+            if guarded is None:
+                return
+            lr = guarded
+
         # Privileged tools may only enter the executor after their pre-action
         # audit record commits.  An unavailable audit store is a hard stop;
         # outcome records after execution remain best effort because a generic
@@ -1781,6 +2228,14 @@ class SessionProcessor:
             goal_id=job.goal_id,
             goal_run_id=job.goal_run_id,
             goal_session_id=job.goal_session_id,
+            root_turn_id=job.root_turn_id,
+            turn_run_id=job.turn_run_id,
+            checkpoint_id=(
+                getattr(sp, "checkpoint_binding", None).checkpoint_id
+                if getattr(sp, "checkpoint_binding", None) is not None
+                else None
+            ),
+            workspace_instance_id=job.workspace_instance_id,
             _publish_fn=lambda et, d: job.publish(SSEEvent(et, d)),
         )
         if job.goal_id is not None:
@@ -1795,7 +2250,22 @@ class SessionProcessor:
             "provider_registry": sp.provider_registry,
             "agent_registry": sp.agent_registry,
             "tool_registry": sp.tool_registry,
+            # Trusted first-party tools can submit a code-owned validation
+            # intent through this object.  No tool schema or PromptRequest
+            # field exposes checkpoint selection or validation budgets.
+            "post_checkpoint_validation_scheduler": (
+                job.post_checkpoint_validation_scheduler
+            ),
         }
+        office_repairer = (
+            _office_precommit_repairer_for_prompt(sp)
+            if tool.id == "office"
+            else None
+        )
+        if office_repairer is not None:
+            # The repairer is server-owned and never appears in a tool schema.
+            # Its request contract contains tokenized declarative args only.
+            ctx._app_state["office_precommit_repairer"] = office_repairer
         ctx._model_id = sp.model_id  # type: ignore[attr-defined]
         ctx._job = job  # type: ignore[attr-defined]
         ctx._depth = job._depth  # type: ignore[attr-defined]
@@ -1816,6 +2286,296 @@ class SessionProcessor:
             "permission_decision": action,
         }
         self._exec_index += 1
+
+    async def _run_post_hook_tool_guards(
+        self,
+        *,
+        tool: Any,
+        tool_args: dict[str, Any],
+        call_id: str,
+        response_scope: str,
+    ) -> LoopCheckResult | None:
+        """Run stateful loop/search middleware only after an allowing Hook."""
+
+        sp = self._sp
+        job = sp.job
+        if (
+            tool.id.lower() == "web_search"
+            and not loop_detector.admit_custom_web_search(response_scope)
+        ):
+            job.publish(
+                SSEEvent(
+                    TOOL_ERROR,
+                    {
+                        "call_id": call_id,
+                        "error": WEB_SEARCH_LIMIT_MSG,
+                        "tool": "web_search",
+                    },
+                )
+            )
+            await _persist_tool_error(
+                sp.session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                "web_search",
+                call_id,
+                tool_args,
+                WEB_SEARCH_LIMIT_MSG,
+            )
+            return None
+
+        result = LoopCheckResult(action="allow")
+        middleware_chain = getattr(sp, "middleware_chain", None)
+        if self._mw_ctx is None or middleware_chain is None:
+            result = loop_detector.check(job.session_id, tool.id, tool_args)
+            if result.action == "block":
+                job.publish(
+                    SSEEvent(
+                        AGENT_ERROR,
+                        {
+                            "error_type": "loop_detected",
+                            "error_message": result.message,
+                            "tool": tool.id,
+                        },
+                    )
+                )
+                await _persist_tool_error(
+                    sp.session_factory,
+                    self._assistant_msg_id,
+                    job.session_id,
+                    tool.id,
+                    call_id,
+                    tool_args,
+                    result.message or "Loop detected — hard stop",
+                )
+                self._exec_blocked = True
+                return None
+            return result
+
+        try:
+            middleware_action = await middleware_chain.run_before_tool_exec(
+                tool.id,
+                copy.deepcopy(tool_args),
+                self._mw_ctx,
+            )
+        except Exception:
+            logger.exception("Pre-tool middleware failed for %s", tool.id)
+            middleware_action = ToolAction(
+                action="block",
+                message="Pre-tool middleware failed; tool execution was blocked",
+                code="middleware_error",
+            )
+        if middleware_action.action == "block":
+            error = middleware_action.message or (
+                f"Tool blocked by middleware: {tool.id}"
+            )
+            job.publish(
+                SSEEvent(
+                    AGENT_ERROR,
+                    {
+                        "error_type": (
+                            middleware_action.code or "middleware_blocked"
+                        ),
+                        "error_message": error,
+                        "tool": tool.id,
+                        "call_id": call_id,
+                    },
+                )
+            )
+            await _persist_tool_error(
+                sp.session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                tool.id,
+                call_id,
+                tool_args,
+                error,
+            )
+            self._exec_blocked = True
+            return None
+        if middleware_action.action == "warn":
+            return LoopCheckResult(
+                action="warn",
+                message=middleware_action.message,
+            )
+        return result
+
+    async def _admit_pre_tool_hook(
+        self,
+        *,
+        tool: Any,
+        tool_args: dict[str, Any],
+        call_id: str,
+        resource_pattern: str,
+    ) -> bool:
+        """Run PreToolUse after permission and fail closed before execution."""
+
+        sp = self._sp
+        active = getattr(sp, "hooks_runtime_active", None)
+        if not callable(active) or not active():
+            return True
+
+        fatal = False
+        try:
+            result = await sp.dispatch_hook_event(
+                "PreToolUse",
+                {
+                    "tool_name": tool.id,
+                    "tool_args": copy.deepcopy(tool_args),
+                    "resource_pattern": resource_pattern,
+                },
+                permission_decision="allow",
+                message_id=self._assistant_msg_id,
+                call_id=call_id,
+                checkpoint_id=(
+                    sp.checkpoint_binding.checkpoint_id
+                    if getattr(sp, "checkpoint_binding", None) is not None
+                    else None
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("PreToolUse Hook admission failed closed")
+            result = None
+            fatal = True
+
+        # The code-owned release switch is intentionally dynamic. If it is
+        # closed while a dispatch or confirmation is in flight, restore the
+        # pre-Hooks admission path instead of turning the kill switch itself
+        # into a tool denial.
+        if not active():
+            return True
+
+        decision = None
+        state = None
+        if result is not None:
+            state = getattr(result.state, "value", str(result.state))
+            decision_value = result.pre_tool_decision
+            decision = (
+                getattr(decision_value, "value", str(decision_value))
+                if decision_value is not None
+                else None
+            )
+            if state == "completed" and decision == "allow":
+                return True
+            if state == "completed" and decision == "ask":
+                if await sp.confirm_pre_tool_hook(
+                    event_id=result.hook_event.event_id,
+                    tool_name=tool.id,
+                    call_id=call_id,
+                ):
+                    return True
+            fatal = state in {"failed_closed", "cancelled"}
+
+        if self._sp.job.abort_event.is_set():
+            return False
+        error = (
+            f"Tool blocked because required Hook policy failed: {tool.id}"
+            if fatal
+            else f"Tool blocked by project Hook policy: {tool.id}"
+        )
+        self._sp.job.publish(
+            SSEEvent(
+                TOOL_ERROR,
+                {"call_id": call_id, "tool": tool.id, "error": error},
+            )
+        )
+        await _persist_tool_error(
+            self._sp.session_factory,
+            self._assistant_msg_id,
+            self._sp.job.session_id,
+            tool.id,
+            call_id,
+            tool_args,
+            error,
+        )
+        if fatal:
+            self._exec_blocked = True
+            self.finish_reason = "error"
+            self._sp.job.publish(
+                SSEEvent(
+                    AGENT_ERROR,
+                    {
+                        "error_type": "hook_policy_failed",
+                        "error_message": "Required Hook policy failed closed.",
+                        "tool": tool.id,
+                        "call_id": call_id,
+                    },
+                )
+            )
+        return False
+
+    async def _dispatch_post_tool_hook(
+        self,
+        *,
+        tool: Any,
+        tool_args: dict[str, Any],
+        call_id: str,
+        outcome: str,
+        result: Any | None = None,
+    ) -> None:
+        """Publish one output-free PostToolUse projection at finalization."""
+
+        sp = self._sp
+        active = getattr(sp, "hooks_runtime_active", None)
+        if not callable(active) or not active():
+            return
+        metadata = getattr(result, "metadata", None) if result is not None else None
+        output = getattr(result, "output", None) if result is not None else None
+        attachments = (
+            getattr(result, "attachments", None) if result is not None else None
+        )
+        await sp._dispatch_required_hook(
+            "PostToolUse",
+            {
+                "tool_name": tool.id,
+                "tool_args": copy.deepcopy(tool_args),
+                "outcome": outcome,
+                "success": (
+                    bool(getattr(result, "success", False))
+                    if result is not None
+                    else False
+                ),
+                "output_length": len(output) if isinstance(output, str) else 0,
+                "attachment_count": len(attachments or ()),
+                "metadata_keys": (
+                    sorted(str(key) for key in metadata)[:128]
+                    if isinstance(metadata, dict)
+                    else []
+                ),
+            },
+            message_id=self._assistant_msg_id,
+            call_id=call_id,
+            checkpoint_id=(
+                sp.checkpoint_binding.checkpoint_id
+                if getattr(sp, "checkpoint_binding", None) is not None
+                else None
+            ),
+        )
+
+    async def _dispatch_post_tool_hook_once(
+        self,
+        meta: dict[str, Any],
+        *,
+        outcome: str,
+        result: Any | None = None,
+    ) -> None:
+        """Dispatch the terminal Hook at most once for this admitted call."""
+
+        if meta.get("_post_tool_hook_dispatched", False):
+            return
+        # Mark before awaiting: if a required Hook fails or this task is
+        # cancelled while dispatching, the finalization fallback must not emit
+        # the same semantic boundary again.
+        meta["_post_tool_hook_dispatched"] = True
+        await self._dispatch_post_tool_hook(
+            tool=meta["tool"],
+            tool_args=meta["tool_args"],
+            call_id=meta["call_id"],
+            outcome=outcome,
+            result=result,
+        )
 
     async def _handle_web_search_start_chunk(self, chunk: Any) -> None:
         """Persist a 'running' tool part for an OpenAI-native web search start."""
@@ -2170,7 +2930,19 @@ class SessionProcessor:
                 meta = self._exec_metadata.get(exec_result.index)
                 if meta is None:
                     continue
-                await self._finalize_one_tool_result(meta, exec_result)
+                try:
+                    await self._finalize_one_tool_result(meta, exec_result)
+                except BaseException:
+                    # Even an unexpected persistence/middleware failure is a
+                    # real terminal boundary for the already-executed tool.
+                    # The per-call guard prevents a required PostToolUse Hook
+                    # failure from being dispatched a second time here.
+                    await self._dispatch_post_tool_hook_once(
+                        meta,
+                        outcome="finalization_error",
+                        result=getattr(exec_result, "result", None),
+                    )
+                    raise
 
         return None
 
@@ -2206,6 +2978,10 @@ class SessionProcessor:
                 outcome="timeout",
                 interactive=job.interactive,
             )
+            await self._dispatch_post_tool_hook_once(
+                meta,
+                outcome="timeout",
+            )
             return
 
         # Handle execution error
@@ -2236,10 +3012,24 @@ class SessionProcessor:
                 ),
                 interactive=job.interactive,
             )
+            await self._dispatch_post_tool_hook_once(
+                meta,
+                outcome=(
+                    "denied"
+                    if isinstance(exec_result.error, RejectedError)
+                    else "cancelled"
+                    if isinstance(exec_result.error, asyncio.CancelledError)
+                    else "error"
+                ),
+            )
             return
 
         result = exec_result.result
         if result is None:
+            await self._dispatch_post_tool_hook_once(
+                meta,
+                outcome="missing_result",
+            )
             return
 
         loop_detector.record_tool_result(
@@ -2248,6 +3038,53 @@ class SessionProcessor:
             success=result.success,
             error=result.error,
         )
+
+        # A guarded workspace transaction is not user-visible success until
+        # its exact mutation evidence and version pins are durable.  This runs
+        # before audit-success, session-file refresh, TOOL_RESULT and the
+        # completed ToolPart transition.
+        if result.success:
+            try:
+                await sp._record_tool_checkpoint_effects(
+                    tool_id=tool.id,
+                    call_id=call_id,
+                    metadata=result.metadata,
+                )
+            except Exception as exc:
+                sp._checkpoint_ledger_failed = True
+                error_message = (
+                    "Workspace changes were applied, but the rewind ledger "
+                    "could not be finalized. The turn was stopped for recovery."
+                )
+                job.publish(
+                    SSEEvent(
+                        TOOL_ERROR,
+                        {"call_id": call_id, "tool": tool.id, "error": error_message},
+                    )
+                )
+                await _update_tool_part_error(
+                    session_factory,
+                    tool_part_id,
+                    tool.id,
+                    call_id,
+                    tool_args,
+                    error_message,
+                )
+                await _audit_tool_event(
+                    session_factory,
+                    tool=tool,
+                    job=job,
+                    call_id=call_id,
+                    decision=permission_decision,
+                    outcome="error",
+                    interactive=job.interactive,
+                )
+                await self._dispatch_post_tool_hook_once(
+                    meta,
+                    outcome="checkpoint_failed",
+                    result=result,
+                )
+                raise RuntimeError(error_message) from exc
 
         await _audit_tool_event(
             session_factory,
@@ -2320,6 +3157,11 @@ class SessionProcessor:
                         )
 
         self._maybe_switch_agent(result)
+        await self._dispatch_post_tool_hook_once(
+            meta,
+            outcome="success" if result.success else "error",
+            result=result,
+        )
 
     async def _apply_tool_side_effects(self, tool: Any, result: Any) -> None:
         """Update session files, todos, and web-search quota from a tool result.

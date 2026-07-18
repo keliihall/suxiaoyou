@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app import release_features
 from app.tool import office_contract as office_contract_module
 from app.tool.office_contract import (
     OFFICE_CONTRACT_VERSION,
@@ -54,6 +55,7 @@ def test_release_commit_override_wins_over_annotated_tag_object(
 
 @pytest.mark.asyncio
 async def test_contract_creates_edits_reopens_and_versions_all_formats():
+    assert release_features.V11_OFFICE_V2_RELEASED is True
     report = await run_office_contract(
         source_commit="a" * 40,
         release_ref="v1.0.0-rc.7",
@@ -80,6 +82,7 @@ async def test_contract_creates_edits_reopens_and_versions_all_formats():
         assert result["initial_sha256"] != result["final_sha256"]
         assert result["final_size"] > 0
         assert result["previous_version_id"]
+    assert release_features.V11_OFFICE_V2_RELEASED is True
 
 
 @pytest.mark.asyncio
@@ -89,6 +92,7 @@ async def test_windows_contract_precreates_guarded_output_parent(
     observed_output_parents: list[Path] = []
 
     async def exercise(workspace: Path) -> dict[str, bool]:
+        assert release_features.V11_OFFICE_V2_RELEASED is False
         output_parent = workspace / "suxiaoyou_written"
         assert output_parent.is_dir()
         assert not output_parent.is_symlink()
@@ -118,6 +122,7 @@ async def test_windows_contract_precreates_guarded_output_parent(
 
     assert report["all_passed"] is True
     assert len(observed_output_parents) == 3
+    assert release_features.V11_OFFICE_V2_RELEASED is True
 
 
 @pytest.mark.asyncio

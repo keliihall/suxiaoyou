@@ -735,6 +735,9 @@ async def run_goal_generation(
                     )
             record_status = "running"
         while current is not None:
+            # Every durable GoalRun is an independent background root turn;
+            # it must not borrow the previous slice's checkpoint identity.
+            job.begin_root_turn(current.run_id)
             job.set_goal_run_id(current.run_id)
             try:
                 async with job.execution_admission_lock:

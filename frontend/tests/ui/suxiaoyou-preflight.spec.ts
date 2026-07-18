@@ -373,7 +373,8 @@ test.describe("苏小有 UI preflight", () => {
             __SUXIAOYOU_TEST_TAURI_LISTENER_COUNT__?: (event: string) => number;
           };
           return (
-            w.__SUXIAOYOU_TEST_TAURI_LISTENER_COUNT__?.("tauri://drag-drop") ?? 0
+            w.__SUXIAOYOU_TEST_TAURI_LISTENER_COUNT__?.("tauri://drag-drop") ??
+            0
           );
         }),
       )
@@ -435,7 +436,11 @@ test.describe("苏小有 UI preflight", () => {
     await expect(
       page.getByText(/retention, onboarding, and pricing clarity/i),
     ).toBeVisible();
-    await expect(page.getByRole("button", { name: /Export/i })).toBeVisible();
+    await page.getByRole("button", { name: "Conversation menu" }).click();
+    await expect(
+      page.getByRole("menuitem", { name: "Export", exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
 
     const invoiceOption = page.getByRole("option", {
       name: /Invoice cleanup/i,
@@ -481,9 +486,9 @@ test.describe("苏小有 UI preflight", () => {
     ).toHaveCount(0);
 
     await openInFinder.click();
-    await expect.poll(() => mockState.systemOpenRequests).toEqual([
-      { path: "." },
-    ]);
+    await expect
+      .poll(() => mockState.systemOpenRequests)
+      .toEqual([{ path: "." }]);
   });
 
   test("desktop literal-dot chat opens its default working directory from the overflow menu", async ({
@@ -511,9 +516,9 @@ test.describe("苏小有 UI preflight", () => {
     ).toHaveCount(0);
 
     await openInFinder.click();
-    await expect.poll(() => mockState.systemOpenRequests).toEqual([
-      { path: "." },
-    ]);
+    await expect
+      .poll(() => mockState.systemOpenRequests)
+      .toEqual([{ path: "." }]);
   });
 
   test("browser non-project chat does not expose a host folder action", async ({
@@ -528,7 +533,7 @@ test.describe("苏小有 UI preflight", () => {
     expect(mockState.systemOpenRequests).toEqual([]);
   });
 
-  test("Tauri remote non-project chat does not expose a host folder action", async ({
+  test("Tauri stale remote storage keeps local host folder actions available", async ({
     page,
   }) => {
     await installTauriMock(page, "macos");
@@ -548,7 +553,7 @@ test.describe("苏小有 UI preflight", () => {
     await invoiceChat.click({ button: "right" });
     await expect(
       page.getByRole("menuitem", { name: "Open in Finder" }),
-    ).toHaveCount(0);
+    ).toHaveCount(1);
     expect(mockState.systemOpenRequests).toEqual([]);
 
     await page.keyboard.press("Escape");
@@ -559,7 +564,7 @@ test.describe("苏小有 UI preflight", () => {
     const openProjectInFinder = page.getByRole("menuitem", {
       name: "Open in Finder",
     });
-    await expect(openProjectInFinder).toHaveCount(0);
+    await expect(openProjectInFinder).toHaveCount(1);
     expect(mockState.systemOpenRequests).toEqual([]);
   });
 
@@ -584,8 +589,7 @@ test.describe("苏小有 UI preflight", () => {
     expect(sidebarHeaderBox).not.toBeNull();
     expect(sidebarHeaderBox!.y).toBe(WINDOWS_TITLE_BAR_HEIGHT);
     expect(sidebarHeaderBox!.height).toBe(WINDOWS_SIDEBAR_HEADER_HEIGHT);
-    const sidebarHeaderBottom =
-      sidebarHeaderBox!.y + sidebarHeaderBox!.height;
+    const sidebarHeaderBottom = sidebarHeaderBox!.y + sidebarHeaderBox!.height;
     expect(sidebarHeaderBottom).toBe(
       WINDOWS_TITLE_BAR_HEIGHT + WINDOWS_SIDEBAR_HEADER_HEIGHT,
     );
@@ -744,7 +748,9 @@ test.describe("苏小有 UI preflight", () => {
     await sendPrompt(page, "Trigger permission flow for always allow");
     await expect(page.getByText("Permission Required")).toBeVisible();
     await page
-      .getByRole("switch", { name: /Remember only for this exact scope: npm run preflight:ui/i })
+      .getByRole("switch", {
+        name: /Remember only for this exact scope: npm run preflight:ui/i,
+      })
       .setChecked(true);
 
     const respond = page.waitForResponse(
@@ -791,25 +797,29 @@ test.describe("苏小有 UI preflight", () => {
   }) => {
     await seed苏小有Storage(page, {
       force: true,
-      savedPermissions: [{
-        tool: "bash",
-        allow: true,
-        pattern: "npm run preflight:ui",
-        workspace: "/Users/alex/suxiaoyou-demo",
-        sessionId: null,
-        source: "desktop",
-        timestamp: Date.parse("2026-04-26T12:00:00.000Z"),
-      }],
+      savedPermissions: [
+        {
+          tool: "bash",
+          allow: true,
+          pattern: "npm run preflight:ui",
+          workspace: "/Users/alex/suxiaoyou-demo",
+          sessionId: null,
+          source: "desktop",
+          timestamp: Date.parse("2026-04-26T12:00:00.000Z"),
+        },
+      ],
     });
 
     await openNewChat(page, true);
     await sendPrompt(page, "Create a workspace-scoped follow-up checklist");
     expect(mockState.promptBodies.at(-1)).toMatchObject({
-      permission_rules: [{
-        action: "allow",
-        permission: "bash",
-        pattern: "npm run preflight:ui",
-      }],
+      permission_rules: [
+        {
+          action: "allow",
+          permission: "bash",
+          pattern: "npm run preflight:ui",
+        },
+      ],
     });
   });
 
@@ -855,7 +865,9 @@ test.describe("苏小有 UI preflight", () => {
     await sendPrompt(page, "Trigger permission flow for always deny");
     await expect(page.getByText("Permission Required")).toBeVisible();
     await page
-      .getByRole("switch", { name: /Remember only for this exact scope: npm run preflight:ui/i })
+      .getByRole("switch", {
+        name: /Remember only for this exact scope: npm run preflight:ui/i,
+      })
       .setChecked(true);
 
     const respond = page.waitForResponse(
@@ -915,9 +927,7 @@ test.describe("苏小有 UI preflight", () => {
     await page.getByRole("button", { name: /Stable/i }).click();
     await respond;
     await expect(page.getByText("Waiting for confirmation")).toBeHidden();
-    await expect(
-      page.getByText(/Confirmed|Answer submitted/),
-    ).toBeVisible();
+    await expect(page.getByText(/Confirmed|Answer submitted/)).toBeVisible();
   });
 
   test("desktop interactive path: plan review is accepted through the GUI", async ({
@@ -954,7 +964,7 @@ test.describe("苏小有 UI preflight", () => {
       page.getByRole("heading", { name: "Providers" }),
     ).toBeVisible();
     await expect(
-      page.getByRole("button", { name: /Own API Key/i }),
+      page.getByRole("button", { name: /China-ready providers/i }),
     ).toBeVisible();
     await expect(page.getByText("OpenRouter")).toBeVisible();
 
@@ -977,9 +987,17 @@ test.describe("苏小有 UI preflight", () => {
     ).toBeVisible();
     await expect(page.getByText("GitHub")).toBeVisible();
 
-    await page.getByRole("button", { name: "Remote" }).click();
-    await expect(page.getByRole("heading", { name: "Remote" })).toBeVisible();
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
+    await page.getByRole("button", { name: "Security Center" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Security Center" }),
+    ).toBeVisible();
+    await expect(page.getByText("Security overview")).toBeVisible();
+    await expect(
+      page.getByText("Remote access", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Remote", exact: true }),
+    ).toHaveCount(0);
 
     await page.getByRole("button", { name: "Usage" }).click();
     await expect(
@@ -1056,16 +1074,14 @@ test.describe("苏小有 UI preflight", () => {
       page.getByRole("heading", { name: "Providers" }),
     ).toBeVisible();
 
-    await page.getByRole("button", { name: /Own API Key/i }).click();
+    await page.getByRole("button", { name: /China-ready providers/i }).click();
     await page.getByPlaceholder("sk-or-...").fill("sk-or-preflight");
     await page.getByRole("button", { name: "Save" }).first().click();
     await expect(page.getByText("sk-or-...mock")).toBeVisible();
 
-    await page.getByRole("button", { name: /ChatGPT Subscription/i }).click();
-    await expect(page.getByText("chatgpt@suxiaoyou.test")).toBeVisible();
     await expect(
-      page.getByRole("button", { name: /Disconnect/i }),
-    ).toBeVisible();
+      page.getByRole("button", { name: /ChatGPT Subscription/i }),
+    ).toHaveCount(0);
 
     await page.getByRole("button", { name: /Rapid-MLX/i }).click();
     await expect(
@@ -1079,9 +1095,8 @@ test.describe("苏小有 UI preflight", () => {
       page.getByText("http://localhost:11434/v1", { exact: true }),
     ).toBeVisible();
     await expect(page.getByText("Acme Local Proxy")).toBeVisible();
-    await page
-      .getByPlaceholder("Endpoint Name (e.g. My Local Model)")
-      .fill("Preflight Endpoint");
+    await page.getByPlaceholder("myprovider").fill("preflight-endpoint");
+    await page.getByPlaceholder("My AI Provider").fill("Preflight Endpoint");
     await page
       .getByPlaceholder(
         "http://localhost:1234/v1 or https://api.example.com/v1",
@@ -1090,7 +1105,7 @@ test.describe("苏小有 UI preflight", () => {
     await page
       .getByPlaceholder("API Key (Leave blank if not required)")
       .fill("sk-custom-preflight");
-    await page.getByRole("button", { name: "Add Endpoint" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
   });
 
   test("automations path: create dialog, required fields, templates", async ({
@@ -1190,19 +1205,18 @@ test.describe("苏小有 UI preflight", () => {
     ).toBeVisible();
   });
 
-  test("remote access path: enable tunnel and expose mobile handoff controls", async ({
+  test("remote access path remains closed in this release", async ({
     page,
   }) => {
     await page.goto("/settings?tab=remote");
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
-
-    await page.getByRole("switch").click();
-    await expect(page.getByText("Remote Access Active")).toBeVisible();
     await expect(
-      page.getByText("https://remote.suxiaoyou.test", { exact: true }).first(),
+      page.getByRole("heading", { name: "General", exact: true }),
     ).toBeVisible();
-    await page.getByRole("button", { name: /Copy/i }).click();
-    await page.getByRole("button", { name: /Rotate Token/i }).click();
+    await expect(
+      page.getByRole("button", { name: "Remote", exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByText("Remote Access Disabled")).toHaveCount(0);
+    await expect(page.getByText("Remote Access Active")).toHaveCount(0);
   });
 });
 

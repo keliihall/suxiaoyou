@@ -82,18 +82,27 @@ class LocalMcpLaunchSpec:
         }
 
 
-def _effective_environment(configured: dict[str, str]) -> dict[str, str]:
+def _effective_environment(
+    configured: dict[str, str],
+    *,
+    inherit_defaults: bool = True,
+) -> dict[str, str]:
     """Freeze every value the MCP SDK may otherwise add at spawn time."""
 
-    defaults = get_default_environment()
-    # Supplying an explicit empty value is intentional: stdio_client merges
-    # its current defaults under server.env.  Including every allow-listed key
-    # prevents a value that appears after approval from leaking into spawn.
-    effective = {
-        key: defaults.get(key, "")
-        for key in DEFAULT_INHERITED_ENV_VARS
-    }
-    effective.update(defaults)
+    if inherit_defaults:
+        defaults = get_default_environment()
+        # Supplying an explicit empty value is intentional: stdio_client merges
+        # its current defaults under server.env. Including every allow-listed
+        # key prevents a value that appears after approval from leaking into
+        # spawn. Other local command users may opt out and provide a complete,
+        # already-minimised environment.
+        effective = {
+            key: defaults.get(key, "")
+            for key in DEFAULT_INHERITED_ENV_VARS
+        }
+        effective.update(defaults)
+    else:
+        effective = {}
 
     if os.name != "nt":
         effective.update(configured)
@@ -330,7 +339,13 @@ def local_mcp_launch_spec(config: dict[str, Any]) -> LocalMcpLaunchSpec:
         configured_environment = dict(raw_environment)
     else:
         raise ValueError("Local MCP environment must map non-empty strings to strings")
-    effective_environment = _effective_environment(configured_environment)
+    inherit_environment = config.get("inherit_environment", True)
+    if not isinstance(inherit_environment, bool):
+        raise ValueError("Local MCP inherit_environment must be a boolean")
+    effective_environment = _effective_environment(
+        configured_environment,
+        inherit_defaults=inherit_environment,
+    )
 
     raw_cwd = config.get("cwd")
     try:
@@ -474,7 +489,11 @@ class LocalMcpApprovalStore:
         return self._approvals.get(server_name)
 
     def approve(self, server_name: str, fingerprint: str) -> None:
-        if not server_name or len(server_name) > 160:
+        if (
+            not isinstance(server_name, str)
+            or not server_name
+            or len(server_name) > 160
+        ):
             raise ValueError("Invalid MCP server name")
         if not valid_local_mcp_fingerprint(fingerprint):
             raise ValueError("Invalid local MCP approval fingerprint")
@@ -493,6 +512,45 @@ class LocalMcpApprovalStore:
             raise LocalMcpApprovalStoreError(
                 "Local MCP approval could not be persisted"
             ) from exc
+
+    def revoke(self, server_name: str) -> bool:
+        """Remove one exact approval without weakening a damaged store.
+
+        A fresh read-back check happens before the mutation so an approval
+        file changed outside this process cannot be silently overwritten by a
+        revocation request.
+        """
+
+        if (
+            not isinstance(server_name, str)
+            or not server_name
+            or len(server_name) > 160
+        ):
+            raise ValueError("Invalid MCP server name")
+        if self._degraded_reason is not None:
+            raise LocalMcpApprovalStoreError(
+                "Local MCP approval store is unavailable; review or remove the damaged state"
+            )
+
+        existing = self.get(server_name)
+        if self._degraded_reason is not None:
+            raise LocalMcpApprovalStoreError(
+                "Local MCP approval store is unavailable; review or remove the damaged state"
+            )
+        if existing is None:
+            return False
+
+        previous = dict(self._approvals)
+        self._approvals.pop(server_name, None)
+        try:
+            self._write()
+        except Exception as exc:
+            self._approvals = previous
+            self._degraded_reason = "local_mcp_approval_state_unwritable"
+            raise LocalMcpApprovalStoreError(
+                "Local MCP approval revocation could not be persisted"
+            ) from exc
+        return True
 
     def _load(self) -> None:
         try:

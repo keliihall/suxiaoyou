@@ -187,10 +187,20 @@ test("localizes English reasoning trace text for Chinese UI", () => {
     localizeVisibleProcessText(englishTrace, "zh"),
     [
       "搜索工具似乎不稳定，改用 web_fetch 访问相关来源。",
-      "搜索请求失败，改用 web_fetch 访问相关网址继续核验。",
-      "搜索请求失败，改用 web_fetch 访问相关网址继续核验。",
+      "搜索暂未返回可用结果，改用 web_fetch 访问相关网址继续核验。",
+      "搜索暂未返回可用结果，改用 web_fetch 访问相关网址继续核验。",
       "继续查找该项目相关论文和学术成果。",
     ].join("\n"),
+  );
+});
+
+test("frames a partial web-search miss as a recovered route change", () => {
+  assert.equal(
+    localizeVisibleProcessText(
+      "The web search failed for some queries. Let me fetch more details from specific articles.",
+      "zh",
+    ),
+    "部分检索未返回可用结果，改用具体来源继续核验。",
   );
 });
 

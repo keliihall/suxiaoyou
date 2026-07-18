@@ -137,6 +137,34 @@ BUILTIN_AGENTS: dict[str, AgentInfo] = {
         ]),
         system_prompt=_load_prompt("summary"),
     ),
+    "validator": AgentInfo(
+        name="validator",
+        description="Server-owned read-only verification agent",
+        mode="hidden",
+        tools=["read", "glob", "grep", "search"],
+        permissions=Ruleset(rules=[
+            # This is an allowlist, not a conventional Agent policy.  Keep the
+            # deny-all rule first so the later entries are the only reachable
+            # capabilities under the last-match-wins permission engine.
+            PermissionRule(action="deny", permission="*", pattern="*"),
+            PermissionRule(action="allow", permission="read", pattern="*"),
+            PermissionRule(action="allow", permission="glob", pattern="*"),
+            PermissionRule(action="allow", permission="grep", pattern="*"),
+            PermissionRule(action="allow", permission="search", pattern="*"),
+            # Read-only validation still must not turn common secret files
+            # into model context.  Examples remain readable by design.
+            PermissionRule(action="deny", permission="read", pattern="*.env"),
+            PermissionRule(action="deny", permission="read", pattern="*.env.*"),
+            PermissionRule(action="allow", permission="read", pattern="*.env.example"),
+        ]),
+        system_prompt=_load_prompt("validator"),
+        temperature=0.0,
+        metadata={
+            "server_owned": True,
+            "validation_agent": True,
+            "contract_version": 1,
+        },
+    ),
 }
 
 
@@ -144,7 +172,19 @@ class AgentRegistry:
     """Registry for agent definitions."""
 
     def __init__(self) -> None:
-        self._agents: dict[str, AgentInfo] = dict(BUILTIN_AGENTS)
+        # Keep unreleased hidden Agents out of the live v1.0 registry.  The
+        # validation service constructs a fresh registry only after checking
+        # its dynamic code-owned gate, so closing the gate also removes the
+        # production reachability surface. Deep copies prevent a custom
+        # registry mutation from changing the process-wide built-in template.
+        from app import release_features
+
+        self._agents = {
+            name: agent.model_copy(deep=True)
+            for name, agent in BUILTIN_AGENTS.items()
+            if name != "validator"
+            or bool(release_features.V11_VALIDATION_AGENT_RELEASED)
+        }
 
     def register(self, agent: AgentInfo) -> None:
         """Register a custom agent."""

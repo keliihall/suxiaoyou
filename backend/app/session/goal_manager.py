@@ -1287,7 +1287,7 @@ async def record_goal_run_usage(
     tokens_used: int,
     cost_used_microusd: int,
 ) -> GoalUsageRecord:
-    """Persist one Provider/child/compaction charge exactly once."""
+    """Persist one Provider/child/compaction/repair charge exactly once."""
 
     def _validate_replay(record: GoalUsageRecord) -> GoalUsageRecord:
         if (
@@ -1449,6 +1449,11 @@ async def get_goal_token_usage_breakdown(
         for record in records
         if (source_id := _usage_source_id(record, "compaction")) is not None
     }
+    office_repair_ids = {
+        source_id
+        for record in records
+        if (source_id := _usage_source_id(record, "office_repair")) is not None
+    }
 
     provider_payloads: dict[
         str, list[tuple[str | None, tuple[int, int, int, int]]]
@@ -1500,6 +1505,30 @@ async def get_goal_token_usage_breakdown(
                 components,
             )
 
+    office_repair_payloads: dict[
+        str, tuple[str | None, tuple[int, int, int, int]]
+    ] = {}
+    if office_repair_ids:
+        parts = list(
+            (
+                await db.execute(
+                    select(Part).where(Part.id.in_(office_repair_ids))
+                )
+            ).scalars()
+        )
+        for part in parts:
+            data = part.data or {}
+            if data.get("type") != "office-repair-usage":
+                continue
+            components = _persisted_token_components(data)
+            if components is None:
+                continue
+            payload_run_id = data.get("goal_run_id")
+            office_repair_payloads[part.id] = (
+                payload_run_id if isinstance(payload_run_id, str) else None,
+                components,
+            )
+
     input_tokens = 0
     output_tokens = 0
     reasoning_tokens = 0
@@ -1538,6 +1567,20 @@ async def get_goal_token_usage_breakdown(
                 payload_run_id, payload = persisted
                 if payload_run_id is None or payload_run_id == record.goal_run_id:
                     components = payload
+            else:
+                office_repair_id = _usage_source_id(record, "office_repair")
+                repair_persisted = (
+                    office_repair_payloads.get(office_repair_id)
+                    if office_repair_id is not None
+                    else None
+                )
+                if repair_persisted is not None:
+                    payload_run_id, payload = repair_persisted
+                    if (
+                        payload_run_id is None
+                        or payload_run_id == record.goal_run_id
+                    ):
+                        components = payload
 
         if components is None or sum(components) != recorded_tokens:
             unattributed_tokens += recorded_tokens
@@ -1630,7 +1673,10 @@ async def interrupt_inflight_goal_runs(db: AsyncSession) -> int:
             )
             for part in parts:
                 data = part.data or {}
-                if data.get("type") != "step-finish":
+                if data.get("type") not in {
+                    "step-finish",
+                    "office-repair-usage",
+                }:
                     continue
                 tokens = data.get("tokens") or {}
                 if isinstance(tokens, dict):

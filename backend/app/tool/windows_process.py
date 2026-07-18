@@ -22,6 +22,7 @@ import ntpath
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ class WindowsProcessApi(Protocol):
         *,
         cwd: str,
         env: Mapping[str, str],
+        stdin_bytes: bytes | None = None,
     ) -> WindowsChildProcess:
         """Create a child with its primary thread suspended."""
 
@@ -170,6 +172,7 @@ def run_windows_process(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
+    stdin_bytes: bytes | None = None,
     _clock: Callable[[], float] = time.monotonic,
 ) -> WindowsProcessResult:
     """Run one Windows command inside a race-free kill-on-close Job Object.
@@ -195,9 +198,23 @@ def run_windows_process(
         raise ValueError("Windows process termination grace must be positive")
     if max_output_bytes < 0:
         raise ValueError("Windows process output limit cannot be negative")
+    if stdin_bytes is not None and not isinstance(stdin_bytes, bytes):
+        raise ValueError("Windows process stdin_bytes must be bytes or None")
 
     process_api = api if api is not None else CtypesWindowsProcessApi()
     abort_requested = should_abort or (lambda: False)
+    if abort_requested():
+        return WindowsProcessResult(
+            exit_code=-1,
+            stdout=b"",
+            stderr=b"",
+            termination="aborted",
+            pid=-1,
+            stdout_total_bytes=0,
+            stderr_total_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
     stdout = _BoundedOutput(max_output_bytes)
     stderr = _BoundedOutput(max_output_bytes)
     drain_errors: list[BaseException] = []
@@ -216,53 +233,70 @@ def run_windows_process(
 
     try:
         job = process_api.create_kill_on_close_job()
-        process = process_api.create_suspended_process(argv, cwd=cwd, env=env)
+        if stdin_bytes is None:
+            # Preserve compatibility with existing injectable process APIs.
+            process = process_api.create_suspended_process(argv, cwd=cwd, env=env)
+        else:
+            process = process_api.create_suspended_process(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdin_bytes=stdin_bytes,
+            )
 
         # Security-critical ordering: the child is not allowed to execute until
         # its lifetime has been made subordinate to the Job Object.
         process_api.assign_process_to_job(job, process)
         assigned = True
 
-        reader_threads = [
-            threading.Thread(
-                target=_drain_stream,
-                args=(process.stdout, stdout, drain_errors),
-                name=f"windows-process-{process.pid}-stdout",
-                daemon=True,
-            ),
-            threading.Thread(
-                target=_drain_stream,
-                args=(process.stderr, stderr, drain_errors),
-                name=f"windows-process-{process.pid}-stderr",
-                daemon=True,
-            ),
-        ]
-        for reader in reader_threads:
-            reader.start()
-
-        process_api.resume_process(process)
-        started = _clock()
-
-        while True:
-            if abort_requested():
-                termination = "aborted"
-                process_api.terminate_job(job, _WINDOWS_TERMINATION_EXIT_CODE)
-                if process_api.wait_process(process, termination_grace_ms):
-                    exit_code = process_api.get_exit_code(process)
-                break
-
-            elapsed = _clock() - started
-            if elapsed >= timeout_seconds:
-                termination = "timeout"
-                process_api.terminate_job(job, _WINDOWS_TERMINATION_EXIT_CODE)
-                if process_api.wait_process(process, termination_grace_ms):
-                    exit_code = process_api.get_exit_code(process)
-                break
-
-            remaining_ms = max(1, int((timeout_seconds - elapsed) * 1000))
-            if process_api.wait_process(process, min(poll_ms, remaining_ms)):
+        if abort_requested():
+            # The process is still suspended and already contained by the Job,
+            # so cancellation at this boundary executes no child code.
+            termination = "aborted"
+            process_api.terminate_job(job, _WINDOWS_TERMINATION_EXIT_CODE)
+            if process_api.wait_process(process, termination_grace_ms):
                 exit_code = process_api.get_exit_code(process)
-                break
+        else:
+            reader_threads = [
+                threading.Thread(
+                    target=_drain_stream,
+                    args=(process.stdout, stdout, drain_errors),
+                    name=f"windows-process-{process.pid}-stdout",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_drain_stream,
+                    args=(process.stderr, stderr, drain_errors),
+                    name=f"windows-process-{process.pid}-stderr",
+                    daemon=True,
+                ),
+            ]
+            for reader in reader_threads:
+                reader.start()
+
+            process_api.resume_process(process)
+            started = _clock()
+
+            while True:
+                if abort_requested():
+                    termination = "aborted"
+                    process_api.terminate_job(job, _WINDOWS_TERMINATION_EXIT_CODE)
+                    if process_api.wait_process(process, termination_grace_ms):
+                        exit_code = process_api.get_exit_code(process)
+                    break
+
+                elapsed = _clock() - started
+                if elapsed >= timeout_seconds:
+                    termination = "timeout"
+                    process_api.terminate_job(job, _WINDOWS_TERMINATION_EXIT_CODE)
+                    if process_api.wait_process(process, termination_grace_ms):
+                        exit_code = process_api.get_exit_code(process)
+                    break
+
+                remaining_ms = max(1, int((timeout_seconds - elapsed) * 1000))
+                if process_api.wait_process(process, min(poll_ms, remaining_ms)):
+                    exit_code = process_api.get_exit_code(process)
+                    break
     except BaseException as exc:
         caught = exc
         caught_traceback = exc.__traceback__
@@ -606,6 +640,14 @@ class CtypesWindowsProcessApi:
         ):
             self._raise_last_error("SetHandleInformation")
 
+    def _make_inheritable(self, handle: object) -> None:
+        if not self._kernel32.SetHandleInformation(
+            handle,
+            self._HANDLE_FLAG_INHERIT,
+            self._HANDLE_FLAG_INHERIT,
+        ):
+            self._raise_last_error("SetHandleInformation")
+
     @staticmethod
     def _environment_block(env: Mapping[str, str]) -> str:
         entries: list[tuple[str, str]] = []
@@ -631,6 +673,7 @@ class CtypesWindowsProcessApi:
         *,
         cwd: str,
         env: Mapping[str, str],
+        stdin_bytes: bytes | None = None,
     ) -> WindowsChildProcess:
         if not argv or not argv[0]:
             raise ValueError("Windows process argv must contain an executable")
@@ -651,15 +694,30 @@ class CtypesWindowsProcessApi:
         attribute_list = None
         stdout_stream: BinaryIO | None = None
         stderr_stream: BinaryIO | None = None
+        stdin_stream: BinaryIO | None = None
         process_created = False
         try:
-            stdin_read, stdin_write = self._create_pipe()
-            handles.extend((stdin_read, stdin_write))
+            stdin_pipe_handles: tuple[object, ...] = ()
+            if stdin_bytes is None:
+                stdin_read, stdin_write = self._create_pipe()
+                stdin_pipe_handles = (stdin_read, stdin_write)
+                handles.extend(stdin_pipe_handles)
+                self._make_non_inheritable(stdin_write)
+                stdin_child_handle = stdin_read
+            else:
+                if not isinstance(stdin_bytes, bytes):
+                    raise ValueError("Windows process stdin_bytes must be bytes or None")
+                stdin_stream = tempfile.TemporaryFile()
+                stdin_stream.write(stdin_bytes)
+                stdin_stream.seek(0)
+                stdin_child_handle = self._msvcrt.get_osfhandle(
+                    stdin_stream.fileno()
+                )
+                self._make_inheritable(stdin_child_handle)
             stdout_read, stdout_write = self._create_pipe()
             handles.extend((stdout_read, stdout_write))
             stderr_read, stderr_write = self._create_pipe()
             handles.extend((stderr_read, stderr_write))
-            self._make_non_inheritable(stdin_write)
             self._make_non_inheritable(stdout_read)
             self._make_non_inheritable(stderr_read)
 
@@ -686,7 +744,7 @@ class CtypesWindowsProcessApi:
                 self._raise_last_error("InitializeProcThreadAttributeList")
 
             inherited_handles = (self._wintypes.HANDLE * 3)(
-                self._handle_value(stdin_read),
+                self._handle_value(stdin_child_handle),
                 self._handle_value(stdout_write),
                 self._handle_value(stderr_write),
             )
@@ -707,7 +765,7 @@ class CtypesWindowsProcessApi:
                 self._STARTF_USESHOWWINDOW | self._STARTF_USESTDHANDLES
             )
             startup.StartupInfo.wShowWindow = self._SW_HIDE
-            startup.StartupInfo.hStdInput = stdin_read
+            startup.StartupInfo.hStdInput = stdin_child_handle
             startup.StartupInfo.hStdOutput = stdout_write
             startup.StartupInfo.hStdError = stderr_write
             startup.lpAttributeList = attribute_list
@@ -743,9 +801,12 @@ class CtypesWindowsProcessApi:
 
             # The parent must not retain any writer.  The explicit HANDLE_LIST
             # ensured no unrelated inheritable backend handle crossed over.
-            for handle in (stdin_read, stdin_write, stdout_write, stderr_write):
+            for handle in (*stdin_pipe_handles, stdout_write, stderr_write):
                 self._close_native_handle(handle)
                 handles.remove(handle)
+            if stdin_stream is not None:
+                stdin_stream.close()
+                stdin_stream = None
 
             stdout_stream = self._stream_from_handle(stdout_read)
             handles.remove(stdout_read)  # ownership moved to the Python stream
@@ -772,6 +833,8 @@ class CtypesWindowsProcessApi:
                 stdout_stream.close()
             if stderr_stream is not None:
                 stderr_stream.close()
+            if stdin_stream is not None:
+                stdin_stream.close()
             for handle in reversed(handles):
                 try:
                     self._close_native_handle(handle)

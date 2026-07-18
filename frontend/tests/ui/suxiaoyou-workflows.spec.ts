@@ -11,7 +11,11 @@ async function setupMockedApp(page: Page): Promise<苏小有MockState> {
 }
 
 async function expectNoAppCrash(page: Page) {
-  await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
+  await expect(
+    page.getByText(
+      /^(?:Unhandled )?Runtime (?:Error|TypeError|ReferenceError)$/,
+    ),
+  ).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);
 }
 
@@ -41,7 +45,7 @@ test.describe("苏小有 complete GUI workflows", () => {
       }),
     ).toBeVisible();
     await expect(
-      page.getByRole("button", { name: /Best Free/i }),
+      page.getByRole("button", { name: /Claude Sonnet 4\.5/i }),
     ).toBeVisible();
 
     await page.locator('input[type="file"]').setInputFiles({
@@ -110,7 +114,7 @@ test.describe("苏小有 complete GUI workflows", () => {
       page.getByRole("heading", { name: "Providers" }),
     ).toBeVisible();
 
-    await page.getByRole("button", { name: /Own API Key/i }).click();
+    await page.getByRole("button", { name: /China-ready providers/i }).click();
     await page.getByPlaceholder("sk-or-...").fill("sk-or-workflow");
     const ownKeySave = page.waitForResponse(
       (res) =>
@@ -126,8 +130,9 @@ test.describe("苏小有 complete GUI workflows", () => {
       .poll(() =>
         page.evaluate(
           () =>
-            JSON.parse(window.localStorage.getItem("suxiaoyou-settings") ?? "{}")
-              ?.state?.activeProvider,
+            JSON.parse(
+              window.localStorage.getItem("suxiaoyou-settings") ?? "{}",
+            )?.state?.activeProvider,
         ),
       )
       .toBe("byok");
@@ -151,9 +156,8 @@ test.describe("苏小有 complete GUI workflows", () => {
     await expect(
       page.getByText("http://localhost:11434/v1", { exact: true }),
     ).toBeVisible();
-    await page
-      .getByPlaceholder("Endpoint Name (e.g. My Local Model)")
-      .fill("Workflow Endpoint");
+    await page.getByPlaceholder("myprovider").fill("workflow-endpoint");
+    await page.getByPlaceholder("My AI Provider").fill("Workflow Endpoint");
     await page
       .getByPlaceholder(
         "http://localhost:1234/v1 or https://api.example.com/v1",
@@ -165,7 +169,7 @@ test.describe("苏小有 complete GUI workflows", () => {
         res.request().method() === "POST" &&
         res.status() === 200,
     );
-    await page.getByRole("button", { name: "Add Endpoint" }).click();
+    await page.getByRole("button", { name: "Submit" }).click();
     await customSave;
     expect(JSON.stringify(state.providerSaves)).toContain("Workflow Endpoint");
     expect(JSON.stringify(state.providerSaves)).toContain(
@@ -241,59 +245,31 @@ test.describe("苏小有 complete GUI workflows", () => {
     await expectNoAppCrash(page);
   });
 
-  test("remote mobile handoff journey: enable desktop remote, change provider on mobile, submit task", async ({
+  test("remote mobile handoff remains closed in this release", async ({
     page,
   }) => {
-    const state = await setupMockedApp(page);
+    await setupMockedApp(page);
 
     await page.goto("/settings?tab=remote");
-    await expect(page.getByText("Remote Access Disabled")).toBeVisible();
-    await page.getByRole("switch").click();
-    await expect(page.getByText("Remote Access Active")).toBeVisible();
     await expect(
-      page.getByText("https://remote.suxiaoyou.test", { exact: true }).first(),
+      page.getByRole("heading", { name: "General", exact: true }),
     ).toBeVisible();
-    await page.getByRole("button", { name: /Rotate Token/i }).click();
-
-    await page.goto("/m/settings?token=rotated-token");
     await expect(
-      page.getByRole("heading", { name: "Connection" }),
+      page.getByRole("button", { name: "Remote", exact: true }),
+    ).toHaveCount(0);
+    await expect(page.getByText("Remote Access Disabled")).toHaveCount(0);
+    await expect(page.getByText("Remote Access Active")).toHaveCount(0);
+
+    await page.goto("/m/settings");
+    await expect(
+      page.getByRole("heading", { name: "Remote connection" }),
     ).toBeVisible();
-    await expect(page.getByText("Connected")).toBeVisible();
-    await page
-      .getByRole("button", { name: /ChatGPT Subscription 1 model available/i })
-      .click();
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.localStorage.getItem("suxiaoyou_remote_provider"),
-        ),
-      )
-      .toBe("chatgpt");
-
-    await page.goto("/m/new");
-    await expect(page.getByRole("heading", { name: "New task" })).toBeVisible();
-    await expect(page.locator("select")).toContainText("GPT-5.5");
-    await page
-      .getByPlaceholder("What should suyo do?")
-      .fill("Check the release notes from my phone");
-
-    const promptResponse = page.waitForResponse(
-      (res) => res.url().includes("/api/chat/prompt") && res.status() === 200,
-    );
-    await page.getByPlaceholder("What should suyo do?").press("Enter");
-    await promptResponse;
-
-    await expect(page).toHaveURL(
-      /\/m\/task\/_\?sessionId=session-new&stream_id=stream-ui-1$/,
-      { timeout: 20_000 },
-    );
-    expect(JSON.stringify(state.promptBodies[0])).toContain(
-      "Check the release notes from my phone",
-    );
-    expect(JSON.stringify(state.promptBodies[0])).toContain(
-      "openai-subscription/gpt-5.5",
-    );
+    await expect(
+      page.getByText("Not connected", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /ChatGPT Subscription/i }),
+    ).toHaveCount(0);
     await expectNoAppCrash(page);
   });
 });

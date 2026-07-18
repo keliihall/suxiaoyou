@@ -13,6 +13,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from app import release_features
 from app.agent.agent import AgentRegistry
 from app.agent.permission import GLOBAL_DEFAULTS, evaluate, merge_rulesets
 from app.schemas.agent import AgentInfo
@@ -41,6 +42,13 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     private.mkdir()
     monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
     return project
+
+
+@pytest.fixture(autouse=True)
+def legacy_office_tool_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the restricted v1 Office engine independently of v1.1 authoring."""
+
+    monkeypatch.setattr(release_features, "V11_OFFICE_V2_RELEASED", False)
 
 
 def _sha256(path: Path) -> str:

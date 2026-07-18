@@ -8,11 +8,27 @@ from app.connector.model import CONNECTOR_PROVENANCE_BUILTIN
 
 
 InvocationSource = Literal[
-    "unknown", "desktop", "goal", "scheduler", "channel", "openai_compat"
+    "unknown",
+    "desktop",
+    "goal",
+    "scheduler",
+    "acp",
+    "validator",
+    "channel",
+    "openai_compat",
 ]
 
 INVOCATION_SOURCES: frozenset[str] = frozenset(
-    {"unknown", "desktop", "goal", "scheduler", "channel", "openai_compat"}
+    {
+        "unknown",
+        "desktop",
+        "goal",
+        "scheduler",
+        "acp",
+        "validator",
+        "channel",
+        "openai_compat",
+    }
 )
 
 # Source policy is an independent ceiling above the ordinary per-tool
@@ -41,6 +57,26 @@ _SOURCE_CAPABILITY_ALLOWLISTS: dict[InvocationSource, frozenset[str] | None] = {
             "remote_data_read",
         }
     ),
+    # ACP is local stdio Beta, but its client-facing permission projection is
+    # intentionally path/argument redacted.  It may coordinate agents and
+    # perform checkpointed workspace/Office mutations under the ordinary
+    # permission pipeline; process, network, credentials, paid calls, desktop
+    # UI, connectors, and remote data stay beyond this independent ceiling.
+    "acp": frozenset(
+        {
+            "agent_control",
+            "filesystem_read",
+            "filesystem_write",
+            "model_inference",
+            "office_document",
+            "recovery",
+        }
+    ),
+    # The validator is a server-created child of an existing root turn.  Its
+    # dedicated ToolRegistry contains only built-in workspace readers; this
+    # independent source ceiling makes an accidental future registration of a
+    # process, network, or mutation tool fail before execution as well.
+    "validator": frozenset({"filesystem_read", "model_inference"}),
     "channel": frozenset({"model_inference"}),
     "openai_compat": frozenset({"model_inference"}),
 }
@@ -187,15 +223,30 @@ def tool_requires_durable_audit(tool: Any) -> bool:
 def source_capability_profiles() -> list[dict[str, Any]]:
     """Stable, credential-free policy summary for Security Center."""
 
+    from app import release_features
+
     profiles: list[dict[str, Any]] = []
     for source in (
         "unknown",
         "desktop",
         "goal",
         "scheduler",
+        "acp",
+        "validator",
         "channel",
         "openai_compat",
     ):
+        if (
+            (
+                source == "validator"
+                and not bool(release_features.V11_VALIDATION_AGENT_RELEASED)
+            )
+            or (
+                source == "acp"
+                and not bool(release_features.V11_ACP_RELEASED)
+            )
+        ):
+            continue
         allowlist = _SOURCE_CAPABILITY_ALLOWLISTS[source]
         profiles.append(
             {

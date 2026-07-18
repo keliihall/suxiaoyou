@@ -17,6 +17,7 @@ const tabsSource = readFileSync(
   "src/components/settings/settings-tabs.ts",
   "utf8",
 );
+const chatStoreSource = readFileSync("src/stores/chat-store.ts", "utf8");
 
 test("security API uses the v1 overview, audit, tool, and emergency-stop contracts", () => {
   assert.match(apiSource, /overview: "\/api\/security\/overview"/);
@@ -31,6 +32,20 @@ test("security queries refresh both overview and audit after mutations", () => {
   assert.match(hookSource, /invalidateQueries\(\{ queryKey: securityQueryKeys\.audit \}\)/);
   assert.match(hookSource, /getSecurityAudit\(limit, \{ signal \}\)/);
   assert.match(hookSource, /refetchInterval: 30_000/g);
+});
+
+test("project Hook trust is session-bound, redacted, and revocable", () => {
+  assert.match(apiSource, /\/api\/security\/hooks\?session_id=/);
+  assert.match(apiSource, /revokeHook: "\/api\/security\/hooks\/revoke"/);
+  assert.match(apiSource, /session_id: sessionId/);
+  assert.match(apiSource, /hook_id: hookId/);
+  assert.match(hookSource, /securityQueryKeys\.hooks\(sessionId/);
+  assert.match(hookSource, /invalidateQueries\(\{ queryKey: securityQueryKeys\.audit \}\)/);
+  assert.match(componentSource, /securityHookRevokeConfirm/);
+  assert.match(componentSource, /hook\.fingerprint/);
+  assert.match(componentSource, /state\.focusedSessionId \?\? state\.lastFocusedSessionId/);
+  assert.match(chatStoreSource, /lastFocusedSessionId: sessionId \?\? state\.lastFocusedSessionId/);
+  assert.doesNotMatch(componentSource, /hook\.(?:command|cwd|environment|executable)/);
 });
 
 test("security center gates dangerous actions and never renders credential values", () => {
@@ -113,6 +128,10 @@ test("security center copy is complete in English and Chinese", () => {
     "securityConnectorFailed",
     "securityConnectorsPaginationLabel",
     "securityProvidersPaginationLabel",
+    "securityProjectHooksTitle",
+    "securityProjectHooksDesc",
+    "securityHookRevokeConfirm",
+    "securityHookTrustUnavailable",
     "securityAuditTitle",
     "securityAuditEmpty",
     "securityAuditPaginationLabel",

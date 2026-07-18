@@ -202,7 +202,7 @@ def test_existing_database_closes_all_handles_before_windows_replace(
 
     token = "windows-existing-handle-order"
     staging = database.with_name(f".{database.name}.{token}.migrating")
-    backup = database.with_name(f"{database.name}.pre-v1.0.0-{token}.bak")
+    backup = database.with_name(f"{database.name}.pre-v1.1.0-{token}.bak")
     real_connect = migrations.sqlite3.connect
     tracked: list[tuple[Path, sqlite3.Connection]] = []
 
@@ -513,7 +513,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     _materialize_v073_database(database)
 
     first = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
-    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v1.0.0-*.bak"))
+    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v1.1.0-*.bak"))
     second = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
 
     assert first is not None and first.upgraded is True
@@ -522,7 +522,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     assert second.created is False
     assert second.previous_revision == V080_HEAD_REVISION
     assert second.backup_path is None
-    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v1.0.0-*.bak")) == backups_after_first
+    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v1.1.0-*.bak")) == backups_after_first
     assert len(backups_after_first) == 1
     assert _revision(database) == V080_HEAD_REVISION
     with sqlite3.connect(database) as connection:
@@ -738,7 +738,7 @@ def test_upgrade_backup_has_checksum_manifest_and_is_listed(tmp_path: Path) -> N
     assert result is not None and result.backup_path is not None
     assert result.backup_metadata_path is not None
     manifest = json.loads(result.backup_metadata_path.read_text(encoding="utf-8"))
-    assert manifest["app_version"] == "1.0.0"
+    assert manifest["app_version"] == "1.1.0"
     assert manifest["database_name"] == database.name
     assert manifest["database_path"] == str(database.resolve())
     assert manifest["backup_file"] == result.backup_path.name
@@ -747,6 +747,24 @@ def test_upgrade_backup_has_checksum_manifest_and_is_listed(tmp_path: Path) -> N
     assert len(manifest["sha256"]) == 64
     assert manifest["size"] == result.backup_path.stat().st_size
     assert manifest["integrity_verified"] is True
+    records = list_database_backups(f"sqlite+aiosqlite:///{database}")
+    assert len(records) == 1
+    assert records[0]["verified"] is True
+
+
+def test_v11_still_accepts_a_v100_backup_manifest(tmp_path: Path) -> None:
+    database = tmp_path / "suxiaoyou.db"
+    _materialize_v073_database(database)
+    result = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
+    assert result is not None and result.backup_metadata_path is not None
+
+    payload = json.loads(result.backup_metadata_path.read_text(encoding="utf-8"))
+    payload["app_version"] = "1.0.0"
+    result.backup_metadata_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
     records = list_database_backups(f"sqlite+aiosqlite:///{database}")
     assert len(records) == 1
     assert records[0]["verified"] is True

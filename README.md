@@ -38,14 +38,16 @@
 
 ## 安装与使用
 
-> 发布状态：正在准备 `v1.0.0-rc.1`；应用与安装包内部版本保持 `1.0.0`。候选版必须由同一 tag
-> 在五个原生 runner 构建并验证七个安装包，以及校验和、发布清单、Office 兼容性和集成合同四份
-> 机器可复核证据。当前公开可下载版本仍为
-> [`v0.9.0-rc.1`](https://github.com/keliihall/suxiaoyou/releases/tag/v0.9.0-rc.1)；`v1.0.0-rc.1`
-> 在受控 Beta 证据完成前只保留为 Release 草稿。稳定 macOS 包还必须完成 Developer ID 签名、
-> Apple 公证和 staple。
+> 发布状态：`v1.1.0` 以公开的 `UNSIGNED-DEGRADED` 预发布配置交付。七个安装包均在文件名中带有
+> `UNSIGNED-DEGRADED`，Release 不设为 latest；Windows/Linux 包未做发行方签名，macOS 应用仅为
+> ad-hoc 签名，DMG 未做 Developer ID 签名、Apple 公证或 staple。发布清单与能力声明会以机器可读
+> 形式记录这些边界。
 >
-> v1.0 的声明式 `write`、`edit`、`apply_patch`、Office 与版本恢复在各桌面平台使用受守卫的目标文件
+> v1.1 开放 ACP、worktree、checkpoint/rewind、Hooks 和只读验证 Agent，并增强 Office 模板、图表、
+> 复杂格式及预览/视觉验证闭环。公开包不携带项目冻结的 authoritative Office renderer，因此权威
+> Office authoring/视觉提交仍会 fail-closed；若本机存在兼容 LibreOffice，只可提供明确标为近似的预览。
+>
+> 声明式 `write`、`edit`、`apply_patch`、Office 与版本恢复在各桌面平台使用受守卫的目标文件
 > 流程，并由对应原生 runner 做故障注入和冻结后端验证。Bash/Python 在 Linux 使用 Bubblewrap、
 > 在 macOS 使用 Seatbelt，并先在应用私有事务副本执行；Windows 使用 Job Object 回收进程树，但命令
 > 直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动，因此界面和发布说明不会把

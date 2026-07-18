@@ -10,11 +10,34 @@ import sys
 import time
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 import run
+
+
+def test_main_dispatches_acp_stdio_before_server_lifecycle(monkeypatch):
+    fake_acp_cli = ModuleType("app.acp.cli")
+    acp_main = Mock(side_effect=SystemExit(78))
+    fake_acp_cli.main = acp_main
+    monkeypatch.setitem(sys.modules, "app.acp.cli", fake_acp_cli)
+    crash_reporter = Mock()
+    windows_job = Mock()
+    parent_watchdog = Mock()
+    monkeypatch.setattr(run, "_install_crash_reporter", crash_reporter)
+    monkeypatch.setattr(run, "_configure_windows_process_job", windows_job)
+    monkeypatch.setattr(run, "_start_desktop_parent_watchdog", parent_watchdog)
+    monkeypatch.setattr(sys, "argv", ["run.py", "--acp-stdio"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    assert exit_info.value.code == 78
+    acp_main.assert_called_once_with()
+    crash_reporter.assert_not_called()
+    windows_job.assert_not_called()
+    parent_watchdog.assert_not_called()
 
 
 def test_main_dispatches_office_self_test_before_server_lifecycle(monkeypatch, capsys):
@@ -43,6 +66,390 @@ def test_main_dispatches_office_self_test_before_server_lifecycle(monkeypatch, c
     contract_runner.assert_called_once_with(expected_platform="windows-x64")
     assert json.loads(capsys.readouterr().out)["all_passed"] is True
     crash_reporter.assert_not_called()
+
+
+def test_main_dispatches_v11_self_test_before_server_lifecycle(monkeypatch, capsys):
+    fake_probe = ModuleType("app.runtime.frozen_self_test")
+    probe = Mock(
+        return_value={
+            "status": "ok",
+            "module_count": 52,
+            "gates_closed": True,
+            "templates": [],
+            "office_repair_prompt_sha256": "7c9cd1613c47761539cd04fa22634e467881bac9917f5c88018454d5b91b5272",
+        }
+    )
+    fake_probe.run_frozen_v11_self_test = probe
+    monkeypatch.setitem(sys.modules, "app.runtime.frozen_self_test", fake_probe)
+    crash_reporter = Mock()
+    monkeypatch.setattr(run, "_install_crash_reporter", crash_reporter)
+    monkeypatch.setattr(sys, "argv", ["run.py", "--v11-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    assert exit_info.value.code == 0
+    assert json.loads(capsys.readouterr().out)["gates_closed"] is True
+    probe.assert_called_once_with()
+    crash_reporter.assert_not_called()
+
+
+def test_main_dispatches_office_renderer_self_test_before_server_lifecycle(
+    monkeypatch, capsys
+):
+    fake_deployment = ModuleType("app.office_rendering.deployment")
+    fake_behavior_probe = ModuleType(
+        "app.office_rendering.native_sandbox_behavior"
+    )
+    fake_execution_probe = ModuleType("app.office_rendering.probe")
+    fake_release_identity = ModuleType("app.office_rendering.release_identity")
+    release_identity = object()
+    provider = object()
+    native_sandbox_contract = object()
+    events: list[str] = []
+    identity_loader = Mock(return_value=release_identity)
+    fake_release_identity.load_frozen_renderer_release_identity = identity_loader
+    contract_report = {
+        "schema_version": 1,
+        "status": "declared-not-proven",
+        "native_behavior_proven": False,
+    }
+    renderer_probe = Mock(
+        return_value={
+            "schema_version": 2,
+            "status": "ok",
+            "available": True,
+            "quality": "authoritative",
+            "native_sandbox_contract": contract_report,
+        }
+    )
+    fake_deployment.authoritative_office_renderer_self_test = renderer_probe
+    provider_builder = Mock(return_value=provider)
+    fake_deployment.build_attested_office_render_provider = provider_builder
+    contract_binder = Mock()
+
+    def bind_contract(bound_provider):
+        assert bound_provider is provider
+        events.append("bind")
+        return native_sandbox_contract
+
+    contract_binder.side_effect = bind_contract
+    fake_deployment.bind_attested_native_sandbox_contract = contract_binder
+    behavior_report = Mock()
+    behavior_report.to_dict.return_value = {
+        "schema_version": 1,
+        "status": "proven",
+        "native_behavior_proven": True,
+    }
+
+    async def prove_behavior(contract):
+        assert contract is native_sandbox_contract
+        events.append("behavior")
+        return behavior_report
+
+    behavior_probe = AsyncMock(side_effect=prove_behavior)
+    fake_behavior_probe.run_native_sandbox_behavior_probe = behavior_probe
+    execution_report = Mock()
+    execution_report.to_dict.return_value = {
+        "schema_version": 1,
+        "bundle_tree_sha256": "a" * 64,
+        "embedded_font_count": 1,
+        "page_count": 1,
+        "pages": [],
+        "pdf_sha256": "b" * 64,
+        "probe_manifest_sha256": "c" * 64,
+        "probe_source_sha256": "d" * 64,
+        "render_manifest_sha256": "e" * 64,
+    }
+
+    async def prove_execution(bound_provider):
+        assert bound_provider is provider
+        events.append("golden")
+        return execution_report
+
+    execution_probe = AsyncMock(side_effect=prove_execution)
+    fake_execution_probe.run_attested_authoritative_office_renderer_probe = (
+        execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.deployment", fake_deployment
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.native_sandbox_behavior",
+        fake_behavior_probe,
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.probe", fake_execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.release_identity",
+        fake_release_identity,
+    )
+    crash_reporter = Mock()
+    monkeypatch.setattr(run, "_install_crash_reporter", crash_reporter)
+    monkeypatch.setattr(sys, "argv", ["run.py", "--office-renderer-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    assert exit_info.value.code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["quality"] == "authoritative"
+    assert output["native_sandbox_contract"] == contract_report
+    assert (
+        output["native_sandbox_behavior"]
+        == behavior_report.to_dict.return_value
+    )
+    assert output["execution_probe"] == execution_report.to_dict.return_value
+    identity_loader.assert_called_once_with()
+    renderer_probe.assert_called_once_with(release_identity=release_identity)
+    provider_builder.assert_called_once_with(release_identity=release_identity)
+    contract_binder.assert_called_once_with(provider)
+    behavior_probe.assert_awaited_once_with(native_sandbox_contract)
+    execution_probe.assert_awaited_once_with(provider)
+    assert events == ["bind", "behavior", "golden"]
+    crash_reporter.assert_not_called()
+
+
+def test_office_renderer_self_test_failure_is_path_free(monkeypatch, capsys):
+    fake_deployment = ModuleType("app.office_rendering.deployment")
+    fake_behavior_probe = ModuleType(
+        "app.office_rendering.native_sandbox_behavior"
+    )
+    fake_execution_probe = ModuleType("app.office_rendering.probe")
+    fake_release_identity = ModuleType("app.office_rendering.release_identity")
+    release_identity = object()
+    fake_release_identity.load_frozen_renderer_release_identity = Mock(
+        return_value=release_identity
+    )
+    fake_deployment.authoritative_office_renderer_self_test = Mock(
+        side_effect=RuntimeError("private /Users/alice/renderer path")
+    )
+    contract_binder = Mock()
+    fake_deployment.bind_attested_native_sandbox_contract = contract_binder
+    fake_deployment.build_attested_office_render_provider = Mock()
+    behavior_probe = AsyncMock()
+    fake_behavior_probe.run_native_sandbox_behavior_probe = behavior_probe
+    fake_execution_probe.run_attested_authoritative_office_renderer_probe = AsyncMock()
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.deployment", fake_deployment
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.native_sandbox_behavior",
+        fake_behavior_probe,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.release_identity",
+        fake_release_identity,
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.probe", fake_execution_probe
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py", "--office-renderer-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    output = capsys.readouterr()
+    assert exit_info.value.code == 1
+    assert json.loads(output.out) == {"schema_version": 2, "status": "unavailable"}
+    assert "Users" not in output.out
+    assert output.err == ""
+    contract_binder.assert_not_called()
+    behavior_probe.assert_not_awaited()
+
+
+def test_office_renderer_identity_failure_is_path_free(monkeypatch, capsys):
+    fake_deployment = ModuleType("app.office_rendering.deployment")
+    fake_behavior_probe = ModuleType(
+        "app.office_rendering.native_sandbox_behavior"
+    )
+    fake_execution_probe = ModuleType("app.office_rendering.probe")
+    fake_release_identity = ModuleType("app.office_rendering.release_identity")
+    renderer_probe = Mock()
+    fake_deployment.authoritative_office_renderer_self_test = renderer_probe
+    contract_binder = Mock()
+    fake_deployment.bind_attested_native_sandbox_contract = contract_binder
+    fake_deployment.build_attested_office_render_provider = Mock()
+    behavior_probe = AsyncMock()
+    fake_behavior_probe.run_native_sandbox_behavior_probe = behavior_probe
+    fake_execution_probe.run_attested_authoritative_office_renderer_probe = AsyncMock()
+    fake_release_identity.load_frozen_renderer_release_identity = Mock(
+        side_effect=RuntimeError("private /Users/alice/release-identity.json")
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.deployment", fake_deployment
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.native_sandbox_behavior",
+        fake_behavior_probe,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.release_identity",
+        fake_release_identity,
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.probe", fake_execution_probe
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py", "--office-renderer-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    output = capsys.readouterr()
+    assert exit_info.value.code == 1
+    assert json.loads(output.out) == {"schema_version": 2, "status": "unavailable"}
+    assert "Users" not in output.out
+    assert output.err == ""
+    renderer_probe.assert_not_called()
+    contract_binder.assert_not_called()
+    behavior_probe.assert_not_awaited()
+
+
+def test_office_renderer_behavior_probe_failure_is_path_free(monkeypatch, capsys):
+    fake_deployment = ModuleType("app.office_rendering.deployment")
+    fake_behavior_probe = ModuleType(
+        "app.office_rendering.native_sandbox_behavior"
+    )
+    fake_execution_probe = ModuleType("app.office_rendering.probe")
+    fake_release_identity = ModuleType("app.office_rendering.release_identity")
+    release_identity = object()
+    provider = object()
+    native_sandbox_contract = object()
+    fake_release_identity.load_frozen_renderer_release_identity = Mock(
+        return_value=release_identity
+    )
+    fake_deployment.authoritative_office_renderer_self_test = Mock(
+        return_value={"schema_version": 2, "status": "ok"}
+    )
+    fake_deployment.build_attested_office_render_provider = Mock(
+        return_value=provider
+    )
+    contract_binder = Mock(return_value=native_sandbox_contract)
+    fake_deployment.bind_attested_native_sandbox_contract = contract_binder
+    behavior_probe = AsyncMock(
+        side_effect=RuntimeError(
+            "private /Users/alice/native-sandbox-helper"
+        )
+    )
+    fake_behavior_probe.run_native_sandbox_behavior_probe = behavior_probe
+    execution_probe = AsyncMock()
+    fake_execution_probe.run_attested_authoritative_office_renderer_probe = (
+        execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.deployment", fake_deployment
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.native_sandbox_behavior",
+        fake_behavior_probe,
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.probe", fake_execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.release_identity",
+        fake_release_identity,
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py", "--office-renderer-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    output = capsys.readouterr()
+    assert exit_info.value.code == 1
+    assert json.loads(output.out) == {"schema_version": 2, "status": "unavailable"}
+    assert "Users" not in output.out
+    assert output.err == ""
+    contract_binder.assert_called_once_with(provider)
+    behavior_probe.assert_awaited_once_with(native_sandbox_contract)
+    execution_probe.assert_not_awaited()
+
+
+def test_office_renderer_execution_probe_failure_is_path_free(monkeypatch, capsys):
+    fake_deployment = ModuleType("app.office_rendering.deployment")
+    fake_behavior_probe = ModuleType(
+        "app.office_rendering.native_sandbox_behavior"
+    )
+    fake_execution_probe = ModuleType("app.office_rendering.probe")
+    fake_release_identity = ModuleType("app.office_rendering.release_identity")
+    release_identity = object()
+    provider = object()
+    events: list[str] = []
+    fake_release_identity.load_frozen_renderer_release_identity = Mock(
+        return_value=release_identity
+    )
+    fake_deployment.authoritative_office_renderer_self_test = Mock(
+        return_value={"schema_version": 2, "status": "ok"}
+    )
+    fake_deployment.build_attested_office_render_provider = Mock(
+        return_value=provider
+    )
+    native_sandbox_contract = object()
+    def bind_contract(bound_provider):
+        assert bound_provider is provider
+        events.append("bind")
+        return native_sandbox_contract
+
+    contract_binder = Mock(side_effect=bind_contract)
+    fake_deployment.bind_attested_native_sandbox_contract = contract_binder
+    behavior_report = Mock()
+
+    async def prove_behavior(contract):
+        assert contract is native_sandbox_contract
+        events.append("behavior")
+        return behavior_report
+
+    behavior_probe = AsyncMock(side_effect=prove_behavior)
+    fake_behavior_probe.run_native_sandbox_behavior_probe = behavior_probe
+
+    async def fail_golden(bound_provider):
+        assert bound_provider is provider
+        events.append("golden")
+        raise RuntimeError("private /Users/alice/probe.docx")
+
+    execution_probe = AsyncMock(side_effect=fail_golden)
+    fake_execution_probe.run_attested_authoritative_office_renderer_probe = (
+        execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.deployment", fake_deployment
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.native_sandbox_behavior",
+        fake_behavior_probe,
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.office_rendering.probe", fake_execution_probe
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.office_rendering.release_identity",
+        fake_release_identity,
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py", "--office-renderer-self-test"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    output = capsys.readouterr()
+    assert exit_info.value.code == 1
+    assert json.loads(output.out) == {"schema_version": 2, "status": "unavailable"}
+    assert "Users" not in output.out
+    assert output.err == ""
+    contract_binder.assert_called_once_with(provider)
+    behavior_probe.assert_awaited_once_with(native_sandbox_contract)
+    execution_probe.assert_awaited_once_with(provider)
+    assert events == ["bind", "behavior", "golden"]
 
 
 def test_main_uses_cli_port_for_settings_and_uvicorn(monkeypatch, tmp_path):

@@ -68,7 +68,7 @@ function expectNaturalOfficePrompt(prompt: string) {
 }
 
 async function expectNoAppCrash(page: Page) {
-  await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
+  await expect(page.getByText(/^(?:Unhandled )?Runtime (?:Error|TypeError|ReferenceError)$/)).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);
 }
 
@@ -140,11 +140,12 @@ test.describe("苏小有 natural office GUI workflows", () => {
 
     await startOfficeWorkflow(page, [files.budgetSheet], prompt);
 
-    await expect(mainContent(page).getByText("Finance review").last()).toBeVisible({ timeout: 20_000 });
-    await expect(mainContent(page).getByText("Budget vs actuals").last()).toBeVisible();
-    await expect(mainContent(page).getByText("Biggest variance").last()).toBeVisible();
-    await expect(mainContent(page).getByText("Forecast").last()).toBeVisible();
-    await expect(mainContent(page).getByText("Owner questions").last()).toBeVisible();
+    await expect(mainContent(page).getByText("Finance workbook review").last()).toBeVisible({ timeout: 20_000 });
+    await expect(mainContent(page).getByRole("columnheader", { name: "Budget" })).toBeVisible();
+    await expect(mainContent(page).getByRole("columnheader", { name: "Actual / forecast signal" })).toBeVisible();
+    await expect(mainContent(page).getByText("Support contractors", { exact: true })).toBeVisible();
+    await expect(mainContent(page).getByText("18% over", { exact: true })).toBeVisible();
+    await expect(mainContent(page).getByRole("columnheader", { name: "Owner question" })).toBeVisible();
     expect(state.fileUploads).toEqual(["budget-review.xlsx"]);
     expect(JSON.stringify(state.promptBodies[0])).toContain(prompt);
     await expectNoAppCrash(page);

@@ -100,15 +100,19 @@ const PROCESS_TRANSLATORS: Array<[RegExp, string]> = [
   ],
   [
     /^Search is failing\.\s*Let me try using web_fetch on some known URLs about this topic\.?$/i,
-    "搜索请求失败，改用 web_fetch 访问相关网址继续核验。",
+    "搜索暂未返回可用结果，改用 web_fetch 访问相关网址继续核验。",
   ],
   [
     /^Search is failing\.\s*Let me try using web_fetch on some known URLs about this topic\..*$/i,
-    "搜索请求失败，改用 web_fetch 访问相关网址继续核验。",
+    "搜索暂未返回可用结果，改用 web_fetch 访问相关网址继续核验。",
   ],
   [
     /^Search is failing consistently\.\s*Let me try academic-specific searches and some known literature databases\.?$/i,
-    "搜索连续失败，改用学术数据库和定向关键词继续查找。",
+    "多次搜索未返回可用结果，改用学术数据库和定向关键词继续查找。",
+  ],
+  [
+    /^The web search failed for some queries\.\s*Let me fetch more details from specific articles\.?$/i,
+    "部分检索未返回可用结果，改用具体来源继续核验。",
   ],
   [
     /^Search seems to have issues\.\s*Let me try some alternative approaches.*$/i,
@@ -474,7 +478,7 @@ function translateProcessBody(body: string): string | null {
     return "继续查找相关论文和学术成果。";
   }
   if (lower.includes("search") && (lower.includes("fail") || lower.includes("issue"))) {
-    return "搜索不稳定，改用其他方式继续核验。";
+    return "检索暂未返回可用结果，已改用其他方式继续核验。";
   }
   if (lower.includes("web_fetch") || lower.includes("fetch")) {
     return "继续抓取并核验相关网页资料。";
@@ -497,7 +501,7 @@ function isEnglishProcessText(text: string): boolean {
   if (letters < 8) return false;
   const cjk = text.match(/[\u3400-\u9fff]/g)?.length ?? 0;
   if (cjk > 0) return false;
-  return /^(The user|The search|The fetch|Search|Let me|I need|I should|I'll|I will|I'm|Now I|Now let me|Actually)/i.test(text);
+  return /^(The user|The (?:web )?search|The fetch|Search|Let me|I need|I should|I'll|I will|I'm|Now I|Now let me|Actually)/i.test(text);
 }
 
 function shouldUseChinese(language?: string): boolean {

@@ -22,8 +22,13 @@ from app.config import Settings
 from app.auth import credential_store
 from app.auth.credential_store import CredentialStore
 from app.connector.registry import ConnectorRegistry
+from app.dependencies import get_stream_manager
 from app.provider.registry import ProviderRegistry
 from app.schemas.provider import ModelCapabilities, ModelInfo
+from app.validation_agent import (
+    PostCheckpointValidationScheduler,
+    ValidationAgentService,
+)
 
 
 @pytest.mark.asyncio
@@ -254,6 +259,24 @@ async def test_real_lifespan_yields_while_network_startup_jobs_are_stuck(tmp_pat
     ):
         async with asyncio.timeout(3):
             async with lifespan(app):  # type: ignore[arg-type]
+                assert isinstance(
+                    app.state.validation_agent_service,
+                    ValidationAgentService,
+                )
+                assert isinstance(
+                    app.state.post_checkpoint_validation_scheduler,
+                    PostCheckpointValidationScheduler,
+                )
+                probe = get_stream_manager().create_job(
+                    "validator-injection-probe",
+                    "validator-injection-probe",
+                    invocation_source="desktop",
+                )
+                assert (
+                    probe.post_checkpoint_validation_scheduler
+                    is app.state.post_checkpoint_validation_scheduler
+                )
+                probe.complete()
                 await asyncio.wait_for(mcp_started.wait(), timeout=1)
                 await asyncio.wait_for(provider_started.wait(), timeout=1)
 
@@ -377,6 +400,10 @@ async def test_runtime_shutdown_stops_consumers_before_providers_and_database() 
             calls.append("generations")
             return 0
 
+        def set_post_checkpoint_validation_scheduler(self, value):
+            assert value is None
+            calls.append("validation-scheduler")
+
     class Component:
         def __init__(self, name: str):
             self.name = name
@@ -422,6 +449,7 @@ async def test_runtime_shutdown_stops_consumers_before_providers_and_database() 
         "background",
         "scheduler",
         "generations",
+        "validation-scheduler",
         "agent",
         "channels",
         "memory",

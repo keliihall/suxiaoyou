@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import hashlib
 import os
 from pathlib import Path
+import stat
 
 import pytest
 
 from app.schemas.agent import AgentInfo
+from app.office_validation.draft import OfficeDraftSeal
 from app.storage import file_versions as file_versions_module
 from app.storage.file_versions import FileVersionStore
 from app.tool.context import ToolContext
@@ -13,6 +17,9 @@ from app.tool import workspace_transaction as transaction_module
 from app.tool.workspace_transaction import (
     WorkspaceMutationError,
     WorkspaceMutationTransaction,
+    WorkspacePrecommitSealError,
+    committed_checkpoint_journal_action,
+    list_committed_checkpoint_journals,
     recover_pending_workspace_transactions,
 )
 
@@ -37,6 +44,876 @@ def _transaction(
         operation="test.command",
         storage_root=private,
     )
+
+
+def _checkpoint_context(workspace: Path, *, checkpoint_id: str) -> ToolContext:
+    return ToolContext(
+        session_id="session",
+        message_id="message",
+        agent=AgentInfo(name="test", description="", mode="primary"),
+        call_id="call",
+        workspace=str(workspace),
+        root_turn_id="root-turn",
+        turn_run_id="turn-run",
+        checkpoint_id=checkpoint_id,
+        workspace_instance_id="workspace-instance",
+    )
+
+
+def _office_seal(staged: Path, source: Path) -> OfficeDraftSeal:
+    root_info = staged.stat(follow_symlinks=False)
+    source_info = source.stat(follow_symlinks=False)
+    content = source.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    return OfficeDraftSeal(
+        relative_path=source.relative_to(staged).as_posix(),
+        source_sha256=digest,
+        source_mode=stat.S_IMODE(source_info.st_mode),
+        source_size=len(content),
+        root_identity=(root_info.st_dev, root_info.st_ino),
+        source_identity=(source_info.st_dev, source_info.st_ino),
+        renderer_id="test-authoritative-renderer",
+        renderer_version="1",
+        font_digest="f" * 64,
+        parameters_version="office-test-v1",
+        parameters_sha256="a" * 64,
+        quality="authoritative",
+        cache_key="b" * 64,
+    )
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_authoritative_office_seal_commits_exact_hidden_replacement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+
+    result = transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"validated candidate"
+    assert result.written_files == (str(target),)
+    assert "office_seal" not in result.metadata
+    assert "precommit_seal" not in result.metadata
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_sealed_create_builds_fresh_workspace_output_parent(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "suxiaoyou_written" / "report.docx"
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.parent.mkdir()
+    staged_target.write_bytes(b"validated create")
+    seal = _office_seal(staged, staged_target)
+
+    result = transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"validated create"
+    assert result.written_files == (str(target),)
+    assert tuple(path.name for path in workspace.iterdir()) == (
+        "suxiaoyou_written",
+    )
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_sealed_create_builds_only_nested_missing_ancestor_chain(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "deliverables" / "2026" / "q3" / "report.docx"
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.parent.mkdir(parents=True)
+    staged_target.write_bytes(b"nested validated create")
+    seal = _office_seal(staged, staged_target)
+
+    transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"nested validated create"
+    assert sorted(
+        path.relative_to(workspace).as_posix()
+        for path in workspace.rglob("*")
+    ) == [
+        "deliverables",
+        "deliverables/2026",
+        "deliverables/2026/q3",
+        "deliverables/2026/q3/report.docx",
+    ]
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_sealed_create_rejects_unrelated_extra_directory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "reports" / "report.docx"
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.parent.mkdir()
+    staged_target.write_bytes(b"candidate")
+    (staged / "unrelated").mkdir()
+    seal = _office_seal(staged, staged_target)
+
+    with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert not (workspace / "reports").exists()
+    assert not (workspace / "unrelated").exists()
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_sealed_create_rejects_sibling_directory_below_new_parent(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "reports" / "final" / "report.docx"
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.parent.mkdir(parents=True)
+    staged_target.write_bytes(b"candidate")
+    (staged / "reports" / "sibling").mkdir()
+    seal = _office_seal(staged, staged_target)
+
+    with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert not (workspace / "reports").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="directory mode mutation assertion requires POSIX",
+)
+def test_office_sealed_edit_rejects_existing_parent_metadata_mutation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    parent = workspace / "reports"
+    parent.mkdir(parents=True, mode=0o750)
+    parent.chmod(0o750)
+    target = parent / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"candidate")
+    (staged / "reports").chmod(0o700)
+    seal = _office_seal(staged, staged_target)
+
+    with pytest.raises(WorkspaceMutationError, match="undeclared directory"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"before"
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o750
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_sealed_create_rolls_back_ancestors_after_precommit_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "suxiaoyou_written" / "nested" / "report.docx"
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.parent.mkdir(parents=True)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    real_prepare = transaction_module._prepare_regular_replacement_at
+    exchange_calls = 0
+
+    def prepare_then_tamper(
+        workspace_fd: int,
+        source: Path,
+        relative: str,
+        mode: int,
+        *,
+        temporary_name: str,
+    ):
+        prepared = real_prepare(
+            workspace_fd,
+            source,
+            relative,
+            mode,
+            temporary_name=temporary_name,
+        )
+        hidden_name = prepared.replacement_name or prepared.temporary_name
+        hidden = workspace / Path(relative).parent / hidden_name
+        hidden.write_bytes(b"fault after hidden prepare")
+        return prepared
+
+    def record_exchange(workspace_fd: int, temporary: object) -> None:
+        del workspace_fd, temporary
+        nonlocal exchange_calls
+        exchange_calls += 1
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_prepare_regular_replacement_at",
+        prepare_then_tamper,
+    )
+    monkeypatch.setattr(transaction_module, "_link_prepared_new_at", record_exchange)
+
+    with pytest.raises(WorkspacePrecommitSealError, match="no longer matches"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert exchange_calls == 0
+    assert not (workspace / "suxiaoyou_written").exists()
+    assert transaction.transaction_root is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_sha256", "0" * 64),
+        ("source_size", 999),
+        ("source_mode", None),
+        ("relative_path", "other.docx"),
+        ("quality", "approximate"),
+        ("root_identity", (0, 0)),
+        ("source_identity", (0, 0)),
+    ),
+)
+def test_wrong_office_seal_aborts_without_changing_original(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    if field == "source_mode":
+        value = seal.source_mode ^ stat.S_IXUSR
+    seal = replace(seal, **{field: value})
+
+    with pytest.raises(WorkspacePrecommitSealError):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"before"
+    assert transaction.staged_workspace is None
+    assert transaction.transaction_root is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_seal_rejects_an_unsealed_second_write(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    first = workspace / "first.docx"
+    second = workspace / "second.docx"
+    first.write_bytes(b"first before")
+    second.write_bytes(b"second before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([first, second])
+    staged_first = transaction.staged_path(first)
+    staged_second = transaction.staged_path(second)
+    staged_first.write_bytes(b"first candidate")
+    staged_second.write_bytes(b"second unsealed candidate")
+    seal = _office_seal(staged, staged_first)
+
+    with pytest.raises(WorkspacePrecommitSealError, match="exact file write"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert first.read_bytes() == b"first before"
+    assert second.read_bytes() == b"second before"
+    assert transaction.staged_workspace is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_seal_rejects_staged_tamper_after_validation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    staged_target.write_bytes(b"tampered after validation")
+
+    with pytest.raises(WorkspacePrecommitSealError, match="changed after validation"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"before"
+    assert transaction.staged_workspace is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_seal_preserves_concurrent_visible_edit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    target.write_bytes(b"concurrent user edit")
+
+    with pytest.raises(WorkspaceMutationError, match="changed outside"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert target.read_bytes() == b"concurrent user edit"
+    assert transaction.staged_workspace is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_seal_detects_hidden_replacement_tamper_before_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    real_prepare = transaction_module._prepare_regular_replacement_at
+    exchange_calls = 0
+
+    def prepare_then_tamper(
+        workspace_fd: int,
+        source: Path,
+        relative: str,
+        mode: int,
+        *,
+        temporary_name: str,
+    ):
+        prepared = real_prepare(
+            workspace_fd,
+            source,
+            relative,
+            mode,
+            temporary_name=temporary_name,
+        )
+        hidden_name = prepared.replacement_name or prepared.temporary_name
+        hidden = workspace / Path(relative).parent / hidden_name
+        hidden.write_bytes(b"hidden replacement tamper")
+        return prepared
+
+    def record_exchange(workspace_fd: int, temporary: object) -> None:
+        del workspace_fd, temporary
+        nonlocal exchange_calls
+        exchange_calls += 1
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_prepare_regular_replacement_at",
+        prepare_then_tamper,
+    )
+    monkeypatch.setattr(transaction_module, "_exchange_prepared_at", record_exchange)
+
+    with pytest.raises(WorkspacePrecommitSealError, match="no longer matches"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert exchange_calls == 0
+    assert target.read_bytes() == b"before"
+    assert transaction.staged_workspace is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_office_seal_detects_source_copy_toctou_before_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    target = workspace / "report.docx"
+    target.write_bytes(b"before")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare_paths([target])
+    staged_target = transaction.staged_path(target)
+    staged_target.write_bytes(b"validated candidate")
+    seal = _office_seal(staged, staged_target)
+    real_prepare = transaction_module._prepare_regular_replacement_at
+    exchange_calls = 0
+
+    def race_source_during_prepare(
+        workspace_fd: int,
+        source: Path,
+        relative: str,
+        mode: int,
+        *,
+        temporary_name: str,
+    ):
+        source.write_bytes(b"raced while copying")
+        return real_prepare(
+            workspace_fd,
+            source,
+            relative,
+            mode,
+            temporary_name=temporary_name,
+        )
+
+    def record_exchange(workspace_fd: int, temporary: object) -> None:
+        del workspace_fd, temporary
+        nonlocal exchange_calls
+        exchange_calls += 1
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_prepare_regular_replacement_at",
+        race_source_during_prepare,
+    )
+    monkeypatch.setattr(transaction_module, "_exchange_prepared_at", record_exchange)
+
+    with pytest.raises(WorkspacePrecommitSealError, match="changed after validation"):
+        transaction.commit_with_precommit_office_seal(seal)
+
+    assert exchange_calls == 0
+    assert target.read_bytes() == b"before"
+    assert transaction.staged_workspace is None
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_checkpoint_journal_records_explicit_turn_commit_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    target = workspace / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="checkpoint"),
+        operation="test.command",
+        storage_root=private,
+    )
+    staged = transaction.prepare_paths([target])
+    (staged / "target.txt").write_text("after", encoding="utf-8")
+
+    result = transaction.commit()
+    journals = list_committed_checkpoint_journals(storage_root=private)
+
+    assert result.checkpoint_journal_token is not None
+    assert len(journals) == 1
+    assert committed_checkpoint_journal_action(journals[0][1]) == (
+        "turn_commit",
+        (),
+    )
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_checkpoint_journal_records_explicit_rewind_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    target = workspace / "target.txt"
+    target.write_text("after", encoding="utf-8")
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="checkpoint-target"),
+        operation="runtime.rewind",
+        storage_root=private,
+        checkpoint_action="rewind",
+        rewind_checkpoint_ids=("checkpoint-target", "checkpoint-later"),
+    )
+    staged = transaction.prepare_paths([target])
+    (staged / "target.txt").write_text("before", encoding="utf-8")
+
+    result = transaction.commit()
+    journals = list_committed_checkpoint_journals(storage_root=private)
+
+    assert result.checkpoint_journal_token is not None
+    assert len(journals) == 1
+    assert committed_checkpoint_journal_action(journals[0][1]) == (
+        "rewind",
+        ("checkpoint-target", "checkpoint-later"),
+    )
+
+
+def test_checkpoint_journal_action_is_schema_bound() -> None:
+    legacy = {
+        "schema_version": 3,
+        "state": "committed",
+        "runtime_checkpoint": {"checkpoint_id": "checkpoint"},
+    }
+    assert committed_checkpoint_journal_action(legacy) == ("turn_commit", ())
+
+    legacy["runtime_checkpoint"]["action"] = "rewind"
+    with pytest.raises(WorkspaceMutationError, match="Legacy checkpoint journal"):
+        committed_checkpoint_journal_action(legacy)
+
+    incomplete_v4 = {
+        "schema_version": 4,
+        "state": "committed",
+        "runtime_checkpoint": {
+            "checkpoint_id": "checkpoint",
+            "action": "turn_commit",
+        },
+    }
+    with pytest.raises(WorkspaceMutationError, match="action metadata is incomplete"):
+        committed_checkpoint_journal_action(incomplete_v4)
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="rewind symlink deletion requires POSIX guarded mutation support",
+)
+def test_only_rewind_can_delete_an_existing_symlink_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    (workspace / "target.txt").write_text("target", encoding="utf-8")
+    link = workspace / "latest"
+    os.symlink("target.txt", link)
+
+    ordinary = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="ordinary"),
+        operation="test.command",
+        storage_root=private,
+    )
+    ordinary_stage = ordinary.prepare()
+    (ordinary_stage / "latest").unlink()
+    with pytest.raises(WorkspaceMutationError, match="Only rewind"):
+        ordinary.commit()
+    ordinary.abort()
+    assert link.is_symlink() and os.readlink(link) == "target.txt"
+
+    rewind = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="rewind-target"),
+        operation="runtime.rewind",
+        storage_root=private,
+        checkpoint_action="rewind",
+        rewind_checkpoint_ids=("rewind-target",),
+    )
+    rewind_stage = rewind.prepare()
+    (rewind_stage / "latest").unlink()
+    result = rewind.commit()
+
+    assert not link.exists() and not link.is_symlink()
+    assert result.checkpoint_journal_token is not None
+    assert len(result.mutations) == 1
+    assert result.mutations[0].node_kind == "symlink"
+    assert result.mutations[0].operation == "deleted"
+    journals = list_committed_checkpoint_journals(storage_root=private)
+    assert committed_checkpoint_journal_action(journals[0][1]) == (
+        "rewind",
+        ("rewind-target",),
+    )
+    assert journals[0][1]["existing_symlinks"]["latest"]["before"][
+        "link_target"
+    ] == "target.txt"
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="rewind symlink deletion requires POSIX guarded mutation support",
+)
+def test_rewind_symlink_delete_rolls_back_on_commit_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    (workspace / "target.txt").write_text("target", encoding="utf-8")
+    link = workspace / "latest"
+    os.symlink("target.txt", link)
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="rewind-target"),
+        operation="runtime.rewind",
+        storage_root=private,
+        checkpoint_action="rewind",
+        rewind_checkpoint_ids=("rewind-target",),
+    )
+    stage = transaction.prepare()
+    (stage / "latest").unlink()
+    real_write_state = transaction._write_journal_state
+
+    def fail_final_marker(state: str) -> None:
+        if state == "committed":
+            raise OSError("simulated journal failure")
+        real_write_state(state)
+
+    monkeypatch.setattr(transaction, "_write_journal_state", fail_final_marker)
+    with pytest.raises(WorkspaceMutationError, match="rolled back"):
+        transaction.commit()
+    transaction.abort()
+
+    assert link.is_symlink()
+    assert os.readlink(link) == "target.txt"
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="rewind symlink deletion requires POSIX guarded mutation support",
+)
+def test_startup_recovery_restores_interrupted_rewind_symlink_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    (workspace / "target.txt").write_text("target", encoding="utf-8")
+    link = workspace / "latest"
+    os.symlink("target.txt", link)
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="rewind-target"),
+        operation="runtime.rewind",
+        storage_root=private,
+        checkpoint_action="rewind",
+        rewind_checkpoint_ids=("rewind-target",),
+    )
+    stage = transaction.prepare()
+    (stage / "latest").unlink()
+    real_write_state = transaction._write_journal_state
+
+    def crash_before_final_marker(state: str) -> None:
+        if state == "committed":
+            raise KeyboardInterrupt("simulated process death")
+        real_write_state(state)
+
+    monkeypatch.setattr(
+        transaction,
+        "_write_journal_state",
+        crash_before_final_marker,
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated process death"):
+        transaction.commit()
+    assert not link.exists() and not link.is_symlink()
+
+    recovered = recover_pending_workspace_transactions(storage_root=private)
+
+    assert len(recovered) == 1
+    assert link.is_symlink()
+    assert os.readlink(link) == "target.txt"
+
+
+@pytest.mark.skipif(
+    os.name != "posix"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="byte-preserving symlink targets require POSIX",
+)
+def test_rewind_journal_preserves_non_utf8_symlink_target_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    link = workspace / "opaque-link"
+    os.symlink(b"opaque-\xff-target", os.fsencode(link))
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        _checkpoint_context(workspace, checkpoint_id="rewind-target"),
+        operation="runtime.rewind",
+        storage_root=private,
+        checkpoint_action="rewind",
+        rewind_checkpoint_ids=("rewind-target",),
+    )
+    stage = transaction.prepare()
+    (stage / link.name).unlink()
+
+    transaction.commit()
+    payload = list_committed_checkpoint_journals(storage_root=private)[0][1]
+
+    raw_target = payload["existing_symlinks"]["opaque-link"]["before"][
+        "link_target"
+    ]
+    assert os.fsencode(raw_target) == b"opaque-\xff-target"
+
+
+@pytest.mark.skipif(
+    transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="guarded mutation primitive unavailable",
+)
+def test_commit_exposes_ordered_checkpoint_mutation_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    changed = workspace / "changed.txt"
+    removed = workspace / "removed.txt"
+    empty = workspace / "empty"
+    changed.write_text("before", encoding="utf-8")
+    removed.write_text("remove", encoding="utf-8")
+    empty.mkdir()
+
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare()
+    (staged / "changed.txt").write_text("after", encoding="utf-8")
+    (staged / "removed.txt").unlink()
+    (staged / "created").mkdir()
+    (staged / "created" / "new.txt").write_text("new", encoding="utf-8")
+    (staged / "empty").rmdir()
+
+    commit = transaction.commit()
+    mutations = [item.metadata for item in commit.mutations]
+
+    assert [item["relative_path"] for item in mutations] == [
+        "created",
+        "changed.txt",
+        "created/new.txt",
+        "removed.txt",
+        "empty",
+    ]
+    assert [item["operation"] for item in mutations] == [
+        "created",
+        "modified",
+        "created",
+        "deleted",
+        "deleted",
+    ]
+    assert mutations[0]["node_kind"] == "directory"
+    assert mutations[1]["before_version_id"] in commit.previous_version_ids
+    assert mutations[1]["before_sha256"]
+    assert mutations[1]["after_sha256"]
+    assert mutations[2]["before_version_id"] is None
+    assert mutations[3]["before_version_id"] in commit.previous_version_ids
+    assert mutations[3]["after_sha256"] is None
+    assert mutations[4]["node_kind"] == "directory"
+    assert mutations[4]["before_mode"] is not None
+    assert commit.metadata["workspace_mutations"] == mutations
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or transaction_module.guarded_file_mutation_unavailable_reason() is not None,
+    reason="symbolic links require POSIX guarded mutation support",
+)
+def test_created_symlink_evidence_uses_byte_stable_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    (workspace / "target.txt").write_text("target", encoding="utf-8")
+
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare()
+    os.symlink("target.txt", staged / "alias.txt")
+
+    commit = transaction.commit()
+    mutation = next(
+        item for item in commit.mutations if item.relative_path == "alias.txt"
+    )
+
+    assert mutation.operation == "created"
+    assert mutation.node_kind == "symlink"
+    assert mutation.link_target_b64 == "dGFyZ2V0LnR4dA=="
+    assert mutation.after_sha256
+    assert mutation.after_size == len(b"target.txt")
 
 
 @pytest.mark.skipif(

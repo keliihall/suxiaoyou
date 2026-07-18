@@ -34,9 +34,36 @@ export interface SecurityProvider {
   capabilities: string[];
 }
 
+export interface SecurityProjectHook {
+  hook_id: string;
+  event: string;
+  source: "project";
+  failure_policy: string;
+  timeout_seconds: number;
+  fingerprint: string;
+  approval_state: "approved" | "required" | "unavailable";
+}
+
+export interface SecurityProjectHooksResponse {
+  session_id: string;
+  trust_store_available: boolean;
+  hooks: SecurityProjectHook[];
+}
+
+export interface SecurityHookRevocationResponse {
+  session_id: string;
+  hook_id: string;
+  revoked: boolean;
+}
+
 export interface SecurityOverview {
   state: SecurityState;
   warnings?: string[];
+  source_profiles?: Array<{
+    source: string;
+    allowed_capabilities: string[];
+    deny_unknown: boolean;
+  }>;
   tools: SecurityTool[];
   connectors: SecurityConnector[];
   providers: SecurityProvider[];
@@ -56,6 +83,57 @@ export interface SecurityOverview {
     goals?: boolean;
     /** Autonomous continuation is released independently from goal CRUD. */
     autonomous_goals?: boolean;
+    /** v1.1 gates remain optional so mixed-version desktop/backend pairs fail closed. */
+    v11_checkpoints?: boolean;
+    v11_rewind?: boolean;
+    v11_hooks?: boolean;
+    v11_acp?: boolean;
+    v11_worktrees?: boolean;
+    v11_validation_agent?: boolean;
+    v11_office_v2?: boolean;
+    v11_user_office_templates_beta?: boolean;
+  };
+  /** Dependency-composed source gates plus redacted machine readiness. */
+  v11_readiness?: Partial<
+    Record<
+      | "checkpoints"
+      | "rewind"
+      | "hooks"
+      | "acp"
+      | "worktrees"
+      | "validator"
+      | "office_preview"
+      | "office_authoring"
+      | "user_office_templates",
+      {
+        code_gate: boolean;
+        released: boolean;
+        dependencies: string[];
+        missing_dependencies: string[];
+        runtime_ready: boolean;
+        missing_runtime: string[];
+        renderer_quality?: "authoritative" | "approximate" | null;
+      }
+    >
+  >;
+  /** Redacted safety contracts for local v1.1 runtime-control surfaces. */
+  v11_runtime_capabilities?: {
+    checkpoint_rewind: {
+      released: boolean;
+      local_session_only: boolean;
+      server_owned_workspace_identity_required: boolean;
+      pre_action_audit_required: boolean;
+      external_side_effects_reverted: boolean;
+      raw_runtime_payloads_exposed: boolean;
+    };
+    managed_worktrees: {
+      released: boolean;
+      local_session_only: boolean;
+      repository_derived_from_database: boolean;
+      force_remove_supported: boolean;
+      pre_action_audit_required: boolean;
+      raw_runtime_payloads_exposed: boolean;
+    };
   };
 }
 

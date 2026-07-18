@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { isActivityComplete } from "../../src/lib/activity-state.ts";
+import {
+  isActivityComplete,
+  isActivityFailed,
+} from "../../src/lib/activity-state.ts";
 import { hasVisibleMessageOutput } from "../../src/lib/message-presentation.ts";
 import type { ToolPart } from "../../src/types/message.ts";
 
@@ -73,6 +76,28 @@ test("terminal lifecycle evidence wins over stale running tool state", () => {
       hasVisibleOutput: true,
     }),
     false,
+  );
+});
+
+test("activity outcome follows the final terminal step instead of tool detours", () => {
+  assert.equal(
+    isActivityFailed({
+      toolParts: [tool("web_search", "error"), tool("web_fetch", "completed")],
+      stepParts: [
+        { type: "step-finish", reason: "error", tokens: {}, cost: 0 },
+        { type: "step-finish", reason: "stop", tokens: {}, cost: 0 },
+      ],
+    }),
+    false,
+  );
+  assert.equal(
+    isActivityFailed({
+      toolParts: [tool("web_search", "error")],
+      stepParts: [
+        { type: "step-finish", reason: "error", tokens: {}, cost: 0 },
+      ],
+    }),
+    true,
   );
 });
 

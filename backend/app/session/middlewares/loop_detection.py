@@ -26,10 +26,15 @@ class LoopDetectionMiddleware(Middleware):
             ctx.session_id, tool_name, tool_args,
         )
         if result.action == "block":
-            return ToolAction(action="block", message=result.message)
+            return ToolAction(
+                action="block",
+                message=result.message,
+                code="loop_detected",
+            )
         if result.action == "warn":
-            # Store warning for after_tool_exec to inject
-            ctx.extra["_loop_warning"] = result.message
+            # Return the warning to the processor so it stays attached to this
+            # exact tool call even when several calls are finalized together.
+            return ToolAction(action="warn", message=result.message)
         return ToolAction(action="allow")
 
     async def after_tool_exec(
@@ -39,7 +44,7 @@ class LoopDetectionMiddleware(Middleware):
         output: str,
         ctx: MiddlewareContext,
     ) -> str:
-        warning = ctx.extra.pop("_loop_warning", None)
-        if warning:
-            output += f"\n\n{warning}"
+        # The processor appends the per-call ToolAction warning. Keeping this
+        # hook as a no-op preserves the public middleware shape without using a
+        # shared context slot that can mix warnings between concurrent tools.
         return output

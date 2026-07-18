@@ -32,6 +32,44 @@ def test_source_profiles_are_fail_closed_above_tool_permissions() -> None:
         "filesystem_write",
         "process",
     )
+    assert denied_tool_capabilities("validator", _Tool("read")) == ()
+    assert denied_tool_capabilities("validator", _Tool("search")) == ()
+    assert denied_tool_capabilities("validator", _Tool("write")) == (
+        "filesystem_write",
+    )
+    assert denied_tool_capabilities("validator", _Tool("bash")) == (
+        "filesystem_write",
+        "network",
+        "process",
+    )
+    assert denied_tool_capabilities("validator", _Tool("task")) == (
+        "agent_control",
+    )
+    assert denied_tool_capabilities("validator", _Tool("question")) == (
+        "agent_control",
+    )
+    assert denied_tool_capabilities("validator", _Tool("web_search")) == (
+        "network",
+        "remote_data_read",
+    )
+    assert denied_invocation_capabilities(
+        "validator", ("model_inference",)
+    ) == ()
+    assert denied_invocation_capabilities("validator", ("network",)) == (
+        "network",
+    )
+    assert denied_tool_capabilities("acp", _Tool("read")) == ()
+    assert denied_tool_capabilities("acp", _Tool("write")) == ()
+    assert denied_tool_capabilities("acp", _Tool("office")) == ()
+    assert denied_tool_capabilities("acp", _Tool("restore_file_version")) == ()
+    assert denied_tool_capabilities("acp", _Tool("bash")) == (
+        "network",
+        "process",
+    )
+    assert denied_tool_capabilities("acp", _Tool("web_search")) == (
+        "network",
+        "remote_data_read",
+    )
     assert denied_tool_capabilities("channel", _Tool("read")) == (
         "filesystem_read",
     )
@@ -44,7 +82,40 @@ def test_source_profiles_are_fail_closed_above_tool_permissions() -> None:
     assert profiles["goal"]["allowed_capabilities"] == ["*"]
     assert profiles["unknown"]["allowed_capabilities"] == []
     assert profiles["channel"]["allowed_capabilities"] == ["model_inference"]
+    assert profiles["validator"]["allowed_capabilities"] == [
+        "filesystem_read",
+        "model_inference",
+    ]
+    assert profiles["acp"]["allowed_capabilities"] == [
+        "agent_control",
+        "filesystem_read",
+        "filesystem_write",
+        "model_inference",
+        "office_document",
+        "recovery",
+    ]
     assert profiles["unknown"]["deny_unknown"] is True
+
+
+def test_validator_profile_is_dynamic_and_can_be_hidden_by_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.release_features.V11_VALIDATION_AGENT_RELEASED",
+        False,
+    )
+
+    profiles = {item["source"]: item for item in source_capability_profiles()}
+    assert "validator" not in profiles
+
+
+def test_acp_profile_is_dynamic_and_can_be_hidden_by_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.release_features.V11_ACP_RELEASED", False)
+
+    profiles = {item["source"]: item for item in source_capability_profiles()}
+    assert "acp" not in profiles
 
 
 def test_unknown_ingress_and_unknown_tools_fail_closed() -> None:

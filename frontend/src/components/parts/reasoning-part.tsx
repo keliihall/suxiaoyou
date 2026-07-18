@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ChevronRight, CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import { ChevronRight, CheckCircle2, CircleAlert, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { SuxiaoyouLogo } from "@/components/ui/suxiaoyou-logo";
@@ -195,13 +195,18 @@ function ToolLine({ tool }: { tool: ToolPart }) {
   return (
     <div className="flex items-center gap-1.5 text-xs text-[var(--text-tertiary)]">
       {isRunning ? (
-        <Loader2 className="h-3 w-3 animate-spin" />
+        <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" />
       ) : isError ? (
-        <XCircle className="h-3 w-3 text-[var(--tool-error)]" />
+        <CircleAlert aria-hidden="true" className="h-3 w-3 text-[var(--tool-adjusted)]" />
       ) : (
-        <CheckCircle2 className="h-3 w-3 text-[var(--tool-completed)]" />
+        <CheckCircle2 aria-hidden="true" className="h-3 w-3 text-[var(--tool-completed)]" />
       )}
       <span className={cn(isRunning && "shimmer-text")}>{label}</span>
+      {isError && (
+        <span className="rounded-full bg-[var(--tool-adjusted)]/10 px-1.5 py-0.5 text-[10px] leading-none text-[var(--tool-adjusted)]">
+          {t("toolAttemptNeedsAdjustment")}
+        </span>
+      )}
       {elapsed && <span className="text-[10px]">{elapsed}</span>}
     </div>
   );

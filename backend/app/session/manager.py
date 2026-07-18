@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
@@ -273,6 +274,12 @@ async def delete_messages_after(
     result = await db.execute(stmt)
     messages_to_delete = list(result.scalars().all())
 
+    await invalidate_acp_prompt_ledgers_for_messages(
+        db,
+        session_id=session_id,
+        messages=messages_to_delete,
+    )
+
     for msg in messages_to_delete:
         await db.delete(msg)
 
@@ -286,6 +293,14 @@ async def update_message_text(
     new_text: str,
 ) -> None:
     """Update the text content of a user message's text part."""
+    msg = await get_by_id(db, Message, message_id)
+    if msg is None:
+        raise ValueError(f"Message {message_id} not found")
+    await invalidate_acp_prompt_ledgers_for_messages(
+        db,
+        session_id=msg.session_id,
+        messages=(msg,),
+    )
     stmt = select(Part).where(Part.message_id == message_id)
     result = await db.execute(stmt)
     parts = list(result.scalars().all())
@@ -297,15 +312,44 @@ async def update_message_text(
             return
 
     # No text part found — create one
-    msg = await get_by_id(db, Message, message_id)
-    if msg is None:
-        raise ValueError(f"Message {message_id} not found")
     await create_part(
         db,
         message_id=message_id,
         session_id=msg.session_id,
         data={"type": "text", "text": new_text},
     )
+
+
+async def invalidate_acp_prompt_ledgers_for_messages(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    messages: Iterable[Message],
+) -> int:
+    """Make ACP replay fail closed when its bound history is edited/removed."""
+
+    message_ids: set[str] = set()
+    for message in messages:
+        if message.session_id != session_id or not isinstance(message.data, dict):
+            continue
+        external_id = message.data.get("acp_message_id")
+        if isinstance(external_id, str) and external_id:
+            message_ids.add(external_id)
+    if not message_ids:
+        return 0
+    result = await db.execute(
+        update(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.scope == f"acp.prompt:{session_id}",
+            IdempotencyRecord.request_key.in_(sorted(message_ids)),
+        )
+        .values(
+            status="interrupted",
+            response={},
+            error_message="acp_prompt_history_changed",
+        )
+    )
+    return int(result.rowcount or 0)
 
 
 async def update_message_file_parts(
@@ -874,9 +918,9 @@ async def update_session(
 
 
 async def delete_session_cascade(
-    db: AsyncSession,
     session_id: str,
     stream_manager: StreamManager,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict[str, bool]:
     """Delete a session, abort in-flight streams, and clean up FTS.
 
@@ -886,47 +930,59 @@ async def delete_session_cascade(
     """
     from app.dependencies import get_index_manager
 
-    if stream_manager is not None:
+    # Admission and the *committed* delete share one lock. Otherwise an ACP
+    # prompt can validate the row, the delete can commit, and SessionPrompt can
+    # recreate the same ID plus an orphan idempotency row. Owning the DB
+    # transaction here (rather than accepting Route's yielded session) keeps
+    # the lock held until commit is complete.
+    async with stream_manager.job_admission_lock:
         _count, quiesced = await stream_manager.abort_session_and_wait(
             session_id,
             timeout=10.0,
         )
         if not quiesced:
-            logger.warning(
-                "Session %s required forced worker cancellation before deletion",
-                session_id,
+            raise Conflict(
+                "Session deletion is blocked until all running work has stopped"
             )
 
-    await delete_session_uploads(db, session_id)
-    deleted = await delete_by_id(db, Session, session_id)
-    if not deleted:
-        raise NotFound("Session not found")
+        async with session_factory() as db:
+            async with db.begin():
+                await delete_session_uploads(db, session_id)
+                deleted = await delete_by_id(db, Session, session_id)
+                if not deleted:
+                    raise NotFound("Session not found")
 
-    # Interactive confirmations and Goal controls use the durable idempotency
-    # ledger so retries survive a restart. Neither may outlive the conversation
-    # the user explicitly deleted. Keep cleanup in the route-owned transaction.
-    goal_idempotency_scopes = tuple(
-        f"goal.{operation}:{session_id}"
-        for operation in ("create", "update", "pause", "resume", "clear")
-    )
-    await db.execute(
-        delete(IdempotencyRecord).where(
-            or_(
-                and_(
-                    IdempotencyRecord.scope.like("chat.respond:%"),
-                    IdempotencyRecord.response["session_id"].as_string()
-                    == session_id,
-                ),
-                and_(
-                    IdempotencyRecord.scope == "chat.goal",
-                    IdempotencyRecord.response["session_id"].as_string()
-                    == session_id,
-                ),
-                IdempotencyRecord.scope.in_(goal_idempotency_scopes),
-                IdempotencyRecord.scope == f"goal.resume.run:{session_id}",
-            )
-        )
-    )
+                # Interactive confirmations and Goal controls use the durable
+                # idempotency ledger so retries survive a restart. None may
+                # outlive the conversation the user explicitly deleted.
+                goal_idempotency_scopes = tuple(
+                    f"goal.{operation}:{session_id}"
+                    for operation in ("create", "update", "pause", "resume", "clear")
+                )
+                await db.execute(
+                    delete(IdempotencyRecord).where(
+                        or_(
+                            and_(
+                                IdempotencyRecord.scope.like("chat.respond:%"),
+                                IdempotencyRecord.response[
+                                    "session_id"
+                                ].as_string()
+                                == session_id,
+                            ),
+                            and_(
+                                IdempotencyRecord.scope == "chat.goal",
+                                IdempotencyRecord.response[
+                                    "session_id"
+                                ].as_string()
+                                == session_id,
+                            ),
+                            IdempotencyRecord.scope.in_(goal_idempotency_scopes),
+                            IdempotencyRecord.scope
+                            == f"goal.resume.run:{session_id}",
+                            IdempotencyRecord.scope == f"acp.prompt:{session_id}",
+                        )
+                    )
+                )
 
     index_manager = get_index_manager()
     if index_manager is not None:

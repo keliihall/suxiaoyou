@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Response } from "@playwright/test";
 import {
   appendLongConversationTurn,
   mock苏小有Api,
@@ -28,19 +28,24 @@ async function submitFirstTurnEdit(page: Page, text: string) {
   await firstMessage.hover();
   await firstMessage.getByRole("button", { name: "Edit message" }).click();
   await firstMessage.locator("textarea").fill(text);
-  const editResponse = page.waitForResponse((response) =>
-    response.url().includes("/api/chat/edit") && response.status() === 200,
+  const editResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes("/api/chat/edit") && response.status() === 200,
   );
   await firstMessage.getByRole("button", { name: "Send", exact: true }).click();
   await editResponse;
 }
 
 test.describe("苏小有 conversation outline navigation", () => {
-  test("keeps idle desktop markers uniform and only emphasizes hover or focus", async ({ page }) => {
+  test("keeps idle desktop markers uniform and only emphasizes hover or focus", async ({
+    page,
+  }) => {
     await setup(page);
     await page.goto("/c/session-long");
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await expect(outline).toBeVisible();
     const markers = outline.locator("button[data-outline-turn]");
     const firstMarker = markers.nth(0);
@@ -52,11 +57,15 @@ test.describe("苏小有 conversation outline navigation", () => {
     expect((secondBox?.y ?? 0) - (firstBox?.y ?? 0)).toBe(8);
 
     const firstLine = firstMarker.locator('span[aria-hidden="true"]');
-    await page.evaluate(() => document.documentElement.classList.remove("dark"));
+    await page.evaluate(() =>
+      document.documentElement.classList.remove("dark"),
+    );
     await expect(firstMarker).toHaveCSS("color", "rgb(138, 143, 152)");
     const idleMarkerStyles = await markers.evaluateAll((elements) =>
       elements.map((element) => {
-        const line = element.querySelector<HTMLElement>('span[aria-hidden="true"]');
+        const line = element.querySelector<HTMLElement>(
+          'span[aria-hidden="true"]',
+        );
         return {
           color: getComputedStyle(element).color,
           height: line ? getComputedStyle(line).height : null,
@@ -73,7 +82,9 @@ test.describe("苏小有 conversation outline navigation", () => {
     ).toBe(true);
     await page.evaluate(() => document.documentElement.classList.add("dark"));
     await expect(firstMarker).toHaveCSS("color", "rgb(149, 151, 157)");
-    await page.evaluate(() => document.documentElement.classList.remove("dark"));
+    await page.evaluate(() =>
+      document.documentElement.classList.remove("dark"),
+    );
     await expect(firstLine).toHaveCSS("height", "2px");
     await expect(firstLine).toHaveCSS("width", "6px");
     await firstMarker.hover();
@@ -118,9 +129,13 @@ test.describe("苏小有 conversation outline navigation", () => {
       outline.locator('button[data-outline-turn][tabindex="-1"]'),
     ).toHaveCount((await markers.count()) - 1);
     await expect(outline.locator("button")).toHaveCount(await markers.count());
-    await expect(outline.getByRole("button")).toHaveCount(await markers.count());
+    await expect(outline.getByRole("button")).toHaveCount(
+      await markers.count(),
+    );
     await expect(
-      outline.getByRole("button", { name: "Open full conversation navigation" }),
+      outline.getByRole("button", {
+        name: "Open full conversation navigation",
+      }),
     ).toHaveCount(0);
 
     // Center the rail as a flex item when it fits. In a short window, cap the
@@ -151,8 +166,12 @@ test.describe("苏小有 conversation outline navigation", () => {
     const shortEndGeometry = await markerScroller.evaluate((element) => {
       element.scrollTop = element.scrollHeight;
       const scrollerBox = element.getBoundingClientRect();
-      const markerButtons = element.querySelectorAll("button[data-outline-turn]");
-      const lastBox = markerButtons.item(markerButtons.length - 1).getBoundingClientRect();
+      const markerButtons = element.querySelectorAll(
+        "button[data-outline-turn]",
+      );
+      const lastBox = markerButtons
+        .item(markerButtons.length - 1)
+        .getBoundingClientRect();
       return {
         lastBottom: lastBox.bottom,
         scrollerBottom: scrollerBox.bottom,
@@ -163,27 +182,35 @@ test.describe("苏小有 conversation outline navigation", () => {
     );
 
     await page.getByRole("button", { name: "Show workspace" }).click();
-    await expect(page.getByRole("button", { name: "Hide workspace" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Hide workspace" }),
+    ).toBeVisible();
     await expect(outline).toBeHidden();
 
     await page.getByRole("button", { name: "Hide workspace" }).click();
     await expect(outline).toBeVisible();
   });
 
-  test("loads an unloaded early turn and returns to the live latest page", async ({ page }) => {
+  test("loads an unloaded early turn and returns to the live latest page", async ({
+    page,
+  }) => {
     await setup(page);
     await page.goto("/c/session-long");
 
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await expect(page.getByText("Long user turn 001")).toHaveCount(0);
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     const scroller = page.getByTestId("message-list-scroller");
     await expect(outline).toBeVisible();
     const firstTurn = outline.getByRole("button", { name: /Turn 1 of 60:/ });
     await firstTurn.click();
 
-    await expect(scroller.getByText(/Long user turn 001:/)).toBeVisible({ timeout: 15_000 });
+    await expect(scroller.getByText(/Long user turn 001:/)).toBeVisible({
+      timeout: 15_000,
+    });
     await expect(page.getByText("Long assistant turn 060")).toHaveCount(0);
     await expect(firstTurn).toHaveAttribute("aria-current", "location");
 
@@ -193,12 +220,18 @@ test.describe("苏小有 conversation outline navigation", () => {
     await expect(secondTurn).toBeFocused();
     await expect(scroller.getByText(/Long user turn 002:/)).toBeVisible();
 
-    await page.getByRole("button", { name: "Return to latest messages" }).click();
-    await expect(page.getByText("Long assistant turn 060")).toBeVisible({ timeout: 15_000 });
+    await page
+      .getByRole("button", { name: "Return to latest messages" })
+      .click();
+    await expect(page.getByText("Long assistant turn 060")).toBeVisible({
+      timeout: 15_000,
+    });
     await expect(page.getByText("Long user turn 001")).toHaveCount(0);
   });
 
-  test("offers retry without replacing the current view when a target page fails", async ({ page }) => {
+  test("offers retry without replacing the current view when a target page fails", async ({
+    page,
+  }) => {
     await setup(page);
     let failFirstPageOnce = true;
     await page.route("**/api/messages/session-long?*", async (route) => {
@@ -216,14 +249,20 @@ test.describe("苏小有 conversation outline navigation", () => {
     });
     await page.goto("/c/session-long");
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     const scroller = page.getByTestId("message-list-scroller");
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
 
-    await expect(page.getByRole("button", { name: "Retry locating turn" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Retry locating turn" }),
+    ).toBeVisible();
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await page.getByRole("button", { name: "Retry locating turn" }).click();
-    await expect(scroller.getByText(/Long user turn 001:/)).toBeVisible({ timeout: 15_000 });
+    await expect(scroller.getByText(/Long user turn 001:/)).toBeVisible({
+      timeout: 15_000,
+    });
   });
 
   test("uses a folded outline on narrow screens", async ({ page }) => {
@@ -234,7 +273,9 @@ test.describe("苏小有 conversation outline navigation", () => {
     await expect(
       page.getByRole("navigation", { name: "Conversation outline" }),
     ).toBeHidden();
-    const outlineButton = page.getByRole("button", { name: "Conversation outline" });
+    const outlineButton = page.getByRole("button", {
+      name: "Conversation outline",
+    });
     await expect(outlineButton).toBeVisible();
     await outlineButton.click();
     await expect(page.getByText("60 turns", { exact: true })).toHaveCount(0);
@@ -242,25 +283,39 @@ test.describe("苏小有 conversation outline navigation", () => {
     await expect(firstTurn).toBeVisible();
     await firstTurn.click();
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 001:/),
     ).toBeVisible({ timeout: 15_000 });
   });
 
-  test("keeps new messages unread in history and returns to their true latest page", async ({ page }) => {
+  test("keeps new messages unread in history and returns to their true latest page", async ({
+    page,
+  }) => {
     const state = await setup(page);
     await page.goto("/c/session-long");
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 001:/),
     ).toBeVisible({ timeout: 15_000 });
 
-    const frozenHistoryPage = page.waitForResponse((response) => {
+    let frozenHistoryPageUrl: string | null = null;
+    const captureFrozenHistoryPage = (response: Response) => {
       const url = new URL(response.url());
-      return url.pathname === "/api/messages/session-long"
-        && url.searchParams.get("offset") === "100"
-        && response.status() === 200;
-    });
+      if (
+        url.pathname === "/api/messages/session-long" &&
+        url.searchParams.get("offset") === "100" &&
+        response.status() === 200
+      ) {
+        frozenHistoryPageUrl = response.url();
+      }
+    };
+    page.on("response", captureFrozenHistoryPage);
 
     appendLongConversationTurn(
       state,
@@ -271,12 +326,22 @@ test.describe("苏小有 conversation outline navigation", () => {
     // Deliberately traverse to the end of the frozen history window. The
     // final request must stop at the pre-navigation total instead of leaking
     // messages that arrived while the user was reading history.
-    await delay(800);
-    await page.getByTestId("message-list-scroller").evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-    });
-    const frozenResponse = await frozenHistoryPage;
-    expect(new URL(frozenResponse.url()).searchParams.get("limit")).toBe("20");
+    const scroller = page.getByTestId("message-list-scroller");
+    await scroller.hover();
+    await expect
+      .poll(
+        async () => {
+          // Each page extends the virtualized history window. Keep emitting a real
+          // user scroll until the final frozen page is observed instead of relying
+          // on one layout-timing-sensitive scrollTop assignment.
+          await page.mouse.wheel(0, 12_000);
+          return frozenHistoryPageUrl;
+        },
+        { timeout: 15_000 },
+      )
+      .not.toBeNull();
+    page.off("response", captureFrozenHistoryPage);
+    expect(new URL(frozenHistoryPageUrl!).searchParams.get("limit")).toBe("20");
 
     const returnButton = page.getByRole("button", {
       name: "Return to latest messages",
@@ -288,11 +353,15 @@ test.describe("苏小有 conversation outline navigation", () => {
 
     await returnButton.click();
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long assistant turn 061:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long assistant turn 061:/),
     ).toBeVisible({ timeout: 15_000 });
   });
 
-  test("a timed-out target cannot replace the live view when its response arrives late", async ({ page }) => {
+  test("a timed-out target cannot replace the live view when its response arrives late", async ({
+    page,
+  }) => {
     await setup(page);
     let delayFirstPage = true;
     let releaseFirstPage!: () => void;
@@ -328,12 +397,16 @@ test.describe("苏小有 conversation outline navigation", () => {
       });
     });
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     const delayedFirstPageResponse = page.waitForResponse((response) => {
       const url = new URL(response.url());
-      return url.pathname === "/api/messages/session-long"
-        && url.searchParams.get("offset") === "0"
-        && response.status() === 200;
+      return (
+        url.pathname === "/api/messages/session-long" &&
+        url.searchParams.get("offset") === "0" &&
+        response.status() === 200
+      );
     });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).press("Enter");
     await firstPageCaptured;
@@ -349,14 +422,20 @@ test.describe("苏小有 conversation outline navigation", () => {
     expect(await lateResponse.finished()).toBeNull();
     await page.clock.fastForward(1_000);
 
-    await expect(page.getByRole("button", { name: "Retry locating turn" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Retry locating turn" }),
+    ).toBeVisible();
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 001:/),
     ).toHaveCount(0);
   });
 
-  test("selecting an already-loaded latest turn cancels a delayed early target", async ({ page }) => {
+  test("selecting an already-loaded latest turn cancels a delayed early target", async ({
+    page,
+  }) => {
     await setup(page);
     let delayFirstPage = true;
     await page.route("**/api/messages/session-long?*", async (route) => {
@@ -369,7 +448,9 @@ test.describe("苏小有 conversation outline navigation", () => {
     });
     await page.goto("/c/session-long");
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
     const latestTurn = outline.getByRole("button", { name: /Turn 60 of 60:/ });
     await latestTurn.click();
@@ -378,16 +459,24 @@ test.describe("苏小有 conversation outline navigation", () => {
     await expect(latestTurn).toHaveAttribute("aria-current", "location");
     await expect(page.getByText("Long assistant turn 060")).toBeVisible();
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 001:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 001:/),
     ).toHaveCount(0);
   });
 
-  test("rapid unloaded targets only allow the final navigation generation to land", async ({ page }) => {
+  test("rapid unloaded targets only allow the final navigation generation to land", async ({
+    page,
+  }) => {
     await setup(page);
     const delayedFirstOffsets = new Set<string>();
     await page.route("**/api/messages/session-long?*", async (route) => {
-      const offset = new URL(route.request().url()).searchParams.get("offset") ?? "";
-      if ((offset === "0" || offset === "50") && !delayedFirstOffsets.has(offset)) {
+      const offset =
+        new URL(route.request().url()).searchParams.get("offset") ?? "";
+      if (
+        (offset === "0" || offset === "50") &&
+        !delayedFirstOffsets.has(offset)
+      ) {
         delayedFirstOffsets.add(offset);
         await delay(2_000);
       }
@@ -395,22 +484,30 @@ test.describe("苏小有 conversation outline navigation", () => {
     });
     await page.goto("/c/session-long");
 
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
     const finalTarget = outline.getByRole("button", { name: /Turn 31 of 60:/ });
     await finalTarget.click();
 
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 031:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 031:/),
     ).toBeVisible({ timeout: 10_000 });
     await delay(2_500);
     await expect(finalTarget).toHaveAttribute("aria-current", "location");
     await expect(
-      page.getByTestId("message-list-scroller").getByText(/Long user turn 031:/),
+      page
+        .getByTestId("message-list-scroller")
+        .getByText(/Long user turn 031:/),
     ).toBeVisible();
   });
 
-  test("an early edit stays in history until authoritative latest atomically replaces live cache", async ({ page }) => {
+  test("an early edit stays in history until authoritative latest atomically replaces live cache", async ({
+    page,
+  }) => {
     const state = await setup(page);
     await page.route("**/api/messages/session-long?*", async (route) => {
       const offset = new URL(route.request().url()).searchParams.get("offset");
@@ -418,24 +515,33 @@ test.describe("苏小有 conversation outline navigation", () => {
       await route.fallback();
     });
     await page.goto("/c/session-long");
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
     const scroller = page.getByTestId("message-list-scroller");
     await expect(scroller.getByText(/Long user turn 001:/)).toBeVisible();
 
-    const editedText = "Edited first turn with an authoritative latest-page handoff.";
+    const editedText =
+      "Edited first turn with an authoritative latest-page handoff.";
     await submitFirstTurnEdit(page, editedText);
     await delay(300);
-    await expect(page.getByRole("button", { name: "Return to latest messages" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Return to latest messages" }),
+    ).toBeVisible();
     await expect(scroller.getByText(/Long user turn 002:/)).toHaveCount(0);
     await expect(page.getByText("Long assistant turn 060")).toHaveCount(0);
 
-    await expect(scroller.getByText(editedText)).toBeVisible({ timeout: 10_000 });
+    await expect(scroller.getByText(editedText)).toBeVisible({
+      timeout: 10_000,
+    });
     await expect(scroller.getByText(/Long user turn 002:/)).toHaveCount(0);
     await expect(page.getByText("Long assistant turn 060")).toHaveCount(0);
   });
 
-  test("a committed early edit with latest refresh failure prunes history and never exposes stale live messages", async ({ page }) => {
+  test("a committed early edit with latest refresh failure prunes history and never exposes stale live messages", async ({
+    page,
+  }) => {
     const state = await setup(page);
     await page.route("**/api/messages/session-long?*", async (route) => {
       const offset = new URL(route.request().url()).searchParams.get("offset");
@@ -450,19 +556,28 @@ test.describe("苏小有 conversation outline navigation", () => {
       await route.fallback();
     });
     await page.goto("/c/session-long");
-    const outline = page.getByRole("navigation", { name: "Conversation outline" });
+    const outline = page.getByRole("navigation", {
+      name: "Conversation outline",
+    });
     await outline.getByRole("button", { name: /Turn 1 of 60:/ }).click();
     const scroller = page.getByTestId("message-list-scroller");
 
-    await submitFirstTurnEdit(page, "Committed edit whose latest refresh fails.");
+    await submitFirstTurnEdit(
+      page,
+      "Committed edit whose latest refresh fails.",
+    );
     await expect(
-      page.getByText(/The edit was saved, but the latest messages could not be refreshed/),
+      page.getByText(
+        /The edit was saved, but the latest messages could not be refreshed/,
+      ),
     ).toBeVisible({ timeout: 10_000 });
     await expect(scroller.locator("textarea")).toHaveCount(0);
     await expect(scroller.getByText(/Long user turn 002:/)).toHaveCount(0);
     await expect(page.getByText("Long assistant turn 060")).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Return to latest messages" }).click();
+    await page
+      .getByRole("button", { name: "Return to latest messages" })
+      .click();
     await expect(scroller.getByText(/Long user turn 002:/)).toHaveCount(0);
     await expect(page.getByText("Long assistant turn 060")).toHaveCount(0);
   });

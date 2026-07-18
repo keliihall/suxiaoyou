@@ -1,11 +1,11 @@
 "use client";
 
-import { CheckCircle2, ChevronRight, Wrench } from "lucide-react";
+import { CheckCircle2, ChevronRight, CircleAlert, Wrench } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { SuxiaoyouLogo } from "@/components/ui/suxiaoyou-logo";
 import { useActivityStore, type ActivityData } from "@/stores/activity-store";
 import { formatElapsedDuration } from "@/lib/duration";
-import { isActivityComplete } from "@/lib/activity-state";
+import { isActivityComplete, isActivityFailed } from "@/lib/activity-state";
 
 interface ActivitySummaryProps {
   data: ActivityData;
@@ -21,11 +21,17 @@ export function ActivitySummary({ data }: ActivitySummaryProps) {
   const hasReasoning = data.reasoningTexts.length > 0;
   const hasTools = data.toolParts.length > 0;
   const isCompleted = isActivityComplete(data);
+  const activityFailed = isCompleted && isActivityFailed(data);
+  const adjustmentCount = isCompleted && !activityFailed
+    ? data.toolParts.filter((tool) => tool.state.status === "error").length
+    : 0;
 
   if (!hasReasoning && !hasTools) return null;
 
   const parts: string[] = [];
-  if (isCompleted) {
+  if (activityFailed) {
+    parts.push(t("activityNotCompleted"));
+  } else if (isCompleted) {
     parts.push(t("done"));
   } else if (hasReasoning) {
     parts.push(
@@ -43,6 +49,9 @@ export function ActivitySummary({ data }: ActivitySummaryProps) {
     const count = data.toolParts.length;
     parts.push(t("toolCallCount", { count }));
   }
+  if (adjustmentCount > 0) {
+    parts.push(t("activityAdjustmentCount", { count: adjustmentCount }));
+  }
 
   return (
     <button
@@ -50,8 +59,13 @@ export function ActivitySummary({ data }: ActivitySummaryProps) {
       onClick={() => data.sourceKey && toggleForMessage(data.sourceKey, data)}
       className="flex items-center gap-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors py-1.5 group"
     >
-      {isCompleted ? (
-        <CheckCircle2 className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
+      {activityFailed ? (
+        <CircleAlert
+          aria-hidden="true"
+          className="h-3.5 w-3.5 text-[var(--color-destructive)]"
+        />
+      ) : isCompleted ? (
+        <CheckCircle2 aria-hidden="true" className="h-3.5 w-3.5 text-[var(--tool-completed)]" />
       ) : hasReasoning ? (
         <SuxiaoyouLogo size={14} />
       ) : (

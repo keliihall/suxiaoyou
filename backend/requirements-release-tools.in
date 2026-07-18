@@ -1,0 +1,10 @@
+# Release-only Python tooling.
+#
+# Keep every direct dependency exactly pinned. The five platform-specific lock
+# files next to this input are generated with uv 0.11.28, Python 3.12, binary
+# distributions only, and hashes for every resolved distribution. See each
+# generated file header for its exact regeneration command.
+pip-audit==2.10.1
+pyinstaller==6.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0

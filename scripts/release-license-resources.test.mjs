@@ -321,10 +321,12 @@ test("source-availability notices match the locked MPL and CDLA versions", () =>
 test("runtime license filenames stay synchronized with release tooling", () => {
   const nodeDownloader = read("backend/scripts/download_node.py");
   const releaseWorkflow = read(".github/workflows/release.yml");
+  const releaseTools = read("backend/requirements-release-tools.in");
   const notices = read("THIRD_PARTY_NOTICES.md");
 
   assert.match(nodeDownloader, /^NODE_VERSION\s*=\s*["']22\.22\.0["']$/m);
-  assert.match(releaseWorkflow, /pyinstaller==6\.21\.0/);
+  assert.match(releaseTools, /^pyinstaller==6\.21\.0$/m);
+  assert.match(releaseWorkflow, /requirements-release-tools-(?:windows|macos|linux)-/);
   assert.match(releaseWorkflow, /python-version:\s*"3\.12\.13"/);
   assert.match(releaseWorkflow, /uv venv --python 3\.12\.13 --managed-python --seed/);
 
@@ -334,12 +336,17 @@ test("runtime license filenames stay synchronized with release tooling", () => {
   }
 
   assert.match(read("release-licenses/JAVASCRIPT-LICENSES.txt"), /Packages in production graph: 447/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Locked packages: 101/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: anthropic 0\.116\.0/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: google-genai 2\.11\.0/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: keyring 25\.7\.0/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: SecretStorage 3\.5\.0/);
-  assert.match(read("release-licenses/PYTHON-LICENSES.txt"), /Package: pywin32-ctypes 0\.2\.3/);
+  const pythonLicenses = read("release-licenses/PYTHON-LICENSES.txt");
+  assert.match(pythonLicenses, /Locked packages: 102/);
+  assert.match(
+    pythonLicenses,
+    /Package: agent-client-protocol 0\.10\.1[\s\S]{0,500}Declared license: UNKNOWN[\s\S]{0,500}Apache License\s+Version 2\.0, January 2004/,
+  );
+  assert.match(pythonLicenses, /Package: anthropic 0\.116\.0/);
+  assert.match(pythonLicenses, /Package: google-genai 2\.11\.0/);
+  assert.match(pythonLicenses, /Package: keyring 25\.7\.0/);
+  assert.match(pythonLicenses, /Package: SecretStorage 3\.5\.0/);
+  assert.match(pythonLicenses, /Package: pywin32-ctypes 0\.2\.3/);
   assert.match(read("release-licenses/RUST-LICENSES.html"), /suxiaoyou/i);
 });
 

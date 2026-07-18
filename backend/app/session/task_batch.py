@@ -382,6 +382,8 @@ async def run_task_batch(
                 invocation_source=job.invocation_source,
                 invocation_source_id=job.invocation_source_id,
             )
+            child_job.inherit_runtime_context(job)
+            child_job.inherit_goal_context(job)
             child_job.abort_event = job.abort_event
             child_job.interactive = False
             child_job._depth = getattr(job, "_depth", 0) + 1

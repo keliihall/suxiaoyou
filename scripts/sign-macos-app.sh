@@ -16,6 +16,7 @@ BACKEND_IDENTIFIER="com.suxiaoyou.backend"
 BACKEND_ADHOC_ENTITLEMENTS="$REPOSITORY_ROOT/desktop-tauri/src-tauri/entitlements.backend-adhoc.plist"
 NODE_BINARY="$APP_PATH/Contents/Resources/nodejs/bin/node"
 NODE_ENTITLEMENTS="$REPOSITORY_ROOT/desktop-tauri/src-tauri/entitlements.node.plist"
+OFFICE_RENDERER_ROOT="$APP_PATH/Contents/Resources/backend/_internal/app/data/office-renderer"
 TEMPORARY_DIRECTORY="$(mktemp -d "${TMPDIR:-/tmp}/suxiaoyou-sign.XXXXXX")"
 MACHO_LIST="$TEMPORARY_DIRECTORY/macho-files.txt"
 SIGNED_BACKEND_ENTITLEMENTS="$TEMPORARY_DIRECTORY/backend-entitlements.plist"
@@ -43,6 +44,18 @@ else
   SIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
 fi
 
+verify_presigned_renderer_code() {
+  local candidate="$1"
+  local details="$TEMPORARY_DIRECTORY/renderer-signature-$RANDOM.txt"
+  codesign --verify --strict --verbose=2 "$candidate"
+  codesign -dv --verbose=4 "$candidate" > "$details" 2>&1
+  if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+    grep -Fxq "Signature=adhoc" "$details"
+  else
+    grep -Fxq "Authority=$SIGNING_IDENTITY" "$details"
+  fi
+}
+
 python3 - "$APP_PATH" "$MACHO_LIST" <<'PY'
 import os
 import sys
@@ -64,7 +77,12 @@ while IFS= read -r candidate; do
   if ! file -b "$candidate" | grep -q "Mach-O"; then
     continue
   fi
-  if [[ "$candidate" == "$NODE_BINARY" ]]; then
+  if [[ "$candidate" == "$OFFICE_RENDERER_ROOT/"* ]]; then
+    # The renderer attestation binds the final code-signature bytes. Re-signing
+    # here would invalidate that tree. Renderer staging must therefore supply
+    # already-signed nested code with the exact release identity.
+    verify_presigned_renderer_code "$candidate"
+  elif [[ "$candidate" == "$NODE_BINARY" ]]; then
     codesign "${SIGN_ARGS[@]}" --entitlements "$NODE_ENTITLEMENTS" "$candidate"
   elif [[ "$candidate" == "$BACKEND_BINARY" ]]; then
     if [[ "$SIGNING_IDENTITY" == "-" ]]; then
@@ -79,7 +97,11 @@ while IFS= read -r candidate; do
 done < "$MACHO_LIST"
 
 while IFS= read -r -d '' framework; do
-  codesign "${SIGN_ARGS[@]}" "$framework"
+  if [[ "$framework" == "$OFFICE_RENDERER_ROOT/"* ]]; then
+    verify_presigned_renderer_code "$framework"
+  else
+    codesign "${SIGN_ARGS[@]}" "$framework"
+  fi
 done < <(find "$APP_PATH" -type d -name '*.framework' -print0)
 
 codesign "${SIGN_ARGS[@]}" "$APP_PATH"

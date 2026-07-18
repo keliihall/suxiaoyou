@@ -64,6 +64,12 @@ class ToolContext:
     goal_id: str | None = None
     goal_run_id: str | None = None
     goal_session_id: str | None = None
+    # Server-owned v1.1 persistence identities.  Tools may pass them through
+    # to guarded journals but model arguments can never set them.
+    root_turn_id: str | None = None
+    turn_run_id: str | None = None
+    checkpoint_id: str | None = None
+    workspace_instance_id: str | None = None
 
     # Callbacks set by the session processor
     _publish_fn: Callable[[str, dict[str, Any]], None] | None = None

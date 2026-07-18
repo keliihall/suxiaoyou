@@ -258,6 +258,14 @@ jobs:
   packaging-smoke:
     name: Production Linux Installer Smoke
     runs-on: ubuntu-22.04
+    env:
+      # v1.1 CI intentionally exercises the transparent no-renderer release
+      # profile. Runtime Office authoring remains fail-closed; preview may use
+      # an explicitly discovered host renderer outside the packaged bundle.
+      SUXIAOYOU_OFFICE_RENDERER_PROFILE: unsigned-degraded
+      VERIFY_BUNDLE_V11_GATE_MODE: released
+      VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE: unsigned-degraded
+      VERIFY_BUNDLE_OFFICE_PLATFORM: linux-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

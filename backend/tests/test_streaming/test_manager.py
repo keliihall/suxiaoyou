@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from app.streaming.events import DESYNC, SSEEvent, TEXT_DELTA, DONE, PERMISSION_REQUEST
-from app.streaming.manager import GenerationJob, StreamManager
+from app.streaming.manager import GenerationJob, SessionBusyError, StreamManager
 
 
 class TestGenerationJobInteractive:
@@ -135,6 +135,57 @@ class TestStreamManagerCleanup:
         active = sm.active_jobs()
         assert len(active) == 1
         assert active[0]["stream_id"] == "s2"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_owns_and_cancels_lingering_reconciliation_tasks() -> None:
+    manager = StreamManager()
+    started = asyncio.Event()
+
+    async def reconcile_forever() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(reconcile_forever())
+    manager.track_reconciliation_task(task)
+    await started.wait()
+
+    count, quiesced = await manager.abort_all_and_wait(timeout=0.0)
+
+    assert count == 0
+    assert quiesced is False
+    assert task.cancelled()
+    assert not manager._reconciliation_tasks
+
+
+@pytest.mark.asyncio
+async def test_completed_job_remains_active_until_tracked_tool_is_quiescent() -> None:
+    manager = StreamManager()
+    job = manager.create_job("old-stream", "shared-session")
+    release = asyncio.Event()
+
+    async def stubborn_tool() -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(stubborn_tool())
+    job.track_tool_task(task)
+    await asyncio.sleep(0)
+    job.complete()
+
+    assert job.is_quiescent is False
+    assert manager.active_job_for_session("shared-session") is job
+    assert manager.remove_job(job.stream_id) is False
+    with pytest.raises(SessionBusyError):
+        manager.create_job("new-stream", "shared-session")
+
+    release.set()
+    await task
+    await asyncio.sleep(0)
+    assert job.is_quiescent is True
+    assert manager.active_job_for_session("shared-session") is None
 
 
 @pytest.mark.asyncio

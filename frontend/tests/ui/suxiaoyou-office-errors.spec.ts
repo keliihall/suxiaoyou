@@ -12,7 +12,7 @@ async function setupMockedApp(page: Page, options?: 苏小有MockOptions): Promi
 }
 
 async function expectNoAppCrash(page: Page) {
-  await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
+  await expect(page.getByText(/^(?:Unhandled )?Runtime (?:Error|TypeError|ReferenceError)$/)).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);
 }
 
@@ -145,6 +145,84 @@ async function mockPptxStaticPreview(page: Page) {
   return () => requests;
 }
 
+async function mockAuthoritativeOfficePreview(page: Page) {
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lL3u4QAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const renderBodies: Array<Record<string, unknown>> = [];
+  let pageRequests = 0;
+  await page.route("**/api/office-v2/context**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        session_id: "session-artifacts",
+        workspace_instance_id: "workspace-artifacts",
+        renderer_available: true,
+        renderer_id: "suxiaoyou-attested-office",
+        renderer_version: "attestation-fixture",
+        font_digest: "f".repeat(64),
+        preview_quality: "authoritative",
+        formula_values_recalculated: false,
+      }),
+    });
+  });
+  await page.route("**/api/office-v2/render", async (route) => {
+    renderBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        session_id: "session-artifacts",
+        workspace_instance_id: "workspace-artifacts",
+        relative_path: "docs/office-brief.docx",
+        source_sha256: "a".repeat(64),
+        checkpoint_id: "checkpoint-office-1",
+        root_turn_id: "turn-office-1",
+        preview_quality: "authoritative",
+        formula_values_recalculated: false,
+        manifest: {
+          cache_key: "b".repeat(64),
+          renderer_id: "suxiaoyou-attested-office",
+          renderer_version: "attestation-fixture",
+          font_digest: "f".repeat(64),
+          quality: "authoritative",
+          pages: [{
+            page_number: 1,
+            filename: "page-1.png",
+            sha256: "c".repeat(64),
+            size_bytes: png.length,
+            width_px: 1,
+            height_px: 1,
+            mime_type: "image/png",
+          }],
+        },
+      }),
+    });
+  });
+  await page.route("**/api/office-v2/validation**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        session_id: "session-artifacts",
+        workspace_instance_id: "workspace-artifacts",
+        relative_path: "docs/office-brief.docx",
+        source_sha256: "a".repeat(64),
+        status: "authoritative_pass",
+        stale_reason: null,
+        report: null,
+      }),
+    });
+  });
+  await page.route("**/api/office-v2/page**", async (route) => {
+    pageRequests += 1;
+    await route.fulfill({ status: 200, contentType: "image/png", body: png });
+  });
+  return { renderBodies, pageRequests: () => pageRequests };
+}
+
 async function mockLegacyPptMessage(page: Page) {
   await page.route("**/api/messages/session-artifacts**", async (route) => {
     if (new URL(route.request().url()).pathname.endsWith("/turn-index")) {
@@ -246,6 +324,29 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     expect(state.binaryReads.join("\n")).toContain("office-matrix.xlsx");
     expect(state.binaryReads.join("\n")).toContain("office-report.pdf");
     expect(state.binaryReads.join("\n")).not.toContain("office-deck.pptx");
+    await expectNoAppCrash(page);
+  });
+
+  test("authoritative Office preview stays bound to a server-owned checkpoint", async ({ page }) => {
+    const state = await setupMockedApp(page);
+    const office = await mockAuthoritativeOfficePreview(page);
+
+    await page.goto("/c/session-artifacts");
+    await openArtifactFile(page, "office-brief.docx");
+
+    await expect(page.getByText("High-fidelity preview", { exact: true })).toBeVisible();
+    await expect(page.getByText("Version linked", { exact: false })).toBeVisible();
+    await expect(page.getByText("Authoritative validation current", { exact: true })).toBeVisible();
+    await expect(page.getByRole("img", { name: "Office preview page 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Previous Office page" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Next Office page" })).toBeDisabled();
+    expect(office.renderBodies).toEqual([{
+      session_id: "session-artifacts",
+      workspace_instance_id: "workspace-artifacts",
+      relative_path: "docs/office-brief.docx",
+    }]);
+    expect(office.pageRequests()).toBe(1);
+    expect(state.binaryReads.join("\n")).not.toContain("office-brief.docx");
     await expectNoAppCrash(page);
   });
 

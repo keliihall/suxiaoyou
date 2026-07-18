@@ -10,6 +10,8 @@ from app.api import pptx as pptx_api
 from app.api import automations as automations_api
 from app.api import workspace_memory as workspace_memory_api
 from app.api import ollama as ollama_api
+from app.api import office_v2 as office_v2_api
+from app.api import office_user_templates as office_user_templates_api
 from app.api import chat as chat_api
 from app.api import session_inputs as session_inputs_api
 from app.api import config as config_api
@@ -24,6 +26,7 @@ from app.api import fts as fts_api
 from app.api import openai_auth as openai_auth_api
 from app.api import plugins as plugins_api
 from app.api import rapid_mlx as rapid_mlx_api
+from app.api import runtime_control as runtime_control_api
 from app.api import security as security_api
 from app.api import sessions as sessions_api
 from app.api import skills as skills_api
@@ -69,6 +72,12 @@ api_router.include_router(automations_api.router, tags=["automations"])
 api_router.include_router(ollama_api.router, tags=["ollama"])
 api_router.include_router(rapid_mlx_api.router, tags=["rapid-mlx"])
 api_router.include_router(security_api.router, tags=["security"])
+api_router.include_router(runtime_control_api.router, tags=["runtime-control"])
+api_router.include_router(office_v2_api.router, tags=["office-v2"])
+api_router.include_router(
+    office_user_templates_api.router,
+    tags=["office-user-templates"],
+)
 if MESSAGING_CHANNELS_RELEASED:
     from app.api import channels as channels_api
 

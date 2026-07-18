@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.idempotency_record import IdempotencyRecord
 from app.models.session_goal import SessionGoal
 from app.schemas.session import SessionResponse
 from app.session.manager import (
@@ -18,6 +20,7 @@ from app.session.manager import (
     get_session,
     list_sessions,
     search_sessions,
+    update_message_text,
     update_session_title,
 )
 
@@ -97,6 +100,97 @@ class TestSessionManager:
 
 
 class TestMessageManager:
+    @pytest.mark.asyncio
+    async def test_history_edit_invalidates_all_bound_acp_replays_in_same_transaction(
+        self,
+        db: AsyncSession,
+    ) -> None:
+        session = await create_session(db, title="ACP history binding")
+        target = await create_message(
+            db,
+            session_id=session.id,
+            data={"role": "user", "acp_message_id": "acp-target"},
+        )
+        await create_part(
+            db,
+            message_id=target.id,
+            session_id=session.id,
+            data={"type": "text", "text": "original target"},
+        )
+        suffix = await create_message(
+            db,
+            session_id=session.id,
+            data={"role": "user", "acp_message_id": "acp-suffix"},
+        )
+        await create_part(
+            db,
+            message_id=suffix.id,
+            session_id=session.id,
+            data={"type": "text", "text": "deleted suffix"},
+        )
+        target.time_created = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
+        suffix.time_created = datetime(2026, 7, 18, 8, 1, tzinfo=timezone.utc)
+        session_id = session.id
+        target_id = target.id
+        scope = f"acp.prompt:{session_id}"
+        for request_key, message_id in (
+            ("acp-target", target.id),
+            ("acp-suffix", suffix.id),
+        ):
+            db.add(
+                IdempotencyRecord(
+                    scope=scope,
+                    request_key=request_key,
+                    request_hash=f"hash-{request_key}",
+                    status="completed",
+                    response={
+                        "userMessageId": message_id,
+                        "staleReplayPayload": request_key,
+                    },
+                )
+            )
+        db.add(
+            IdempotencyRecord(
+                scope=scope,
+                request_key="unbound-survivor",
+                request_hash="hash-survivor",
+                status="completed",
+                response={"preserved": True},
+            )
+        )
+        await db.flush()
+
+        await update_message_text(db, target.id, "rewritten target")
+        assert await delete_messages_after(db, session.id, target.id) == 1
+
+        # Query before the fixture transaction commits: history and durable ACP
+        # replay state must change atomically in the caller-owned transaction.
+        db.expire_all()
+        records = {
+            record.request_key: record
+            for record in (
+                await db.execute(
+                    select(IdempotencyRecord).where(IdempotencyRecord.scope == scope)
+                )
+            ).scalars()
+        }
+        for request_key in ("acp-target", "acp-suffix"):
+            assert records[request_key].status == "interrupted"
+            assert records[request_key].response == {}
+            assert (
+                records[request_key].error_message
+                == "acp_prompt_history_changed"
+            )
+        assert records["unbound-survivor"].status == "completed"
+        assert records["unbound-survivor"].response == {"preserved": True}
+
+        messages = await get_messages(db, session_id)
+        assert [message.id for message in messages] == [target_id]
+        assert messages[0].parts[0].data == {
+            "type": "text",
+            "text": "rewritten target",
+        }
+
     @pytest.mark.asyncio
     async def test_message_order_and_history_deletion_are_stable_for_tied_timestamps(
         self, db: AsyncSession

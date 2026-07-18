@@ -75,6 +75,7 @@
   --tool-pending: #EAB308;
   --tool-running: #171717;
   --tool-completed: #22C55E;
+  --tool-adjusted: #A16207;
   --tool-error: #EF4444;
 
   /* Prose — content styling */
@@ -159,6 +160,9 @@
 
   /* Switch */
   --switch-checked: #339CFF;
+
+  /* Recoverable tool detours should stay distinct from task-level errors. */
+  --tool-adjusted: #d7b565;
 
   /* Shadows */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.18);

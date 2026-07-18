@@ -1,8 +1,9 @@
 [project]
 name = "suxiaoyou"
-version = "1.0.0"
+version = "1.1.0"
 description = "Your local AI assistant — private, powerful, personal"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     # Web framework
@@ -37,6 +38,9 @@ dependencies = [
     "qrcode[pil]>=8.0",
     "pyyaml>=6.0",
     "mcp==1.28.1",
+    # ACP v1 schema/runtime. 0.11 changes the Python agent interface; keep the
+    # 0.10 line aligned with grok-build's agent-client-protocol 0.10.4 wire.
+    "agent-client-protocol>=0.10.1,<0.11",
     "croniter==6.2.4",
     "wcmatch==11.0",
 
@@ -46,14 +50,17 @@ dependencies = [
 
     # Office document reading & creation
     "pypdf>=4.0.0",
-    "python-docx>=1.1.0",
-    "openpyxl>=3.1.0",
-    "python-pptx>=0.6.23",
+    # OOXML round-trip behavior is fidelity-sensitive. Keep development,
+    # template generation, and the hash-locked release graph on one version.
+    "python-docx==1.1.2",
+    "openpyxl==3.1.5",
+    "python-pptx==1.0.2",
     "markdown>=3.5",
     "beautifulsoup4>=4.12.0",
     "reportlab>=4.4.0",
-    # WeChat media encryption uses cryptography as a fallback. Version 48.0.1
-    # retains an official universal2 wheel for Intel and Apple Silicon.
+    # Ed25519 verification for the signed Office template catalog and WeChat
+    # media encryption require cryptography. Version 48.0.1 retains an
+    # official universal2 wheel for Intel and Apple Silicon.
     "cryptography==48.0.1",
 
     # Data science (used by code_execute)
@@ -71,6 +78,9 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
 ]
+
+[project.scripts]
+suxiaoyou-acp = "app.acp.cli:main"
 
 [build-system]
 requires = ["hatchling"]

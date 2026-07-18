@@ -10,7 +10,12 @@ import {
   expectedReleaseAssets,
   parseChecksumMarkdown,
   RELEASE_MANIFEST_KIND,
+  RELEASE_PROFILES,
   RELEASE_MANIFEST_SCHEMA_VERSION,
+  resolveReleaseProfile,
+  UNSIGNED_DEGRADED_CAPABILITIES,
+  UNSIGNED_DEGRADED_RELEASE_MANIFEST_SCHEMA_VERSION,
+  UNSIGNED_DEGRADED_TRUST,
   releaseIdentityFromVersion,
   releaseVersionFromTag,
 } from "./generate-release-manifest.mjs";
@@ -23,29 +28,56 @@ export function verifyReleaseManifest({
   expectedTag,
   expectedCommit,
   expectedRepository,
+  releaseProfile,
 }) {
   const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
   const version = releaseVersionFromTag(expectedTag);
   const { appVersion, channel } = releaseIdentityFromVersion(version);
+  const profile = resolveReleaseProfile(version, releaseProfile);
+  const unsignedDegraded = profile === RELEASE_PROFILES.UNSIGNED_DEGRADED;
   requireExactKeys(
     manifest,
-    [
-      "schemaVersion",
-      "kind",
-      "updateMode",
-      "channel",
-      "repository",
-      "tag",
-      "version",
-      "appVersion",
-      "commit",
-      "releaseUrl",
-      "checksumUrl",
-      "assets",
-    ],
+    unsignedDegraded
+      ? [
+          "schemaVersion",
+          "kind",
+          "updateMode",
+          "channel",
+          "repository",
+          "tag",
+          "version",
+          "appVersion",
+          "commit",
+          "releaseUrl",
+          "checksumUrl",
+          "assets",
+          "releaseProfile",
+          "publicationChannel",
+          "officialReleaseEligible",
+          "latestEligible",
+          "trust",
+          "capabilities",
+        ]
+      : [
+          "schemaVersion",
+          "kind",
+          "updateMode",
+          "channel",
+          "repository",
+          "tag",
+          "version",
+          "appVersion",
+          "commit",
+          "releaseUrl",
+          "checksumUrl",
+          "assets",
+        ],
     "release manifest",
   );
-  if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA_VERSION) {
+  const expectedSchemaVersion = unsignedDegraded
+    ? UNSIGNED_DEGRADED_RELEASE_MANIFEST_SCHEMA_VERSION
+    : RELEASE_MANIFEST_SCHEMA_VERSION;
+  if (manifest.schemaVersion !== expectedSchemaVersion) {
     throw new Error(`unsupported release manifest schema ${manifest.schemaVersion}`);
   }
   if (manifest.kind !== RELEASE_MANIFEST_KIND) throw new Error("release manifest kind is invalid");
@@ -58,6 +90,30 @@ export function verifyReleaseManifest({
   requireEqual(manifest.appVersion, appVersion, "app version");
   requireEqual(manifest.commit, expectedCommit, "commit");
   requireEqual(manifest.repository, expectedRepository, "repository");
+  if (unsignedDegraded) {
+    requireEqual(manifest.releaseProfile, profile, "release profile");
+    requireEqual(
+      manifest.publicationChannel,
+      "prerelease",
+      "publication channel",
+    );
+    requireEqual(
+      manifest.officialReleaseEligible,
+      false,
+      "official release eligibility",
+    );
+    requireEqual(manifest.latestEligible, false, "latest eligibility");
+    requireExactObject(
+      manifest.trust,
+      UNSIGNED_DEGRADED_TRUST,
+      "unsigned-degraded trust",
+    );
+    requireExactObject(
+      manifest.capabilities,
+      UNSIGNED_DEGRADED_CAPABILITIES,
+      "unsigned-degraded capabilities",
+    );
+  }
   const releaseBase = `https://github.com/${expectedRepository}/releases`;
   requireEqual(manifest.releaseUrl, `${releaseBase}/tag/${expectedTag}`, "release URL");
   requireEqual(
@@ -68,7 +124,7 @@ export function verifyReleaseManifest({
   if (!Array.isArray(manifest.assets)) throw new Error("release manifest assets must be an array");
 
   const root = resolve(assetsDirectory);
-  const expected = expectedReleaseAssets(version);
+  const expected = expectedReleaseAssets(version, profile);
   const installerNames = readdirSync(root)
     .filter((name) => /\.(?:exe|dmg|deb|rpm)$/i.test(name))
     .sort();
@@ -140,6 +196,13 @@ function requireExactKeys(value, expectedKeys, label) {
   }
 }
 
+function requireExactObject(value, expected, label) {
+  requireExactKeys(value, Object.keys(expected), label);
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    requireEqual(value[key], expectedValue, `${label}.${key}`);
+  }
+}
+
 function main() {
   const [
     manifestFile,
@@ -148,6 +211,7 @@ function main() {
     expectedTag,
     expectedCommit,
     expectedRepository,
+    releaseProfile,
   ] = process.argv.slice(2);
   if (
     !manifestFile ||
@@ -158,7 +222,7 @@ function main() {
     !expectedRepository
   ) {
     throw new Error(
-      "usage: verify-release-manifest.mjs <manifest> <assets-dir> <checksums> <tag> <commit> <owner/repo>",
+      "usage: verify-release-manifest.mjs <manifest> <assets-dir> <checksums> <tag> <commit> <owner/repo> [official|rc-adhoc|unsigned-degraded]",
     );
   }
   const manifest = verifyReleaseManifest({
@@ -168,6 +232,7 @@ function main() {
     expectedTag,
     expectedCommit,
     expectedRepository,
+    releaseProfile,
   });
   console.log(
     `[verify-release-manifest] ${manifest.tag} has ${manifest.assets.length} ` +

@@ -492,12 +492,7 @@ function cloneJson<T>(value: T): T {
 }
 
 type NaturalOfficeKind =
-  | "memo"
-  | "budget"
-  | "deck"
-  | "vendor"
-  | "board"
-  | "followup";
+  "memo" | "budget" | "deck" | "vendor" | "board" | "followup";
 
 const naturalOfficeResponses: Record<NaturalOfficeKind, string> = {
   memo: "VP-ready customer feedback memo\n\nExecutive readout: the feedback points to a fixable revenue risk, not a product-market problem. Customers still value the workflow, but onboarding, pricing language, and support ownership are creating avoidable friction before expansion conversations.\n\nTop three themes\n\n| Theme | Signal from notes | Business impact | Owner |\n| --- | --- | --- | --- |\n| Onboarding friction | New teams need repeated setup help | Delays first successful project | Growth Ops |\n| Pricing confusion | Buyers ask when usage becomes billable | Slows procurement and expansion | Finance |\n| Support handoff gaps | Tickets bounce between CS and Support | Creates executive escalation risk | Support Ops |\n\nRecommended actions\n\n1. Publish a one-page pricing FAQ by Friday.\n2. Assign one owner for onboarding follow-up on every strategic account.\n3. Review the SLA dashboard in next week's staff meeting.\n\nEmail draft\n\nTeam, I reviewed the customer notes and the pattern is clear: we should tighten onboarding, clarify pricing language, and close support handoffs before the next expansion cycle. I recommend Growth Ops, Finance, and Support Ops each bring a concrete fix and owner to tomorrow's planning review.",
@@ -514,8 +509,7 @@ const naturalOfficeResponses: Record<NaturalOfficeKind, string> = {
 
 function latestPromptText(state: 苏小有MockState) {
   const latest = state.promptBodies[state.promptBodies.length - 1] as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   return typeof latest?.text === "string" ? latest.text : "";
 }
 
@@ -699,10 +693,7 @@ function createdMessagePageForState(state: 苏小有MockState) {
   return page;
 }
 
-function sessionMessagePageForState(
-  sessionId: string,
-  state: 苏小有MockState,
-) {
+function sessionMessagePageForState(sessionId: string, state: 苏小有MockState) {
   const page = cloneJson(messagePage(sessionId));
   const edit = [...state.editBodies].reverse().find((body) => {
     const data = body as Record<string, unknown> | null;
@@ -797,11 +788,22 @@ export function appendLongConversationTurn(
   prompt: string,
   reply: string,
 ) {
-  const turnNumber = 61 + Math.floor(state.extraLongConversationMessages.length / 2);
+  const turnNumber =
+    61 + Math.floor(state.extraLongConversationMessages.length / 2);
   const turn = String(turnNumber).padStart(3, "0");
   state.extraLongConversationMessages.push(
-    textMessage("session-long", `user-${turn}`, "user", `Long user turn ${turn}: ${prompt}`),
-    textMessage("session-long", `assistant-${turn}`, "assistant", `Long assistant turn ${turn}: ${reply}`),
+    textMessage(
+      "session-long",
+      `user-${turn}`,
+      "user",
+      `Long user turn ${turn}: ${prompt}`,
+    ),
+    textMessage(
+      "session-long",
+      `assistant-${turn}`,
+      "assistant",
+      `Long assistant turn ${turn}: ${reply}`,
+    ),
   );
 }
 
@@ -894,7 +896,13 @@ function compactMessagePage(compacted: boolean) {
     "assistant-1",
     "assistant",
     "This conversation is above the manual compaction threshold.",
-    { input: 90000, output: 500, reasoning: 60, cache_read: 0, cache_write: 0 },
+    {
+      input: 100000,
+      output: 500,
+      reasoning: 60,
+      cache_read: 0,
+      cache_write: 0,
+    },
   );
 
   if (compacted) {
@@ -982,17 +990,20 @@ function conversationTurnIndex(messages: MockMessage[]) {
       .map((part) => String(part.data.name ?? ""))
       .filter(Boolean);
     const rawSummary = text || attachmentNames[0] || "";
-    const summary = rawSummary.length <= 160
-      ? rawSummary
-      : `${rawSummary.slice(0, 159).trimEnd()}…`;
-    return [{
-      message_id: message.id,
-      ordinal: 0,
-      message_offset: messageOffset,
-      time_created: message.time_created,
-      summary,
-      attachment_names: attachmentNames,
-    }];
+    const summary =
+      rawSummary.length <= 160
+        ? rawSummary
+        : `${rawSummary.slice(0, 159).trimEnd()}…`;
+    return [
+      {
+        message_id: message.id,
+        ordinal: 0,
+        message_offset: messageOffset,
+        time_created: message.time_created,
+        summary,
+        attachment_names: attachmentNames,
+      },
+    ];
   });
   turns.forEach((turn, index) => {
     turn.ordinal = index + 1;
@@ -2018,6 +2029,16 @@ export async function mock苏小有Api(
       return fulfillJson(route, { status: "ok" });
     }
     if (path === "/api/models") return fulfillJson(route, models);
+    if (path === "/api/runtime/context") {
+      return route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({
+          code: "v11_runtime_not_available",
+          detail: "Runtime controls are not available in this release",
+        }),
+      });
+    }
     if (path === "/api/security/overview") {
       return fulfillJson(route, {
         state: {
@@ -2049,9 +2070,11 @@ export async function mock苏小有Api(
     if (path === "/api/chat/active") {
       if (options.activeJobs) return fulfillJson(route, options.activeJobs);
       const goalJobs = [...goalsBySession.values()]
-        .filter((goal) => (
-          goal.run_state === "reserved" || goal.run_state === "running"
-        ) && goal.last_stream_id)
+        .filter(
+          (goal) =>
+            (goal.run_state === "reserved" || goal.run_state === "running") &&
+            goal.last_stream_id,
+        )
         .map((goal) => ({
           stream_id: goal.last_stream_id,
           session_id: goal.session_id,
@@ -2387,11 +2410,18 @@ export async function mock苏小有Api(
       if (method === "PATCH" && current) {
         const body = (requestJson(request) ?? {}) as Record<string, unknown>;
         const update: Partial<SessionGoal> = {};
-        if (typeof body.objective === "string") update.objective = body.objective;
-        if (typeof body.definition_of_done === "string" || body.definition_of_done === null) {
+        if (typeof body.objective === "string")
+          update.objective = body.objective;
+        if (
+          typeof body.definition_of_done === "string" ||
+          body.definition_of_done === null
+        ) {
           update.definition_of_done = body.definition_of_done;
         }
-        if (typeof body.token_budget === "number" || body.token_budget === null) {
+        if (
+          typeof body.token_budget === "number" ||
+          body.token_budget === null
+        ) {
           update.token_budget = body.token_budget;
         }
         state.goalUpdates.push({ session_id: sessionId, ...body });
@@ -2524,7 +2554,11 @@ export async function mock苏小有Api(
       if (sessionId === "session-long")
         return fulfillJson(
           route,
-          paginatedMessages(messagesForSession(sessionId, state), limit, offset),
+          paginatedMessages(
+            messagesForSession(sessionId, state),
+            limit,
+            offset,
+          ),
         );
       if (sessionId === "session-compact")
         return fulfillJson(
@@ -2546,9 +2580,10 @@ export async function mock苏小有Api(
     }
     if (path === "/api/chat/goal" && method === "POST") {
       const body = (requestJson(request) ?? {}) as Record<string, unknown>;
-      const sessionId = typeof body.session_id === "string"
-        ? body.session_id
-        : createdSession.id;
+      const sessionId =
+        typeof body.session_id === "string"
+          ? body.session_id
+          : createdSession.id;
       const streamId = `stream-goal-initial-${state.goalStarts.length + 1}`;
       const goal = createdGoal(
         sessionId,
@@ -3020,7 +3055,9 @@ export async function mock苏小有Api(
     if (path === "/api/remote/status") {
       return fulfillJson(route, {
         enabled: state.remoteEnabled,
-        tunnel_url: state.remoteEnabled ? "https://remote.suxiaoyou.test" : null,
+        tunnel_url: state.remoteEnabled
+          ? "https://remote.suxiaoyou.test"
+          : null,
         token_preview: state.remoteEnabled ? "remote..." : null,
         active_tasks: 1,
         tunnel_mode: "cloud",

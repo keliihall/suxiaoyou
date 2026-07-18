@@ -31,6 +31,7 @@ from sqlalchemy import create_engine as create_sync_engine
 from sqlalchemy.engine import URL, make_url
 
 from app.utils.atomic_write import atomic_write_text
+from app.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,9 @@ V100_SECURITY_AUDIT_REVISION: Final = "0006_v100_security_audit"
 V100_INVOCATION_SOURCE_REVISION: Final = "0007_v100_invocation_source"
 V100_SESSION_GOAL_REVISION: Final = "0008_v100_session_goal"
 V100_GOAL_USAGE_LEDGER_REVISION: Final = "0009_v100_goal_usage_ledger"
-CURRENT_HEAD_REVISION: Final = V100_GOAL_USAGE_LEDGER_REVISION
+V110_CHECKPOINT_LEDGER_REVISION: Final = "0010_v110_checkpoint_ledger"
+V110_USER_OFFICE_TEMPLATES_REVISION: Final = "0011_v110_user_office_templates"
+CURRENT_HEAD_REVISION: Final = V110_USER_OFFICE_TEMPLATES_REVISION
 # Backward-compatible import for older callers/tests. New code must use the
 # release-neutral CURRENT_HEAD_REVISION name.
 V080_HEAD_REVISION: Final = CURRENT_HEAD_REVISION
@@ -57,11 +60,16 @@ SUPPORTED_REVISIONS: Final[frozenset[str]] = frozenset(
         V100_SECURITY_AUDIT_REVISION,
         V100_INVOCATION_SOURCE_REVISION,
         V100_SESSION_GOAL_REVISION,
+        V100_GOAL_USAGE_LEDGER_REVISION,
+        V110_CHECKPOINT_LEDGER_REVISION,
         CURRENT_HEAD_REVISION,
     }
 )
 BACKUP_MANIFEST_VERSION: Final = 1
-BACKUP_APP_VERSION: Final = "1.0.0"
+BACKUP_APP_VERSION: Final = APP_VERSION
+SUPPORTED_BACKUP_APP_VERSIONS: Final[frozenset[str]] = frozenset(
+    {"1.0.0", BACKUP_APP_VERSION}
+)
 
 # This is the schema shipped by v0.7.3.  It is deliberately independent from
 # current ORM metadata: using the current models here would silently bless an
@@ -670,7 +678,7 @@ def _load_and_verify_backup_manifest(
     )
     if any(not isinstance(payload.get(key), str) or not payload[key] for key in required_strings):
         raise DatabaseRestoreError(f"Incomplete backup manifest: {manifest_path}")
-    if payload.get("app_version") != BACKUP_APP_VERSION:
+    if payload.get("app_version") not in SUPPORTED_BACKUP_APP_VERSIONS:
         raise DatabaseRestoreError(
             f"Backup manifest was created by unsupported app version "
             f"{payload.get('app_version')!r}"
@@ -974,7 +982,7 @@ def _upgrade_existing_database(
 ) -> MigrationResult:
     token = _migration_token()
     backup_path = database_path.with_name(
-        f"{database_path.name}.pre-v1.0.0-{token}.bak"
+        f"{database_path.name}.pre-v{BACKUP_APP_VERSION}-{token}.bak"
     )
     backup_metadata_path: Path | None = None
     staging_path = database_path.with_name(f".{database_path.name}.{token}.migrating")

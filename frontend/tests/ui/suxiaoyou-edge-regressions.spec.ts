@@ -16,14 +16,20 @@ async function setupMockedApp(
 }
 
 async function expectNoAppCrash(page: Page) {
-  await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
+  await expect(
+    page.getByText(
+      /^(?:Unhandled )?Runtime (?:Error|TypeError|ReferenceError)$/,
+    ),
+  ).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);
 }
 
 test.describe("苏小有 edge-state GUI regressions", () => {
   test.describe.configure({ timeout: 75_000 });
 
-  test("a late files response from the previous session cannot overwrite the focused workspace", async ({ page }) => {
+  test("a late files response from the previous session cannot overwrite the focused workspace", async ({
+    page,
+  }) => {
     await setupMockedApp(page);
 
     let releaseAlphaFiles!: () => void;
@@ -42,12 +48,14 @@ test.describe("苏小有 edge-state GUI regressions", () => {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          files: [{
-            name: "alpha-only.txt",
-            path: "/Users/alex/suxiaoyou-demo/alpha-only.txt",
-            type: "generated",
-            tool: "write",
-          }],
+          files: [
+            {
+              name: "alpha-only.txt",
+              path: "/Users/alex/suxiaoyou-demo/alpha-only.txt",
+              type: "generated",
+              tool: "write",
+            },
+          ],
         }),
       });
     });
@@ -62,32 +70,42 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await page.goto("/c/session-alpha");
     await alphaFilesRequested;
 
-    const betaFilesResponse = page.waitForResponse((response) =>
-      response.url().endsWith("/api/sessions/session-beta/files")
-      && response.status() === 200,
+    const betaFilesResponse = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/sessions/session-beta/files") &&
+        response.status() === 200,
     );
     await page.getByText("Invoice cleanup", { exact: true }).click();
     await expect(page).toHaveURL(/\/c\/session-beta$/);
     await betaFilesResponse;
-    await expect(page.getByRole("button", { name: "Hide workspace" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Hide workspace" }),
+    ).toBeVisible();
 
-    const lateAlphaResponse = page.waitForResponse((response) =>
-      response.url().endsWith("/api/sessions/session-alpha/files")
-      && response.status() === 200,
+    const lateAlphaResponse = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/sessions/session-alpha/files") &&
+        response.status() === 200,
     );
     releaseAlphaFiles();
     await lateAlphaResponse;
 
-    await expect(page.getByText("alpha-only.txt", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("alpha-only.txt", { exact: true })).toHaveCount(
+      0,
+    );
     await expect(page).toHaveURL(/\/c\/session-beta$/);
   });
 
-  test("a background stream cannot project its todos, files, tasks, or artifact into the focused session", async ({ page }) => {
+  test("a background stream cannot project its todos, files, tasks, or artifact into the focused session", async ({
+    page,
+  }) => {
     await setupMockedApp(page, {
-      activeJobs: [{
-        stream_id: "stream-background-projection",
-        session_id: "session-alpha",
-      }],
+      activeJobs: [
+        {
+          stream_id: "stream-background-projection",
+          session_id: "session-alpha",
+        },
+      ],
     });
 
     let releaseBackgroundStream!: () => void;
@@ -106,12 +124,16 @@ test.describe("苏小有 edge-state GUI regressions", () => {
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(backgroundActive
-          ? [{
-            stream_id: "stream-background-projection",
-            session_id: "session-alpha",
-          }]
-          : []),
+        body: JSON.stringify(
+          backgroundActive
+            ? [
+                {
+                  stream_id: "stream-background-projection",
+                  session_id: "session-alpha",
+                },
+              ]
+            : [],
+        ),
       }),
     );
 
@@ -148,23 +170,27 @@ test.describe("苏小有 edge-state GUI regressions", () => {
               call_id: "background-todo",
               output: "updated",
               metadata: {
-                todos: [{
-                  content: "Background A todo",
-                  status: "in_progress",
-                  activeForm: "Running background A",
-                }],
+                todos: [
+                  {
+                    content: "Background A todo",
+                    status: "in_progress",
+                    activeForm: "Running background A",
+                  },
+                ],
               },
             }),
             event(4, "task-batch-start", {
               batch_id: "background-batch",
               mode: "parallel",
-              tasks: [{
-                task_id: "background-task",
-                session_id: "session-alpha",
-                title: "Background A agent task",
-                agent: "general",
-                status: "running",
-              }],
+              tasks: [
+                {
+                  task_id: "background-task",
+                  session_id: "session-alpha",
+                  title: "Background A agent task",
+                  agent: "general",
+                  status: "running",
+                },
+              ],
             }),
             event(5, "tool-call", {
               tool: "bash",
@@ -204,11 +230,13 @@ test.describe("苏小有 edge-state GUI regressions", () => {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          todos: [{
-            content: "Background A todo",
-            status: "in_progress",
-            activeForm: "Running background A",
-          }],
+          todos: [
+            {
+              content: "Background A todo",
+              status: "in_progress",
+              activeForm: "Running background A",
+            },
+          ],
         }),
       }),
     );
@@ -217,12 +245,14 @@ test.describe("苏小有 edge-state GUI regressions", () => {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          files: [{
-            name: "background-a.txt",
-            path: "/Users/alex/suxiaoyou-demo/background-a.txt",
-            type: "generated",
-            tool: "bash",
-          }],
+          files: [
+            {
+              name: "background-a.txt",
+              path: "/Users/alex/suxiaoyou-demo/background-a.txt",
+              type: "generated",
+              tool: "bash",
+            },
+          ],
         }),
       }),
     );
@@ -230,51 +260,84 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await page.goto("/c/session-beta");
     await backgroundStreamRequested;
     await expect(page).toHaveURL(/\/c\/session-beta$/);
-    await expect(page.getByRole("button", { name: "Show workspace" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Show workspace" }),
+    ).toBeVisible();
 
-    const streamResponse = page.waitForResponse((response) =>
-      response.url().endsWith("/api/chat/stream/stream-background-projection")
-      && response.status() === 200,
+    const streamResponse = page.waitForResponse(
+      (response) =>
+        response
+          .url()
+          .endsWith("/api/chat/stream/stream-background-projection") &&
+        response.status() === 200,
     );
     releaseBackgroundStream();
     await streamResponse;
     await page.waitForTimeout(250);
 
-    await expect(page.getByRole("button", { name: "Show workspace" })).toBeVisible();
-    await expect(page.getByText("Background A artifact", { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Show workspace" }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Background A artifact", { exact: true }),
+    ).toHaveCount(0);
     await page.getByRole("button", { name: "Show workspace" }).click();
-    await expect(page.getByText("Background A todo", { exact: true })).toHaveCount(0);
-    await expect(page.getByText("Background A agent task", { exact: true })).toHaveCount(0);
-    await expect(page.getByText("background-a.txt", { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByText("Background A todo", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("Background A agent task", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("background-a.txt", { exact: true }),
+    ).toHaveCount(0);
 
     await page.getByText("Quarterly planning notes", { exact: true }).click();
     await expect(page).toHaveURL(/\/c\/session-alpha$/);
     await expect(page.getByText(/background-a\.txt/)).toBeVisible();
     await page.getByText("Progress", { exact: true }).click();
-    await expect(page.getByText("Background A todo", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("Background A todo", { exact: true }),
+    ).toBeVisible();
   });
 
-  test("auth expiry workflow: backend 401 while sending is recoverable and keeps the composer usable", async ({ page }) => {
+  test("auth expiry workflow: backend 401 while sending is recoverable and keeps the composer usable", async ({
+    page,
+  }) => {
     await setupMockedApp(page, {
-      promptErrors: [{ match: "expired auth", status: 401, detail: "Session expired" }],
+      promptErrors: [
+        { match: "expired auth", status: 401, detail: "Session expired" },
+      ],
     });
 
     await page.goto("/c/new");
-    await page.getByPlaceholder(/Describe the result you want/i).fill("expired auth should not crash");
-    const failedPrompt = page.waitForResponse((res) =>
-      res.url().includes("/api/chat/prompt") && res.status() === 401,
+    await page
+      .getByPlaceholder(/Describe the result you want/i)
+      .fill("expired auth should not crash");
+    const failedPrompt = page.waitForResponse(
+      (res) => res.url().includes("/api/chat/prompt") && res.status() === 401,
     );
     await page.getByRole("button", { name: /Send message/i }).click();
     await failedPrompt;
 
     await expect(page.getByText(/Session expired|API 401/i)).toBeVisible();
-    await expect(page.getByPlaceholder(/Describe the result you want/i)).toBeVisible();
+    await expect(
+      page.getByPlaceholder(/Describe the result you want/i),
+    ).toBeVisible();
     await expectNoAppCrash(page);
   });
 
-  test("mobile needs-input workflow: task list badge opens the detail prompt and responds from the GUI", async ({ page }) => {
+  test("mobile needs-input workflow: task list badge opens the detail prompt and responds from the GUI", async ({
+    page,
+  }) => {
     const state = await setupMockedApp(page, {
-      activeJobs: [{ stream_id: "stream-question", session_id: "session-alpha", needs_input: true }],
+      activeJobs: [
+        {
+          stream_id: "stream-question",
+          session_id: "session-alpha",
+          needs_input: true,
+        },
+      ],
     });
 
     await page.goto("/m?token=remote-token");
@@ -282,10 +345,14 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await expect(page.getByText("Needs input")).toBeVisible();
     await page.getByText("Quarterly planning notes").click();
 
-    await expect(page.getByText("Agent is asking")).toBeVisible({ timeout: 20_000 });
-    await expect(page.getByText("Which release channel should this automation watch?")).toBeVisible();
-    const response = page.waitForResponse((res) =>
-      res.url().includes("/api/chat/respond") && res.status() === 200,
+    await expect(page.getByText("Agent is asking")).toBeVisible({
+      timeout: 20_000,
+    });
+    await expect(
+      page.getByText("Which release channel should this automation watch?"),
+    ).toBeVisible();
+    const response = page.waitForResponse(
+      (res) => res.url().includes("/api/chat/respond") && res.status() === 200,
     );
     await page.getByRole("button", { name: /Stable/i }).click();
     await response;
@@ -294,50 +361,73 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await expectNoAppCrash(page);
   });
 
-  test("mobile remote disconnect workflow: an unreachable desktop tunnel shows disconnected health without leaving tasks", async ({ page }) => {
+  test("mobile remote disconnect workflow: an unreachable desktop tunnel shows disconnected health without leaving tasks", async ({
+    page,
+  }) => {
     await setupMockedApp(page, { remoteProviderInfoStatus: 503 });
 
     await page.goto("/m?token=remote-token");
     await expect(page.getByRole("heading", { name: "suyo" })).toBeVisible();
     await expect(page.getByText("Quarterly planning notes")).toBeVisible();
-    await expect(page.locator('span[title="disconnected"]')).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('span[title="disconnected"]')).toBeVisible({
+      timeout: 20_000,
+    });
     await expectNoAppCrash(page);
   });
 
-  test("connector auth failure workflow: failed OAuth is surfaced as a toast instead of an unhandled UI error", async ({ page }) => {
+  test("connector auth failure workflow: an HTTP failure is surfaced as a localized toast instead of an unhandled UI error", async ({
+    page,
+  }) => {
     await setupMockedApp(page, {
-      connectorErrors: [{ match: "notion/connect", status: 500, detail: "Notion OAuth unavailable" }],
+      connectorErrors: [
+        {
+          match: "notion/connect",
+          status: 500,
+          detail: "Notion OAuth unavailable",
+        },
+      ],
     });
 
     await page.goto("/settings?tab=plugins");
     await expect(page.getByRole("heading", { name: "Plugins" })).toBeVisible();
     await page.locator('input[placeholder="Search..."]:visible').fill("notion");
-    const notionRow = page.locator("div").filter({ hasText: "Notion" }).filter({ hasText: "Search and update pages" }).first();
+    const notionRow = page
+      .locator("div")
+      .filter({ hasText: "Notion" })
+      .filter({ hasText: "Search and update pages" })
+      .first();
     await expect(notionRow).toBeVisible();
     await notionRow.getByRole("switch").click();
 
-    await expect(page.getByText("Notion OAuth unavailable")).toBeVisible();
+    await expect(page.getByText("Failed to connect connector")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Plugins" })).toBeVisible();
     await expectNoAppCrash(page);
   });
 
-  test("chatgpt auth launch failure stops the waiting state", async ({ page }) => {
-    await setupMockedApp(page, {
-      openaiSubscriptionConnected: false,
-      openaiLoginStatus: 500,
-    });
+  test("chatgpt subscription entry remains closed in this release", async ({
+    page,
+  }) => {
+    await setupMockedApp(page);
 
     await page.goto("/settings?tab=providers");
-    await page.getByRole("button", { name: /ChatGPT Subscription/i }).click();
-    await page.getByRole("button", { name: "Sign in with ChatGPT" }).click();
-
-    await expect(page.getByText("Failed to start authentication")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Sign in with ChatGPT" })).toBeEnabled();
-    await expect(page.getByText("Waiting for authentication...")).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "China-ready providers" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /ChatGPT Subscription/i }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Sign in with ChatGPT" }),
+    ).toHaveCount(0);
+    await expect(page.getByText("Waiting for authentication...")).toHaveCount(
+      0,
+    );
     await expectNoAppCrash(page);
   });
 
-  test("ollama status failure shows a retryable error instead of an endless spinner", async ({ page }) => {
+  test("ollama status failure shows a retryable error instead of an endless spinner", async ({
+    page,
+  }) => {
     await setupMockedApp(page, {
       ollamaStatusCode: 500,
     });

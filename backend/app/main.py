@@ -8,7 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from functools import wraps
 from pathlib import Path
-from typing import AsyncGenerator, Awaitable, Callable, Final
+from typing import AsyncGenerator, Awaitable, Callable
 
 import httpx
 
@@ -45,10 +45,9 @@ from app.provider.registry import ProviderRegistry
 from app.skill.registry import SkillRegistry
 from app.storage.database import create_engine, create_session_factory
 from app.tool.registry import ToolRegistry
+from app.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
-
-APP_VERSION: Final = "1.0.0"
 
 
 class _BackgroundTaskManager:
@@ -359,6 +358,7 @@ async def _shutdown_runtime(
     provider_registry,
     engine,
     session_factory=None,
+    app_state=None,
 ) -> None:
     """Stop producers/consumers before their provider and database resources."""
 
@@ -400,6 +400,34 @@ async def _shutdown_runtime(
         "active generations",
         lambda: _stop_active_generation_jobs(stream_manager, shutdown_timeout),
     )
+    if app_state is not None:
+        async def uninstall_office_runtime() -> None:
+            from app.office_validation.runtime import uninstall_office_v11_runtime
+
+            uninstall_office_v11_runtime(app_state)
+
+        await step("Office v1.1 runtime", uninstall_office_runtime)
+    if stream_manager is not None:
+        async def clear_post_checkpoint_validation_scheduler() -> None:
+            """Do not let the process-global StreamManager retain a dead app.
+
+            The scheduler owns a validator service whose session factory and
+            provider registry belong to this lifespan.  New jobs must not be
+            able to inherit it after the active jobs above have quiesced.
+            """
+
+            setter = getattr(
+                stream_manager,
+                "set_post_checkpoint_validation_scheduler",
+                None,
+            )
+            if callable(setter):
+                setter(None)
+
+        await step(
+            "post-checkpoint validation scheduler",
+            clear_post_checkpoint_validation_scheduler,
+        )
     if agent_adapter is not None:
         await step("channel agent adapter", agent_adapter.stop)
     if channel_manager is not None:
@@ -480,6 +508,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.release_features import (
         MESSAGING_CHANNELS_RELEASED,
         REMOTE_ACCESS_RELEASED,
+        V11_CHECKPOINTS_RELEASED,
     )
 
     # Stale per-user configuration from an older build must not reopen either
@@ -529,7 +558,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.tool.workspace_transaction import recover_pending_workspace_transactions
 
     recovered_command_transactions = await asyncio.to_thread(
-        recover_pending_workspace_transactions
+        recover_pending_workspace_transactions,
+        preserve_committed_checkpoint_journals=V11_CHECKPOINTS_RELEASED,
     )
     if recovered_command_transactions:
         logger.warning(
@@ -604,6 +634,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         private_data_root=Path.cwd(),
         store=credential_store,
     )
+
+    if V11_CHECKPOINTS_RELEASED:
+        from app.runtime.checkpoint_runtime import recover_checkpoint_runtime
+
+        checkpoint_recovery = await recover_checkpoint_runtime(session_factory)
+        if any(checkpoint_recovery.values()):
+            logger.warning(
+                "Recovered v1.1 checkpoint runtime state: %s",
+                checkpoint_recovery,
+            )
 
     # A process can exit after an input or GoalRun is durably claimed but before
     # it is safe to say whether its tools ran. Never auto-replay that ambiguous
@@ -919,6 +959,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         set_index_manager(IndexManager())
         logger.info("FTS5 search enabled")
 
+    # Construct the server-owned validator only after its database, Provider,
+    # and optional FTS dependencies are ready.  The scheduler checks the
+    # dependency-composed release capability at each request/dispatch boundary,
+    # so constructing and injecting it while the gate is closed has no runtime,
+    # database, or model-visible side effects.
+    from app.validation_agent import (
+        PostCheckpointValidationScheduler,
+        ValidationAgentService,
+    )
+
+    validation_agent_service = ValidationAgentService(
+        session_factory=session_factory,
+        provider_registry=registry,
+        index_manager=get_index_manager(),
+    )
+    post_checkpoint_validation_scheduler = PostCheckpointValidationScheduler(
+        validation_agent_service
+    )
+    app.state.validation_agent_service = validation_agent_service
+    app.state.post_checkpoint_validation_scheduler = (
+        post_checkpoint_validation_scheduler
+    )
+    get_stream_manager().set_post_checkpoint_validation_scheduler(
+        post_checkpoint_validation_scheduler
+    )
+
     # Task scheduler (cron + interval automations)
     from app.scheduler.engine import TaskScheduler
     task_scheduler = TaskScheduler(session_factory, app.state)
@@ -1023,6 +1089,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
 
     try:
+        # Install Office last, after its checkpoint/validator dependencies
+        # exist. No request can observe it until this lifespan yields, and this
+        # outer finally owns teardown even if final startup logging fails.
+        from app.office_validation.startup import initialize_office_v11_runtime
+
+        try:
+            office_startup = await initialize_office_v11_runtime(
+                app.state,
+                session_factory,
+                data_dir=data_dir.absolute(),
+            )
+            if office_startup.preview_installed:
+                logger.info(
+                    "Office v1.1 preview runtime initialized (%s)",
+                    office_startup.renderer_quality or "unavailable",
+                )
+            if (
+                office_startup.preview_installed
+                and not office_startup.authoring_installed
+            ):
+                logger.info(
+                    "Office v1.1 authoring remains unavailable; preview is read-only"
+                )
+        except Exception:
+            # The HTTP boundary returns a stable, path-free unavailable status.
+            # Startup remains usable for non-Office work.
+            logger.exception("Office v1.1 runtime initialization failed")
         yield
     finally:
         # Stop producers and active work before closing the services they use.
@@ -1044,6 +1137,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             provider_registry=registry,
             engine=engine,
             session_factory=session_factory,
+            app_state=app.state,
         )
 
 

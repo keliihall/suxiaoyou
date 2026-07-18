@@ -110,6 +110,21 @@ function readUniqueEmbeddedVersion(text, pattern, source) {
   return matches[0][1];
 }
 
+function readPythonFinalString(text, name, source) {
+  const pattern = new RegExp(
+    `^[ \\t]*${escapeRegExp(name)}[ \\t]*:[ \\t]*Final[ \\t]*=[ \\t]*"([^"]+)"[ \\t]*$`,
+    "gm",
+  );
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length === 0) {
+    throw new Error(`${source} is missing ${name}: Final`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`${source} contains multiple ${name}: Final values`);
+  }
+  return matches[0][1];
+}
+
 export function assertReleaseVersion(version) {
   if (!RELEASE_VERSION_PATTERN.test(version ?? "")) {
     throw new Error(`Invalid expected version "${version ?? ""}". Expected format: X.Y.Z`);
@@ -165,6 +180,16 @@ export function collectReleaseMetadata(rootDir) {
           "project",
           "version",
           "backend/pyproject.toml",
+        ),
+      kind: "version",
+    },
+    {
+      source: "backend/app/version.py APP_VERSION",
+      read: () =>
+        readPythonFinalString(
+          readText(rootDir, "backend/app/version.py"),
+          "APP_VERSION",
+          "backend/app/version.py",
         ),
       kind: "version",
     },

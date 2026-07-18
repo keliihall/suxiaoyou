@@ -8,6 +8,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from app.runtime.events import (
+    LifecycleEventV1,
+    lifecycle_event_from_transport,
+    sanitize_lifecycle_payload,
+)
 from app.streaming.events import AGENT_ERROR, DESYNC, DONE, SSEEvent
 from app.i18n import Language
 from app.security.capabilities import InvocationSource, normalize_invocation_source
@@ -86,9 +91,30 @@ class GenerationJob:
         goal_id: str | None = None,
         goal_run_id: str | None = None,
         goal_session_id: str | None = None,
+        root_turn_id: str | None = None,
+        turn_run_id: str | None = None,
+        parent_turn_id: str | None = None,
+        workspace_instance_id: str | None = None,
+        post_checkpoint_validation_scheduler: Any | None = None,
     ):
         self.stream_id = stream_id
         self.session_id = session_id
+        # Until the durable TurnRun row is admitted, a root generation's stream
+        # id is its stable runtime identity. Child jobs explicitly inherit the
+        # root turn while retaining their own turn_run_id.
+        self._root_turn_id = str(root_turn_id or stream_id)
+        self._turn_run_id = str(turn_run_id or stream_id)
+        self._parent_turn_id = (
+            str(parent_turn_id) if parent_turn_id is not None else None
+        )
+        self._workspace_instance_id = (
+            str(workspace_instance_id) if workspace_instance_id else None
+        )
+        # Server-injected only. Prompt/tool request payloads have no field that
+        # can select a validator, checkpoint, or validation budget.
+        self._post_checkpoint_validation_scheduler = (
+            post_checkpoint_validation_scheduler
+        )
         # The ingress owns this immutable root source.  It never comes from a
         # PromptRequest JSON field, and child agents inherit it unchanged.
         self._invocation_source = normalize_invocation_source(invocation_source)
@@ -122,6 +148,12 @@ class GenerationJob:
         self.language: Language = language
         self.events: list[SSEEvent] = []
         self.subscribers: list[asyncio.Queue[SSEEvent | None]] = []
+        self.lifecycle_events: list[LifecycleEventV1] = []
+        self.lifecycle_subscribers: list[
+            asyncio.Queue[LifecycleEventV1 | None]
+        ] = []
+        self._lifecycle_root: GenerationJob = self
+        self._lifecycle_event_counter = 0
         self.abort_event = asyncio.Event()
         # Admission and the final durable-queue check share this lock.  Without
         # it, an input can commit immediately after the generation observes an
@@ -178,12 +210,81 @@ class GenerationJob:
         return self._completed
 
     @property
+    def is_quiescent(self) -> bool:
+        """True only when no runner or tracked tool can still cause effects."""
+
+        runner = self.task
+        return bool(
+            self._completed
+            and not self._tool_tasks
+            and (runner is None or runner.done())
+        )
+
+    @property
     def invocation_source(self) -> InvocationSource:
         return self._invocation_source
 
     @property
     def invocation_source_id(self) -> str | None:
         return self._invocation_source_id
+
+    @property
+    def root_turn_id(self) -> str:
+        return self._root_turn_id
+
+    @property
+    def turn_run_id(self) -> str:
+        return self._turn_run_id
+
+    @property
+    def parent_turn_id(self) -> str | None:
+        return self._parent_turn_id
+
+    @property
+    def workspace_instance_id(self) -> str | None:
+        return self._workspace_instance_id
+
+    @property
+    def post_checkpoint_validation_scheduler(self) -> Any | None:
+        return self._post_checkpoint_validation_scheduler
+
+    def begin_root_turn(self, turn_id: str) -> None:
+        """Advance one transport stream to a distinct queued root turn."""
+
+        if self._lifecycle_root is not self or self._parent_turn_id is not None:
+            raise ValueError("A child generation job cannot begin a root turn")
+        normalized = str(turn_id).strip()
+        if not normalized:
+            raise ValueError("turn_id cannot be empty")
+        self._root_turn_id = normalized
+        self._turn_run_id = normalized
+
+    def bind_workspace_instance(self, workspace_instance_id: str) -> None:
+        """Bind the job once to the durable workspace selected during setup."""
+
+        normalized = str(workspace_instance_id).strip()
+        if not normalized:
+            raise ValueError("workspace_instance_id cannot be empty")
+        if (
+            self._workspace_instance_id is not None
+            and self._workspace_instance_id != normalized
+        ):
+            raise ValueError("A generation job cannot change workspace instance")
+        self._workspace_instance_id = normalized
+
+    def inherit_runtime_context(self, parent: "GenerationJob") -> None:
+        """Bind a child job to its parent's immutable root turn/workspace."""
+
+        self._root_turn_id = parent.root_turn_id
+        self._parent_turn_id = parent.turn_run_id
+        self._workspace_instance_id = parent.workspace_instance_id
+        self._post_checkpoint_validation_scheduler = (
+            parent.post_checkpoint_validation_scheduler
+        )
+        lifecycle_root = parent._lifecycle_root
+        self._lifecycle_root = lifecycle_root
+        self.lifecycle_events = lifecycle_root.lifecycle_events
+        self.lifecycle_subscribers = lifecycle_root.lifecycle_subscribers
 
     @property
     def goal_id(self) -> str | None:
@@ -321,10 +422,28 @@ class GenerationJob:
         self._event_counter += 1
         event.id = self._event_counter
         self.events.append(event)
+        lifecycle_root = self._lifecycle_root
+        lifecycle_root._lifecycle_event_counter += 1
+        lifecycle_event = lifecycle_event_from_transport(
+            sequence=lifecycle_root._lifecycle_event_counter,
+            transport_event=event.event,
+            data=event.data,
+            session_id=self.session_id,
+            stream_id=self.stream_id,
+            root_turn_id=self.root_turn_id,
+            turn_run_id=self.turn_run_id,
+            workspace_instance_id=self.workspace_instance_id,
+            invocation_source=self.invocation_source,
+        )
+        lifecycle_root.lifecycle_events.append(lifecycle_event)
 
         # Cap replay buffer to prevent unbounded memory growth
         if len(self.events) > self._MAX_EVENT_BUFFER:
             self.events = self.events[-self._MAX_EVENT_BUFFER:]
+        if len(lifecycle_root.lifecycle_events) > self._MAX_EVENT_BUFFER:
+            lifecycle_root.lifecycle_events[:] = lifecycle_root.lifecycle_events[
+                -self._MAX_EVENT_BUFFER:
+            ]
 
         for q in self.subscribers:
             try:
@@ -351,6 +470,164 @@ class GenerationJob:
                         q.put_nowait(SSEEvent(DESYNC, {"dropped_event_id": event.id}))
                     except Exception:
                         pass
+
+        for q in lifecycle_root.lifecycle_subscribers:
+            try:
+                q.put_nowait(lifecycle_event)
+            except asyncio.QueueFull:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                q.put_nowait(
+                    LifecycleEventV1(
+                        sequence=lifecycle_event.sequence,
+                        event_type="runtime.desync",
+                        session_id=self.session_id,
+                        stream_id=self.stream_id,
+                        event_id=(
+                            f"{self.stream_id}:{lifecycle_event.sequence}:live-desync"
+                        ),
+                        root_turn_id=self.root_turn_id,
+                        turn_run_id=self.turn_run_id,
+                        workspace_instance_id=self.workspace_instance_id,
+                        invocation_source=self.invocation_source,
+                        payload={"dropped_through_sequence": lifecycle_event.sequence - 1},
+                    )
+                )
+                q.put_nowait(lifecycle_event)
+
+    def publish_lifecycle(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        message_id: str | None = None,
+        call_id: str | None = None,
+        checkpoint_id: str | None = None,
+    ) -> LifecycleEventV1:
+        """Publish a transport-neutral fact without inventing an SSE event."""
+
+        lifecycle_root = self._lifecycle_root
+        lifecycle_root._lifecycle_event_counter += 1
+        event = LifecycleEventV1(
+            sequence=lifecycle_root._lifecycle_event_counter,
+            event_type=event_type,
+            session_id=self.session_id,
+            stream_id=self.stream_id,
+            root_turn_id=self.root_turn_id,
+            turn_run_id=self.turn_run_id,
+            workspace_instance_id=self.workspace_instance_id,
+            message_id=str(message_id) if message_id is not None else None,
+            call_id=str(call_id) if call_id is not None else None,
+            checkpoint_id=(
+                str(checkpoint_id) if checkpoint_id is not None else None
+            ),
+            invocation_source=self.invocation_source,
+            payload=sanitize_lifecycle_payload(payload or {}),
+        )
+        lifecycle_root.lifecycle_events.append(event)
+        if len(lifecycle_root.lifecycle_events) > self._MAX_EVENT_BUFFER:
+            lifecycle_root.lifecycle_events[:] = lifecycle_root.lifecycle_events[
+                -self._MAX_EVENT_BUFFER:
+            ]
+        for queue in lifecycle_root.lifecycle_subscribers:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                queue.put_nowait(
+                    LifecycleEventV1(
+                        sequence=event.sequence,
+                        event_type="runtime.desync",
+                        session_id=self.session_id,
+                        stream_id=self.stream_id,
+                        event_id=f"{self.stream_id}:{event.sequence}:live-desync",
+                        root_turn_id=self.root_turn_id,
+                        turn_run_id=self.turn_run_id,
+                        workspace_instance_id=self.workspace_instance_id,
+                        invocation_source=self.invocation_source,
+                        payload={"dropped_through_sequence": event.sequence - 1},
+                    )
+                )
+                queue.put_nowait(event)
+        return event
+
+    def subscribe_lifecycle(
+        self,
+        last_sequence: int = 0,
+    ) -> asyncio.Queue[LifecycleEventV1 | None]:
+        """Subscribe to the transport-neutral runtime event stream."""
+
+        lifecycle_root = self._lifecycle_root
+        queue: asyncio.Queue[LifecycleEventV1 | None] = asyncio.Queue(maxsize=5000)
+        replay = [
+            event
+            for event in lifecycle_root.lifecycle_events
+            if event.sequence > last_sequence
+        ]
+        first_available_sequence = (
+            lifecycle_root.lifecycle_events[0].sequence
+            if lifecycle_root.lifecycle_events
+            else None
+        )
+        history_gap = (
+            first_available_sequence is not None
+            and last_sequence < first_available_sequence - 1
+        )
+        terminal_reserve = 1 if lifecycle_root._completed else 0
+        available = queue.maxsize - terminal_reserve
+        needs_desync = history_gap or len(replay) > available
+        if needs_desync:
+            replay_capacity = max(0, available - 1)
+            if len(replay) > replay_capacity:
+                replay = replay[-replay_capacity:] if replay_capacity else []
+            first_sequence = (
+                replay[0].sequence
+                if replay
+                else first_available_sequence or max(1, last_sequence + 1)
+            )
+            queue.put_nowait(
+                LifecycleEventV1(
+                    sequence=max(last_sequence, first_sequence - 1),
+                    event_type="runtime.desync",
+                    session_id=self.session_id,
+                    stream_id=self.stream_id,
+                    event_id=(
+                        f"{self.stream_id}:{first_sequence}:replay-desync"
+                    ),
+                    root_turn_id=self.root_turn_id,
+                    turn_run_id=self.turn_run_id,
+                    workspace_instance_id=self.workspace_instance_id,
+                    invocation_source=self.invocation_source,
+                    payload={
+                        "requested_last_sequence": last_sequence,
+                        "first_available_sequence": first_sequence,
+                    },
+                )
+            )
+        for event in replay:
+            queue.put_nowait(event)
+        if lifecycle_root._completed:
+            queue.put_nowait(None)
+        else:
+            lifecycle_root.lifecycle_subscribers.append(queue)
+        return queue
+
+    def unsubscribe_lifecycle(
+        self,
+        queue: asyncio.Queue[LifecycleEventV1 | None],
+    ) -> None:
+        lifecycle_root = self._lifecycle_root
+        try:
+            lifecycle_root.lifecycle_subscribers.remove(queue)
+        except ValueError:
+            pass
 
     def subscribe(self, last_event_id: int = 0) -> asyncio.Queue[SSEEvent | None]:
         """Create a subscriber queue. Replays missed events if last_event_id > 0."""
@@ -470,6 +747,37 @@ class GenerationJob:
                 q.put_nowait(desync)
                 q.put_nowait(None)
         self.subscribers.clear()
+        # Child jobs share their root job's lifecycle stream. Completing one
+        # child must not terminate ACP/Hook observers for the still-running root.
+        if self._lifecycle_root is not self:
+            return
+        for q in self.lifecycle_subscribers:
+            if q.full():
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                q.put_nowait(
+                    LifecycleEventV1(
+                        sequence=self._lifecycle_event_counter,
+                        event_type="runtime.desync",
+                        session_id=self.session_id,
+                        stream_id=self.stream_id,
+                        event_id=(
+                            f"{self.stream_id}:{self._lifecycle_event_counter}:completion-desync"
+                        ),
+                        root_turn_id=self.root_turn_id,
+                        turn_run_id=self.turn_run_id,
+                        workspace_instance_id=self.workspace_instance_id,
+                        invocation_source=self.invocation_source,
+                        payload={
+                            "dropped_through_sequence": self._lifecycle_event_counter
+                        },
+                    )
+                )
+            q.put_nowait(None)
+        self.lifecycle_subscribers.clear()
 
     def abort(self) -> None:
         """Signal abort to the generation loop."""
@@ -505,6 +813,13 @@ class GenerationJob:
                     task.cancel()
                 return False
         return True
+
+    async def wait_for_tool_tasks_to_finish(self) -> None:
+        """Wait without forgetting cancelled tools that have not really exited."""
+
+        while self._tool_tasks:
+            tasks = set(self._tool_tasks)
+            await asyncio.wait(tasks)
 
     def register_response_request(
         self,
@@ -715,11 +1030,75 @@ class StreamManager:
     def __init__(self):
         from app.config import get_settings as _get_settings
         self._jobs: dict[str, GenerationJob] = {}
+        # Runtime finalizers may need to outlive the client task or the
+        # GenerationJob whose side effects they describe. Keep strong ownership
+        # here so cancellation cannot orphan quiescence or durable-state work.
+        self._reconciliation_tasks: set[asyncio.Task[Any]] = set()
         # Serializes durable request-ledger insertion with in-memory job
         # creation.  This prevents concurrent retries from both observing an
         # absent idempotency record before either job is registered.
         self.job_admission_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(_get_settings().max_concurrent_generations)
+        self._post_checkpoint_validation_scheduler: Any | None = None
+
+    def track_runtime_task(self, task: asyncio.Task[Any]) -> None:
+        """Own a safety-critical finalizer until it settles or shutdown ends it."""
+
+        self._reconciliation_tasks.add(task)
+
+        def _finished(completed: asyncio.Task[Any]) -> None:
+            self._reconciliation_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                # Never interpolate the exception: database errors can include
+                # private paths, statements, or bound values.
+                logger.error(
+                    "Durable-state reconciliation failed (%s)",
+                    type(error).__name__,
+                )
+
+        task.add_done_callback(_finished)
+
+    def track_reconciliation_task(self, task: asyncio.Task[Any]) -> None:
+        """Backward-compatible name for durable-state reconciliation ownership."""
+
+        self.track_runtime_task(task)
+
+    async def wait_for_reconciliation_tasks(self, timeout: float) -> bool:
+        """Wait for manager-owned finalizers, cancelling leftovers at deadline."""
+
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in self._reconciliation_tasks
+            if task is not current and not task.done()
+        }
+        if not tasks:
+            return True
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(0.0, timeout),
+        )
+        if not pending:
+            return True
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return False
+
+    def set_post_checkpoint_validation_scheduler(self, scheduler: Any | None) -> None:
+        """Inject the app-owned scheduler used by newly admitted root jobs."""
+
+        if scheduler is not None and not callable(
+            getattr(scheduler, "run_pending", None)
+        ):
+            raise TypeError("post-checkpoint validation scheduler is invalid")
+        self._post_checkpoint_validation_scheduler = scheduler
 
     def create_job(
         self,
@@ -731,6 +1110,9 @@ class StreamManager:
         goal_id: str | None = None,
         goal_run_id: str | None = None,
         goal_session_id: str | None = None,
+        root_turn_id: str | None = None,
+        turn_run_id: str | None = None,
+        workspace_instance_id: str | None = None,
     ) -> GenerationJob:
         """Create a new generation job and auto-cleanup old completed ones."""
         active = self.active_job_for_session(session_id)
@@ -744,6 +1126,12 @@ class StreamManager:
             goal_id=goal_id,
             goal_run_id=goal_run_id,
             goal_session_id=goal_session_id,
+            root_turn_id=root_turn_id,
+            turn_run_id=turn_run_id,
+            workspace_instance_id=workspace_instance_id,
+            post_checkpoint_validation_scheduler=(
+                self._post_checkpoint_validation_scheduler
+            ),
         )
         self._jobs[stream_id] = job
         # Proactively cleanup old completed jobs on each new creation
@@ -759,20 +1147,33 @@ class StreamManager:
             (
                 job
                 for job in self._jobs.values()
-                if job.session_id == session_id and not job.completed
+                if job.session_id == session_id and not job.is_quiescent
             ),
             None,
         )
 
-    def remove_job(self, stream_id: str) -> None:
-        """Remove a completed job."""
+    def remove_job(self, stream_id: str) -> bool:
+        """Remove only a truly quiescent job; never forget live side effects."""
+
+        job = self._jobs.get(stream_id)
+        if job is None:
+            return False
+        if not job.is_quiescent:
+            # Admission failures may dispose a job before a worker was ever
+            # attached. That state has no runner/tool side effects to forget.
+            if job.task is not None or job._tool_tasks:
+                return False
+            job.abort()
+            if not job.completed:
+                job.complete()
         self._jobs.pop(stream_id, None)
+        return True
 
     def active_jobs(self) -> list[dict[str, Any]]:
         """List all active (non-completed) jobs."""
         active: list[dict[str, Any]] = []
         for job in self._jobs.values():
-            if job.completed:
+            if job.is_quiescent:
                 continue
             item: dict[str, Any] = {
                 "stream_id": job.stream_id,
@@ -794,7 +1195,7 @@ class StreamManager:
         """Abort all active jobs for a given session. Used when deleting a session."""
         count = 0
         for job in self._jobs.values():
-            if job.session_id == session_id and not job.completed:
+            if job.session_id == session_id and not job.is_quiescent:
                 job.abort()
                 count += 1
         return count
@@ -803,16 +1204,25 @@ class StreamManager:
         """Abort all active jobs. Used during graceful shutdown."""
         count = 0
         for job in self._jobs.values():
-            if not job.completed:
+            if not job.is_quiescent:
                 job.abort()
                 count += 1
         return count
 
     async def abort_all_and_wait(self, *, timeout: float = 10.0) -> tuple[int, bool]:
-        """Abort active jobs and wait for tools plus owning workers to settle."""
+        """Abort jobs and wait for workers plus durable finalizers to settle."""
 
-        jobs = [job for job in self._jobs.values() if not job.completed]
-        return await self._abort_jobs_and_wait(jobs, timeout=timeout)
+        jobs = [job for job in self._jobs.values() if not job.is_quiescent]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        count, jobs_quiesced = await self._abort_jobs_and_wait(
+            jobs,
+            timeout=max(0.0, deadline - loop.time()),
+        )
+        reconciled = await self.wait_for_reconciliation_tasks(
+            max(0.0, deadline - loop.time())
+        )
+        return count, jobs_quiesced and reconciled
 
     async def abort_session_and_wait(
         self,
@@ -823,7 +1233,7 @@ class StreamManager:
         jobs = [
             job
             for job in self._jobs.values()
-            if job.session_id == session_id and not job.completed
+            if job.session_id == session_id and not job.is_quiescent
         ]
         return await self._abort_jobs_and_wait(jobs, timeout=timeout)
 
@@ -866,14 +1276,15 @@ class StreamManager:
                 workers_quiesced = False
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                # A coroutine is allowed to catch cancellation. Do not turn a
+                # bounded shutdown/delete wait into an unbounded gather, and do
+                # not remove its owning GenerationJob while it remains live.
+                await asyncio.sleep(0)
         return len(jobs), tools_quiesced and workers_quiesced
 
     def cleanup_completed(self, keep_last: int = 50) -> int:
         """Remove old completed jobs, keeping the most recent ones."""
-        completed = [
-            sid for sid, j in self._jobs.items() if j.completed
-        ]
+        completed = [sid for sid, job in self._jobs.items() if job.is_quiescent]
         to_remove = completed[:-keep_last] if len(completed) > keep_last else []
         for sid in to_remove:
             del self._jobs[sid]

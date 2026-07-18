@@ -16,14 +16,18 @@ async function setupMockedApp(
 }
 
 async function expectNoAppCrash(page: Page) {
-  await expect(page.getByText("Runtime", { exact: false })).toHaveCount(0);
+  await expect(
+    page.getByText(
+      /^(?:Unhandled )?Runtime (?:Error|TypeError|ReferenceError)$/,
+    ),
+  ).toHaveCount(0);
   await expect(page.getByText("API 401", { exact: false })).toHaveCount(0);
 }
 
 async function sendPrompt(page: Page, text: string) {
   await page.getByPlaceholder(/Describe the result you want/i).fill(text);
-  const promptResponse = page.waitForResponse((res) =>
-    res.url().includes("/api/chat/prompt") && res.status() === 200,
+  const promptResponse = page.waitForResponse(
+    (res) => res.url().includes("/api/chat/prompt") && res.status() === 200,
   );
   await page.getByRole("button", { name: /Send message/i }).click();
   await promptResponse;
@@ -31,6 +35,8 @@ async function sendPrompt(page: Page, text: string) {
 
 async function seedByokProvider(page: Page) {
   await page.addInitScript(() => {
+    const seedKey = "suxiaoyou-ui-byok-provider-seeded";
+    if (window.sessionStorage.getItem(seedKey)) return;
     const raw = window.localStorage.getItem("suxiaoyou-settings");
     const settings = raw ? JSON.parse(raw) : { state: {}, version: 0 };
     settings.state = {
@@ -41,14 +47,20 @@ async function seedByokProvider(page: Page) {
       selectedProviderId: "openrouter",
     };
     window.localStorage.setItem("suxiaoyou-settings", JSON.stringify(settings));
+    window.sessionStorage.setItem(seedKey, "1");
   });
 }
 
 test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
   test.describe.configure({ timeout: 90_000 });
-  test.skip(({ isMobile }) => isMobile, "Desktop-only surfaces are covered alongside separate mobile GUI workflows.");
+  test.skip(
+    ({ isMobile }) => isMobile,
+    "Desktop-only surfaces are covered alongside separate mobile GUI workflows.",
+  );
 
-  test("message workflow: edit/resend from a historical user bubble and stop an active stream", async ({ page }) => {
+  test("message workflow: edit/resend from a historical user bubble and stop an active stream", async ({
+    page,
+  }) => {
     const state = await setupMockedApp(page);
 
     await page.goto("/c/session-alpha");
@@ -59,27 +71,39 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     const editBox = page.locator("textarea").first();
     await editBox.fill("Summarize the quarterly plan with edited scope");
 
-    const editResponse = page.waitForResponse((res) =>
-      res.url().includes("/api/chat/edit") && res.status() === 200,
+    const editResponse = page.waitForResponse(
+      (res) => res.url().includes("/api/chat/edit") && res.status() === 200,
     );
     await editBox.press("Enter");
     await editResponse;
 
-    await expect(page.getByText("Summarize the quarterly plan with edited scope")).toBeVisible();
-    await expect(page.getByText("Edited response streamed from the mock backend.")).toBeVisible({ timeout: 20_000 });
-    expect(JSON.stringify(state.editBodies[0])).toContain("session-alpha-user-1");
+    await expect(
+      page.getByText("Summarize the quarterly plan with edited scope"),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Edited response streamed from the mock backend."),
+    ).toBeVisible({ timeout: 20_000 });
+    expect(JSON.stringify(state.editBodies[0])).toContain(
+      "session-alpha-user-1",
+    );
     expect(JSON.stringify(state.editBodies[0])).toContain("edited scope");
 
     await page.goto("/c/new");
     await sendPrompt(page, "Start a slow stream so I can test stop generation");
-    await expect(page.getByText("Starting a deliberately slow GUI stream.")).toBeVisible({ timeout: 20_000 });
+    await expect(
+      page.getByText("Starting a deliberately slow GUI stream."),
+    ).toBeVisible({ timeout: 20_000 });
     await page.getByRole("button", { name: "Stop" }).click();
     await expect.poll(() => state.abortRequests.length).toBeGreaterThan(0);
-    await expect(page.getByRole("button", { name: /Send message/i })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /Send message/i }),
+    ).toBeVisible();
     await expectNoAppCrash(page);
   });
 
-  test("assistant action workflow: activity, good/bad feedback, and visible recovery controls", async ({ page }) => {
+  test("assistant action workflow: activity, good/bad feedback, and visible recovery controls", async ({
+    page,
+  }) => {
     await setupMockedApp(page);
 
     await page.goto("/c/session-artifacts");
@@ -100,51 +124,222 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await expectNoAppCrash(page);
   });
 
-  test("model selector workflow: search, sort modes, model switch, and send payload stay aligned", async ({ page }) => {
+  test("activity treats recovered tool misses as adjustments, not task failure", async ({
+    page,
+  }) => {
+    await setupMockedApp(page);
+
+    const sessionId = "session-alpha";
+    const messageId = `${sessionId}-assistant-recovered`;
+    const now = "2026-07-18T10:00:00.000Z";
+    const toolPart = (
+      callId: string,
+      tool: "web_search" | "web_fetch",
+      status: "completed" | "error",
+      title: string,
+    ) => ({
+      id: `${messageId}-${callId}`,
+      message_id: messageId,
+      session_id: sessionId,
+      time_created: now,
+      data: {
+        type: "tool",
+        tool,
+        call_id: callId,
+        state: {
+          status,
+          input: tool === "web_search"
+            ? { query: title }
+            : { url: `https://example.test/${callId}` },
+          output: status === "error" ? "The source did not return a usable result." : "Source verified.",
+          metadata: null,
+          title,
+          time_start: now,
+          time_end: "2026-07-18T10:00:01.000Z",
+          time_compacted: null,
+        },
+      },
+    });
+
+    await page.route(
+      /\/api\/messages\/session-alpha(?:\?.*)?$/,
+      (route) => route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 2,
+          offset: 0,
+          messages: [
+            {
+              id: `${sessionId}-user-recovered`,
+              session_id: sessionId,
+              time_created: now,
+              data: { role: "user", agent: "build" },
+              parts: [{
+                id: `${sessionId}-user-recovered-text`,
+                message_id: `${sessionId}-user-recovered`,
+                session_id: sessionId,
+                time_created: now,
+                data: { type: "text", text: "Research the latest release." },
+              }],
+            },
+            {
+              id: messageId,
+              session_id: sessionId,
+              time_created: now,
+              data: { role: "assistant", agent: "build", finish: "stop" },
+              parts: [
+                {
+                  id: `${messageId}-reasoning-1`,
+                  message_id: messageId,
+                  session_id: sessionId,
+                  time_created: now,
+                  data: { type: "reasoning", text: "Checking multiple sources." },
+                },
+                toolPart("search-miss", "web_search", "error", "Search primary source"),
+                toolPart("fetch-miss", "web_fetch", "error", "Fetch alternate source"),
+                {
+                  id: `${messageId}-reasoning-2`,
+                  message_id: messageId,
+                  session_id: sessionId,
+                  time_created: now,
+                  data: { type: "reasoning", text: "Using another verified source." },
+                },
+                toolPart("fetch-success", "web_fetch", "completed", "Fetched verified source"),
+                {
+                  id: `${messageId}-text`,
+                  message_id: messageId,
+                  session_id: sessionId,
+                  time_created: now,
+                  data: { type: "text", text: "Recovered research result." },
+                },
+                {
+                  id: `${messageId}-finish`,
+                  message_id: messageId,
+                  session_id: sessionId,
+                  time_created: now,
+                  data: {
+                    type: "step-finish",
+                    reason: "stop",
+                    tokens: { input: 100, output: 30, reasoning: 10, cache_read: 0 },
+                    cost: 0,
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+    );
+
+    await page.goto(`/c/${sessionId}`);
+    await page.getByText("Recovered research result.").hover();
+    await page.getByRole("button", { name: "View activity" }).click();
+
+    const panel = page.getByRole("heading", { name: "Activity" }).locator("..").locator("..");
+    await expect(page.getByText("Automatic adjustment · 2 attempts did not complete")).toBeVisible();
+    await expect(page.locator('[data-activity-status="adjusted"]')).toHaveCount(1);
+    await expect(page.locator('[data-activity-status="failed"]')).toHaveCount(0);
+    await expect(page.getByText("Task not completed")).toHaveCount(0);
+    await expect(page.getByText("Done", { exact: true })).toBeVisible();
+
+    await page.getByText("Automatic adjustment · 2 attempts did not complete").click();
+    await expect(page.getByText("Search primary source")).toBeVisible();
+    await expect(page.getByText("Fetch alternate source")).toBeVisible();
+    await expect(panel).toBeVisible();
+    await expectNoAppCrash(page);
+  });
+
+  test("model selector workflow: search and provider-scoped model switch keep the send payload aligned", async ({
+    page,
+  }) => {
     const state = await setupMockedApp(page);
     await seedByokProvider(page);
 
     await page.goto("/c/new");
-    await expect(page.getByRole("button", { name: /Claude Sonnet 4\.5/i })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /Claude Sonnet 4\.5/i }),
+    ).toBeVisible();
     await page.getByRole("button", { name: /Claude Sonnet 4\.5/i }).click();
-    await expect(page.getByPlaceholder("Search models...")).toBeVisible();
+    const modelSearch = page.getByPlaceholder("Search models...");
+    await expect(modelSearch).toBeVisible();
+    await modelSearch.fill("Acme");
+    await expect(page.getByText("Acme Coder")).toHaveCount(0);
+    await page.keyboard.press("Escape");
 
-    await page.getByRole("button", { name: /^Price$/i }).click();
-    await page.getByRole("button", { name: /^Name$/i }).click();
+    await page.goto("/settings?tab=providers");
+    await page.getByRole("button", { name: /Custom Endpoint/i }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            JSON.parse(
+              window.localStorage.getItem("suxiaoyou-settings") ?? "{}",
+            )?.state?.activeProvider,
+        ),
+      )
+      .toBe("custom");
+
+    await page.goto("/c/new");
+    await expect(
+      page.getByRole("button", { name: /Qwen3 Coder Local/i }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: /Qwen3 Coder Local/i }).click();
     await page.getByPlaceholder("Search models...").fill("Acme");
-    await expect(page.getByText("Acme Coder")).toBeVisible();
-    await page.getByText("Acme Coder").click();
-    await expect(page.getByRole("button", { name: /Acme Coder/i })).toBeVisible();
+    const acmeOption = page.getByText("Acme Coder", { exact: true }).last();
+    await expect(acmeOption).toBeVisible();
+    await acmeOption.click();
+    await expect(
+      page.getByRole("button", { name: /Acme Coder/i }),
+    ).toBeVisible();
 
     await sendPrompt(page, "Use the selected custom model from the GUI");
-    expect(JSON.stringify(state.promptBodies[0])).toContain("custom_acme/acme-coder");
+    expect(JSON.stringify(state.promptBodies[0])).toContain(
+      "custom_acme/acme-coder",
+    );
     expect(JSON.stringify(state.promptBodies[0])).toContain("custom_acme");
     await expectNoAppCrash(page);
   });
 
-  test("sidebar workflow: pin, rename, export, delete confirmation, and undo are reachable from the real menu", async ({ page }) => {
+  test("sidebar workflow: pin, rename, export, delete confirmation, and undo are reachable from the real menu", async ({
+    page,
+  }) => {
     const state = await setupMockedApp(page);
 
     await page.goto("/c/session-alpha");
-    const alpha = page.getByRole("option", { name: /Quarterly planning notes/i });
+    const alpha = page.getByRole("option", {
+      name: /Quarterly planning notes/i,
+    });
     await expect(alpha).toBeVisible();
 
     await alpha.hover();
     await alpha.locator("button").last().click();
     await page.getByRole("menuitem", { name: /Unpin/i }).click();
-    await expect.poll(() => JSON.stringify(state.sessionUpdates)).toContain('"is_pinned":false');
+    await expect
+      .poll(() => JSON.stringify(state.sessionUpdates))
+      .toContain('"is_pinned":false');
 
-    const alphaAfterPin = page.getByRole("option", { name: /Quarterly planning notes/i });
+    const alphaAfterPin = page.getByRole("option", {
+      name: /Quarterly planning notes/i,
+    });
     await alphaAfterPin.hover();
     await alphaAfterPin.locator("button").last().click();
     await page.getByRole("menuitem", { name: /Rename/i }).click();
     await expect(alphaAfterPin.locator('input[type="text"]')).toBeVisible();
-    await alphaAfterPin.locator('input[type="text"]').fill("Quarterly planning notes renamed");
+    await alphaAfterPin
+      .locator('input[type="text"]')
+      .fill("Quarterly planning notes renamed");
     await page.keyboard.press("Enter");
-    await expect(page.getByRole("option", { name: /Quarterly planning notes renamed/i })).toBeVisible();
-    expect(JSON.stringify(state.sessionUpdates)).toContain("Quarterly planning notes renamed");
+    await expect(
+      page.getByRole("option", { name: /Quarterly planning notes renamed/i }),
+    ).toBeVisible();
+    expect(JSON.stringify(state.sessionUpdates)).toContain(
+      "Quarterly planning notes renamed",
+    );
 
-    const renamed = page.getByRole("option", { name: /Quarterly planning notes renamed/i });
+    const renamed = page.getByRole("option", {
+      name: /Quarterly planning notes renamed/i,
+    });
     await renamed.hover();
     await renamed.locator("button").last().click();
     const mdDownload = page.waitForEvent("download");
@@ -157,7 +352,9 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     const pdfDownload = page.waitForEvent("download");
     await page.getByRole("menuitem", { name: /Export PDF/i }).click();
     await pdfDownload;
-    await expect.poll(() => state.sessionExports).toContain("session-alpha.pdf");
+    await expect
+      .poll(() => state.sessionExports)
+      .toContain("session-alpha.pdf");
 
     await renamed.hover();
     await renamed.locator("button").last().click();
@@ -166,16 +363,22 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await page.getByRole("button", { name: /^Delete$/i }).click();
     await expect(page.getByText("Conversation deleted")).toBeVisible();
     await page.getByRole("button", { name: "Undo" }).click();
-    await expect(page.getByRole("option", { name: /Quarterly planning notes renamed/i })).toBeVisible();
+    await expect(
+      page.getByRole("option", { name: /Quarterly planning notes renamed/i }),
+    ).toBeVisible();
     expect(state.sessionDeletes).toHaveLength(0);
     await expectNoAppCrash(page);
   });
 
-  test("sidebar right-click menu keeps inline rename active until it is submitted", async ({ page }) => {
+  test("sidebar right-click menu keeps inline rename active until it is submitted", async ({
+    page,
+  }) => {
     const state = await setupMockedApp(page);
 
     await page.goto("/c/session-alpha");
-    const alpha = page.getByRole("option", { name: /Quarterly planning notes/i });
+    const alpha = page.getByRole("option", {
+      name: /Quarterly planning notes/i,
+    });
     await expect(alpha).toBeVisible();
 
     await alpha.click({ button: "right" });
@@ -195,12 +398,14 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
         name: /Quarterly planning renamed from context menu/i,
       }),
     ).toBeVisible();
-    await expect.poll(() => JSON.stringify(state.sessionUpdates)).toContain(
-      "Quarterly planning renamed from context menu",
-    );
+    await expect
+      .poll(() => JSON.stringify(state.sessionUpdates))
+      .toContain("Quarterly planning renamed from context menu");
   });
 
-  test("workspace workflow: progress, scratchpad, file preview, and artifact side panel work together", async ({ page }) => {
+  test("workspace workflow: progress, scratchpad, file preview, and artifact side panel work together", async ({
+    page,
+  }) => {
     await setupMockedApp(page);
 
     await page.goto("/c/session-alpha");
@@ -208,21 +413,29 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await page.getByRole("button", { name: /Progress/i }).click();
     await expect(page.getByText("Draft outline")).toBeVisible();
 
-    const filesCard = page.getByRole("button", { name: /Files 5 generated files/i });
+    const filesCard = page.getByRole("button", {
+      name: /Files 5 generated files/i,
+    });
     await expect(filesCard).toBeVisible();
     await filesCard.click();
     await page.getByRole("button", { name: "Scratchpad" }).click();
     const scratchpad = page.getByPlaceholder("Notes, ideas, reminders...");
     await scratchpad.fill("Remember to verify the GUI artifact path.");
-    await expect(scratchpad).toHaveValue("Remember to verify the GUI artifact path.");
+    await expect(scratchpad).toHaveValue(
+      "Remember to verify the GUI artifact path.",
+    );
 
     await page.getByRole("button", { name: "plan.md" }).click();
-    await expect(page.getByText("Workspace file preview loaded through the GUI.")).toBeVisible();
+    await expect(
+      page.getByText("Workspace file preview loaded through the GUI."),
+    ).toBeVisible();
     await expect(page.getByText("plan.md").first()).toBeVisible();
     await expectNoAppCrash(page);
   });
 
-  test("unreleased Remote and Channels controls stay hidden", async ({ page }) => {
+  test("unreleased Remote and Channels controls stay hidden", async ({
+    page,
+  }) => {
     await setupMockedApp(page);
 
     await page.goto("/remote");
@@ -233,11 +446,15 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
     await expectNoAppCrash(page);
   });
 
-  test("standalone and first-run workflows: routes render outside settings and onboarding routes to provider setup", async ({ page }) => {
+  test("standalone and first-run workflows: routes render outside settings and onboarding routes to provider setup", async ({
+    page,
+  }) => {
     await setupMockedApp(page);
 
     await page.goto("/automations");
-    await expect(page.getByRole("heading", { name: "Automations" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Automations" }),
+    ).toBeVisible();
     await expect(page.getByText("Morning brief")).toBeVisible();
 
     await page.goto("/plugins");
@@ -256,18 +473,26 @@ test.describe("苏小有 deep claimed-feature GUI surfaces", () => {
       hasCompletedOnboarding: false,
     });
     await onboarding.goto("/c/new");
-    await expect(onboarding.getByRole("heading", { name: "Welcome to suyo" })).toBeVisible();
+    await expect(
+      onboarding.getByRole("heading", { name: "Welcome to suyo" }),
+    ).toBeVisible();
 
-    const providerButton = onboarding.getByRole("button", { name: "Configure provider" });
+    const providerButton = onboarding.getByRole("button", {
+      name: "Configure provider",
+    });
     await expect(providerButton).toBeDisabled();
-    await onboarding.getByRole("button", { name: "Select workspace folder" }).click();
+    await onboarding
+      .getByRole("button", { name: "Select workspace folder" })
+      .click();
     await expect(
       onboarding.getByRole("button", { name: "/Users/alex/suxiaoyou-demo" }),
     ).toBeVisible();
     await expect(providerButton).toBeEnabled();
     await providerButton.click();
     await expect(onboarding).toHaveURL(/\/settings\?tab=providers$/);
-    await expect(onboarding.getByRole("heading", { name: "Providers" })).toBeVisible();
+    await expect(
+      onboarding.getByRole("heading", { name: "Providers" }),
+    ).toBeVisible();
     await expectNoAppCrash(onboarding);
     await onboarding.close();
   });

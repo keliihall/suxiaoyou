@@ -7,7 +7,9 @@
  *
  * The executable exposes the control files only when release CI supplies
  * SUXIAOYOU_DESKTOP_LIFECYCLE_SMOKE_DIR. No authentication token is read or
- * written by this verifier.
+ * written by this verifier. Release CI seals the installer/package before its
+ * first install or mount. This verifier requires that size/SHA-256/commit seal,
+ * checks it before launching the app, and re-hashes the artifact after exit.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -55,8 +57,9 @@ if (
 }
 const WINDOWS_RESERVED_PATH_SEGMENT =
   /^(?:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/iu;
+const FULL_COMMIT_PATTERN = /^(?!0{40}$)[0-9a-f]{40}$/u;
 
-export const DESKTOP_LIFECYCLE_SCHEMA_VERSION = 1;
+export const DESKTOP_LIFECYCLE_SCHEMA_VERSION = 3;
 
 function normalizedTauriBundleDigest(bytes, expectedBundleType) {
   const expectedMarker = TAURI_LINUX_BUNDLE_MARKERS[expectedBundleType];
@@ -176,6 +179,47 @@ export function validateDesktopLifecycleReport(
   if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(String(report.executable_sha256 ?? ""))) {
     failures.push("executable_sha256 must be a non-zero SHA-256 digest");
   }
+  if (!isCanonicalAbsoluteExecutablePath(report.artifact_path, report.platform)) {
+    failures.push("artifact_path must be an absolute canonical path");
+  }
+  if (!Number.isSafeInteger(report.artifact_size) || report.artifact_size <= 0) {
+    failures.push("artifact_size must be a positive safe integer");
+  }
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(String(report.artifact_sha256 ?? ""))) {
+    failures.push("artifact_sha256 must be a non-zero SHA-256 digest");
+  }
+  const preinstallSeal =
+    report.artifact_preinstall_seal &&
+    typeof report.artifact_preinstall_seal === "object" &&
+    !Array.isArray(report.artifact_preinstall_seal)
+      ? report.artifact_preinstall_seal
+      : {};
+  const sealedCommit = String(preinstallSeal.source_commit ?? "").toLowerCase();
+  if (!FULL_COMMIT_PATTERN.test(sealedCommit)) {
+    failures.push(
+      "artifact_preinstall_seal.source_commit must be a full non-zero Git commit ID",
+    );
+  } else if (sealedCommit !== sourceCommit) {
+    failures.push("artifact_preinstall_seal.source_commit must match source_commit");
+  }
+  if (
+    !Number.isSafeInteger(preinstallSeal.artifact_size) ||
+    preinstallSeal.artifact_size <= 0
+  ) {
+    failures.push(
+      "artifact_preinstall_seal.artifact_size must be a positive safe integer",
+    );
+  } else if (preinstallSeal.artifact_size !== report.artifact_size) {
+    failures.push("artifact_preinstall_seal.artifact_size must match artifact_size");
+  }
+  const sealedSha256 = String(preinstallSeal.artifact_sha256 ?? "").toLowerCase();
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(sealedSha256)) {
+    failures.push(
+      "artifact_preinstall_seal.artifact_sha256 must be a non-zero SHA-256 digest",
+    );
+  } else if (sealedSha256 !== report.artifact_sha256) {
+    failures.push("artifact_preinstall_seal.artifact_sha256 must match artifact_sha256");
+  }
   const hasBundleEvidence =
     report.tauri_bundle_type !== undefined ||
     report.executable_unpatched_sha256 !== undefined ||
@@ -239,6 +283,8 @@ export function validateDesktopLifecycleReport(
     "graceful_exit",
     "no_orphan_processes",
     "backend_stopped",
+    "artifact_unchanged",
+    "artifact_matches_preinstall_seal",
   ]) {
     if (checks[field] !== true) failures.push(`checks.${field} must be true`);
   }
@@ -392,21 +438,24 @@ export function resolveDesktopExecutable(executable) {
   return realpathSync(requested);
 }
 
-export function hashStableExecutable(executable, { expectedBundleType } = {}) {
+function hashStableRegularFile(
+  requestedPath,
+  { label, expectedBundleType, resolvePath = resolveDesktopExecutable },
+) {
   if (
     expectedBundleType !== undefined &&
     !Object.hasOwn(TAURI_LINUX_BUNDLE_MARKERS, expectedBundleType)
   ) {
     throw new Error(`unsupported Tauri Linux bundle type: ${String(expectedBundleType)}`);
   }
-  const path = resolveDesktopExecutable(executable);
+  const path = resolvePath(requestedPath);
   const before = statSync(path, { bigint: false });
   let descriptor = -1;
   try {
     descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const openedBefore = fstatSync(descriptor, { bigint: false });
     if (!openedBefore.isFile() || openedBefore.size <= 0) {
-      throw new Error(`desktop executable must be a non-empty regular file: ${path}`);
+      throw new Error(`${label} must be a non-empty regular file: ${path}`);
     }
     const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(1024 * 1024);
@@ -430,11 +479,11 @@ export function hashStableExecutable(executable, { expectedBundleType } = {}) {
         candidate.size !== before.size ||
         candidate.mtimeMs !== before.mtimeMs
       ) {
-        throw new Error(`desktop executable changed while it was hashed: ${path}`);
+        throw new Error(`${label} changed while it was hashed: ${path}`);
       }
     }
     if (total !== before.size) {
-      throw new Error(`desktop executable changed while it was hashed: ${path}`);
+      throw new Error(`${label} changed while it was hashed: ${path}`);
     }
     const evidence = {
       path,
@@ -454,8 +503,97 @@ export function hashStableExecutable(executable, { expectedBundleType } = {}) {
   }
 }
 
+export function hashStableExecutable(executable, { expectedBundleType } = {}) {
+  return hashStableRegularFile(executable, {
+    label: "desktop executable",
+    expectedBundleType,
+  });
+}
+
+export function hashStableArtifact(artifact) {
+  return hashStableRegularFile(artifact, {
+    label: "release artifact",
+    resolvePath(requestedPath) {
+      const requested = resolve(requestedPath);
+      if (!existsSync(requested)) {
+        throw new Error(`release artifact does not exist: ${requested}`);
+      }
+      return realpathSync(requested);
+    },
+  });
+}
+
+function assertArtifactEvidenceMatches(expected, actual, context) {
+  const mismatches = [];
+  if (actual.path !== expected.path) mismatches.push("canonical path");
+  if (actual.size !== expected.size) mismatches.push("size");
+  if (actual.sha256 !== expected.sha256) mismatches.push("SHA-256");
+  if (mismatches.length > 0) {
+    throw new Error(
+      `${context}: release artifact changed (${mismatches.join(", ")})`,
+    );
+  }
+  return actual;
+}
+
+function assertArtifactMatchesPreinstallSeal(expected, actual) {
+  const mismatches = [];
+  if (actual.size !== expected.artifact_size) mismatches.push("size");
+  if (actual.sha256 !== expected.artifact_sha256) mismatches.push("SHA-256");
+  if (mismatches.length > 0) {
+    throw new Error(
+      `preinstall artifact seal verification failed: release artifact changed (${mismatches.join(", ")})`,
+    );
+  }
+  return actual;
+}
+
+export function verifyLifecycleArtifactBinding({
+  report,
+  reportPath,
+  artifact,
+  expectedPlatform,
+  expectedCommit,
+  expectedReleaseRef,
+  expectedBundleType,
+}) {
+  if ((report === undefined) === (reportPath === undefined)) {
+    throw new Error("provide exactly one of report or reportPath");
+  }
+  if (!artifact) throw new Error("artifact is required");
+  let reportValue = report;
+  if (reportPath !== undefined) {
+    try {
+      reportValue = JSON.parse(readFileSync(resolve(reportPath), "utf8"));
+    } catch (error) {
+      throw new Error(
+        `cannot read lifecycle report: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  const validation = validateDesktopLifecycleReport(reportValue, {
+    expectedPlatform,
+    expectedCommit,
+    expectedReleaseRef,
+    expectedBundleType,
+  });
+  if (!validation.ok) {
+    throw new Error(`lifecycle report is invalid: ${validation.failures.join("; ")}`);
+  }
+  return assertArtifactEvidenceMatches(
+    {
+      path: validation.report.artifact_path,
+      size: validation.report.artifact_size,
+      sha256: validation.report.artifact_sha256,
+    },
+    hashStableArtifact(artifact),
+    "lifecycle artifact verification failed",
+  );
+}
+
 export async function verifyDesktopLifecycle({
   executable,
+  artifact,
   workDirectory,
   platform = process.platform,
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
@@ -463,8 +601,33 @@ export async function verifyDesktopLifecycle({
   sourceCommit = resolveCheckoutCommit(),
   releaseRef = process.env.GITHUB_REF_NAME || "local",
   expectedBundleType,
+  expectedArtifactSize,
+  expectedArtifactSha256,
 }) {
   const startedAt = new Date().toISOString();
+  const normalizedSourceCommit = String(sourceCommit ?? "").trim().toLowerCase();
+  if (!FULL_COMMIT_PATTERN.test(normalizedSourceCommit)) {
+    throw new Error("sourceCommit must be a full non-zero Git commit ID");
+  }
+  if (!artifact) throw new Error("release artifact is required");
+  if (!Number.isSafeInteger(expectedArtifactSize) || expectedArtifactSize <= 0) {
+    throw new Error("expectedArtifactSize must be a positive safe integer");
+  }
+  const normalizedExpectedArtifactSha256 = String(
+    expectedArtifactSha256 ?? "",
+  ).toLowerCase();
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/u.test(normalizedExpectedArtifactSha256)) {
+    throw new Error("expectedArtifactSha256 must be a non-zero SHA-256 digest");
+  }
+  const preinstallSeal = {
+    source_commit: normalizedSourceCommit,
+    artifact_size: expectedArtifactSize,
+    artifact_sha256: normalizedExpectedArtifactSha256,
+  };
+  const artifactEvidence = assertArtifactMatchesPreinstallSeal(
+    preinstallSeal,
+    hashStableArtifact(artifact),
+  );
   const application = resolveDesktopExecutable(executable);
   if (expectedBundleType && platform !== "linux") {
     throw new Error("Tauri Linux bundle evidence is only valid on linux");
@@ -564,17 +727,26 @@ export async function verifyDesktopLifecycle({
     await waitForProcessesGone(pidsToReap, platform, shutdownTimeoutMs);
     await requireBackendStopped(ready.backendUrl, 10_000);
     copyApplicationLogs(ready.appLogDir, work);
+    const verifiedArtifactEvidence = assertArtifactEvidenceMatches(
+      artifactEvidence,
+      hashStableArtifact(artifact),
+      "desktop lifecycle verification failed",
+    );
 
     const result = {
       schema_version: DESKTOP_LIFECYCLE_SCHEMA_VERSION,
       status: "ok",
       ok: true,
       platform,
-      source_commit: sourceCommit,
+      source_commit: normalizedSourceCommit,
       release_ref: releaseRef,
       executable_path: executableEvidence.path,
       executable_size: executableEvidence.size,
       executable_sha256: executableEvidence.sha256,
+      artifact_path: verifiedArtifactEvidence.path,
+      artifact_size: verifiedArtifactEvidence.size,
+      artifact_sha256: verifiedArtifactEvidence.sha256,
+      artifact_preinstall_seal: preinstallSeal,
       ...(expectedBundleType
         ? {
             tauri_bundle_type: executableEvidence.tauriBundleType,
@@ -594,11 +766,13 @@ export async function verifyDesktopLifecycle({
         graceful_exit: true,
         no_orphan_processes: true,
         backend_stopped: true,
+        artifact_unchanged: true,
+        artifact_matches_preinstall_seal: true,
       },
     };
     const validation = validateDesktopLifecycleReport(result, {
       expectedPlatform: platform,
-      expectedCommit: sourceCommit,
+      expectedCommit: normalizedSourceCommit,
       expectedReleaseRef: releaseRef,
       expectedBundleType,
     });
@@ -614,6 +788,21 @@ export async function verifyDesktopLifecycle({
     );
     return result;
   } catch (error) {
+    let failure = error;
+    try {
+      assertArtifactEvidenceMatches(
+        artifactEvidence,
+        hashStableArtifact(artifact),
+        "desktop lifecycle verification failed",
+      );
+    } catch (artifactError) {
+      const artifactMessage =
+        artifactError instanceof Error ? artifactError.message : String(artifactError);
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      if (!originalMessage.includes(artifactMessage)) {
+        failure = new Error(`${artifactMessage}; lifecycle error: ${originalMessage}`);
+      }
+    }
     writeFileSync(
       join(work, "failure.json"),
       `${JSON.stringify(
@@ -622,11 +811,15 @@ export async function verifyDesktopLifecycle({
           status: "failed",
           ok: false,
           platform,
-          source_commit: sourceCommit,
+          source_commit: normalizedSourceCommit,
           release_ref: releaseRef,
           executable_path: executableEvidence.path,
           executable_size: executableEvidence.size,
           executable_sha256: executableEvidence.sha256,
+          artifact_path: artifactEvidence.path,
+          artifact_size: artifactEvidence.size,
+          artifact_sha256: artifactEvidence.sha256,
+          artifact_preinstall_seal: preinstallSeal,
           ...(expectedBundleType
             ? {
                 tauri_bundle_type: executableEvidence.tauriBundleType,
@@ -635,7 +828,7 @@ export async function verifyDesktopLifecycle({
             : {}),
           started_at: startedAt,
           completed_at: new Date().toISOString(),
-          error: error instanceof Error ? error.message : String(error),
+          error: failure instanceof Error ? failure.message : String(failure),
           desktopPid: child?.pid ?? null,
           backendPid: ready?.backendPid ?? null,
           observedDescendantPids: observedProcesses,
@@ -645,7 +838,7 @@ export async function verifyDesktopLifecycle({
         2,
       )}\n`,
     );
-    throw error;
+    throw failure;
   } finally {
     if (child && !closed) {
       await terminateDesktopTree(child, platform, closePromise);
@@ -802,24 +995,58 @@ async function withTimeout(promise, timeoutMs, message) {
   }
 }
 
-function parseArguments(argv) {
+const LIFECYCLE_USAGE =
+  "usage: verify-desktop-lifecycle.mjs --executable <path> --artifact <path> " +
+  "--artifact-size <bytes> --artifact-sha256 <digest> --work-dir <path> " +
+  "--release-commit <40-char-commit> [--bundle-type deb|rpm]";
+const ARTIFACT_VERIFICATION_USAGE =
+  "usage: verify-desktop-lifecycle.mjs verify-artifact --report <path> " +
+  "--artifact <path> --release-commit <40-char-commit>";
+
+function parseOptions(argv, { allowed, usage }) {
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
     if (!key?.startsWith("--") || value === undefined) {
-      throw new Error(
-        "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path> [--bundle-type deb|rpm]",
-      );
+      throw new Error(usage);
     }
-    values.set(key.slice(2), value);
+    const name = key.slice(2);
+    if (!allowed.has(name) || values.has(name)) throw new Error(usage);
+    values.set(name, value);
   }
+  return values;
+}
+
+function parseArguments(argv) {
+  const values = parseOptions(argv, {
+    allowed: new Set([
+      "executable",
+      "artifact",
+      "artifact-size",
+      "artifact-sha256",
+      "work-dir",
+      "release-commit",
+      "bundle-type",
+    ]),
+    usage: LIFECYCLE_USAGE,
+  });
   const executable = values.get("executable");
+  const artifact = values.get("artifact");
+  const artifactSize = Number(values.get("artifact-size"));
+  const artifactSha256 = String(values.get("artifact-sha256") ?? "").toLowerCase();
   const workDirectory = values.get("work-dir");
-  if (!executable || !workDirectory) {
-    throw new Error(
-      "usage: verify-desktop-lifecycle.mjs --executable <path> --work-dir <path> [--bundle-type deb|rpm]",
-    );
+  const releaseCommit = String(values.get("release-commit") ?? "").toLowerCase();
+  if (
+    !executable ||
+    !artifact ||
+    !Number.isSafeInteger(artifactSize) ||
+    artifactSize <= 0 ||
+    !/^(?!0{64}$)[0-9a-f]{64}$/u.test(artifactSha256) ||
+    !workDirectory ||
+    !FULL_COMMIT_PATTERN.test(releaseCommit)
+  ) {
+    throw new Error(LIFECYCLE_USAGE);
   }
   const expectedBundleType = values.get("bundle-type");
   if (
@@ -828,12 +1055,45 @@ function parseArguments(argv) {
   ) {
     throw new Error("--bundle-type must be deb or rpm");
   }
-  return { executable, workDirectory, expectedBundleType };
+  return {
+    executable,
+    artifact,
+    expectedArtifactSize: artifactSize,
+    expectedArtifactSha256: artifactSha256,
+    workDirectory,
+    sourceCommit: releaseCommit,
+    expectedBundleType,
+  };
+}
+
+function parseArtifactVerificationArguments(argv) {
+  const values = parseOptions(argv, {
+    allowed: new Set(["report", "artifact", "release-commit"]),
+    usage: ARTIFACT_VERIFICATION_USAGE,
+  });
+  const reportPath = values.get("report");
+  const artifact = values.get("artifact");
+  const expectedCommit = String(values.get("release-commit") ?? "").toLowerCase();
+  if (!reportPath || !artifact || !FULL_COMMIT_PATTERN.test(expectedCommit)) {
+    throw new Error(ARTIFACT_VERIFICATION_USAGE);
+  }
+  return { reportPath, artifact, expectedCommit };
 }
 
 async function main() {
   try {
-    await verifyDesktopLifecycle(parseArguments(process.argv.slice(2)));
+    const argv = process.argv.slice(2);
+    if (argv[0] === "verify-artifact") {
+      const evidence = verifyLifecycleArtifactBinding(
+        parseArtifactVerificationArguments(argv.slice(1)),
+      );
+      console.log(
+        `[verify-desktop-lifecycle] artifact=${evidence.path}, ` +
+          `size=${evidence.size}, sha256=${evidence.sha256}, binding=passed`,
+      );
+    } else {
+      await verifyDesktopLifecycle(parseArguments(argv));
+    }
   } catch (error) {
     console.error(
       `[verify-desktop-lifecycle] ${error instanceof Error ? error.message : String(error)}`,

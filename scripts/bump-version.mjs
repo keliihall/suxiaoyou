@@ -123,6 +123,36 @@ function replaceProjectVersion(rootDir, version) {
   fs.writeFileSync(pyprojectPath, updated);
 }
 
+export function replacePythonFinalString(text, name, version, source) {
+  assertReleaseVersion(version);
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `^([ \\t]*${escapedName}[ \\t]*:[ \\t]*Final[ \\t]*=[ \\t]*)"[^"]+"([ \\t]*)$`,
+    "gm",
+  );
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length !== 1) {
+    throw new Error(
+      `${source} must contain exactly one ${name}: Final string, found ${matches.length}`,
+    );
+  }
+  return text.replace(pattern, `$1${JSON.stringify(version)}$2`);
+}
+
+function replaceBackendAppVersion(rootDir, version) {
+  const versionPath = path.join(rootDir, "backend", "app", "version.py");
+  const source = fs.readFileSync(versionPath, "utf8");
+  fs.writeFileSync(
+    versionPath,
+    replacePythonFinalString(
+      source,
+      "APP_VERSION",
+      version,
+      "backend/app/version.py",
+    ),
+  );
+}
+
 function updatePoweredBy(rootDir, version) {
   for (const locale of ["en", "zh"]) {
     const commonPath = path.join(
@@ -175,6 +205,9 @@ export function updateProjectVersion(rootDir, version) {
 
   replaceProjectVersion(rootDir, version);
   console.log("  ✓ backend/pyproject.toml");
+
+  replaceBackendAppVersion(rootDir, version);
+  console.log("  ✓ backend/app/version.py APP_VERSION");
 
   syncDesktopMeta(rootDir);
   console.log("  ✓ desktop-tauri (tauri.conf.json + Cargo.toml)");

@@ -85,6 +85,7 @@ class _FakeWindowsApi:
         self.wait_calls = 0
         self.job_terminated = False
         self.process_terminated = False
+        self.stdin_bytes: bytes | None = None
 
     def create_kill_on_close_job(self) -> object:
         self.events.append("create_job")
@@ -96,10 +97,12 @@ class _FakeWindowsApi:
         *,
         cwd: str,
         env: Mapping[str, str],
+        stdin_bytes: bytes | None = None,
     ) -> WindowsChildProcess:
         assert list(argv) == [r"C:\Windows\System32\cmd.exe", "/c", "echo ok"]
         assert cwd == r"C:\workspace"
         assert env == {"SAFE": "1"}
+        self.stdin_bytes = stdin_bytes
         self.events.append("create_suspended")
         if self.create_error is not None:
             raise self.create_error
@@ -235,6 +238,16 @@ def test_suspended_process_is_assigned_before_resume_and_job_closes_normally() -
     assert api.events[-1] == "close_process"
 
 
+def test_stdin_bytes_are_bound_to_the_suspended_process_creation() -> None:
+    clock = _FakeClock()
+    api = _FakeWindowsApi(clock=clock)
+
+    result = _run(api, stdin_bytes=b'{"version":1}\n')
+
+    assert result.exit_code == 0
+    assert api.stdin_bytes == b'{"version":1}\n'
+
+
 def test_output_is_bounded_but_both_pipes_are_fully_drained() -> None:
     clock = _FakeClock()
     stdout = b"x" * 200_000
@@ -355,6 +368,17 @@ def test_abort_callback_terminates_entire_job() -> None:
     assert api.events.count("close_job") == 1
 
 
+def test_preexisting_abort_does_not_create_a_windows_process() -> None:
+    clock = _FakeClock()
+    api = _FakeWindowsApi(clock=clock)
+
+    result = _run(api, should_abort=lambda: True)
+
+    assert result.termination == "aborted"
+    assert result.pid == -1
+    assert api.events == []
+
+
 def test_wait_exception_still_closes_job_streams_and_process_handles() -> None:
     clock = _FakeClock()
     api = _FakeWindowsApi(
@@ -444,6 +468,25 @@ def test_native_ctypes_runner_executes_suspended_child_and_captures_output(
     assert result.termination is None
     assert result.stdout.strip() == b"native-stdout"
     assert result.stderr.strip() == b"native-stderr"
+
+
+@WINDOWS_ONLY
+def test_native_ctypes_runner_delivers_stdin(tmp_path: Path) -> None:
+    payload = b'{"version":1,"event":"PreToolUse"}\n'
+    result = run_windows_process(
+        [
+            sys.executable,
+            "-c",
+            "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+        cwd=str(tmp_path),
+        env=os.environ,
+        timeout_seconds=10,
+        stdin_bytes=payload,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == payload
 
 
 @WINDOWS_ONLY

@@ -15,33 +15,126 @@ import { fileURLToPath } from "node:url";
 
 import { validateDesktopLifecycleReport } from "./verify-desktop-lifecycle.mjs";
 
-export const NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION = 1;
+export const NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION = 2;
+export const UNSIGNED_DEGRADED_NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION = 3;
 
 const COMMIT_PATTERN = /^(?!0{40}$)[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^(?!0{64}$)[0-9a-f]{64}$/;
 const RELEASE_CHANNELS = new Set(["prerelease", "stable"]);
+const RELEASE_PROFILES = new Set([
+  "official",
+  "rc-adhoc",
+  "unsigned-degraded",
+]);
+
+function resolveReleaseProfile(releaseChannel, version, requestedProfile) {
+  const defaultProfile =
+    version === "1.1.0"
+      ? "unsigned-degraded"
+      : releaseChannel === "stable"
+        ? "official"
+        : "rc-adhoc";
+  const profile = String(requestedProfile ?? "").trim() || defaultProfile;
+  if (!RELEASE_PROFILES.has(profile)) {
+    throw new Error(
+      "releaseProfile must be official, rc-adhoc, or unsigned-degraded",
+    );
+  }
+  const expectedChannel = profile === "rc-adhoc" ? "prerelease" : "stable";
+  if (releaseChannel !== expectedChannel) {
+    throw new Error(
+      `releaseProfile ${profile} requires releaseChannel ${expectedChannel}`,
+    );
+  }
+  if (profile === "unsigned-degraded" && version !== "1.1.0") {
+    throw new Error(
+      `releaseProfile ${profile} is defined only for v1.1.0, got v${version}`,
+    );
+  }
+  if (version === "1.1.0" && profile !== "unsigned-degraded") {
+    throw new Error(
+      "v1.1.0 is defined by the unsigned-degraded release contract",
+    );
+  }
+  return profile;
+}
+
+function profiledInstallerName(stem, extension, releaseProfile) {
+  const suffix =
+    releaseProfile === "unsigned-degraded" ? "-UNSIGNED-DEGRADED" : "";
+  return `${stem}${suffix}.${extension}`;
+}
+
+function packageTrustEvidence(definition, releaseChannel, releaseProfile) {
+  if (releaseProfile === "unsigned-degraded") {
+    const platformTrust =
+      definition.platform === "win32"
+        ? { authenticode_signed: false }
+        : definition.platform === "darwin"
+          ? {
+              app_signature: "adhoc",
+              developer_id_signed: false,
+              dmg_signed: false,
+              notarized: false,
+              stapled: false,
+              trust_boundary_verified: true,
+            }
+          : {
+              package_signed: false,
+              repository_signed: false,
+            };
+    return {
+      artifact_profile: "unsigned-degraded",
+      ...platformTrust,
+    };
+  }
+  if (!definition.kind.startsWith("macos-")) return {};
+  return releaseChannel === "stable"
+    ? {
+        artifact_profile: "release",
+        developer_id_signed: true,
+        notarized: true,
+      }
+    : {
+        artifact_profile: "rc-adhoc",
+        trust_boundary_verified: true,
+      };
+}
 
 const PACKAGE_DEFINITIONS = Object.freeze([
   {
     kind: "windows-x64-nsis",
     platform: "win32",
-    artifactName: (version) => `suyo-${version}-windows-x64-setup.exe`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-windows-x64-setup`,
+        "exe",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^windows-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-windows",
   },
   {
     kind: "macos-arm64-dmg",
     platform: "darwin",
-    artifactName: (version, channel) =>
-      `suyo-${version}-macos-aarch64${channel === "prerelease" ? "-ADHOC-NOT-NOTARIZED" : ""}.dmg`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-macos-aarch64${releaseProfile === "rc-adhoc" ? "-ADHOC-NOT-NOTARIZED" : ""}`,
+        "dmg",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^macos-aarch64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-macos-aarch64",
   },
   {
     kind: "macos-x64-dmg",
     platform: "darwin",
-    artifactName: (version, channel) =>
-      `suyo-${version}-macos-x64${channel === "prerelease" ? "-ADHOC-NOT-NOTARIZED" : ""}.dmg`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-macos-x64${releaseProfile === "rc-adhoc" ? "-ADHOC-NOT-NOTARIZED" : ""}`,
+        "dmg",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^macos-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-macos-x64",
   },
@@ -49,7 +142,12 @@ const PACKAGE_DEFINITIONS = Object.freeze([
     kind: "linux-x64-deb",
     platform: "linux",
     bundleType: "deb",
-    artifactName: (version) => `suyo-${version}-linux-amd64.deb`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-linux-amd64`,
+        "deb",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^linux-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-deb",
   },
@@ -57,7 +155,12 @@ const PACKAGE_DEFINITIONS = Object.freeze([
     kind: "linux-x64-rpm",
     platform: "linux",
     bundleType: "rpm",
-    artifactName: (version) => `suyo-${version}-linux-x86_64.rpm`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-linux-x86_64`,
+        "rpm",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^linux-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-rpm",
   },
@@ -65,7 +168,12 @@ const PACKAGE_DEFINITIONS = Object.freeze([
     kind: "linux-arm64-deb",
     platform: "linux",
     bundleType: "deb",
-    artifactName: (version) => `suyo-${version}-linux-arm64.deb`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-linux-arm64`,
+        "deb",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^linux-arm64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-deb",
   },
@@ -73,7 +181,12 @@ const PACKAGE_DEFINITIONS = Object.freeze([
     kind: "linux-arm64-rpm",
     platform: "linux",
     bundleType: "rpm",
-    artifactName: (version) => `suyo-${version}-linux-aarch64.rpm`,
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-linux-aarch64`,
+        "rpm",
+        releaseProfile,
+      ),
     lifecycleArtifact: /^linux-arm64-lifecycle-diagnostics-[1-9][0-9]*$/,
     lifecycleDirectory: "suxiaoyou-desktop-lifecycle-linux-rpm",
   },
@@ -151,6 +264,7 @@ export async function collectNativePackageEvidence({
   releaseCommit,
   releaseTag,
   releaseChannel,
+  releaseProfile,
 }) {
   const commit = String(releaseCommit ?? "").trim().toLowerCase();
   if (!COMMIT_PATTERN.test(commit)) {
@@ -160,6 +274,11 @@ export async function collectNativePackageEvidence({
     throw new Error("releaseChannel must be prerelease or stable");
   }
   const version = releaseVersion(releaseTag, releaseChannel);
+  const profile = resolveReleaseProfile(
+    releaseChannel,
+    version,
+    releaseProfile,
+  );
   const assetsDirectory = resolve(assetsRoot);
   const artifactsDirectory = resolve(artifactsRoot);
   if (!statSync(assetsDirectory).isDirectory()) {
@@ -173,7 +292,7 @@ export async function collectNativePackageEvidence({
   const checksumEntries = parseChecksums(readFileSync(checksumFile, "utf8"));
   const expectedAssetNames = new Set(
     PACKAGE_DEFINITIONS.map((definition) =>
-      definition.artifactName(version, releaseChannel),
+      definition.artifactName(version, profile),
     ),
   );
   const installerFiles = assetFiles.filter((path) => /\.(?:exe|dmg|deb|rpm)$/iu.test(path));
@@ -205,7 +324,7 @@ export async function collectNativePackageEvidence({
   const packages = [];
   const consumedReports = new Set();
   for (const definition of PACKAGE_DEFINITIONS) {
-    const artifactName = definition.artifactName(version, releaseChannel);
+    const artifactName = definition.artifactName(version, profile);
     const matchingAssets = installerFiles.filter((path) => basename(path) === artifactName);
     if (matchingAssets.length !== 1) {
       throw new Error(`${definition.kind}: expected one ${artifactName}, found ${matchingAssets.length}`);
@@ -254,6 +373,15 @@ export async function collectNativePackageEvidence({
         `${definition.kind}: lifecycle result is invalid: ${lifecycle.failures.join("; ")}`,
       );
     }
+    if (
+      lifecycle.report.artifact_size !== artifactSize ||
+      lifecycle.report.artifact_sha256 !== artifactSha256
+    ) {
+      throw new Error(
+        `${definition.kind}: downloaded installer does not match the artifact ` +
+          `verified by the lifecycle run`,
+      );
+    }
 
     packages.push({
       kind: definition.kind,
@@ -262,6 +390,7 @@ export async function collectNativePackageEvidence({
       artifact_name: artifactName,
       artifact_sha256: artifactSha256,
       artifact_size: artifactSize,
+      lifecycle_artifact_bound: true,
       lifecycle_report_sha256: sha256Text(lifecycleRaw),
       executable_path: lifecycle.report.executable_path,
       executable_size: lifecycle.report.executable_size,
@@ -278,18 +407,7 @@ export async function collectNativePackageEvidence({
       launched: lifecycle.report.checks.backend_ready,
       exited_cleanly: lifecycle.report.checks.graceful_exit,
       no_orphan_processes: lifecycle.report.checks.no_orphan_processes,
-      ...(definition.kind.startsWith("macos-")
-        ? releaseChannel === "stable"
-          ? {
-              artifact_profile: "release",
-              developer_id_signed: true,
-              notarized: true,
-            }
-          : {
-              artifact_profile: "rc-adhoc",
-              trust_boundary_verified: true,
-            }
-        : {}),
+      ...packageTrustEvidence(definition, releaseChannel, profile),
     });
   }
 
@@ -327,13 +445,26 @@ export async function collectNativePackageEvidence({
     }
   }
 
-  return {
-    schema_version: NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+  const common = {
     release_tag: releaseTag,
     release_commit: commit,
     release_channel: releaseChannel,
     generated_at: new Date().toISOString(),
     packages,
+  };
+  if (profile !== "unsigned-degraded") {
+    return {
+      schema_version: NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+      ...common,
+    };
+  }
+  return {
+    schema_version: UNSIGNED_DEGRADED_NATIVE_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+    ...common,
+    release_profile: profile,
+    publication_channel: "prerelease",
+    official_release_eligible: false,
+    latest_eligible: false,
   };
 }
 
@@ -358,6 +489,7 @@ async function runCli() {
     releaseTag,
     releaseChannel,
     outputPath,
+    releaseProfile,
   ] = process.argv.slice(2);
   if (
     command !== "aggregate" ||
@@ -372,7 +504,8 @@ async function runCli() {
     console.error(
       "Usage: node scripts/native-package-evidence.mjs aggregate " +
         "<release-assets> <downloaded-artifacts> <CHECKSUMS.md> " +
-        "<40-char-commit> <release-tag> <prerelease|stable> <output.json>",
+        "<40-char-commit> <release-tag> <prerelease|stable> <output.json> " +
+        "[official|rc-adhoc|unsigned-degraded]",
     );
     process.exitCode = 2;
     return;
@@ -385,6 +518,7 @@ async function runCli() {
       releaseCommit,
       releaseTag,
       releaseChannel,
+      releaseProfile,
     });
     writeJsonAtomic(outputPath, evidence);
     console.log(

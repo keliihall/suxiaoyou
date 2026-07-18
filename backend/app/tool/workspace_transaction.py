@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+import base64
 import ctypes
 import errno
 import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -30,7 +32,7 @@ import tempfile
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from app.storage.file_versions import (
     FileVersion,
@@ -57,6 +59,9 @@ from app.utils.windows_guarded_file import (
     windows_relative_key,
 )
 
+if TYPE_CHECKING:
+    from app.office_validation.draft import OfficeDraftSeal
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +72,16 @@ MAX_STAGED_ENTRIES: Final = 50_000
 _COPY_CHUNK_BYTES: Final = 1024 * 1024
 _INTERNAL_ROOT: Final = ".suxiaoyou"
 _JOURNAL_NAME: Final = "journal-v1.json"
-_JOURNAL_SCHEMA_VERSION: Final = 2
-_SUPPORTED_JOURNAL_SCHEMA_VERSIONS: Final = frozenset({1, 2})
+_JOURNAL_SCHEMA_VERSION: Final = 4
+_SUPPORTED_JOURNAL_SCHEMA_VERSIONS: Final = frozenset({1, 2, 3, 4})
 
 
 class WorkspaceMutationError(RuntimeError):
     """A staged command could not be prepared or safely committed."""
+
+
+class WorkspacePrecommitSealError(WorkspaceMutationError):
+    """Server-owned precommit evidence no longer matches staged output."""
 
 
 class _WorkspaceParentMovedAfterOperation(WorkspaceMutationError):
@@ -96,6 +105,34 @@ class WorkspaceEntry:
     link_target: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceOfficePrecommitView:
+    """Transaction-derived identities for one armed Office validation run.
+
+    Callers cannot choose staging or baseline paths independently.  The view is
+    produced only after ``prepare_paths()`` has pinned the declared target and
+    is intentionally free of any commit credential.
+    """
+
+    workspace_root: Path
+    visible_target: Path
+    staged_root: Path
+    staged_target: Path
+    relative_path: str
+    workspace_identity: tuple[int, int]
+    staged_root_identity: tuple[int, int]
+    baseline: WorkspaceEntry | None
+    baseline_identity: tuple[int, int] | None
+    operation: str
+    session_id: str
+    message_id: str
+    call_id: str
+    root_turn_id: str | None
+    turn_run_id: str | None
+    checkpoint_id: str | None
+    workspace_instance_id: str | None
+
+
 @dataclass(slots=True)
 class _PreparedPath:
     relative: str
@@ -108,6 +145,19 @@ class _PreparedPath:
     current_sidecar_name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _OfficePrecommitGuard:
+    """Transaction-bound form of an authoritative Office draft seal."""
+
+    relative: str
+    expected: WorkspaceEntry
+    workspace_identity: tuple[int, int]
+    baseline: WorkspaceEntry | None
+    created_directories: tuple[tuple[str, WorkspaceEntry], ...]
+    staged_root_identity: tuple[int, int]
+    staged_source_identity: tuple[int, int]
+
+
 @dataclass(slots=True)
 class _WindowsWorkspaceAnchor:
     root: Path
@@ -118,6 +168,50 @@ class _WindowsWorkspaceAnchor:
 
 _LOCKS_GUARD = threading.Lock()
 _WORKSPACE_COMMIT_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _require_office_precommit_seal(value: object) -> OfficeDraftSeal:
+    """Accept only the nominal server-internal Office validation evidence."""
+
+    # Local import keeps the generic transaction module out of the Office
+    # validation import graph.  In particular, this value is never parsed from
+    # JSON or reconstructed from tool/model arguments.
+    from app.office_validation.draft import OfficeDraftSeal
+
+    if not isinstance(value, OfficeDraftSeal):
+        raise WorkspacePrecommitSealError(
+            "A server-owned Office precommit seal is required"
+        )
+    return value
+
+
+def _office_sealed_create_ancestors(
+    relative: str,
+    *,
+    baseline: dict[str, WorkspaceEntry],
+) -> tuple[str, ...]:
+    """Return the exact missing ancestor chain allowed for one sealed create."""
+
+    if baseline.get(relative) is not None:
+        return ()
+    parents = tuple(
+        parent.as_posix()
+        for parent in reversed(Path(relative).parents)
+        if parent != Path(".")
+    )
+    missing: list[str] = []
+    missing_parent = False
+    for parent in parents:
+        entry = baseline.get(parent)
+        if entry is None:
+            missing_parent = True
+            missing.append(parent)
+            continue
+        if entry.kind != "directory" or missing_parent:
+            raise WorkspacePrecommitSealError(
+                "Office precommit create ancestor baseline is inconsistent"
+            )
+    return tuple(missing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,15 +231,58 @@ class WorkspaceChangeSet:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceMutationRecord:
+    """Canonical post-commit evidence consumed by the v1.1 checkpoint ledger.
+
+    Absolute delivery paths remain in :class:`WorkspaceCommitResult` for v1.0
+    clients.  Rewind uses only canonical workspace-relative paths plus exact
+    before/after evidence, so a moved or replaced workspace root cannot be
+    confused with the instance that originally committed the mutation.
+    """
+
+    relative_path: str
+    operation: Literal["created", "modified", "deleted"]
+    node_kind: Literal["file", "directory", "symlink"]
+    before_version_id: str | None = None
+    before_sha256: str | None = None
+    before_mode: int | None = None
+    after_sha256: str | None = None
+    after_mode: int | None = None
+    after_size: int | None = None
+    link_target: str | None = None
+    # POSIX link targets are byte strings.  Base64 preserves a target that was
+    # decoded with surrogateescape without putting invalid Unicode in JSON.
+    link_target_b64: str | None = None
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return {
+            "relative_path": self.relative_path,
+            "operation": self.operation,
+            "node_kind": self.node_kind,
+            "before_version_id": self.before_version_id,
+            "before_sha256": self.before_sha256,
+            "before_mode": self.before_mode,
+            "after_sha256": self.after_sha256,
+            "after_mode": self.after_mode,
+            "after_size": self.after_size,
+            "link_target": self.link_target,
+            "link_target_b64": self.link_target_b64,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceCommitResult:
     written_files: tuple[str, ...]
     deleted_files: tuple[str, ...]
     previous_version_ids: tuple[str, ...]
     recovery_sidecars: tuple[str, ...] = ()
+    mutations: tuple[WorkspaceMutationRecord, ...] = ()
+    checkpoint_journal_token: str | None = None
 
     @property
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "workspace_transaction": True,
             "atomic_file_install": True,
             "written_files": list(self.written_files),
@@ -155,7 +292,16 @@ class WorkspaceCommitResult:
             # Generic name for tool/API consumers; values are the same hidden
             # workspace files described more precisely as sidecars above.
             "recovery_files": list(self.recovery_sidecars),
+            # Versioned, workspace-relative mutation evidence.  The session
+            # processor persists this before publishing TOOL_RESULT when the
+            # v1.1 checkpoint gate is enabled.
+            "workspace_mutations": [item.metadata for item in self.mutations],
         }
+        if self.checkpoint_journal_token is not None:
+            # Internal hand-off removed by SessionProcessor before the result
+            # reaches SSE or message persistence.
+            metadata["_checkpoint_journal"] = self.checkpoint_journal_token
+        return metadata
 
 
 class WorkspaceMutationTransaction:
@@ -168,12 +314,38 @@ class WorkspaceMutationTransaction:
         *,
         operation: str,
         storage_root: str | os.PathLike[str] | None = None,
+        checkpoint_action: Literal["turn_commit", "rewind"] = "turn_commit",
+        rewind_checkpoint_ids: Iterable[str] = (),
     ) -> None:
         self.workspace = validate_workspace_private_boundary(workspace)
         if not self.workspace.is_dir():
             raise WorkspaceMutationError(f"Workspace does not exist: {self.workspace}")
         self.ctx = ctx
         self.operation = operation
+        if checkpoint_action not in {"turn_commit", "rewind"}:
+            raise WorkspaceMutationError("Unsupported checkpoint journal action")
+        normalized_rewind_ids = tuple(str(value).strip() for value in rewind_checkpoint_ids)
+        if (
+            len(normalized_rewind_ids) > 500
+            or any(not value or len(value) > 200 for value in normalized_rewind_ids)
+            or len(set(normalized_rewind_ids)) != len(normalized_rewind_ids)
+        ):
+            raise WorkspaceMutationError("Rewind checkpoint identity list is invalid")
+        if checkpoint_action == "rewind":
+            if (
+                not normalized_rewind_ids
+                or ctx.checkpoint_id is None
+                or ctx.checkpoint_id not in normalized_rewind_ids
+            ):
+                raise WorkspaceMutationError(
+                    "Rewind journal requires its target and affected checkpoint IDs"
+                )
+        elif normalized_rewind_ids:
+            raise WorkspaceMutationError(
+                "Turn-commit journal cannot carry rewind checkpoint IDs"
+            )
+        self.checkpoint_action = checkpoint_action
+        self.rewind_checkpoint_ids = normalized_rewind_ids
         private_base = Path(
             storage_root
             if storage_root is not None
@@ -193,6 +365,8 @@ class WorkspaceMutationTransaction:
         self._targeted_read_paths: frozenset[str] | None = None
         self._targeted_declared_baseline: dict[str, WorkspaceEntry | None] | None = None
         self._targeted_source_identities: dict[str, tuple[int, int] | None] | None = None
+        self._office_precommit_relative: str | None = None
+        self._office_precommit_root_identity: tuple[int, int] | None = None
         self._finished = False
         self._preserve_for_recovery = False
         self._journal_payload: dict[str, object] | None = None
@@ -465,6 +639,227 @@ class WorkspaceMutationTransaction:
             ) from exc
         return staged / relative
 
+    def arm_office_precommit_validation(
+        self,
+        logical_target: str | os.PathLike[str],
+    ) -> WorkspaceOfficePrecommitView:
+        """Bind the prepared single-file target to the sealed commit path.
+
+        Once armed, ``commit()`` is mechanically unavailable.  The transaction
+        can only be published through ``commit_with_precommit_office_seal()`` or
+        discarded with ``abort()``.
+        """
+
+        if self._finished:
+            raise WorkspacePrecommitSealError(
+                "Workspace transaction is already finished"
+            )
+        staged = self._require_stage()
+        baseline = self._require_baseline()
+        if self._targeted_mutation_paths is None:
+            raise WorkspacePrecommitSealError(
+                "Office precommit validation requires prepare_paths()"
+            )
+        relative = _normalize_targeted_paths(
+            self.workspace,
+            (logical_target,),
+        )[0]
+        if self._targeted_mutation_paths != frozenset({relative}):
+            raise WorkspacePrecommitSealError(
+                "Office precommit validation requires exactly one declared write"
+            )
+        if self._office_precommit_relative is not None:
+            raise WorkspacePrecommitSealError(
+                "Office precommit validation is already armed"
+            )
+        workspace_identity = self._workspace_identity
+        identities = self._targeted_source_identities
+        if workspace_identity is None or identities is None or relative not in identities:
+            raise WorkspacePrecommitSealError(
+                "Office precommit transaction identities are unavailable"
+            )
+        staged_target = staged / relative
+        staged_root_identity = _path_identity(staged, directory=True)
+        self._office_precommit_relative = relative
+        self._office_precommit_root_identity = staged_root_identity
+        return WorkspaceOfficePrecommitView(
+            workspace_root=self.workspace,
+            visible_target=self.workspace / relative,
+            staged_root=staged,
+            staged_target=staged_target,
+            relative_path=relative,
+            workspace_identity=workspace_identity,
+            staged_root_identity=staged_root_identity,
+            baseline=baseline.get(relative),
+            baseline_identity=identities[relative],
+            operation=self.operation,
+            session_id=self.ctx.session_id,
+            message_id=self.ctx.message_id,
+            call_id=self.ctx.call_id,
+            root_turn_id=self.ctx.root_turn_id,
+            turn_run_id=self.ctx.turn_run_id,
+            checkpoint_id=self.ctx.checkpoint_id,
+            workspace_instance_id=self.ctx.workspace_instance_id,
+        )
+
+    def reset_office_precommit_target(
+        self,
+        logical_target: str | os.PathLike[str],
+    ) -> None:
+        """Reset one armed Office candidate without replacing its transaction view.
+
+        Create candidates are removed.  Edit candidates are replaced with a new
+        private copy only while the visible baseline still has the exact entry,
+        inode identity, and SHA-256 captured by ``prepare_paths()``.  The armed
+        relative path, staged root, and staged-root identity are preserved, so a
+        later validation result must seal a newly captured candidate inode.
+        """
+
+        if self._finished:
+            raise WorkspacePrecommitSealError(
+                "Workspace transaction is already finished"
+            )
+        staged = self._require_stage()
+        baseline = self._require_baseline()
+        relative = _normalize_targeted_paths(
+            self.workspace,
+            (logical_target,),
+        )[0]
+        expected_root_identity = self._office_precommit_root_identity
+        if (
+            self._office_precommit_relative != relative
+            or expected_root_identity is None
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit target is not armed for reset"
+            )
+        if _path_identity(staged, directory=True) != expected_root_identity:
+            raise WorkspacePrecommitSealError(
+                "Office precommit staged root changed before reset"
+            )
+        if self.operation not in {"office.create", "office.edit"}:
+            raise WorkspacePrecommitSealError(
+                "Office precommit reset operation is invalid"
+            )
+
+        visible_identity = self._workspace_identity
+        source_identities = self._targeted_source_identities
+        declared_baseline = self._targeted_declared_baseline
+        if (
+            visible_identity is None
+            or source_identities is None
+            or declared_baseline is None
+            or relative not in source_identities
+            or relative not in declared_baseline
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit reset identities are unavailable"
+            )
+
+        expected_visible = declared_baseline[relative]
+        expected_visible_identity = source_identities[relative]
+        if self.operation == "office.edit":
+            if (
+                expected_visible is None
+                or expected_visible.kind != "file"
+                or expected_visible.sha256 is None
+                or expected_visible_identity is None
+                or baseline.get(relative) != expected_visible
+            ):
+                raise WorkspacePrecommitSealError(
+                    "Office edit baseline is unavailable for reset"
+                )
+            with _open_workspace_root_fd(
+                self.workspace,
+                expected_identity=visible_identity,
+            ) as workspace_fd:
+                self._assert_office_reset_visible_baseline(
+                    workspace_fd,
+                    relative=relative,
+                    expected=expected_visible,
+                    expected_identity=expected_visible_identity,
+                )
+                self._remove_office_staged_candidate(
+                    staged,
+                    relative=relative,
+                    expected_root_identity=expected_root_identity,
+                )
+                copied, link_count = _copy_regular_file_at_relative(
+                    workspace_fd,
+                    relative,
+                    staged / relative,
+                )
+                if copied != expected_visible or link_count > 1:
+                    raise WorkspacePrecommitSealError(
+                        "Office edit baseline changed while it was reset"
+                    )
+                self._assert_office_reset_visible_baseline(
+                    workspace_fd,
+                    relative=relative,
+                    expected=expected_visible,
+                    expected_identity=expected_visible_identity,
+                )
+        else:
+            self._remove_office_staged_candidate(
+                staged,
+                relative=relative,
+                expected_root_identity=expected_root_identity,
+            )
+
+        if (
+            self._office_precommit_relative != relative
+            or self._office_precommit_root_identity != expected_root_identity
+            or _path_identity(staged, directory=True) != expected_root_identity
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit transaction identity changed during reset"
+            )
+
+    def _assert_office_reset_visible_baseline(
+        self,
+        workspace_fd: int,
+        *,
+        relative: str,
+        expected: WorkspaceEntry,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        if (
+            _read_entry_at_relative(workspace_fd, relative) != expected
+            or _read_identity_at_relative(workspace_fd, relative)
+            != expected_identity
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office edit baseline changed before candidate reset"
+            )
+
+    def _remove_office_staged_candidate(
+        self,
+        staged: Path,
+        *,
+        relative: str,
+        expected_root_identity: tuple[int, int],
+    ) -> None:
+        with _open_workspace_root_fd(
+            staged,
+            expected_identity=expected_root_identity,
+        ) as staged_fd:
+            current = _read_entry_at_relative(staged_fd, relative)
+            if current is None or current.kind != "file":
+                raise WorkspacePrecommitSealError(
+                    "Office staged candidate is unavailable for reset"
+                )
+            captured = _rename_to_backup_at(staged_fd, relative)
+            try:
+                _remove_owned_temporary_if_matches_at(
+                    staged_fd,
+                    captured,
+                    acceptable={current},
+                )
+            except WorkspaceMutationError as exc:
+                raise WorkspacePrecommitSealError(
+                    "Office staged candidate changed during reset"
+                ) from exc
+
     def collect_changes(self) -> WorkspaceChangeSet:
         staged = self._require_stage()
         baseline = self._require_baseline()
@@ -526,9 +921,15 @@ class WorkspaceMutationTransaction:
                     f"Command changed the filesystem type of {relative}; the transaction was discarded"
                 )
             if before is not None and before.kind == "symlink":
-                raise WorkspaceMutationError(
-                    f"Command changed an existing symbolic link at {relative}; the transaction was discarded"
-                )
+                if not (
+                    self.checkpoint_action == "rewind"
+                    and after is None
+                    and os.name == "posix"
+                ):
+                    raise WorkspaceMutationError(
+                        "Only rewind may delete an existing symbolic link; "
+                        f"the transaction was discarded: {relative}"
+                    )
             if after is not None and after.kind == "directory":
                 if before is None:
                     created_directories.append(relative)
@@ -566,15 +967,62 @@ class WorkspaceMutationTransaction:
     def commit(self) -> WorkspaceCommitResult:
         """Version displaced files and atomically install the staged changes."""
 
+        if self._office_precommit_relative is not None:
+            raise WorkspacePrecommitSealError(
+                "An armed Office transaction requires its precommit seal"
+            )
+        return self._commit(office_seal=None)
+
+    def commit_with_precommit_office_seal(
+        self,
+        seal: object,
+    ) -> WorkspaceCommitResult:
+        """Commit exactly one authoritative, server-validated Office output.
+
+        ``seal`` is an in-process capability returned by the Office draft
+        validator.  It is intentionally not accepted by tool schemas and is
+        never copied into public commit metadata.  Any failure discards the
+        private transaction unless existing recovery rules require retaining
+        sidecars after an ambiguous platform operation.
+        """
+
+        try:
+            office_seal = _require_office_precommit_seal(seal)
+            if (
+                self._office_precommit_relative is not None
+                and office_seal.relative_path != self._office_precommit_relative
+            ):
+                raise WorkspacePrecommitSealError(
+                    "Office precommit seal targets a different armed path"
+                )
+            return self._commit(office_seal=office_seal)
+        except Exception:
+            if not self._finished:
+                self.abort()
+            raise
+
+    def _commit(
+        self,
+        *,
+        office_seal: OfficeDraftSeal | None,
+    ) -> WorkspaceCommitResult:
         _require_guarded_workspace_mutation_support()
         with self._commit_lock:
             with _open_workspace_root_fd(
                 self.workspace,
                 expected_identity=self._workspace_identity,
             ) as workspace_fd:
-                return self._commit_with_fd(workspace_fd)
+                return self._commit_with_fd(
+                    workspace_fd,
+                    office_seal=office_seal,
+                )
 
-    def _commit_with_fd(self, workspace_fd: int) -> WorkspaceCommitResult:
+    def _commit_with_fd(
+        self,
+        workspace_fd: int,
+        *,
+        office_seal: OfficeDraftSeal | None,
+    ) -> WorkspaceCommitResult:
         """Commit while holding the process lock and an immutable root handle."""
 
         if self._finished:
@@ -582,6 +1030,16 @@ class WorkspaceMutationTransaction:
         staged = self._require_stage()
         baseline = self._require_baseline()
         changes = self.collect_changes()
+        office_guard = (
+            self._bind_office_precommit_guard(
+                seal=office_seal,
+                staged=staged,
+                baseline=baseline,
+                changes=changes,
+            )
+            if office_seal is not None
+            else None
+        )
         if sys.platform == "win32" and (
             changes.created_directories or changes.deleted_directories
         ):
@@ -604,6 +1062,29 @@ class WorkspaceMutationTransaction:
             for relative in (*changes.writes, *changes.deletes)
             if relative in baseline
         ]
+        versioned_existing = [
+            relative
+            for relative in touched_existing
+            if baseline[relative].kind == "file"
+        ]
+        rewind_symlink_deletes = [
+            relative
+            for relative in changes.deletes
+            if relative in baseline and baseline[relative].kind == "symlink"
+        ]
+        if any(
+            baseline[relative].kind not in {"file", "symlink"}
+            for relative in touched_existing
+        ):
+            raise WorkspaceMutationError(
+                "Transaction touched an unsupported existing filesystem type"
+            )
+        if rewind_symlink_deletes and (
+            self.checkpoint_action != "rewind" or os.name != "posix"
+        ):
+            raise WorkspaceMutationError(
+                "Existing symbolic-link deletion is restricted to POSIX rewind"
+            )
         for relative in (*touched_existing, *changes.deleted_directories):
             current = _read_entry_at_relative(workspace_fd, relative)
             if current != baseline.get(relative):
@@ -625,7 +1106,7 @@ class WorkspaceMutationTransaction:
         )
         try:
             versions = store.capture_batch_before_mutation(
-                [str(self.workspace / relative) for relative in touched_existing],
+                [str(self.workspace / relative) for relative in versioned_existing],
                 operation=self.operation,
                 session_id=self.ctx.session_id,
                 message_id=self.ctx.message_id,
@@ -636,14 +1117,14 @@ class WorkspaceMutationTransaction:
         _assert_workspace_path_identity(self.workspace, self._workspace_identity)
         version_by_path = {version.relative_path: version for version in versions}
         if (
-            len(versions) != len(touched_existing)
-            or len(version_by_path) != len(touched_existing)
-            or set(version_by_path) != set(touched_existing)
+            len(versions) != len(versioned_existing)
+            or len(version_by_path) != len(versioned_existing)
+            or set(version_by_path) != set(versioned_existing)
         ):
             raise WorkspaceMutationError(
                 "File-version capture did not return the complete command mutation batch"
             )
-        for relative in touched_existing:
+        for relative in versioned_existing:
             entry = baseline[relative]
             version = version_by_path[relative]
             if (
@@ -656,15 +1137,23 @@ class WorkspaceMutationTransaction:
                 raise WorkspaceMutationError(
                     f"File-version snapshot does not match transaction baseline: {relative}"
                 )
+        for relative in rewind_symlink_deletes:
+            if _relative_nlink(workspace_fd, relative) != 1:
+                raise WorkspaceMutationError(
+                    "Rewind symbolic-link target gained a hard link: "
+                    f"{relative}"
+                )
 
         created_directories: dict[str, tuple[int, int]] = {}
         prepared: dict[str, _PreparedPath] = {}
+        prepared_cleanup_entries: dict[str, WorkspaceEntry] = {}
         deleted_backups: dict[str, _PreparedPath] = {}
         applied_writes: list[str] = []
         attempted_writes: set[str] = set()
         applied_deletes: list[str] = []
         removed_directories: list[str] = []
         recovery_sidecars: list[_PreparedPath] = []
+        preinstall_cleanup_error: WorkspaceMutationError | None = None
         final_entries: dict[str, WorkspaceEntry] = {}
         temporary_names = {
             relative: _temporary_name(Path(relative).name)
@@ -672,6 +1161,17 @@ class WorkspaceMutationTransaction:
         }
         try:
             final_entries = _scan_workspace(staged)
+            if office_guard is not None:
+                self._assert_office_precommit_layout(
+                    guard=office_guard,
+                    changes=changes,
+                    observed=final_entries,
+                )
+                self._assert_office_precommit_source(
+                    staged=staged,
+                    guard=office_guard,
+                    observed=final_entries.get(office_guard.relative),
+                )
             if changes.changed_paths:
                 self._write_prepared_journal(
                     changes=changes,
@@ -725,6 +1225,39 @@ class WorkspaceMutationTransaction:
                     )
                 else:  # pragma: no cover - guarded by collect_changes
                     raise WorkspaceMutationError(f"Unsupported staged entry: {relative}")
+
+                observed_prepared = _read_prepared_entry(
+                    workspace_fd,
+                    prepared[relative],
+                )
+                if observed_prepared is None:
+                    raise WorkspaceMutationError(
+                        f"Prepared transaction output disappeared: {relative}"
+                    )
+                prepared_cleanup_entries[relative] = observed_prepared
+
+            if office_guard is not None:
+                # Revalidate the private source after the copy, then validate
+                # the exact hidden replacement that will be exchanged.  This
+                # is deliberately the final step before any visible install.
+                self._assert_office_precommit_source(
+                    staged=staged,
+                    guard=office_guard,
+                )
+                temporary = prepared[office_guard.relative]
+                observed_prepared = _read_prepared_entry(workspace_fd, temporary)
+                if (
+                    observed_prepared != office_guard.expected
+                    or _prepared_nlink(workspace_fd, temporary) != 1
+                ):
+                    if observed_prepared is not None:
+                        prepared_cleanup_entries[office_guard.relative] = (
+                            observed_prepared
+                        )
+                    raise WorkspacePrecommitSealError(
+                        "Prepared Office output no longer matches its precommit "
+                        f"seal: {office_guard.relative}"
+                    )
 
             for relative in changes.writes:
                 temporary = prepared[relative]
@@ -835,6 +1368,26 @@ class WorkspaceMutationTransaction:
                 self._write_journal_state("committed")
                 _assert_workspace_path_identity(self.workspace, self._workspace_identity)
         except Exception as exc:
+            if not attempted_writes and prepared and not self._preserve_for_recovery:
+                # A sealed create may have provisionally created missing
+                # ancestors so the hidden same-directory replacement can be
+                # prepared.  Remove every known-never-installed replacement
+                # before rollback tries to remove those directories.
+                try:
+                    for relative, temporary in tuple(prepared.items()):
+                        expected = final_entries[relative]
+                        _remove_owned_temporary_if_matches_at(
+                            workspace_fd,
+                            temporary,
+                            acceptable={
+                                expected,
+                                prepared_cleanup_entries.get(relative, expected),
+                            },
+                        )
+                    prepared.clear()
+                except WorkspaceMutationError as cleanup_exc:
+                    preinstall_cleanup_error = cleanup_exc
+                    self._preserve_for_recovery = True
             rollback_error = _rollback_commit(
                 workspace=self.workspace,
                 workspace_fd=workspace_fd,
@@ -860,12 +1413,22 @@ class WorkspaceMutationTransaction:
                     "Workspace commit failed "
                     f"({exc}) and rollback failed ({rollback_error}){sidecar_suffix}"
                 ) from exc
+            if preinstall_cleanup_error is not None:
+                raise WorkspaceMutationError(
+                    "Workspace precommit cleanup failed; recovery journal and "
+                    f"hidden output were preserved: {preinstall_cleanup_error}"
+                ) from exc
             if self._preserve_for_recovery:
                 raise WorkspaceMutationError(
                     "Workspace commit entered an ambiguous Windows replacement "
                     f"state; recovery journal and sidecars were preserved: {exc}"
                     f"{sidecar_suffix}"
                 ) from exc
+            if isinstance(exc, WorkspacePrecommitSealError):
+                # No visible install has been attempted on the sealed path.
+                # Preserve the specific fail-closed reason so the server-only
+                # entry point can atomically discard its private transaction.
+                raise exc
             raise WorkspaceMutationError(
                 "Workspace commit failed; all applied file changes were rolled back: "
                 f"{exc}{sidecar_suffix}"
@@ -883,13 +1446,30 @@ class WorkspaceMutationTransaction:
                         _remove_owned_temporary_if_matches_at(
                             workspace_fd,
                             temporary,
-                            acceptable={final_entries[temporary.relative]},
+                            acceptable={
+                                final_entries[temporary.relative],
+                                prepared_cleanup_entries.get(
+                                    temporary.relative,
+                                    final_entries[temporary.relative],
+                                ),
+                            },
                         )
                     except WorkspaceMutationError:
                         self._preserve_for_recovery = True
                         raise
 
         self._finished = True
+        mutations = _workspace_mutation_records(
+            changes=changes,
+            baseline=baseline,
+            final_entries=final_entries,
+            version_by_path=version_by_path,
+        )
+        checkpoint_journal_token = (
+            self._checkpoint_journal_token()
+            if mutations and self.ctx.checkpoint_id is not None
+            else None
+        )
         result = WorkspaceCommitResult(
             written_files=tuple(str(self.workspace / value) for value in changes.writes),
             deleted_files=tuple(str(self.workspace / value) for value in changes.deletes),
@@ -900,9 +1480,140 @@ class WorkspaceMutationTransaction:
                     for value in recovery_sidecars
                 )
             ),
+            mutations=mutations,
+            checkpoint_journal_token=checkpoint_journal_token,
         )
-        self.abort()
+        if checkpoint_journal_token is not None:
+            self._retain_committed_checkpoint_journal()
+        else:
+            self.abort()
         return result
+
+    def _bind_office_precommit_guard(
+        self,
+        *,
+        seal: OfficeDraftSeal,
+        staged: Path,
+        baseline: dict[str, WorkspaceEntry],
+        changes: WorkspaceChangeSet,
+    ) -> _OfficePrecommitGuard:
+        """Bind validation evidence to this exact targeted transaction."""
+
+        if self._targeted_mutation_paths is None:
+            raise WorkspacePrecommitSealError(
+                "Office precommit seals require targeted transaction staging"
+            )
+        if seal.quality != "authoritative":
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal is not authoritative"
+            )
+        if (
+            changes.writes != (seal.relative_path,)
+            or changes.deletes
+            or changes.deleted_directories
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal must cover the transaction's exact file write"
+            )
+        if seal.relative_path not in self._targeted_mutation_paths:
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal is outside the declared mutation set"
+            )
+        if self._workspace_identity is None:
+            raise WorkspacePrecommitSealError(
+                "Office precommit transaction identity is unavailable"
+            )
+        expected_created = _office_sealed_create_ancestors(
+            seal.relative_path,
+            baseline=baseline,
+        )
+        if changes.created_directories != expected_created:
+            raise WorkspacePrecommitSealError(
+                "Office precommit seal includes an unrelated directory change"
+            )
+        staged_entries = _scan_workspace(staged)
+        created_entries: list[tuple[str, WorkspaceEntry]] = []
+        for relative in expected_created:
+            entry = staged_entries.get(relative)
+            if entry is None or entry.kind != "directory":
+                raise WorkspacePrecommitSealError(
+                    "Office precommit create ancestor is not a directory"
+                )
+            created_entries.append((relative, entry))
+        guard = _OfficePrecommitGuard(
+            relative=seal.relative_path,
+            expected=WorkspaceEntry(
+                kind="file",
+                mode=seal.source_mode,
+                size=seal.source_size,
+                sha256=seal.source_sha256,
+            ),
+            workspace_identity=self._workspace_identity,
+            baseline=baseline.get(seal.relative_path),
+            created_directories=tuple(created_entries),
+            staged_root_identity=seal.root_identity,
+            staged_source_identity=seal.source_identity,
+        )
+        self._assert_office_precommit_source(staged=staged, guard=guard)
+        return guard
+
+    def _assert_office_precommit_layout(
+        self,
+        *,
+        guard: _OfficePrecommitGuard,
+        changes: WorkspaceChangeSet,
+        observed: dict[str, WorkspaceEntry],
+    ) -> None:
+        """Keep the exact sealed write/ancestor layout stable until journal."""
+
+        if self.collect_changes() != changes:
+            raise WorkspacePrecommitSealError(
+                "Office precommit staged layout changed after validation"
+            )
+        for relative, expected in guard.created_directories:
+            if observed.get(relative) != expected:
+                raise WorkspacePrecommitSealError(
+                    "Office precommit create ancestor metadata changed"
+                )
+
+    def _assert_office_precommit_source(
+        self,
+        *,
+        staged: Path,
+        guard: _OfficePrecommitGuard,
+        observed: WorkspaceEntry | None = None,
+    ) -> None:
+        """Revalidate the sealed source through an immutable staged-root handle."""
+
+        if (
+            self._workspace_identity != guard.workspace_identity
+            or self._require_baseline().get(guard.relative) != guard.baseline
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit transaction identity changed"
+            )
+        try:
+            with _open_workspace_root_fd(
+                staged,
+                expected_identity=guard.staged_root_identity,
+            ) as staged_fd:
+                current = _read_entry_at_relative(staged_fd, guard.relative)
+                source_identity = _read_identity_at_relative(
+                    staged_fd,
+                    guard.relative,
+                )
+        except WorkspaceMutationError as exc:
+            raise WorkspacePrecommitSealError(
+                "Office precommit staged source is unavailable"
+            ) from exc
+        if (
+            current != guard.expected
+            or source_identity != guard.staged_source_identity
+            or (observed is not None and observed != guard.expected)
+        ):
+            raise WorkspacePrecommitSealError(
+                "Office precommit staged source changed after validation"
+            )
 
     def abort(self) -> None:
         """Discard the private view without mutating the selected workspace."""
@@ -920,7 +1631,47 @@ class WorkspaceMutationTransaction:
             self._targeted_read_paths = None
             self._targeted_declared_baseline = None
             self._targeted_source_identities = None
+            self._office_precommit_relative = None
+            self._office_precommit_root_identity = None
             self._journal_payload = None
+        self._finished = True
+
+    def _checkpoint_journal_token(self) -> str:
+        root = self.transaction_root
+        if root is None or root.parent.name != self._workspace_key:
+            raise WorkspaceMutationError("Checkpoint journal has an invalid owner path")
+        journal = root / _JOURNAL_NAME
+        if not journal.is_file() or (self._journal_payload or {}).get("state") != "committed":
+            raise WorkspaceMutationError("Checkpoint journal is not durably committed")
+        return f"{self._workspace_key}/{root.name}"
+
+    def _retain_committed_checkpoint_journal(self) -> None:
+        """Drop the large stage but retain the minimal crash-bridge journal."""
+
+        root = self.transaction_root
+        if root is None:
+            raise WorkspaceMutationError("Checkpoint journal root is unavailable")
+        journal = root / _JOURNAL_NAME
+        for child in root.iterdir():
+            if child == journal:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        self.transaction_root = None
+        self.staged_workspace = None
+        self._baseline = None
+        self._baseline_hardlinks = None
+        self._baseline_linked_paths = None
+        self._targeted_scope_paths = None
+        self._targeted_mutation_paths = None
+        self._targeted_read_paths = None
+        self._targeted_declared_baseline = None
+        self._targeted_source_identities = None
+        self._office_precommit_relative = None
+        self._office_precommit_root_identity = None
+        self._journal_payload = None
         self._finished = True
 
     def _write_prepared_journal(
@@ -937,9 +1688,24 @@ class WorkspaceMutationTransaction:
             raise WorkspaceMutationError("Workspace transaction journal has no root")
         version_by_path = {version.relative_path: version.id for version in versions}
         existing: dict[str, object] = {}
+        existing_symlinks: dict[str, object] = {}
         for relative in (*changes.writes, *changes.deletes):
             before = baseline.get(relative)
             if before is None:
+                continue
+            if before.kind == "symlink":
+                if (
+                    self.checkpoint_action != "rewind"
+                    or relative not in changes.deletes
+                    or relative in changes.writes
+                ):
+                    raise WorkspaceMutationError(
+                        "Existing symbolic links are journaled only for rewind deletion"
+                    )
+                existing_symlinks[relative] = {
+                    "before": asdict(before),
+                    "after": None,
+                }
                 continue
             version_id = version_by_path.get(relative)
             if version_id is None:
@@ -972,6 +1738,7 @@ class WorkspaceMutationTransaction:
             else None,
             "operation": self.operation,
             "existing": existing,
+            "existing_symlinks": existing_symlinks,
             "new_paths": new_paths,
             "created_directories": {
                 relative: {
@@ -989,6 +1756,29 @@ class WorkspaceMutationTransaction:
             },
             "temporary_paths": temporary_names,
         }
+        if self.ctx.checkpoint_id is not None:
+            runtime_values = {
+                "session_id": self.ctx.session_id,
+                "message_id": self.ctx.message_id,
+                "call_id": self.ctx.call_id,
+                "root_turn_id": self.ctx.root_turn_id,
+                "turn_run_id": self.ctx.turn_run_id,
+                "checkpoint_id": self.ctx.checkpoint_id,
+                "workspace_instance_id": self.ctx.workspace_instance_id,
+                "tool_operation": self.operation,
+            }
+            if not all(
+                isinstance(value, str) and bool(value.strip())
+                for value in runtime_values.values()
+            ):
+                raise WorkspaceMutationError(
+                    "Checkpoint-aware commit is missing trusted runtime identity"
+                )
+            payload["runtime_checkpoint"] = {
+                **runtime_values,
+                "action": self.checkpoint_action,
+                "rewind_checkpoint_ids": list(self.rewind_checkpoint_ids),
+            }
         self._journal_payload = payload
         _persist_journal(root / _JOURNAL_NAME, payload)
 
@@ -2859,6 +3649,112 @@ def _validate_new_symlink(
         ) from exc
 
 
+def _workspace_mutation_records(
+    *,
+    changes: WorkspaceChangeSet,
+    baseline: dict[str, WorkspaceEntry],
+    final_entries: dict[str, WorkspaceEntry],
+    version_by_path: dict[str, FileVersion],
+) -> tuple[WorkspaceMutationRecord, ...]:
+    """Build ordered evidence only after the guarded commit is durable."""
+
+    records: list[WorkspaceMutationRecord] = []
+
+    for relative in changes.created_directories:
+        after = final_entries[relative]
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="created",
+                node_kind="directory",
+                after_mode=after.mode,
+            )
+        )
+
+    for relative in changes.writes:
+        before = baseline.get(relative)
+        after = final_entries[relative]
+        version = version_by_path.get(relative)
+        if before is not None and version is None:
+            raise WorkspaceMutationError(
+                f"Committed file has no retained before version: {relative}"
+            )
+        link_bytes = (
+            os.fsencode(after.link_target or "")
+            if after.kind == "symlink"
+            else None
+        )
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="modified" if before is not None else "created",
+                node_kind=after.kind,
+                before_version_id=version.id if version is not None else None,
+                before_sha256=before.sha256 if before is not None else None,
+                before_mode=before.mode if before is not None else None,
+                after_sha256=(
+                    hashlib.sha256(link_bytes).hexdigest()
+                    if link_bytes is not None
+                    else after.sha256
+                ),
+                after_mode=after.mode,
+                after_size=(len(link_bytes) if link_bytes is not None else after.size),
+                link_target=(after.link_target if link_bytes is not None else None),
+                link_target_b64=(
+                    base64.b64encode(link_bytes).decode("ascii")
+                    if link_bytes is not None
+                    else None
+                ),
+            )
+        )
+
+    for relative in changes.deletes:
+        before = baseline[relative]
+        version = version_by_path.get(relative)
+        if before.kind == "symlink":
+            link_bytes = os.fsencode(before.link_target or "")
+            records.append(
+                WorkspaceMutationRecord(
+                    relative_path=relative,
+                    operation="deleted",
+                    node_kind="symlink",
+                    before_sha256=hashlib.sha256(link_bytes).hexdigest(),
+                    before_mode=before.mode,
+                    after_size=None,
+                    link_target=before.link_target,
+                    link_target_b64=base64.b64encode(link_bytes).decode("ascii"),
+                )
+            )
+            continue
+        if version is None:
+            raise WorkspaceMutationError(
+                f"Committed deletion has no retained before version: {relative}"
+            )
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="deleted",
+                node_kind="file",
+                before_version_id=version.id,
+                before_sha256=before.sha256,
+                before_mode=before.mode,
+            )
+        )
+
+    for relative in changes.deleted_directories:
+        before = baseline[relative]
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="deleted",
+                node_kind="directory",
+                before_mode=before.mode,
+            )
+        )
+
+    return tuple(records)
+
+
 def _rollback_commit(
     *,
     workspace: Path,
@@ -2954,7 +3850,10 @@ def _rollback_commit(
 def _persist_journal(path: Path, payload: dict[str, object]) -> None:
     atomic_write_text(
         path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        # ASCII escaping is required for POSIX link targets decoded with
+        # surrogateescape.  Loading the JSON reconstructs the exact surrogate
+        # code points, which ``os.fsencode`` maps back to the original bytes.
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         mode=0o600,
     )
 
@@ -2962,6 +3861,7 @@ def _persist_journal(path: Path, payload: dict[str, object]) -> None:
 def recover_pending_workspace_transactions(
     *,
     storage_root: str | os.PathLike[str] | None = None,
+    preserve_committed_checkpoint_journals: bool = False,
 ) -> list[str]:
     """Recover prepared command commits left by an interrupted backend.
 
@@ -3006,6 +3906,12 @@ def recover_pending_workspace_transactions(
                     payload,
                     expected_workspace_key=workspace_root.name,
                 )
+                if (
+                    preserve_committed_checkpoint_journals
+                    and isinstance(payload.get("runtime_checkpoint"), dict)
+                ):
+                    recovered.append(transaction_root.name)
+                    continue
                 shutil.rmtree(transaction_root)
                 recovered.append(transaction_root.name)
                 continue
@@ -3049,6 +3955,323 @@ def _load_journal(path: Path) -> dict[str, object]:
     ):
         raise WorkspaceMutationError(f"Transaction journal schema is invalid: {path}")
     return value
+
+
+def list_committed_checkpoint_journals(
+    *,
+    storage_root: str | os.PathLike[str] | None = None,
+) -> list[tuple[str, dict[str, object]]]:
+    """Return retained committed journals for database-ledger recovery."""
+
+    private_base = Path(
+        storage_root
+        if storage_root is not None
+        else default_file_version_storage_root().parent
+    ).expanduser()
+    root = Path(os.path.abspath(private_base)) / "execution-transactions"
+    if not root.exists():
+        return []
+    if _path_is_redirected(root) or not root.is_dir():
+        raise WorkspaceMutationError(
+            f"Transaction recovery root is redirected: {root}"
+        )
+    journals: list[tuple[str, dict[str, object]]] = []
+    for workspace_root in sorted(root.iterdir()):
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", workspace_root.name)
+            or _path_is_redirected(workspace_root)
+            or not workspace_root.is_dir()
+        ):
+            raise WorkspaceMutationError(
+                f"Checkpoint journal workspace owner is invalid: {workspace_root}"
+            )
+        for transaction_root in sorted(workspace_root.iterdir()):
+            if (
+                not re.fullmatch(r"tx-[A-Za-z0-9._-]+", transaction_root.name)
+                or _path_is_redirected(transaction_root)
+                or not transaction_root.is_dir()
+            ):
+                raise WorkspaceMutationError(
+                    f"Checkpoint journal entry is invalid: {transaction_root}"
+                )
+            payload = _load_journal(transaction_root / _JOURNAL_NAME)
+            if payload.get("state") != "committed":
+                continue
+            if not isinstance(payload.get("runtime_checkpoint"), dict):
+                continue
+            journals.append(
+                (f"{workspace_root.name}/{transaction_root.name}", payload)
+            )
+    return journals
+
+
+def committed_checkpoint_journal_metadata(
+    payload: dict[str, object],
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Reconstruct the same canonical mutation evidence returned at commit."""
+
+    if payload.get("state") != "committed":
+        raise WorkspaceMutationError("Checkpoint journal is not committed")
+    action, _rewind_checkpoint_ids = committed_checkpoint_journal_action(payload)
+    if action != "turn_commit":
+        raise WorkspaceMutationError(
+            "Rewind checkpoint journal cannot be replayed as a forward tool commit"
+        )
+    raw_runtime = payload.get("runtime_checkpoint")
+    required_runtime = (
+        "session_id",
+        "message_id",
+        "call_id",
+        "root_turn_id",
+        "turn_run_id",
+        "checkpoint_id",
+        "workspace_instance_id",
+        "tool_operation",
+    )
+    if not isinstance(raw_runtime, dict) or not all(
+        isinstance(raw_runtime.get(key), str) and bool(raw_runtime[key].strip())
+        for key in required_runtime
+    ):
+        raise WorkspaceMutationError("Checkpoint journal runtime identity is invalid")
+    runtime = {key: str(raw_runtime[key]) for key in required_runtime}
+
+    existing = _journal_mapping(payload, "existing")
+    existing_symlinks = _journal_mapping(payload, "existing_symlinks")
+    if existing_symlinks:
+        raise WorkspaceMutationError(
+            "Forward checkpoint journal contains rewind-only symlink evidence"
+        )
+    new_paths = _journal_mapping(payload, "new_paths")
+    created_directories = _journal_mapping(payload, "created_directories")
+    deleted_directories = _journal_mapping(payload, "deleted_directories")
+    records: list[WorkspaceMutationRecord] = []
+
+    for relative in sorted(
+        created_directories,
+        key=lambda value: (value.count("/"), value),
+    ):
+        _validate_journal_relative(relative)
+        raw = created_directories[relative]
+        if not isinstance(raw, dict):
+            raise WorkspaceMutationError(
+                "Checkpoint journal created-directory proof is invalid"
+            )
+        mode = _validate_journal_mode(raw.get("mode"))
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="created",
+                node_kind="directory",
+                after_mode=mode,
+            )
+        )
+
+    writes: list[WorkspaceMutationRecord] = []
+    deletes: list[WorkspaceMutationRecord] = []
+    for relative, raw in existing.items():
+        _validate_journal_relative(relative)
+        if not isinstance(raw, dict):
+            raise WorkspaceMutationError("Checkpoint journal existing entry is invalid")
+        version_id = raw.get("version_id")
+        if not isinstance(version_id, str) or not version_id:
+            raise WorkspaceMutationError("Checkpoint journal version ID is invalid")
+        before = _entry_from_journal(raw.get("before"))
+        if before.kind != "file" or before.sha256 is None:
+            raise WorkspaceMutationError(
+                "Checkpoint journal before entry is not a regular file"
+            )
+        raw_after = raw.get("after")
+        if raw_after is None:
+            deletes.append(
+                WorkspaceMutationRecord(
+                    relative_path=relative,
+                    operation="deleted",
+                    node_kind="file",
+                    before_version_id=version_id,
+                    before_sha256=before.sha256,
+                    before_mode=before.mode,
+                )
+            )
+            continue
+        after = _entry_from_journal(raw_after)
+        if after.kind != "file" or after.sha256 is None:
+            raise WorkspaceMutationError(
+                "Checkpoint journal after entry is not a regular file"
+            )
+        writes.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="modified",
+                node_kind="file",
+                before_version_id=version_id,
+                before_sha256=before.sha256,
+                before_mode=before.mode,
+                after_sha256=after.sha256,
+                after_mode=after.mode,
+                after_size=after.size,
+            )
+        )
+
+    for relative, raw in new_paths.items():
+        _validate_journal_relative(relative)
+        after = _entry_from_journal(raw)
+        if after.kind not in {"file", "symlink"}:
+            raise WorkspaceMutationError(
+                "Checkpoint journal new path has an unsupported type"
+            )
+        link_bytes = (
+            os.fsencode(after.link_target or "")
+            if after.kind == "symlink"
+            else None
+        )
+        writes.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="created",
+                node_kind=after.kind,
+                after_sha256=(
+                    hashlib.sha256(link_bytes).hexdigest()
+                    if link_bytes is not None
+                    else after.sha256
+                ),
+                after_mode=after.mode,
+                after_size=len(link_bytes) if link_bytes is not None else after.size,
+                link_target=after.link_target if link_bytes is not None else None,
+                link_target_b64=(
+                    base64.b64encode(link_bytes).decode("ascii")
+                    if link_bytes is not None
+                    else None
+                ),
+            )
+        )
+    records.extend(sorted(writes, key=lambda item: item.relative_path))
+    records.extend(sorted(deletes, key=lambda item: item.relative_path))
+
+    for relative in sorted(
+        deleted_directories,
+        key=lambda value: (-value.count("/"), value),
+    ):
+        _validate_journal_relative(relative)
+        records.append(
+            WorkspaceMutationRecord(
+                relative_path=relative,
+                operation="deleted",
+                node_kind="directory",
+                before_mode=_validate_journal_mode(deleted_directories[relative]),
+            )
+        )
+
+    return runtime, {
+        "workspace_transaction": True,
+        "workspace_changes_committed": True,
+        "workspace_mutations": [item.metadata for item in records],
+    }
+
+
+def committed_checkpoint_journal_action(
+    payload: dict[str, object],
+) -> tuple[Literal["turn_commit", "rewind"], tuple[str, ...]]:
+    """Validate and return the durable database action owned by a journal.
+
+    Schema 1-3 journals predate rewind and are unambiguously ordinary tool
+    commits.  Schema 4 records the action explicitly so startup recovery can
+    never append reverse mutations to the forward checkpoint ledger.
+    """
+
+    if payload.get("state") != "committed":
+        raise WorkspaceMutationError("Checkpoint journal is not committed")
+    schema_version = payload.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_JOURNAL_SCHEMA_VERSIONS
+    ):
+        raise WorkspaceMutationError("Checkpoint journal schema is invalid")
+    raw_runtime = payload.get("runtime_checkpoint")
+    if not isinstance(raw_runtime, dict):
+        raise WorkspaceMutationError("Checkpoint journal runtime identity is invalid")
+    if schema_version < 4:
+        if "action" in raw_runtime or "rewind_checkpoint_ids" in raw_runtime:
+            raise WorkspaceMutationError(
+                "Legacy checkpoint journal contains unsupported action metadata"
+            )
+        action: object = "turn_commit"
+        raw_ids: object = []
+    else:
+        if "action" not in raw_runtime or "rewind_checkpoint_ids" not in raw_runtime:
+            raise WorkspaceMutationError(
+                "Checkpoint journal action metadata is incomplete"
+            )
+        action = raw_runtime["action"]
+        raw_ids = raw_runtime["rewind_checkpoint_ids"]
+    if action not in {"turn_commit", "rewind"}:
+        raise WorkspaceMutationError("Checkpoint journal action is invalid")
+    if not isinstance(raw_ids, list) or any(
+        not isinstance(value, str) or not value.strip() or len(value) > 200
+        for value in raw_ids
+    ):
+        raise WorkspaceMutationError("Checkpoint journal rewind identity list is invalid")
+    checkpoint_ids = tuple(str(value) for value in raw_ids)
+    if len(checkpoint_ids) > 500 or len(set(checkpoint_ids)) != len(checkpoint_ids):
+        raise WorkspaceMutationError("Checkpoint journal rewind identity list is invalid")
+    target_checkpoint_id = raw_runtime.get("checkpoint_id")
+    if action == "rewind":
+        if (
+            not checkpoint_ids
+            or not isinstance(target_checkpoint_id, str)
+            or target_checkpoint_id not in checkpoint_ids
+        ):
+            raise WorkspaceMutationError(
+                "Rewind checkpoint journal does not include its target"
+            )
+    elif checkpoint_ids:
+        raise WorkspaceMutationError(
+            "Turn-commit checkpoint journal unexpectedly contains rewind identities"
+        )
+    return action, checkpoint_ids
+
+
+def cleanup_committed_checkpoint_journal(
+    token: str,
+    *,
+    expected_checkpoint_id: str,
+    storage_root: str | os.PathLike[str] | None = None,
+) -> None:
+    """Delete a crash bridge only after its database ledger is committed."""
+
+    parts = str(token).split("/")
+    if (
+        len(parts) != 2
+        or not re.fullmatch(r"[0-9a-f]{64}", parts[0])
+        or not re.fullmatch(r"tx-[A-Za-z0-9._-]+", parts[1])
+    ):
+        raise WorkspaceMutationError("Checkpoint journal token is invalid")
+    private_base = Path(
+        storage_root
+        if storage_root is not None
+        else default_file_version_storage_root().parent
+    ).expanduser()
+    recovery_root = Path(os.path.abspath(private_base)) / "execution-transactions"
+    workspace_root = recovery_root / parts[0]
+    transaction_root = workspace_root / parts[1]
+    if _path_is_redirected(transaction_root) or not transaction_root.is_dir():
+        raise WorkspaceMutationError("Checkpoint journal is unavailable")
+    payload = _load_journal(transaction_root / _JOURNAL_NAME)
+    runtime = payload.get("runtime_checkpoint")
+    if (
+        payload.get("state") != "committed"
+        or not isinstance(runtime, dict)
+        or runtime.get("checkpoint_id") != expected_checkpoint_id
+    ):
+        raise WorkspaceMutationError("Checkpoint journal ownership does not match")
+    shutil.rmtree(transaction_root)
+    try:
+        workspace_root.rmdir()
+    except OSError:
+        pass
+    try:
+        recovery_root.rmdir()
+    except OSError:
+        pass
 
 
 def _recover_prepared_journal(
@@ -3100,6 +4323,7 @@ def _cleanup_committed_journal_temporaries(
             "Transaction journal workspace does not match its private storage scope"
         )
     existing = _journal_mapping(payload, "existing")
+    existing_symlinks = _journal_mapping(payload, "existing_symlinks")
     new_paths = _journal_mapping(payload, "new_paths")
     temporary_paths = _journal_mapping(payload, "temporary_paths")
     if not temporary_paths:
@@ -3113,6 +4337,18 @@ def _cleanup_committed_journal_temporaries(
         after_raw = raw.get("after")
         after = _entry_from_journal(after_raw) if after_raw is not None else None
         acceptable[relative] = {entry for entry in (before, after) if entry is not None}
+    for relative, raw in existing_symlinks.items():
+        _validate_journal_relative(relative)
+        if not isinstance(raw, dict):
+            raise WorkspaceMutationError(
+                "Transaction journal existing symlink entry is invalid"
+            )
+        before = _entry_from_journal(raw.get("before"))
+        if before.kind != "symlink" or raw.get("after") is not None:
+            raise WorkspaceMutationError(
+                "Transaction journal existing symlink entry is invalid"
+            )
+        acceptable[relative] = {before}
     for relative, raw in new_paths.items():
         _validate_journal_relative(relative)
         acceptable[relative] = {_entry_from_journal(raw)}
@@ -3141,6 +4377,7 @@ def _recover_prepared_journal_with_fd(
 ) -> None:
 
     existing = _journal_mapping(payload, "existing")
+    existing_symlinks = _journal_mapping(payload, "existing_symlinks")
     new_paths = _journal_mapping(payload, "new_paths")
     created_directories = _journal_mapping(payload, "created_directories")
     deleted_directories = _journal_mapping(payload, "deleted_directories")
@@ -3154,6 +4391,7 @@ def _recover_prepared_journal_with_fd(
         _recover_windows_prepared_replace_gaps(
             workspace_fd,
             existing=existing,
+            existing_symlinks=existing_symlinks,
             new_paths=new_paths,
             temporary_paths=temporary_paths,
         )
@@ -3183,6 +4421,43 @@ def _recover_prepared_journal_with_fd(
         }
         if after is not None:
             expected_replacements[relative] = after
+
+    symlinks_to_restore: dict[str, tuple[WorkspaceEntry, _PreparedPath]] = {}
+    for relative, raw in existing_symlinks.items():
+        _validate_journal_relative(relative)
+        if not isinstance(raw, dict):
+            raise WorkspaceMutationError(
+                "Transaction journal existing symlink entry is invalid"
+            )
+        before = _entry_from_journal(raw.get("before"))
+        if before.kind != "symlink" or raw.get("after") is not None:
+            raise WorkspaceMutationError(
+                "Transaction journal existing symlink entry is invalid"
+            )
+        current = _read_entry_at_relative(workspace_fd, relative)
+        if current is not None and current != before:
+            raise WorkspaceMutationError(
+                "Interrupted rewind symlink conflicts with a later edit: "
+                f"{relative}"
+            )
+        temporary_name = _validate_journal_temporary_name(
+            temporary_paths.get(relative)
+        )
+        backup = _PreparedPath(
+            relative=relative,
+            temporary_name=temporary_name,
+        )
+        if current is None:
+            if (
+                _read_prepared_entry(workspace_fd, backup) != before
+                or _prepared_nlink(workspace_fd, backup) != 1
+            ):
+                raise WorkspaceMutationError(
+                    "Interrupted rewind symlink has no exact recovery backup: "
+                    f"{relative}"
+                )
+            symlinks_to_restore[relative] = (before, backup)
+        acceptable_temporaries[relative] = {before}
 
     parsed_new: dict[str, WorkspaceEntry] = {}
     for relative, raw in new_paths.items():
@@ -3242,6 +4517,18 @@ def _recover_prepared_journal_with_fd(
             )
         except FileVersionError as exc:
             raise WorkspaceMutationError(str(exc)) from exc
+
+    for relative, (before, backup) in symlinks_to_restore.items():
+        if _read_entry_at_relative(workspace_fd, relative) is not None:
+            raise WorkspaceMutationError(
+                f"Interrupted rewind symlink was recreated: {relative}"
+            )
+        _restore_backup_noreplace_at(workspace_fd, backup)
+        if _read_entry_at_relative(workspace_fd, relative) != before:
+            raise WorkspaceMutationError(
+                f"Interrupted rewind restored a different symlink: {relative}"
+            )
+        _fsync_parent_at(workspace_fd, relative)
 
     for relative, expected in parsed_new.items():
         current = _read_entry_at_relative(workspace_fd, relative)
@@ -3344,6 +4631,7 @@ def _recover_windows_prepared_replace_gaps(
     workspace_fd: int,
     *,
     existing: dict[str, object],
+    existing_symlinks: dict[str, object],
     new_paths: dict[str, object],
     temporary_paths: dict[str, object],
 ) -> None:
@@ -3355,6 +4643,10 @@ def _recover_windows_prepared_replace_gaps(
     deleted an already-installed command output after the crash.
     """
 
+    if existing_symlinks:
+        raise WorkspaceMutationError(
+            "Windows recovery does not accept POSIX rewind symlink journals"
+        )
     expected_paths = set(existing) | set(new_paths)
     if set(temporary_paths) != expected_paths:
         raise WorkspaceMutationError(
@@ -3549,9 +4841,15 @@ def _journal_workspace_identity(payload: dict[str, object]) -> tuple[int, int]:
 
 
 __all__ = [
+    "cleanup_committed_checkpoint_journal",
+    "committed_checkpoint_journal_action",
+    "committed_checkpoint_journal_metadata",
+    "list_committed_checkpoint_journals",
     "WorkspaceChangeSet",
     "WorkspaceCommitResult",
+    "WorkspaceMutationRecord",
     "WorkspaceMutationError",
+    "WorkspacePrecommitSealError",
     "WorkspaceMutationTransaction",
     "recover_pending_workspace_transactions",
 ]

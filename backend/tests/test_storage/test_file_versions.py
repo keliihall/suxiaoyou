@@ -16,6 +16,9 @@ from app.storage.file_versions import (
     FileVersionNotFound,
     FileVersionStore,
 )
+from app.schemas.agent import AgentInfo
+from app.tool.context import ToolContext
+from app.tool.workspace_transaction import WorkspaceMutationTransaction
 
 
 def _store(tmp_path: Path, **limit_overrides: int) -> tuple[Path, FileVersionStore]:
@@ -50,6 +53,57 @@ def test_capture_lists_checksum_and_restores_binary_atomically(tmp_path: Path) -
     assert recovery is not None
     assert recovery.sha256 == hashlib.sha256(b"replacement").hexdigest()
     assert len(store.list_versions(file_path="report.bin")) == 2
+
+
+def test_materialize_version_is_limited_to_owned_transaction_stage(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _store(tmp_path)
+    target = workspace / "reports" / "quarter.txt"
+    target.parent.mkdir()
+    target.write_text("before", encoding="utf-8")
+    version = store.capture_before_mutation(target, operation="write")
+    assert version is not None
+    target.write_text("after", encoding="utf-8")
+    ctx = ToolContext(
+        session_id="session",
+        message_id="message",
+        call_id="rewind",
+        agent=AgentInfo(name="test", description="", mode="primary"),
+        workspace=str(workspace),
+    )
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        ctx,
+        operation="rewind",
+        storage_root=tmp_path / "private",
+    )
+    staged = transaction.prepare_paths(["reports/quarter.txt"])
+
+    restored, staged_target = store.materialize_version_in_transaction(
+        version.id,
+        staged,
+        expected_relative_path="reports/quarter.txt",
+    )
+
+    assert restored == version
+    assert staged_target.read_text(encoding="utf-8") == "before"
+    assert target.read_text(encoding="utf-8") == "after"
+    with pytest.raises(FileVersionError, match="different workspace path"):
+        store.materialize_version_in_transaction(
+            version.id,
+            staged,
+            expected_relative_path="reports/other.txt",
+        )
+    outside = tmp_path / "not-a-transaction"
+    outside.mkdir()
+    with pytest.raises(FileVersionError, match="owned workspace transaction"):
+        store.materialize_version_in_transaction(
+            version.id,
+            outside,
+            expected_relative_path="reports/quarter.txt",
+        )
+    transaction.abort()
 
 
 def test_restore_preserves_snapshot_mode_on_posix(tmp_path: Path) -> None:

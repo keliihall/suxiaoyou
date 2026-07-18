@@ -49,7 +49,8 @@ from app.utils.windows_guarded_file import (
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_SCHEMA_VERSION: Final = 1
+MANIFEST_SCHEMA_VERSION: Final = 2
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS: Final = frozenset({1, MANIFEST_SCHEMA_VERSION})
 DEFAULT_MAX_FILE_BYTES: Final = 100 * 1024 * 1024
 DEFAULT_MAX_WORKSPACE_BYTES: Final = 512 * 1024 * 1024
 DEFAULT_MAX_VERSIONS_PER_FILE: Final = 50
@@ -338,12 +339,15 @@ class FileVersionStore:
                 )
                 manifest = self._load_manifest()
                 versions = [*manifest["versions"], version]
+                durable_pins = _manifest_pinned_version_ids(manifest["pins"])
                 retained = self._apply_retention(
                     versions,
                     newest=version,
-                    pinned_version_ids=pinned_version_ids,
+                    pinned_version_ids=frozenset(
+                        {*pinned_version_ids, *durable_pins}
+                    ),
                 )
-                self._write_manifest(retained)
+                self._write_manifest(retained, pins=manifest["pins"])
                 manifest_committed = True
                 self._delete_unreferenced_objects(retained)
                 # Make the postcondition explicit: a successful capture always
@@ -399,6 +403,304 @@ class FileVersionStore:
             if relative_path is not None:
                 versions = [v for v in versions if v.relative_path == relative_path]
             return sorted(versions, key=_version_sort_key, reverse=True)[:limit]
+
+    def list_pins(self) -> dict[str, frozenset[str]]:
+        """Return durable retention owners and their immutable version IDs."""
+
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            return {
+                owner: frozenset(version_ids)
+                for owner, version_ids in manifest["pins"].items()
+            }
+
+    def get_version(self, version_id: str) -> FileVersion:
+        """Return one immutable version by ID or fail closed."""
+
+        requested = str(version_id).strip()
+        if not requested:
+            raise FileVersionNotFound("version_id is required")
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            version = next(
+                (item for item in manifest["versions"] if item.id == requested),
+                None,
+            )
+            if version is None:
+                raise FileVersionNotFound(
+                    f"File version not found in this workspace: {requested}"
+                )
+            return version
+
+    def materialize_version_in_transaction(
+        self,
+        version_id: str,
+        staged_workspace: str | os.PathLike[str],
+        *,
+        expected_relative_path: str,
+    ) -> tuple[FileVersion, Path]:
+        """Copy a verified version into a private workspace transaction stage.
+
+        This is intentionally narrower than a generic export API.  Rewind must
+        assemble its complete desired state in ``WorkspaceMutationTransaction``
+        before the first visible write, but the immutable version objects live
+        outside that stage.  The destination therefore has to match the
+        transaction service's private ``execution-transactions/<workspace-key>/
+        tx-*/workspace`` layout and the version's own canonical relative path.
+        It can never point at the selected workspace itself.
+        """
+
+        requested = str(version_id).strip()
+        relative = str(expected_relative_path).strip()
+        if not requested:
+            raise FileVersionNotFound("version_id is required")
+        if not relative or "\\" in relative:
+            raise FileVersionError("Expected version path is not canonical")
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative_path.parts
+        ):
+            raise FileVersionError("Expected version path is not canonical")
+
+        stage = Path(staged_workspace)
+        if not stage.is_absolute():
+            raise FileVersionError("Transaction stage must be an absolute path")
+        stage = Path(os.path.abspath(stage))
+        transaction_root = stage.parent
+        workspace_owner = transaction_root.parent
+        transaction_service = workspace_owner.parent
+        expected_owner = hashlib.sha256(os.fsencode(str(self.workspace))).hexdigest()
+        if (
+            stage.name != "workspace"
+            or not transaction_root.name.startswith("tx-")
+            or workspace_owner.name != expected_owner
+            or transaction_service.name != "execution-transactions"
+        ):
+            raise FileVersionError(
+                "Version materialization is restricted to an owned workspace transaction"
+            )
+
+        try:
+            stage_info = stage.lstat()
+        except OSError as exc:
+            raise FileVersionError("Transaction stage is unavailable") from exc
+        if (
+            stat.S_ISLNK(stage_info.st_mode)
+            or (sys.platform == "win32" and windows_lstat_is_reparse(stage_info))
+            or not stat.S_ISDIR(stage_info.st_mode)
+        ):
+            raise FileVersionError("Transaction stage is redirected or invalid")
+        stage_identity = (int(stage_info.st_dev), int(stage_info.st_ino))
+
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            version = next(
+                (item for item in manifest["versions"] if item.id == requested),
+                None,
+            )
+            if version is None:
+                raise FileVersionNotFound(
+                    f"File version not found in this workspace: {requested}"
+                )
+            if version.relative_path != relative_path.as_posix():
+                raise FileVersionError("Version belongs to a different workspace path")
+            source = self._object_path(version)
+            self._verify_object(
+                source,
+                digest=version.sha256,
+                size=version.size,
+            )
+
+            parent = stage
+            for component in relative_path.parts[:-1]:
+                parent = parent / component
+                try:
+                    parent_info = parent.lstat()
+                except OSError as exc:
+                    raise FileVersionError(
+                        "Version destination parent is unavailable in the transaction stage"
+                    ) from exc
+                if (
+                    stat.S_ISLNK(parent_info.st_mode)
+                    or (
+                        sys.platform == "win32"
+                        and windows_lstat_is_reparse(parent_info)
+                    )
+                    or not stat.S_ISDIR(parent_info.st_mode)
+                ):
+                    raise FileVersionError(
+                        "Version destination parent is redirected or not a directory"
+                    )
+
+            target = stage.joinpath(*relative_path.parts)
+            try:
+                target_info = target.lstat()
+            except FileNotFoundError:
+                target_info = None
+            except OSError as exc:
+                raise FileVersionError("Version destination cannot be inspected") from exc
+            if target_info is not None and (
+                stat.S_ISLNK(target_info.st_mode)
+                or (
+                    sys.platform == "win32"
+                    and windows_lstat_is_reparse(target_info)
+                )
+                or not stat.S_ISREG(target_info.st_mode)
+            ):
+                raise FileVersionError(
+                    "Version destination is redirected or not a regular file"
+                )
+
+            temporary_fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".rewind.tmp",
+                dir=target.parent,
+            )
+            temporary = Path(temporary_name)
+            source_fd = -1
+            digest = hashlib.sha256()
+            copied = 0
+            try:
+                source_fd = os.open(
+                    source,
+                    os.O_RDONLY
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                opened_source = os.fstat(source_fd)
+                if not stat.S_ISREG(opened_source.st_mode):
+                    raise FileVersionError("Recovery object is not a regular file")
+                with os.fdopen(source_fd, "rb") as src, os.fdopen(
+                    temporary_fd, "wb"
+                ) as dst:
+                    source_fd = -1
+                    temporary_fd = -1
+                    while chunk := src.read(_COPY_CHUNK_BYTES):
+                        digest.update(chunk)
+                        copied += len(chunk)
+                        dst.write(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                if copied != version.size or digest.hexdigest() != version.sha256:
+                    raise FileVersionError("Recovery object changed during materialization")
+                if version.original_mode is not None:
+                    os.chmod(temporary, version.original_mode)
+                current_stage = stage.lstat()
+                if (int(current_stage.st_dev), int(current_stage.st_ino)) != stage_identity:
+                    raise FileVersionError("Transaction stage changed during materialization")
+                os.replace(temporary, target)
+                _fsync_directory(target.parent)
+                installed_digest, installed_size = _sha256_regular_file(target)
+                if (
+                    installed_digest != version.sha256
+                    or installed_size != version.size
+                ):
+                    raise FileVersionError("Materialized version failed verification")
+                return version, target
+            except FileVersionError:
+                raise
+            except OSError as exc:
+                raise FileVersionError(
+                    f"Could not materialize version into transaction: {exc}"
+                ) from exc
+            finally:
+                if temporary_fd >= 0:
+                    os.close(temporary_fd)
+                if source_fd >= 0:
+                    os.close(source_fd)
+                temporary.unlink(missing_ok=True)
+
+    def pin_versions(
+        self,
+        owner_id: str,
+        version_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    ) -> frozenset[str]:
+        """Persistently protect versions for one checkpoint/retention owner.
+
+        The return value contains only IDs newly added for this owner.  Callers
+        can use it for narrow compensation if their database flush fails.
+        """
+
+        owner = _safe_pin_owner(owner_id)
+        requested = _safe_version_ids(version_ids)
+        if not requested:
+            return frozenset()
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            available = {version.id for version in manifest["versions"]}
+            missing = requested - available
+            if missing:
+                raise FileVersionNotFound(
+                    "Pinned file version is missing from this workspace: "
+                    + ", ".join(sorted(missing))
+                )
+            existing = set(manifest["pins"].get(owner, ()))
+            added = requested - existing
+            if not added:
+                return frozenset()
+            pins = dict(manifest["pins"])
+            pins[owner] = sorted(existing | requested)
+            self._write_manifest(manifest["versions"], pins=pins)
+            return frozenset(added)
+
+    def replace_pinned_versions(
+        self,
+        owner_id: str,
+        version_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    ) -> None:
+        """Reconcile one owner's exact pins from the database source of truth."""
+
+        owner = _safe_pin_owner(owner_id)
+        requested = _safe_version_ids(version_ids)
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            available = {version.id for version in manifest["versions"]}
+            missing = requested - available
+            if missing:
+                raise FileVersionNotFound(
+                    "Pinned file version is missing from this workspace: "
+                    + ", ".join(sorted(missing))
+                )
+            pins = dict(manifest["pins"])
+            if requested:
+                pins[owner] = sorted(requested)
+            else:
+                pins.pop(owner, None)
+            if pins != manifest["pins"]:
+                self._write_manifest(manifest["versions"], pins=pins)
+
+    def unpin_versions(
+        self,
+        owner_id: str,
+        version_ids: (
+            list[str] | tuple[str, ...] | set[str] | frozenset[str] | None
+        ) = None,
+    ) -> frozenset[str]:
+        """Release some or all versions held by one retention owner.
+
+        Unpinning does not eagerly prune blobs.  The next capture applies the
+        ordinary retention policy, which avoids deleting a just-released
+        recovery source in the middle of a larger checkpoint transaction.
+        """
+
+        owner = _safe_pin_owner(owner_id)
+        requested = None if version_ids is None else _safe_version_ids(version_ids)
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            existing = set(manifest["pins"].get(owner, ()))
+            if not existing:
+                return frozenset()
+            removed = existing if requested is None else existing & requested
+            if not removed:
+                return frozenset()
+            retained = existing - removed
+            pins = dict(manifest["pins"])
+            if retained:
+                pins[owner] = sorted(retained)
+            else:
+                pins.pop(owner, None)
+            self._write_manifest(manifest["versions"], pins=pins)
+            return frozenset(removed)
 
     def restore(
         self,
@@ -1264,7 +1566,7 @@ class FileVersionStore:
         if not self.manifest_path.exists():
             if create:
                 self._ensure_store()
-            return {"versions": []}
+            return {"versions": [], "pins": {}}
         manifest_info = self.manifest_path.lstat()
         if self.manifest_path.is_symlink() or (
             sys.platform == "win32" and windows_lstat_is_reparse(manifest_info)
@@ -1274,7 +1576,10 @@ class FileVersionStore:
             raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FileVersionError("File-version manifest is unreadable or corrupt") from exc
-        if not isinstance(raw, dict) or raw.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+        ):
             raise FileVersionError("Unsupported file-version manifest schema")
         if raw.get("workspace") != str(self.workspace):
             raise FileVersionError("File-version manifest belongs to a different workspace")
@@ -1295,10 +1600,18 @@ class FileVersionStore:
         values = raw.get("versions")
         if not isinstance(values, list):
             raise FileVersionError("File-version manifest has an invalid versions list")
-        return {"versions": [FileVersion.from_dict(value) for value in values]}
+        versions = [FileVersion.from_dict(value) for value in values]
+        pins = _parse_manifest_pins(raw.get("pins", {}), versions=versions)
+        return {"versions": versions, "pins": pins}
 
-    def _write_manifest(self, versions: list[FileVersion]) -> None:
+    def _write_manifest(
+        self,
+        versions: list[FileVersion],
+        *,
+        pins: dict[str, list[str]] | None = None,
+    ) -> None:
         self._assert_workspace_identity()
+        normalized_pins = _parse_manifest_pins(pins or {}, versions=versions)
         payload = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "workspace": str(self.workspace),
@@ -1307,6 +1620,7 @@ class FileVersionStore:
                 "ino": self._workspace_identity[1],
             },
             "versions": [asdict(version) for version in versions],
+            "pins": normalized_pins,
         }
         atomic_write_text(
             self.manifest_path,
@@ -1501,6 +1815,61 @@ def _workspace_storage_key(
 def _safe_operation(value: str) -> str:
     operation = str(value).strip()[:80]
     return operation or "write"
+
+
+def _safe_pin_owner(value: Any) -> str:
+    if not isinstance(value, str):
+        raise FileVersionError("pin owner must be a string")
+    owner = value.strip()
+    if not owner or len(owner) > 240:
+        raise FileVersionError("pin owner must contain between 1 and 240 characters")
+    return owner
+
+
+def _safe_version_ids(values: Any) -> frozenset[str]:
+    if isinstance(values, (str, bytes)):
+        raise FileVersionError("version_ids must be a collection")
+    try:
+        raw_values = list(values)
+    except TypeError as exc:
+        raise FileVersionError("version_ids must be a collection") from exc
+    if any(not isinstance(value, str) for value in raw_values):
+        raise FileVersionError("version_ids must contain strings")
+    requested = frozenset(value.strip() for value in raw_values)
+    if any(not value or len(value) > 200 for value in requested):
+        raise FileVersionError("version_ids contains an invalid identifier")
+    return requested
+
+
+def _parse_manifest_pins(
+    value: Any,
+    *,
+    versions: list[FileVersion],
+) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        raise FileVersionError("File-version manifest has an invalid pins map")
+    available = {version.id for version in versions}
+    pins: dict[str, list[str]] = {}
+    for raw_owner, raw_ids in value.items():
+        if not isinstance(raw_owner, str):
+            raise FileVersionError("File-version manifest has an invalid pin owner")
+        owner = _safe_pin_owner(raw_owner)
+        if not isinstance(raw_ids, list):
+            raise FileVersionError("File-version manifest has an invalid pin list")
+        requested = _safe_version_ids(raw_ids)
+        if requested - available:
+            raise FileVersionError(
+                "File-version manifest pins a version that is not retained"
+            )
+        if requested:
+            pins[owner] = sorted(requested)
+    return pins
+
+
+def _manifest_pinned_version_ids(
+    pins: dict[str, list[str]],
+) -> frozenset[str]:
+    return frozenset(version_id for values in pins.values() for version_id in values)
 
 
 def _optional_string(value: Any) -> str | None:

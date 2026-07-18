@@ -13,6 +13,7 @@ import test from "node:test";
 
 import {
   prepareEmbeddedReleaseVersionUpdates,
+  replacePythonFinalString,
   replaceRequiredReleaseReference,
   updateCargoLockVersion,
   updateNpmLockVersion,
@@ -61,6 +62,18 @@ dependencies = [
   assert.match(updated, /name = "dependency"\nversion = "9\.9\.9"/);
   assert.match(updated, /name = "suxiaoyou-desktop"\nversion = "0\.7\.3"/);
   assert.doesNotMatch(updated, /name = "suxiaoyou-desktop"\nversion = "0\.7\.2"/);
+});
+
+test("updates the backend runtime app version exactly", () => {
+  const source = `from typing import Final\n\nAPP_VERSION: Final = "1.0.0"\nOTHER_VERSION: Final = "9.9.9"\n`;
+  const updated = replacePythonFinalString(
+    source,
+    "APP_VERSION",
+    "1.1.0",
+    "backend/app/version.py",
+  );
+  assert.match(updated, /APP_VERSION: Final = "1\.1\.0"/);
+  assert.match(updated, /OTHER_VERSION: Final = "9\.9\.9"/);
 });
 
 test("version bump script cannot invoke dependency-upgrade commands", () => {
