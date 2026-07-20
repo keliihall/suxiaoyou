@@ -29,7 +29,11 @@ from release_packaging.office_renderer_trust import (
     OfficeRendererTrustError,
     verify_office_renderer_attestation_signature,
 )
-from release_packaging.release_identity import ReleaseIdentityValues
+from release_packaging.release_identity import (
+    ReleaseIdentityValues,
+    cross_api_file_identity,
+    descriptor_mutation_identity,
+)
 
 
 LOCK_FILENAME = "office-renderer.lock.json"
@@ -226,15 +230,12 @@ def _read_regular(path: Path, *, label: str, max_bytes: int) -> tuple[bytes, int
         visible = path.lstat()
     except OSError as exc:
         raise OfficeRendererPackagingError(f"{label} changed while reading") from exc
-    identity = lambda item: (  # noqa: E731 - compact race identity used twice
-        item.st_dev,
-        item.st_ino,
-        item.st_mode,
-        item.st_size,
-        item.st_mtime_ns,
-        item.st_ctime_ns,
-    )
-    if total != before.st_size or identity(before) != identity(after) or identity(after) != identity(visible):
+    if (
+        total != before.st_size
+        or descriptor_mutation_identity(before)
+        != descriptor_mutation_identity(after)
+        or cross_api_file_identity(after) != cross_api_file_identity(visible)
+    ):
         _fail(f"{label} changed while reading")
     return bytes(digest_input), stat.S_IMODE(before.st_mode)
 
@@ -278,19 +279,12 @@ def _sha256_file(path: Path, *, expected_size: int) -> tuple[str, int]:
         visible = path.lstat()
     except OSError as exc:
         raise OfficeRendererPackagingError("renderer payload changed while reading") from exc
-    identity = lambda item: (  # noqa: E731 - compact race identity used twice
-        item.st_dev,
-        item.st_ino,
-        item.st_mode,
-        item.st_size,
-        item.st_mtime_ns,
-        item.st_ctime_ns,
-    )
     if (
         total != expected_size
         or total != before.st_size
-        or identity(before) != identity(after)
-        or identity(after) != identity(visible)
+        or descriptor_mutation_identity(before)
+        != descriptor_mutation_identity(after)
+        or cross_api_file_identity(after) != cross_api_file_identity(visible)
     ):
         _fail("renderer payload file changed or does not match its locked size")
     return digest.hexdigest(), stat.S_IMODE(before.st_mode)
@@ -1326,20 +1320,12 @@ def _copy_locked_file(
         os.fsync(destination_descriptor)
         after = os.fstat(source_descriptor)
         visible = source.lstat()
-        identity = lambda item: (  # noqa: E731 - compact race identity
-            item.st_dev,
-            item.st_ino,
-            item.st_mode,
-            item.st_nlink,
-            item.st_size,
-            item.st_mtime_ns,
-            item.st_ctime_ns,
-        )
         if (
             total != locked["size"]
             or digest.hexdigest() != locked["sha256"]
-            or identity(before) != identity(after)
-            or identity(after) != identity(visible)
+            or descriptor_mutation_identity(before)
+            != descriptor_mutation_identity(after)
+            or cross_api_file_identity(after) != cross_api_file_identity(visible)
         ):
             _fail("Office renderer snapshot source changed while copying")
     except OSError as exc:

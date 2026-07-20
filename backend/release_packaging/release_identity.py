@@ -326,26 +326,55 @@ def _read_bounded_regular(path: Path, *, label: str, max_bytes: int) -> bytes:
         visible_after = path.lstat()
     except OSError as exc:
         raise ReleaseIdentityPackagingError(f"{label} changed while reading") from exc
-    if total != before.st_size or not (
-        _file_identity(visible_before)
-        == _file_identity(before)
-        == _file_identity(after)
-        == _file_identity(visible_after)
+    if (
+        total != before.st_size
+        or descriptor_mutation_identity(before)
+        != descriptor_mutation_identity(after)
+        or not (
+            cross_api_file_identity(visible_before)
+            == cross_api_file_identity(before)
+            == cross_api_file_identity(after)
+            == cross_api_file_identity(visible_after)
+        )
     ):
         _fail(f"{label} changed while reading")
     return b"".join(chunks)
 
 
-def _file_identity(info: os.stat_result) -> tuple[int, ...]:
-    return (
+def cross_api_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Return metadata that is comparable across path stat and fstat."""
+
+    identity = (
         info.st_dev,
         info.st_ino,
         info.st_mode,
         info.st_nlink,
         info.st_size,
         info.st_mtime_ns,
-        info.st_ctime_ns,
     )
+    if os.name == "nt":
+        # CPython 3.12's path-based stat/lstat compatibility layer exposes
+        # creation time through st_ctime_ns, while fstat exposes the native
+        # metadata change time there.  Comparing that field across the two
+        # APIs can therefore reject an unchanged Windows file.  Birth time is
+        # the common creation-time field; file attributes and the reparse tag
+        # retain the Windows-specific path safety metadata.
+        return (
+            *identity,
+            info.st_birthtime_ns,
+            info.st_file_attributes,
+            info.st_reparse_tag,
+        )
+    return (*identity, info.st_ctime_ns)
+
+
+def descriptor_mutation_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Include Windows change time when comparing two fstat snapshots."""
+
+    identity = cross_api_file_identity(info)
+    if os.name == "nt":
+        return (*identity, info.st_ctime_ns)
+    return identity
 
 
 def _write_new_private_file(path: Path, raw: bytes) -> None:

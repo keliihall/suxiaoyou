@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -244,4 +245,77 @@ def test_untracked_reserved_binding_module_cannot_shadow_generated_identity(
         prepare_frozen_release_identity(
             repository_root=repository,
             work_root=tmp_path / "shadowed-work",
+        )
+
+
+def _windows_stat(*, changed_ns: int, birth_ns: int = 101) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_dev=7,
+        st_ino=11,
+        st_mode=0o100644,
+        st_nlink=1,
+        st_size=17,
+        st_mtime_ns=37,
+        st_ctime_ns=changed_ns,
+        st_birthtime_ns=birth_ns,
+        st_file_attributes=32,
+        st_reparse_tag=0,
+    )
+
+
+def test_windows_birth_time_remains_part_of_file_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(packaging.os, "name", "nt")
+
+    assert packaging.cross_api_file_identity(
+        _windows_stat(changed_ns=211, birth_ns=101)
+    ) != packaging.cross_api_file_identity(
+        _windows_stat(changed_ns=211, birth_ns=103)
+    )
+
+
+def _read_with_windows_stat_views(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    descriptor_changed_ns: tuple[int, int],
+) -> bytes:
+    visible = _windows_stat(changed_ns=101)
+    descriptor_stats = iter(
+        _windows_stat(changed_ns=value) for value in descriptor_changed_ns
+    )
+    chunks = iter((b"release metadata\n", b""))
+    fake_path = SimpleNamespace(
+        is_symlink=lambda: False,
+        lstat=lambda: visible,
+    )
+    monkeypatch.setattr(packaging.os, "name", "nt")
+    monkeypatch.setattr(packaging.os, "open", lambda *_args: 41)
+    monkeypatch.setattr(packaging.os, "fstat", lambda _descriptor: next(descriptor_stats))
+    monkeypatch.setattr(packaging.os, "read", lambda _descriptor, _size: next(chunks))
+    monkeypatch.setattr(packaging.os, "close", lambda _descriptor: None)
+
+    return packaging._read_bounded_regular(
+        fake_path,
+        label="Windows release metadata",
+        max_bytes=1024,
+    )
+
+
+def test_windows_bounded_read_accepts_distinct_path_and_fstat_ctime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _read_with_windows_stat_views(
+        monkeypatch,
+        descriptor_changed_ns=(211, 211),
+    ) == b"release metadata\n"
+
+
+def test_windows_bounded_read_rejects_descriptor_metadata_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ReleaseIdentityPackagingError, match="changed while reading"):
+        _read_with_windows_stat_views(
+            monkeypatch,
+            descriptor_changed_ns=(211, 307),
         )
