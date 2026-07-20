@@ -116,6 +116,7 @@ function isFeatureUnavailable(error: unknown): boolean {
   if (!error.body || typeof error.body !== "object") return false;
   const code = (error.body as { code?: unknown }).code;
   return code === "user_office_template_runtime_unavailable" ||
+    code === "user_office_template_provenance_mismatch" ||
     code === "runtime_workspace_provenance_mismatch";
 }
 

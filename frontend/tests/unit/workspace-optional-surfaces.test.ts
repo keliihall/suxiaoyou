@@ -12,9 +12,18 @@ test("optional workspace surfaces handle unavailable and provenance states", () 
     "src/components/workspace/user-office-template-card.tsx",
     "utf8",
   );
+  const panelSource = readFileSync(
+    "src/components/workspace/workspace-panel.tsx",
+    "utf8",
+  );
+  const chatViewSource = readFileSync(
+    "src/components/chat/chat-view.tsx",
+    "utf8",
+  );
   const zh = JSON.parse(readFileSync("src/i18n/locales/zh/chat.json", "utf8"));
 
   assert.match(runtimeSource, /code === "runtime_workspace_not_found"/);
+  assert.match(runtimeSource, /if \(!context && loading\) return null;/);
   assert.match(runtimeSource, /t\("runtimeWorkspaceIdentityMismatch"\)/);
   assert.match(runtimeSource, /worktree_creation_available/);
   assert.match(runtimeSource, /runtimeAdvancedOptions/);
@@ -31,7 +40,40 @@ test("optional workspace surfaces handle unavailable and provenance states", () 
   );
   assert.match(
     officeSource,
+    /code === "user_office_template_provenance_mismatch"/,
+  );
+  assert.match(
+    officeSource,
     /code === "runtime_workspace_provenance_mismatch"/,
+  );
+  assert.match(
+    panelSource,
+    /const activeWorkspacePath = useWorkspaceStore\(\(state\) => state\.activeWorkspacePath\)/,
+  );
+  const optionalSurfaceGate = panelSource.slice(
+    panelSource.indexOf("{activeWorkspacePath && ("),
+    panelSource.indexOf("<ProgressCard />"),
+  );
+  assert.match(
+    optionalSurfaceGate,
+    /<RuntimeControlCard[\s\S]*key=\{`runtime-\$\{focusedSessionId \?\? "none"\}`\}[\s\S]*sessionId=\{focusedSessionId\}/,
+  );
+  assert.match(
+    optionalSurfaceGate,
+    /<UserOfficeTemplateCard[\s\S]*key=\{`office-templates-\$\{focusedSessionId \?\? "none"\}`\}[\s\S]*sessionId=\{focusedSessionId\}/,
+  );
+  assert.match(chatViewSource, /const sessionDirectory = session\?\.directory \?\? null;/);
+  assert.match(
+    chatViewSource,
+    /focusedSessionId !== sessionId\) return;[\s\S]*setActiveWorkspacePath\(sessionDirectory\);/,
+  );
+  assert.match(
+    chatViewSource,
+    /\[hasLoadedSession, sessionDirectory, sessionId\]/,
+  );
+  assert.doesNotMatch(
+    chatViewSource,
+    /api\.get<SessionResponse>\(API\.SESSIONS\.DETAIL\(sessionId\)\)\.then/,
   );
   assert.equal(
     zh.runtimeWorkspaceIdentityMismatch,

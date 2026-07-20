@@ -94,6 +94,37 @@ test.beforeEach(async ({ page, isMobile }) => {
   await mock苏小有Api(page);
 });
 
+test("a default-directory chat does not mount workspace-only recovery or Office surfaces", async ({
+  page,
+}) => {
+  let runtimeCalls = 0;
+  let officeTemplateCalls = 0;
+
+  await page.route("**/api/runtime/**", async (route) => {
+    runtimeCalls += 1;
+    return route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "runtime must not be requested" }),
+    });
+  });
+  await page.route("**/api/office-v2/user-templates**", async (route) => {
+    officeTemplateCalls += 1;
+    return route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Office templates must not be requested" }),
+    });
+  });
+
+  await page.goto("/c/session-default-directory");
+  await expect(page.getByText("Progress", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Versions & recovery/ })).toHaveCount(0);
+  await expect(page.getByTestId("user-office-template-card")).toHaveCount(0);
+  expect(runtimeCalls).toBe(0);
+  expect(officeTemplateCalls).toBe(0);
+});
+
 test("runtime control binds rewind preview to the active workspace and refuses conflicts", async ({
   page,
 }) => {

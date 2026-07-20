@@ -311,6 +311,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
   };
 
   if (!sessionId) return null;
+  if (!context && loading) return null;
   if (unavailable && !loading) return null;
   if (failure && !context && !loading) {
     return (

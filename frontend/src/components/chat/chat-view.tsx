@@ -120,6 +120,8 @@ export function ChatView({ sessionId }: ChatViewProps) {
     queryFn: () => api.get<SessionResponse>(API.SESSIONS.DETAIL(sessionId)),
     staleTime: 30_000,
   });
+  const hasLoadedSession = session !== undefined;
+  const sessionDirectory = session?.directory ?? null;
 
   // Auto-fix sessions with default title — set to first user message
   const qc = useQueryClient();
@@ -158,13 +160,6 @@ export function ChatView({ sessionId }: ChatViewProps) {
     useActivityStore.getState().close();
     useWorkspaceStore.getState().resetForSession();
 
-    api.get<SessionResponse>(API.SESSIONS.DETAIL(sessionId)).then((s) => {
-      if (!isFreshSessionHydration()) return;
-      if (s.directory) {
-        useWorkspaceStore.getState().setActiveWorkspacePath(s.directory);
-      }
-    }).catch(() => {});
-
     api.get<{ todos: Array<{ content: string; status: string; activeForm?: string }> }>(
       API.SESSIONS.TODOS(sessionId),
     ).then((res) => {
@@ -200,6 +195,16 @@ export function ChatView({ sessionId }: ChatViewProps) {
       }
     };
   }, [sessionId]);
+
+  // Keep workspace-only surfaces in lockstep with the authoritative session
+  // query. This covers both selecting and clearing a folder after the view has
+  // mounted. The focus check prevents a late refetch for the previous session
+  // from projecting its directory into the newly focused conversation.
+  useEffect(() => {
+    if (!hasLoadedSession) return;
+    if (useChatStore.getState().focusedSessionId !== sessionId) return;
+    useWorkspaceStore.getState().setActiveWorkspacePath(sessionDirectory);
+  }, [hasLoadedSession, sessionDirectory, sessionId]);
 
   // Copy last assistant message to clipboard
   const handleCopyLast = useCallback(() => {
