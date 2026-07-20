@@ -11,12 +11,19 @@ Use the built-in `office` tool for its supported declarative operations. Use
 matter, and `pandas` for table-shaped analysis before writing the result back
 carefully.
 
-For basic sheet creation/deletion, row appends, cell updates, number formats,
-fonts, and solid fills, use the built-in `office` tool first. It is available
-on macOS, Windows, and Linux, stays inside the selected workspace, versions an
-existing destination, and validates a temporary XLSX before atomic
-installation. It stores formulas but never recalculates their results. Do not
-write a Python or shell helper for operations covered by `office`.
+If the built-in `office` tool reports that its authoritative Office v1.1
+runtime is unavailable, do not retry it. Use `code_execute` with the bundled
+`openpyxl` package, save and reopen the workbook in the same call, and verify
+the requested sheets and representative cells. Do not create a virtual
+environment or install packages.
+
+When its runtime is available, use the built-in `office` tool first for basic
+sheet creation/deletion, row appends, cell updates, number formats, fonts, and
+solid fills. It is available on macOS, Windows, and Linux, stays inside the
+selected workspace, versions an existing destination, and validates a
+temporary XLSX before atomic installation. It stores formulas but never
+recalculates their results. Do not write a Python or shell helper for
+operations covered by `office`.
 
 ## Procedure
 

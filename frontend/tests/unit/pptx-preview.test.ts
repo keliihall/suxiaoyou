@@ -83,3 +83,24 @@ test("PPTX preview exposes thumbnails, page navigation, zoom, and localized degr
     assert.ok(en[key], `missing en translation: ${key}`);
   }
 });
+
+test("PPTX preview keeps a bounded responsive height chain in narrow windows", () => {
+  const panel = readFileSync("src/components/artifacts/artifact-panel.tsx", "utf8");
+  const office = readFileSync(
+    "src/components/artifacts/renderers/office-v2-renderer.tsx",
+    "utf8",
+  );
+  const renderer = readFileSync(
+    "src/components/artifacts/renderers/pptx-renderer.tsx",
+    "utf8",
+  );
+
+  assert.equal(
+    panel.match(/flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden/g)?.length,
+    2,
+  );
+  assert.match(panel, /window\.addEventListener\("resize", clampPanelToWindow\)/);
+  assert.match(office, /h-full min-h-0 w-full flex-1 flex-col overflow-hidden/);
+  assert.match(renderer, /className="flex min-h-0 min-w-0 flex-1"/);
+  assert.match(renderer, /new ResizeObserver\(update\)/);
+});

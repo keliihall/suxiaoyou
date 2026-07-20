@@ -10,12 +10,17 @@ Use this skill when the primary input or output is a `.docx` file. The
 built-in `office` tool is the default for its supported declarative operations;
 use `python-docx` only for advanced images, sections, headers, and footers.
 
-For ordinary paragraphs, headings, tables, page breaks, workspace-local
-images, appends, and exact text replacements, use the built-in `office` tool
-first. It is available on macOS, Windows, and Linux, stays inside the selected
-workspace, versions an existing destination, and validates a temporary DOCX
-before atomic installation. Do not write a Python or shell helper for
-operations covered by `office`.
+If the built-in `office` tool reports that its authoritative Office v1.1
+runtime is unavailable, treat that as a capability signal, not a transient
+error. Do not retry the tool. Continue with `code_execute` and the bundled
+`python-docx` package. Do not create a virtual environment or install packages.
+
+When its runtime is available, use the built-in `office` tool first for
+ordinary paragraphs, headings, tables, page breaks, workspace-local images,
+appends, and exact text replacements. It is available on macOS, Windows, and
+Linux, stays inside the selected workspace, versions an existing destination,
+and validates a temporary DOCX before atomic installation. Do not write a
+Python or shell helper for operations covered by `office`.
 
 ## Procedure
 

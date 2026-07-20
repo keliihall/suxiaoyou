@@ -35,6 +35,7 @@ from app.runtime.rewind import (
     rewind_runtime_enabled,
 )
 from app.security.audit import AuditPersistenceError, record_security_event
+from app.session.managed_workspace import managed_workspace_for_session
 from app.storage.checkpoints import (
     CheckpointConflictError,
     CheckpointNotFoundError,
@@ -421,9 +422,24 @@ async def _current_workspace_context(
         session = await db.get(Session, session_id)
         if session is None:
             raise RewindNotFoundError("Session was not found")
-        raw_root = session.directory
-        if not raw_root or raw_root == ".":
-            raise RewindProvenanceError("Session has no selected workspace")
+        uses_managed_workspace = not session.directory or session.directory == "."
+        if uses_managed_workspace:
+            try:
+                managed_root = managed_workspace_for_session(
+                    session.id,
+                    create=False,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RewindNotFoundError(
+                    "Managed session workspace was not found"
+                ) from exc
+            if not managed_root.is_dir():
+                raise RewindNotFoundError(
+                    "Managed session workspace was not found"
+                )
+            raw_root = str(managed_root)
+        else:
+            raw_root = session.directory
         try:
             canonical, identity = await asyncio.to_thread(
                 inspect_workspace_identity,
@@ -451,10 +467,20 @@ async def _current_workspace_context(
             (
                 item
                 for item in candidates
-                if not (
-                    session.project_id is not None
-                    and item.project_id is not None
-                    and session.project_id != item.project_id
+                if (
+                    (
+                        item.kind == "managed"
+                        and item.created_by_session_id == session.id
+                        and item.project_id == session.project_id
+                        and isinstance(item.details, dict)
+                        and item.details.get("managed") is True
+                    )
+                    if uses_managed_workspace
+                    else not (
+                        session.project_id is not None
+                        and item.project_id is not None
+                        and session.project_id != item.project_id
+                    )
                 )
             ),
             None,
@@ -490,6 +516,43 @@ async def _session_repository(
         return str(Path(repository).expanduser().resolve(strict=True))
     except (OSError, RuntimeError, ValueError) as exc:
         raise WorktreeConflictError("Session repository is unavailable") from exc
+
+
+async def _worktree_creation_preflight(
+    request: Request,
+    session_factory: async_sessionmaker[AsyncSession],
+    stream_manager: Any,
+    *,
+    session_id: str,
+    workspace_kind: str,
+) -> tuple[bool, str | None]:
+    """Return path-free worktree creation eligibility for the current session."""
+
+    if not worktree_runtime_enabled():
+        return False, "feature_unavailable"
+    if workspace_kind == "git_worktree":
+        return False, "already_isolated"
+    if workspace_kind != "direct":
+        return False, "workspace_not_supported"
+    try:
+        repository = await _session_repository(session_factory, session_id)
+        runtime = _worktree_runtime(request, session_factory, stream_manager)
+        await asyncio.to_thread(runtime.service.validate_source, repository)
+    except WorktreeDirtyError:
+        return False, "workspace_dirty"
+    except RepositoryValidationError:
+        return False, "repository_not_supported"
+    except GitUnavailableError:
+        return False, "git_unavailable"
+    except GitCommandTimeout:
+        return False, "git_timeout"
+    except GitCommandError:
+        return False, "git_failed"
+    except WorktreePathError:
+        return False, "storage_unavailable"
+    except WorktreeError:
+        return False, "preflight_failed"
+    return True, None
 
 
 async def _worktree_db_state(
@@ -560,7 +623,9 @@ def _gc_payload(report: Any) -> dict[str, Any]:
 
 @router.get("/context")
 async def runtime_context(
+    request: Request,
     session_factory: SessionFactoryDep,
+    stream_manager: StreamManagerDep,
     session_id: str = Query(min_length=1, max_length=128),
 ) -> Any:
     """Return the current path-free workspace identity for local controls."""
@@ -586,6 +651,15 @@ async def runtime_context(
             code="runtime_workspace_provenance_mismatch",
             detail="The session workspace identity could not be verified",
         )
+    worktree_creation_available, worktree_creation_reason = (
+        await _worktree_creation_preflight(
+            request,
+            session_factory,
+            stream_manager,
+            session_id=session_id,
+            workspace_kind=instance.kind,
+        )
+    )
     return JSONResponse(
         content={
             "session_id": session_id,
@@ -597,6 +671,8 @@ async def runtime_context(
             "managed_worktrees_released": bool(
                 release_features.V11_WORKTREES_RELEASED
             ),
+            "worktree_creation_available": worktree_creation_available,
+            "worktree_creation_reason": worktree_creation_reason,
             "external_side_effects_reverted": False,
         },
         headers={"Cache-Control": "no-store"},

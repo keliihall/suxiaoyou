@@ -19,6 +19,7 @@ const COMMIT = "a".repeat(40);
 const TAG = "v1.0.0-rc.7";
 const VERSION = TAG.slice(1);
 const UNSIGNED_DEGRADED_TAG = "v1.1.0";
+const UNSIGNED_DEGRADED_RC_TAG = "v1.1.0-rc.2";
 
 const FIXTURES = [
   ["windows-x64-nsis", `suyo-${VERSION}-windows-x64-setup.exe`, "windows-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows", "win32"],
@@ -36,6 +37,15 @@ const UNSIGNED_DEGRADED_FIXTURES = FIXTURES.map((entry) => {
     .replace(VERSION, UNSIGNED_DEGRADED_TAG.slice(1))
     .replace("-ADHOC-NOT-NOTARIZED", "")
     .replace(/\.(exe|dmg|deb|rpm)$/u, "-UNSIGNED-DEGRADED.$1");
+  return copy;
+});
+
+const UNSIGNED_DEGRADED_RC_FIXTURES = UNSIGNED_DEGRADED_FIXTURES.map((entry) => {
+  const copy = [...entry];
+  copy[1] = copy[1].replace(
+    UNSIGNED_DEGRADED_TAG.slice(1),
+    UNSIGNED_DEGRADED_RC_TAG.slice(1),
+  );
   return copy;
 });
 
@@ -365,11 +375,24 @@ test("native evidence CLI accepts unsigned-degraded as its final profile argumen
   );
 });
 
-test("unsigned-degraded native evidence is restricted to stable v1.1.0", async (t) => {
-  const prerelease = fixture(t);
-  await assert.rejects(
-    () => collect(prerelease, { releaseProfile: "unsigned-degraded" }),
-    /requires releaseChannel stable/u,
+test("unsigned-degraded native evidence supports synchronized v1.1 RC installers", async (t) => {
+  const prerelease = fixture(t, {
+    definitions: UNSIGNED_DEGRADED_RC_FIXTURES,
+    releaseTag: UNSIGNED_DEGRADED_RC_TAG,
+  });
+  const evidence = await collect(prerelease, {
+    releaseTag: UNSIGNED_DEGRADED_RC_TAG,
+    releaseChannel: "prerelease",
+    releaseProfile: "unsigned-degraded",
+  });
+  assert.equal(evidence.release_tag, UNSIGNED_DEGRADED_RC_TAG);
+  assert.equal(evidence.release_channel, "prerelease");
+  assert.equal(evidence.release_profile, "unsigned-degraded");
+  assert.ok(
+    evidence.packages.every((item) =>
+      item.artifact_name.includes("1.1.0-rc.2") &&
+      item.artifact_name.includes("-UNSIGNED-DEGRADED."),
+    ),
   );
 
   const stableTag = "v1.0.0";

@@ -42,6 +42,7 @@ class QuestionTool(ToolDefinition):
                 # Legacy single-question mode
                 "question": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The question to ask the user (single-question mode)",
                 },
                 "options": {
@@ -60,11 +61,13 @@ class QuestionTool(ToolDefinition):
                         "properties": {
                             "question": {
                                 "type": "string",
+                                "minLength": 1,
                                 "description": "The question text",
                             },
                             "header": {
                                 "type": "string",
                                 "description": "Tab label (max 12 chars)",
+                                "minLength": 1,
                                 "maxLength": 12,
                             },
                             "options": {
@@ -101,15 +104,52 @@ class QuestionTool(ToolDefinition):
                     },
                 },
             },
+            "anyOf": [
+                {"required": ["question"]},
+                {"required": ["questions"]},
+            ],
         }
 
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        questions = args.get("questions")
-        is_multi = isinstance(questions, list) and len(questions) > 0
+        raw_questions = args.get("questions")
+        questions: list[dict[str, Any]] = []
+        invalid_multi = False
+        if isinstance(raw_questions, list) and raw_questions:
+            for item in raw_questions:
+                if not isinstance(item, dict):
+                    invalid_multi = True
+                    continue
+                question_text = item.get("question")
+                header_text = item.get("header")
+                if not isinstance(question_text, str) or not question_text.strip():
+                    invalid_multi = True
+                    continue
+                if not isinstance(header_text, str) or not header_text.strip():
+                    invalid_multi = True
+                    continue
+                questions.append(
+                    {
+                        **item,
+                        "question": question_text.strip(),
+                        "header": header_text.strip(),
+                    }
+                )
+        is_multi = bool(questions) and not invalid_multi
 
         # Legacy fields
-        question = args.get("question", "")
+        raw_question = args.get("question", "")
+        question = raw_question.strip() if isinstance(raw_question, str) else ""
         options = args.get("options", [])
+
+        if invalid_multi or (not is_multi and not question):
+            return ToolResult(
+                error=ctx.tr(
+                    "提问内容为空或格式不完整，请明确问题后重新提问。",
+                    "The question was empty or incomplete. Ask again with explicit question text.",
+                ),
+                title=ctx.tr("提问内容无效", "Invalid question"),
+                metadata={"code": "invalid_question_payload"},
+            )
 
         # Access the GenerationJob for wait_for_response
         job = getattr(ctx, "_job", None)
@@ -132,9 +172,14 @@ class QuestionTool(ToolDefinition):
             }
             if is_multi:
                 payload["questions"] = questions
+                payload["arguments"] = {"questions": questions}
             else:
                 payload["question"] = question
                 payload["options"] = options
+                payload["arguments"] = {
+                    "question": question,
+                    "options": options,
+                }
             ctx._publish_fn("question", payload)
 
         # If no job context or not interactive — degrade gracefully

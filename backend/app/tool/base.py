@@ -102,6 +102,15 @@ class ToolDefinition(ABC):
         properties = schema.get("properties", {})
         required = schema.get("required", [])
 
+        # Providers preserve malformed streamed JSON under this sentinel so
+        # the raw text is not lost. It is never a valid tool argument and must
+        # not reach permissive tools whose schemas have no required fields.
+        # In particular, executing an interactive tool with this payload can
+        # create an empty prompt that leaves the user waiting for a question
+        # that was never parsed.
+        if "_raw" in args:
+            return "tool arguments were not valid JSON"
+
         # Check required fields
         for field_name in required:
             if field_name not in args:

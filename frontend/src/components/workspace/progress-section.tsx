@@ -5,16 +5,26 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import Link from "next/link";
 import { useWorkspaceStore, type WorkspaceAgentTask, type WorkspaceTodo } from "@/stores/workspace-store";
+import { useChatStore } from "@/stores/chat-store";
 import { cn } from "@/lib/utils";
 import { getChatRoute } from "@/lib/routes";
 
-function TodoItem({ todo }: { todo: WorkspaceTodo }) {
+function TodoItem({
+  todo,
+  isGenerating,
+}: {
+  todo: WorkspaceTodo;
+  isGenerating: boolean;
+}) {
+  const { t } = useTranslation("chat");
+  const isActivelyRunning = todo.status === "in_progress" && isGenerating;
+  const wasLeftInProgress = todo.status === "in_progress" && !isGenerating;
   return (
     <div className="flex items-start gap-2.5 py-1">
       <div className="mt-0.5 shrink-0">
         {todo.status === "completed" ? (
           <CheckCircle2 className="h-4 w-4 text-[var(--tool-completed)]" />
-        ) : todo.status === "in_progress" ? (
+        ) : isActivelyRunning ? (
           <Loader2 className="h-4 w-4 text-[var(--text-accent)] animate-spin" />
         ) : (
           <Circle className="h-4 w-4 text-[var(--text-quaternary)]" />
@@ -26,16 +36,19 @@ function TodoItem({ todo }: { todo: WorkspaceTodo }) {
             "text-[13px] leading-snug",
             todo.status === "completed"
               ? "text-[var(--text-tertiary)] line-through"
-              : todo.status === "in_progress"
+              : isActivelyRunning
                 ? "text-[var(--text-primary)]"
                 : "text-[var(--text-secondary)]",
           )}
         >
           {todo.content}
         </p>
-        {todo.status === "in_progress" && todo.activeForm && (
-          <p className="text-[11px] text-[var(--text-tertiary)] mt-0.5 animate-pulse">
-            {todo.activeForm}
+        {todo.status === "in_progress" && (todo.activeForm || wasLeftInProgress) && (
+          <p className={cn(
+            "text-[11px] text-[var(--text-tertiary)] mt-0.5",
+            isActivelyRunning && "animate-pulse",
+          )}>
+            {wasLeftInProgress ? t("toolAttemptIncomplete") : todo.activeForm}
           </p>
         )}
       </div>
@@ -115,6 +128,12 @@ function AgentTaskItem({ task }: { task: WorkspaceAgentTask }) {
 export function ProgressCard() {
   const { t } = useTranslation("chat");
   const todos = useWorkspaceStore((s) => s.todos);
+  const focusedSessionId = useChatStore((s) => s.focusedSessionId);
+  const isGenerating = useChatStore((s) =>
+    focusedSessionId
+      ? (s.sessions[focusedSessionId]?.isGenerating ?? false)
+      : false,
+  );
   const taskBatch = useWorkspaceStore((s) => s.taskBatch);
   const collapsed = useWorkspaceStore((s) => s.collapsedSections["progress"]);
   const toggleSection = useWorkspaceStore((s) => s.toggleSection);
@@ -124,7 +143,13 @@ export function ProgressCard() {
     agentTasks.filter((task) => !["completed", "failed", "cancelled"].includes(task.status)).length;
   const totalCount = todos.length + agentTasks.length;
   const previewItems = [
-    ...todos.slice(0, 3).map((todo) => ({ key: todo.content, status: todo.status })),
+    ...todos.slice(0, 3).map((todo) => ({
+      key: todo.content,
+      status:
+        todo.status === "in_progress" && !isGenerating
+          ? "pending"
+          : todo.status,
+    })),
     ...agentTasks.slice(0, 3).map((task) => ({ key: task.task_id, status: task.status })),
   ].slice(0, 3);
 
@@ -210,7 +235,11 @@ export function ProgressCard() {
                 </div>
               )}
               {todos.map((todo, i) => (
-                <TodoItem key={`${todo.content}-${i}`} todo={todo} />
+                <TodoItem
+                  key={`${todo.content}-${i}`}
+                  todo={todo}
+                  isGenerating={isGenerating}
+                />
               ))}
             </div>
           </motion.div>

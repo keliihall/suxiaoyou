@@ -28,8 +28,9 @@ const RELEASE_PROFILES = new Set([
 ]);
 
 function resolveReleaseProfile(releaseChannel, version, requestedProfile) {
+  const appVersion = version.replace(/-rc\.[1-9][0-9]*$/u, "");
   const defaultProfile =
-    version === "1.1.0"
+    appVersion === "1.1.0"
       ? "unsigned-degraded"
       : releaseChannel === "stable"
         ? "official"
@@ -40,20 +41,24 @@ function resolveReleaseProfile(releaseChannel, version, requestedProfile) {
       "releaseProfile must be official, rc-adhoc, or unsigned-degraded",
     );
   }
-  const expectedChannel = profile === "rc-adhoc" ? "prerelease" : "stable";
+  const expectedChannel = profile === "rc-adhoc"
+    ? "prerelease"
+    : profile === "official"
+      ? "stable"
+      : releaseChannel;
   if (releaseChannel !== expectedChannel) {
     throw new Error(
       `releaseProfile ${profile} requires releaseChannel ${expectedChannel}`,
     );
   }
-  if (profile === "unsigned-degraded" && version !== "1.1.0") {
+  if (profile === "unsigned-degraded" && appVersion !== "1.1.0") {
     throw new Error(
-      `releaseProfile ${profile} is defined only for v1.1.0, got v${version}`,
+      `releaseProfile ${profile} is defined only for v1.1.0 release line tags, got v${version}`,
     );
   }
-  if (version === "1.1.0" && profile !== "unsigned-degraded") {
+  if (appVersion === "1.1.0" && profile !== "unsigned-degraded") {
     throw new Error(
-      "v1.1.0 is defined by the unsigned-degraded release contract",
+      "v1.1.0 release line tags are defined by the unsigned-degraded release contract",
     );
   }
   return profile;

@@ -129,6 +129,8 @@
   "securityV11Worktrees": "Git worktree",
   "securityV11Validator": "Validation Agent",
   "securityV11UserOfficeTemplates": "User Office templates",
+  "securityStatusTesting": "Testing",
+  "securityStatusAvailable": "Generally available",
   "securityRuntimeReady": "runtime ready",
   "securityRuntimePending": "runtime not ready",
   "securitySourceCeilings": "Execution-source ceilings",

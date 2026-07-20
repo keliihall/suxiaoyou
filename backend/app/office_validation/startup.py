@@ -93,7 +93,7 @@ async def initialize_office_v11_runtime(
     ):
         try:
             delattr(app_state, name)
-        except AttributeError:
+        except (AttributeError, KeyError):
             pass
 
     if not v11_capability_released("office_preview"):

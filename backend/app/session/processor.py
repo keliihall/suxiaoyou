@@ -405,6 +405,7 @@ async def _audit_provider_event(
 from app.session.loop_detection import (
     WEB_FETCH_CIRCUIT_OPEN_MSG,
     WEB_SEARCH_LIMIT_MSG,
+    TOOL_FAILURE_CIRCUIT_OPEN_MSG,
     LoopCheckResult,
     loop_detector,
     web_fetch_circuit_scope,
@@ -1546,6 +1547,14 @@ class SessionProcessor:
             }
             if source_denied:
                 exclude_tools = source_denied
+        response_scope = web_fetch_circuit_scope(
+            sp.job.session_id,
+            sp.job.stream_id,
+        )
+        failure_blocked_tools = loop_detector.blocked_tools(response_scope)
+        if failure_blocked_tools:
+            exclude_tools = exclude_tools or set()
+            exclude_tools.update(failure_blocked_tools)
         sq_count, sq_credits = await _search_quota.get_quota()
         quota_exhausted = not sq_credits and sq_count >= get_settings().daily_search_limit
         if quota_exhausted:
@@ -1749,6 +1758,30 @@ class SessionProcessor:
                 ci,
                 ta,
                 WEB_FETCH_CIRCUIT_OPEN_MSG,
+            )
+            return
+
+        # Repeated failures with different arguments are not caught by the
+        # identical-call hash.  Once a tool's response-scoped circuit opens,
+        # keep the model free to switch approaches without running it again.
+        # The narrower web_fetch policy above retains its more specific error.
+        if loop_detector.is_tool_failure_circuit_open(response_scope, tn):
+            job.publish(SSEEvent(
+                TOOL_ERROR,
+                {
+                    "call_id": ci,
+                    "error": TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+                    "tool": tn,
+                },
+            ))
+            await _persist_tool_error(
+                session_factory,
+                self._assistant_msg_id,
+                job.session_id,
+                tn,
+                ci,
+                ta,
+                TOOL_FAILURE_CIRCUIT_OPEN_MSG,
             )
             return
 
@@ -3215,6 +3248,16 @@ class SessionProcessor:
         # Inject loop warning into output so LLM sees it
         if loop_result.action == "warn" and loop_result.message:
             persist_output += f"\n\n{loop_result.message}"
+
+        response_scope = web_fetch_circuit_scope(
+            sp.job.session_id,
+            sp.job.stream_id,
+        )
+        if (
+            not result.success
+            and loop_detector.is_tool_failure_circuit_open(response_scope, tool.id)
+        ):
+            persist_output += f"\n\n{TOOL_FAILURE_CIRCUIT_OPEN_MSG}"
 
         # Run middleware after_tool_exec hooks
         if self._mw_ctx is not None:

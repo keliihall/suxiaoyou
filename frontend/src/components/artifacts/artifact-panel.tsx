@@ -76,6 +76,17 @@ export function ArtifactPanel() {
   const isMac = useIsMacOS();
   const topOffset = IS_DESKTOP && !isMac ? TITLE_BAR_HEIGHT : 0;
 
+  useEffect(() => {
+    if (!isDesktop) return;
+    const clampPanelToWindow = () => {
+      const currentWidth = useArtifactStore.getState().panelWidth;
+      useArtifactStore.getState().setWidth(currentWidth);
+    };
+    clampPanelToWindow();
+    window.addEventListener("resize", clampPanelToWindow);
+    return () => window.removeEventListener("resize", clampPanelToWindow);
+  }, [isDesktop]);
+
   // Desktop: fixed right panel with smooth mount/unmount
   if (isDesktop) {
     return (
@@ -89,7 +100,7 @@ export function ArtifactPanel() {
       >
         <ResizeHandle />
         <ArtifactPanelHeader />
-        <div className="flex-1 overflow-hidden">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <ArtifactPanelContent />
         </div>
       </motion.aside>
@@ -108,7 +119,7 @@ export function ArtifactPanel() {
         </VisuallyHidden.Root>
         <div className="flex flex-col h-full">
           <ArtifactPanelHeader />
-          <div className="flex-1 overflow-hidden">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <ArtifactPanelContent />
           </div>
         </div>

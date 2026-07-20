@@ -194,6 +194,23 @@ test("localizes English reasoning trace text for Chinese UI", () => {
   );
 });
 
+test("localizes Python environment chatter for Chinese activity UI", () => {
+  assert.equal(
+    localizeVisibleProcessText(
+      "The venv was not persisted. Each bash call is a fresh session, so I need to recreate it.",
+      "zh",
+    ),
+    "正在核对 Python 执行环境，并改用可持久化的内置运行时。",
+  );
+  assert.equal(
+    localizeVisibleProcessText(
+      "Good, all required packages are installed. Now I can create the files.",
+      "zh",
+    ),
+    "所需组件已就绪，继续生成并验证文件。",
+  );
+});
+
 test("frames a partial web-search miss as a recovered route change", () => {
   assert.equal(
     localizeVisibleProcessText(

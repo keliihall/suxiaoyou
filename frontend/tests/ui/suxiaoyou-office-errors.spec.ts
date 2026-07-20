@@ -285,6 +285,9 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
 
     await openArtifactFile(page, "office-brief.docx");
     await expect(page.getByText("苏小有 DOCX workflow")).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByText("1 / 3", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Next Word preview page" }).click();
+    await expect(page.getByText("2 / 3", { exact: true })).toBeVisible();
     await closeArtifactPanel(page);
 
     await openArtifactFile(page, "office-matrix.xlsx");
@@ -325,6 +328,24 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     expect(state.binaryReads.join("\n")).toContain("office-report.pdf");
     expect(state.binaryReads.join("\n")).not.toContain("office-deck.pptx");
     await expectNoAppCrash(page);
+  });
+
+  test("PPTX preview stays inside a non-maximized desktop window", async ({ page }) => {
+    await page.setViewportSize({ width: 980, height: 700 });
+    await setupMockedApp(page);
+    await mockPptxStaticPreview(page);
+
+    await page.goto("/c/session-artifacts");
+    await openArtifactFile(page, "office-deck.pptx");
+    const slide = page.getByLabel("Preview of slide 1");
+    await expect(slide).toBeVisible({ timeout: 20_000 });
+    await expect.poll(async () => slide.boundingBox()).not.toBeNull();
+    const box = await slide.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.width).toBeGreaterThan(120);
+    expect(box!.height).toBeGreaterThan(60);
+    expect(box!.y).toBeLessThan(350);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(700);
   });
 
   test("authoritative Office preview stays bound to a server-owned checkpoint", async ({ page }) => {

@@ -111,7 +111,12 @@ interface PreviewSelection {
 }
 
 function isFeatureUnavailable(error: unknown): boolean {
-  return error instanceof ApiError && error.status === 404;
+  if (!(error instanceof ApiError)) return false;
+  if (error.status === 404) return true;
+  if (!error.body || typeof error.body !== "object") return false;
+  const code = (error.body as { code?: unknown }).code;
+  return code === "user_office_template_runtime_unavailable" ||
+    code === "runtime_workspace_provenance_mismatch";
 }
 
 async function responseBody(response: Response): Promise<unknown> {
@@ -506,7 +511,7 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           {t("userOfficeTemplateTitle")}
           <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-500">
-            Beta
+            {t("userOfficeTemplatePreviewFeature")}
           </span>
         </p>
         <p role="alert" className="mt-2 break-words text-[11px] text-[var(--text-secondary)]">
@@ -548,7 +553,7 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
             <span className="flex flex-wrap items-center gap-2 text-[13px] font-medium text-[var(--text-primary)]">
               {t("userOfficeTemplateTitle")}
               <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-500">
-                Beta
+                {t("userOfficeTemplatePreviewFeature")}
               </span>
             </span>
             <span className="mt-1 block text-[11px] text-[var(--text-tertiary)]">

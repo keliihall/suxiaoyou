@@ -24,6 +24,8 @@ async function mockRuntimeApi(page: Page) {
         workspace_kind: "direct",
         checkpoint_rewind_released: true,
         managed_worktrees_released: true,
+        worktree_creation_available: false,
+        worktree_creation_reason: "repository_not_supported",
         external_side_effects_reverted: false,
       });
     }
@@ -98,28 +100,28 @@ test("runtime control binds rewind preview to the active workspace and refuses c
   const state = await mockRuntimeApi(page);
 
   await page.goto("/c/session-alpha");
-  const runtime = page.getByRole("button", { name: /Versions & workspace/ });
-  await expect(runtime).toContainText("7 recoverable checkpoints");
+  const runtime = page.getByRole("button", { name: /Versions & recovery/ });
+  await expect(runtime).toContainText("7 recoverable versions");
   await runtime.click();
 
-  await expect(page.getByText("Workspace identity verified")).toBeVisible();
-  await expect(page.getByText("Checkpoint #3")).toBeVisible();
+  await expect(page.getByText("Automatic protection is on")).toBeVisible();
+  await expect(page.getByRole("list").getByText("Version 3", { exact: true })).toBeVisible();
   for (const label of [
-    "Validation passed",
-    "Validation failed",
-    "Validation needs review",
-    "Validation failed closed",
-    "Validation cancelled",
-    "Validation record invalid",
+    "Check passed",
+    "Check failed",
+    "Needs confirmation",
+    "Safety check incomplete; stopped",
+    "Check cancelled",
+    "Check record invalid",
   ]) {
     await expect(page.getByText(label, { exact: true })).toBeVisible();
   }
   await expect(page.getByTestId("runtime-validation-not_requested")).toHaveCount(0);
   await expect(
-    page.getByText("External effects such as email or cloud writes are not reverted."),
+    page.getByText("Sent email, cloud changes, and similar actions cannot be undone automatically."),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: "Rewind", exact: true }).first().click();
+  await page.getByRole("button", { name: "Restore here", exact: true }).first().click();
   await expect.poll(() => state.previewBodies).toEqual([
     {
       session_id: "session-alpha",
@@ -127,6 +129,7 @@ test("runtime control binds rewind preview to the active workspace and refuses c
       checkpoint_id: "checkpoint-alpha-3",
     },
   ]);
-  await expect(page.getByText("workspace changed after checkpoint")).toBeVisible();
+  await expect(page.getByText("This version cannot be restored safely right now.")).toBeVisible();
+  await expect(page.getByText("workspace changed after checkpoint")).toHaveCount(0);
   expect(state.executeCalls()).toBe(0);
 });

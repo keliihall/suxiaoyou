@@ -94,14 +94,14 @@ jobs:
                 MACOS_ARTIFACT_PROFILE="release"
               fi
             elif [[ "$GITHUB_REF_NAME" =~ ^v${APP_VERSION_REGEX}-rc\.([1-9][0-9]*)$ ]]; then
-              if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
-                echo "::error::the unsigned-degraded v1.1 release uses the exact v$APP_VERSION tag, not an rc tag"
-                exit 1
-              fi
               RELEASE_VERSION="${GITHUB_REF_NAME#v}"
               RELEASE_CHANNEL="prerelease"
               IS_STABLE="false"
-              MACOS_ARTIFACT_PROFILE="RC-ADHOC-NOT-NOTARIZED"
+              if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+                MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"
+              else
+                MACOS_ARTIFACT_PROFILE="RC-ADHOC-NOT-NOTARIZED"
+              fi
             else
               echo "::error::tag must be v$APP_VERSION or v$APP_VERSION-rc.N with N >= 1; got $GITHUB_REF_NAME"
               exit 1
@@ -2381,7 +2381,7 @@ jobs:
 
           if (
             document.releaseProfile !== "unsigned-degraded" ||
-            !/^v1\.1\.0$/.test(document.releaseTag ?? "") ||
+            !/^v1\.1\.0(?:-rc\.[1-9][0-9]*)?$/.test(document.releaseTag ?? "") ||
             !/^[0-9a-f]{40}$/.test(document.releaseCommit ?? "")
           ) {
             throw new Error("invalid unsigned-degraded release identity");

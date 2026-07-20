@@ -1137,10 +1137,23 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   onCurrent(SSE_EVENTS.QUESTION, (data) => {
     if (!data.call_id) return;
     clearInteractionRecovery();
+    const nestedArguments = data.arguments && typeof data.arguments === "object"
+      ? data.arguments
+      : {};
+    const questionArguments: Record<string, unknown> = { ...nestedArguments };
+    if (questionArguments.question == null && data.question != null) {
+      questionArguments.question = data.question;
+    }
+    if (questionArguments.options == null && data.options != null) {
+      questionArguments.options = data.options;
+    }
+    if (questionArguments.questions == null && data.questions != null) {
+      questionArguments.questions = data.questions;
+    }
     store.getState().setQuestion(sessionId, {
       callId: data.call_id,
       tool: data.tool ?? "question",
-      arguments: data.arguments ?? { question: data.question, options: data.options, questions: data.questions },
+      arguments: questionArguments,
     });
   });
 

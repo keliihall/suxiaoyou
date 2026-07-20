@@ -11,7 +11,9 @@ warn-then-stop strategy inspired by DeerFlow's LoopDetectionMiddleware:
      and force the agent to produce a final text answer.
 
 This is strictly better than the old binary block/allow: the model gets a
-chance to self-correct before being hard-stopped.
+chance to self-correct before being hard-stopped.  A separate response-scoped
+failure circuit also removes a tool after a bounded number of failed
+executions, preventing argument churn from evading the identical-call hash.
 """
 
 from __future__ import annotations
@@ -55,6 +57,13 @@ WEB_SEARCH_LIMIT_MSG = (
     "web_search calls. Do not call web_search again in this response. "
     "Synthesize the results already collected and answer from them; if the "
     "available evidence is insufficient, clearly state the remaining gap."
+)
+TOOL_FAILURE_LIMIT = 3
+WEB_SEARCH_FAILURE_LIMIT = 2
+TOOL_FAILURE_CIRCUIT_OPEN_MSG = (
+    "This tool failed repeatedly in this response and is now disabled for the "
+    "remainder of the response. Do not retry it with different arguments. "
+    "Use a different available tool or report the concrete blocker."
 )
 
 
@@ -156,6 +165,8 @@ class LoopDetector:
         self._web_fetch_non_public_failures: dict[str, int] = defaultdict(int)
         self._web_fetch_circuit_open: set[str] = set()
         self._custom_web_search_submissions: dict[str, int] = defaultdict(int)
+        self._tool_failures: dict[tuple[str, str], int] = defaultdict(int)
+        self._tool_failure_circuit_open: set[tuple[str, str]] = set()
 
     def check(self, session_id: str, tool_name: str, tool_args: dict) -> LoopCheckResult:
         """Check a tool call for loop patterns.
@@ -216,15 +227,37 @@ class LoopDetector:
         success: bool,
         error: str | None = None,
     ) -> None:
-        """Update the narrow web-fetch policy circuit from a completed result.
+        """Update response-scoped failure circuits from a completed result.
 
-        Only the SSRF guard's non-public-address rejection contributes to this
-        circuit.  A successful fetch, or a different completed web-fetch
-        result, breaks the consecutive-error sequence.  Other tools have no
-        effect on it.
+        The generic circuit prevents a model from cycling through cosmetically
+        different arguments after a capability has repeatedly failed.  The
+        narrower web-fetch circuit retains its SSRF-specific behavior.
         """
 
-        if tool_name.lower() != "web_fetch":
+        normalized_tool = tool_name.casefold()
+        tool_key = (scope_id, normalized_tool)
+        if success:
+            self._tool_failures.pop(tool_key, None)
+            self._tool_failure_circuit_open.discard(tool_key)
+        else:
+            failures = self._tool_failures[tool_key] + 1
+            self._tool_failures[tool_key] = failures
+            failure_limit = (
+                WEB_SEARCH_FAILURE_LIMIT
+                if normalized_tool == "web_search"
+                else TOOL_FAILURE_LIMIT
+            )
+            if failures >= failure_limit:
+                self._tool_failure_circuit_open.add(tool_key)
+                logger.warning(
+                    "Opening tool failure circuit for response %s tool %s "
+                    "after %d failures",
+                    scope_id,
+                    normalized_tool,
+                    failures,
+                )
+
+        if normalized_tool != "web_fetch":
             return
 
         if success or WEB_FETCH_NON_PUBLIC_ERROR not in (error or ""):
@@ -242,6 +275,24 @@ class LoopDetector:
                 scope_id,
                 failures,
             )
+
+    def is_tool_failure_circuit_open(
+        self,
+        scope_id: str,
+        tool_name: str,
+    ) -> bool:
+        """Return whether a repeatedly failing tool is disabled this response."""
+
+        return (scope_id, tool_name.casefold()) in self._tool_failure_circuit_open
+
+    def blocked_tools(self, scope_id: str) -> set[str]:
+        """Return tool IDs hidden from the next provider step."""
+
+        return {
+            tool_name
+            for candidate_scope, tool_name in self._tool_failure_circuit_open
+            if candidate_scope == scope_id
+        }
 
     def admit_custom_web_search(self, scope_id: str) -> bool:
         """Reserve one custom ``web_search`` slot for this response.
@@ -280,12 +331,22 @@ class LoopDetector:
                 self._web_fetch_non_public_failures.pop(scope, None)
                 self._web_fetch_circuit_open.discard(scope)
                 self._custom_web_search_submissions.pop(scope, None)
+            matching_tool_keys = {
+                key
+                for key in set(self._tool_failures) | self._tool_failure_circuit_open
+                if key[0] == session_id or key[0].startswith(scope_prefix)
+            }
+            for key in matching_tool_keys:
+                self._tool_failures.pop(key, None)
+                self._tool_failure_circuit_open.discard(key)
         else:
             self._history.clear()
             self._warned.clear()
             self._web_fetch_non_public_failures.clear()
             self._web_fetch_circuit_open.clear()
             self._custom_web_search_submissions.clear()
+            self._tool_failures.clear()
+            self._tool_failure_circuit_open.clear()
 
     def _evict_if_needed(self) -> None:
         """Evict least recently used sessions if over the limit."""
@@ -306,6 +367,14 @@ class LoopDetector:
                 self._web_fetch_non_public_failures.pop(scope, None)
                 self._web_fetch_circuit_open.discard(scope)
                 self._custom_web_search_submissions.pop(scope, None)
+            matching_tool_keys = {
+                key
+                for key in set(self._tool_failures) | self._tool_failure_circuit_open
+                if key[0] == evicted_id or key[0].startswith(scope_prefix)
+            }
+            for key in matching_tool_keys:
+                self._tool_failures.pop(key, None)
+                self._tool_failure_circuit_open.discard(key)
 
 
 # Module-level singleton — shared across all generations

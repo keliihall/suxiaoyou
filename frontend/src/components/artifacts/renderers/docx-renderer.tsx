@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Download, Loader2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { api, apiErrorMessage } from "@/lib/api";
@@ -17,9 +17,12 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
   const { t } = useTranslation("chat");
   const workspace = useWorkspaceStore((s) => s.activeWorkspacePath);
   const containerRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string>("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageCount, setPageCount] = useState(0);
   const blobRef = useRef<Blob | null>(null);
 
   useEffect(() => {
@@ -35,6 +38,8 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
       try {
         setLoading(true);
         setError(null);
+        setCurrentPage(1);
+        setPageCount(0);
 
         const res = await api.post<{
           content_base64: string;
@@ -58,7 +63,7 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
         containerRef.current.innerHTML = "";
 
         await renderAsync(buffer, containerRef.current, undefined, {
-          className: "docx-preview-wrapper",
+          className: "docx",
           inWrapper: true,
           ignoreWidth: false,
           ignoreHeight: true,
@@ -69,6 +74,13 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
           trimXmlDeclaration: true,
           useBase64URL: true,
         });
+        if (!cancelled && containerRef.current) {
+          const pages = containerRef.current.querySelectorAll<HTMLElement>(
+            ".docx-wrapper > section.docx",
+          );
+          setPageCount(Math.max(1, pages.length));
+          setCurrentPage(1);
+        }
       } catch (err) {
         if (!cancelled) {
           setError(apiErrorMessage(err, t("failedRenderDocument")));
@@ -88,6 +100,41 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
     downloadBlob(blobRef.current, fileName || "document.docx");
   }, [fileName]);
 
+  const pageElements = useCallback(() => (
+    containerRef.current
+      ? Array.from(
+          containerRef.current.querySelectorAll<HTMLElement>(
+            ".docx-wrapper > section.docx",
+          ),
+        )
+      : []
+  ), []);
+
+  const goToPage = useCallback((page: number) => {
+    const scroller = scrollRef.current;
+    const pages = pageElements();
+    if (!scroller || pages.length === 0) return;
+    const nextPage = Math.min(Math.max(1, page), pages.length);
+    const target = pages[nextPage - 1];
+    const targetTop = target.getBoundingClientRect().top
+      - scroller.getBoundingClientRect().top
+      + scroller.scrollTop;
+    scroller.scrollTo({ top: Math.max(0, targetTop - 16), behavior: "smooth" });
+    setCurrentPage(nextPage);
+  }, [pageElements]);
+
+  const syncCurrentPage = useCallback(() => {
+    const scroller = scrollRef.current;
+    const pages = pageElements();
+    if (!scroller || pages.length === 0) return;
+    const marker = scroller.getBoundingClientRect().top + Math.min(120, scroller.clientHeight * 0.25);
+    let visiblePage = 1;
+    pages.forEach((page, index) => {
+      if (page.getBoundingClientRect().top <= marker) visiblePage = index + 1;
+    });
+    setCurrentPage((previous) => previous === visiblePage ? previous : visiblePage);
+  }, [pageElements]);
+
   if (error) {
     return (
       <div className="flex-1 flex items-center justify-center p-4">
@@ -97,12 +144,37 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-default)] bg-[var(--surface-tertiary)] shrink-0">
-        <span className="text-[11px] font-medium text-[var(--text-secondary)] uppercase tracking-wide">
+      <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border-default)] bg-[var(--surface-tertiary)] px-3 py-2">
+        <span className="min-w-0 flex-1 truncate text-[11px] font-medium uppercase tracking-wide text-[var(--text-secondary)]">
           {fileName || "document.docx"}
         </span>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            aria-label={t("docxPreviousPage")}
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            disabled={loading || currentPage <= 1}
+            onClick={() => goToPage(currentPage - 1)}
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </Button>
+          <span className="min-w-14 text-center text-xs text-[var(--text-secondary)]" aria-live="polite">
+            {currentPage} / {Math.max(1, pageCount)}
+          </span>
+          <Button
+            aria-label={t("docxNextPage")}
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            disabled={loading || currentPage >= pageCount}
+            onClick={() => goToPage(currentPage + 1)}
+          >
+            <ChevronRight className="h-4 w-4" />
+          </Button>
+        </div>
         <Button
           variant="ghost"
           size="icon"
@@ -116,7 +188,7 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-auto bg-white relative">
+      <div ref={scrollRef} onScroll={syncCurrentPage} className="relative min-h-0 flex-1 overflow-auto bg-white">
         {loading && (
           <div className="absolute inset-0 flex items-center justify-center bg-[var(--surface-primary)]">
             <Loader2 className="h-5 w-5 animate-spin text-[var(--text-tertiary)]" />

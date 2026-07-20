@@ -73,23 +73,23 @@ interface BinaryContentResponse {
 
 const TYPE_CONFIG: Record<
   string,
-  { icon: React.ComponentType<{ className?: string }>; label: string }
+  { icon: React.ComponentType<{ className?: string }>; labelKey: string; format?: string }
 > = {
-  html: { icon: Globe, label: "Page · HTML" },
-  svg: { icon: Image, label: "Image · SVG" },
-  image: { icon: Image, label: "Image" },
-  audio: { icon: Music, label: "Audio" },
-  video: { icon: Video, label: "Video" },
-  markdown: { icon: FileText, label: "Document · MD" },
-  docx: { icon: FileText, label: "Document · Word" },
-  pdf: { icon: FileText, label: "Document · PDF" },
-  pptx: { icon: Presentation, label: "Presentation · PPTX" },
-  xlsx: { icon: FileSpreadsheet, label: "Spreadsheet · Excel" },
-  csv: { icon: FileSpreadsheet, label: "Spreadsheet · CSV" },
-  mermaid: { icon: Code, label: "Diagram · Mermaid" },
-  react: { icon: Code, label: "Component · TSX" },
-  code: { icon: Code, label: "Code" },
-  file: { icon: FileArchive, label: "File" },
+  html: { icon: Globe, labelKey: "artifactTypePage", format: "HTML" },
+  svg: { icon: Image, labelKey: "artifactTypeImage", format: "SVG" },
+  image: { icon: Image, labelKey: "artifactTypeImage" },
+  audio: { icon: Music, labelKey: "artifactTypeAudio" },
+  video: { icon: Video, labelKey: "artifactTypeVideo" },
+  markdown: { icon: FileText, labelKey: "artifactTypeDocument", format: "MD" },
+  docx: { icon: FileText, labelKey: "artifactTypeDocument", format: "Word" },
+  pdf: { icon: FileText, labelKey: "artifactTypeDocument", format: "PDF" },
+  pptx: { icon: Presentation, labelKey: "artifactTypePresentation", format: "PPTX" },
+  xlsx: { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet", format: "Excel" },
+  csv: { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet", format: "CSV" },
+  mermaid: { icon: Code, labelKey: "artifactTypeDiagram", format: "Mermaid" },
+  react: { icon: Code, labelKey: "artifactTypeComponent", format: "TSX" },
+  code: { icon: Code, labelKey: "artifactTypeCode" },
+  file: { icon: FileArchive, labelKey: "artifactTypeFile" },
 };
 
 function basename(path: string): string {
@@ -100,15 +100,23 @@ function titleWithoutExtension(name: string): string {
   return name.replace(/\.[^.]+$/, "");
 }
 
-function labelForFile(filePath: string, artifactType: ArtifactType | null): string {
+function labelForFile(
+  filePath: string,
+  artifactType: ArtifactType | null,
+  translate: (key: string) => string,
+): string {
   if (filePath.toLowerCase().endsWith(".ppt")) {
-    return "Presentation · PPT";
+    return `${translate("artifactTypePresentation")} · PPT`;
   }
   if (artifactType === "code") {
     const language = languageFromExtension(filePath);
-    return language ? `Code · ${language.charAt(0).toUpperCase() + language.slice(1)}` : "Code";
+    return language
+      ? `${translate("artifactTypeCode")} · ${language.charAt(0).toUpperCase() + language.slice(1)}`
+      : translate("artifactTypeCode");
   }
-  return TYPE_CONFIG[artifactType ?? "file"]?.label ?? TYPE_CONFIG.file.label;
+  const config = TYPE_CONFIG[artifactType ?? "file"] ?? TYPE_CONFIG.file;
+  const label = translate(config.labelKey);
+  return config.format ? `${label} · ${config.format}` : label;
 }
 
 function artifactPanelType(filePath: string): ArtifactType {
@@ -159,7 +167,7 @@ export function FileArtifactCard({
   const metadata = (data?.state.metadata ?? {}) as Record<string, unknown>;
   const metadataFilePath = typeof metadata.file_path === "string" ? metadata.file_path : undefined;
   const filePath = directFilePath || metadataFilePath || input.file_path || "";
-  const fileName = filePath ? basename(filePath) : "File";
+  const fileName = filePath ? basename(filePath) : t("artifactTypeFile");
   const metadataTitle = typeof metadata.title === "string" ? metadata.title : undefined;
   const title = directTitle || metadataTitle || input.title || titleWithoutExtension(fileName);
   const isRunning = data?.state.status === "running" || data?.state.status === "pending";
@@ -170,7 +178,9 @@ export function FileArtifactCard({
   const actionIds = getFileArtifactActionIds(nativeFileActionsAvailable);
 
   const artifactType = useMemo(() => (filePath ? artifactTypeFromExtension(filePath) : null), [filePath]);
-  const typeLabel = filePath ? labelForFile(filePath, artifactType) : "File";
+  const typeLabel = filePath
+    ? labelForFile(filePath, artifactType, (key) => t(key))
+    : t("artifactTypeFile");
   const config = TYPE_CONFIG[artifactType ?? "file"] ?? TYPE_CONFIG.file;
   const TypeIcon = config.icon;
 

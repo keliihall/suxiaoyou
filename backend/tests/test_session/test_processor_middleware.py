@@ -16,6 +16,7 @@ from app.session.middleware import (
     MiddlewareContext,
     ToolAction,
 )
+from app.session.middlewares.factory import build_middleware_chain
 from app.session.processor import SessionProcessor
 from app.streaming.events import AGENT_ERROR, TEXT_DELTA, TOOL_START
 from app.streaming.manager import GenerationJob
@@ -204,6 +205,62 @@ async def test_no_after_llm_override_preserves_immediate_streaming_tool_dispatch
 
     assert await processor._stream_llm_with_retry() is None
     assert order == ["dispatch", "provider-stream-continued"]
+
+
+@pytest.mark.asyncio
+async def test_default_chain_suppresses_tool_bound_narration(
+    monkeypatch,
+) -> None:
+    processor, job = _stream_processor(
+        build_middleware_chain(),
+        stream_id="tool-bound-narration",
+    )
+    processor._handle_tool_call_chunk = AsyncMock()
+    monkeypatch.setattr(processor_module, "record_security_event", AsyncMock())
+
+    async def fake_stream_llm(*_args, **_kwargs):
+        yield SimpleNamespace(
+            type="text-delta",
+            data={"text": "Let me recreate the environment and try again."},
+        )
+        yield SimpleNamespace(type="tool-call", data={
+            "id": "python-call",
+            "name": "code_execute",
+            "arguments": {"code": "print('ok')"},
+        })
+        yield SimpleNamespace(type="finish", data={"reason": "tool_calls"})
+
+    monkeypatch.setattr(processor_module, "stream_llm", fake_stream_llm)
+
+    assert await processor._stream_llm_with_retry() is None
+    assert processor._accumulated_text == ""
+    assert processor._mw_ctx is not None
+    assert processor._mw_ctx.extra["suppressed_tool_bound_text_chars"] == 46
+    assert not any(event.event == TEXT_DELTA for event in job.events)
+    processor._handle_tool_call_chunk.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_chain_keeps_tool_free_final_text(
+    monkeypatch,
+) -> None:
+    processor, job = _stream_processor(
+        build_middleware_chain(),
+        stream_id="tool-free-final",
+    )
+    monkeypatch.setattr(processor_module, "record_security_event", AsyncMock())
+
+    async def fake_stream_llm(*_args, **_kwargs):
+        yield SimpleNamespace(type="text-delta", data={"text": "文件已经生成。"})
+        yield SimpleNamespace(type="finish", data={"reason": "stop"})
+
+    monkeypatch.setattr(processor_module, "stream_llm", fake_stream_llm)
+
+    assert await processor._stream_llm_with_retry() is None
+    assert processor._accumulated_text == "文件已经生成。"
+    assert [event.data["text"] for event in job.events if event.event == TEXT_DELTA] == [
+        "文件已经生成。",
+    ]
 
 
 class _FailAfterLlm(Middleware):

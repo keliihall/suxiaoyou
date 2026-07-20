@@ -617,7 +617,8 @@ test("separates app version from stable and RC release identities", () => {
   assert.match(context, /1\.1\.0\)[\s\S]*?EVIDENCE_CONTRACT="v1\.1"[\s\S]*?RELEASE_PROFILE="unsigned-degraded"/);
   assert.match(context, /tagged releases require a reviewed evidence contract/);
   assert.match(context, /RELEASE_CHANNEL="stable"[\s\S]*?IS_STABLE="false"[\s\S]*?MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"/);
-  assert.match(context, /unsigned-degraded v1\.1 release uses the exact v\$APP_VERSION tag/);
+  assert.doesNotMatch(context, /unsigned-degraded v1\.1 release uses the exact/);
+  assert.match(context, /RELEASE_PROFILE" == "unsigned-degraded"[\s\S]*?MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"/);
   assert.match(context, /release_profile=\$RELEASE_PROFILE/);
   assert.match(context, /evidence_contract=\$EVIDENCE_CONTRACT/);
   assert.doesNotMatch(validate, /Block v1\.1 tags/);
@@ -1873,7 +1874,7 @@ test("native bundle verification rejects half-open v1.1 gate graphs", () => {
   assert.match(bundleVerifier, /status\.missing_dependencies\.length === 0/);
 });
 
-test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
+test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded public prereleases", () => {
   const validate = job("validate-release");
   const context = step(validate, "Resolve and validate release context");
   assert.match(
@@ -1926,6 +1927,39 @@ test("publishes exact v1.1.0 as an unsigned-degraded public prerelease", () => {
     "macos_artifact_profile=UNSIGNED-DEGRADED",
   ]) {
     assert.match(resolvedOutput, new RegExp(`^${output}$`, "mu"));
+  }
+
+  const rcOutputDirectory = mkdtempSync(
+    join(tmpdir(), "suxiaoyou-release-workflow-rc-"),
+  );
+  try {
+    const githubOutput = join(rcOutputDirectory, "github-output");
+    const resolved = spawnSync("bash", ["-c", contextScript], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_REF: "refs/tags/v1.1.0-rc.2",
+        GITHUB_REF_NAME: "v1.1.0-rc.2",
+        GITHUB_OUTPUT: githubOutput,
+      },
+    });
+    assert.equal(resolved.status, 0, resolved.stderr);
+    const output = readFileSync(githubOutput, "utf8");
+    for (const expected of [
+      "app_version=1.1.0",
+      "release_version=1.1.0-rc.2",
+      "release_channel=prerelease",
+      "release_profile=unsigned-degraded",
+      "evidence_contract=v1.1",
+      "is_stable=false",
+      "macos_artifact_profile=UNSIGNED-DEGRADED",
+    ]) {
+      assert.match(output, new RegExp(`^${expected}$`, "mu"));
+    }
+  } finally {
+    rmSync(rcOutputDirectory, { recursive: true, force: true });
   }
 
   const preflight = step(

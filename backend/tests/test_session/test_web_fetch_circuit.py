@@ -1,4 +1,4 @@
-"""Focused coverage for the response-scoped web_fetch policy circuit."""
+"""Focused coverage for response-scoped tool failure circuits."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +13,7 @@ from app.session.loop_detection import (
     WEB_SEARCH_LIMIT_MSG,
     LoopCheckResult,
     LoopDetector,
+    TOOL_FAILURE_LIMIT,
     loop_detector,
     web_fetch_circuit_scope,
 )
@@ -20,6 +21,38 @@ from app.session.processor import SessionProcessor
 from app.streaming.events import TOOL_ERROR, TOOL_START
 from app.streaming.manager import GenerationJob
 from app.tool.base import ToolResult
+
+
+def test_repeated_tool_failures_open_response_scoped_circuit() -> None:
+    detector = LoopDetector(warn_threshold=10, hard_limit=20)
+    scope = "session:stream"
+
+    for index in range(TOOL_FAILURE_LIMIT):
+        detector.record_tool_result(
+            scope,
+            "office",
+            success=False,
+            error=f"failure {index}",
+        )
+
+    assert detector.is_tool_failure_circuit_open(scope, "OFFICE")
+    assert detector.blocked_tools(scope) == {"office"}
+    assert not detector.is_tool_failure_circuit_open("session:other", "office")
+
+
+def test_tool_failure_circuit_resets_after_success_and_session_reset() -> None:
+    detector = LoopDetector(warn_threshold=10, hard_limit=20)
+    scope = "session:stream"
+
+    for _ in range(TOOL_FAILURE_LIMIT):
+        detector.record_tool_result(scope, "bash", success=False, error="failed")
+    detector.record_tool_result(scope, "bash", success=True)
+    assert not detector.is_tool_failure_circuit_open(scope, "bash")
+
+    for _ in range(TOOL_FAILURE_LIMIT):
+        detector.record_tool_result(scope, "office", success=False, error="failed")
+    detector.reset("session")
+    assert detector.blocked_tools(scope) == set()
 
 
 def _policy_error() -> str:
@@ -147,6 +180,18 @@ def test_custom_web_search_allows_five_then_blocks_sixth_per_stream() -> None:
     ] == [True, True, True, True, True]
     assert detector.admit_custom_web_search(first_scope) is False
     assert detector.admit_custom_web_search(next_scope) is True
+
+
+def test_web_search_failure_circuit_opens_after_one_failed_retry() -> None:
+    detector = LoopDetector(warn_threshold=10, hard_limit=20)
+    scope = web_fetch_circuit_scope("session-a", "stream-a")
+
+    detector.record_tool_result(scope, "web_search", success=False)
+    assert detector.is_tool_failure_circuit_open(scope, "web_search") is False
+
+    detector.record_tool_result(scope, "web_search", success=False)
+    assert detector.is_tool_failure_circuit_open(scope, "web_search") is True
+    assert detector.blocked_tools(scope) == {"web_search"}
 
 
 @pytest.mark.asyncio

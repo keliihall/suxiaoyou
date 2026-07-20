@@ -129,6 +129,14 @@ const PROCESS_TRANSLATORS: Array<[RegExp, string]> = [
   [/^Let me inspect the implementation\.?$/i, "正在检查实现细节。"],
   [/^Let me load the (.+?) skill first.*$/i, "正在加载相关技能。"],
   [/^The user wants me to .+$/i, "正在确认用户需求和交付目标。"],
+  [
+    /^The (?:venv|virtual environment) .+$/i,
+    "正在核对 Python 执行环境，并改用可持久化的内置运行时。",
+  ],
+  [
+    /^Good,\s*(?:all )?(?:required )?packages .+$/i,
+    "所需组件已就绪，继续生成并验证文件。",
+  ],
   [/^Now I have the skills loaded\..*$/i, "技能已加载，开始规划具体步骤。"],
   [/^Actually,\s*let me plan this out:?$/i, "先整理执行计划："],
   [/^Let me start by:?$/i, "先从以下步骤开始："],

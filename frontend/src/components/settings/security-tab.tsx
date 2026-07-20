@@ -631,7 +631,7 @@ export function SecurityTab() {
                 <div className="min-w-0">
                   <p className="truncate text-xs font-medium text-[var(--text-primary)]">{feature.label}</p>
                   <p className="mt-0.5 text-[10px] text-[var(--text-tertiary)]">
-                    {feature.beta ? "Beta" : "GA"} · {feature.ready ? t("securityRuntimeReady") : feature.released ? t("securityRuntimePending") : t("securityClosed")}
+                    {feature.beta ? t("securityStatusTesting") : t("securityStatusAvailable")} · {feature.ready ? t("securityRuntimeReady") : feature.released ? t("securityRuntimePending") : t("securityClosed")}
                   </p>
                 </div>
                 <BinaryStatus active={feature.ready} activeLabel={t("securityExposed")} inactiveLabel={feature.released ? t("securityRuntimePending") : t("securityClosed")} warning={feature.beta || (feature.released && !feature.ready)} />
@@ -947,7 +947,7 @@ export function SecurityTab() {
                     {t("securityProjectHooksDesc")}
                   </p>
                 </div>
-                <Badge variant="outline">GA</Badge>
+                <Badge variant="outline">{t("securityStatusAvailable")}</Badge>
               </div>
 
               {!taskSessionId ? (

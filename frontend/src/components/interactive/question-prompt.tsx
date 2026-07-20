@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { HelpCircle, Send, ChevronDown, ChevronUp } from "lucide-react";
+import { HelpCircle, Send, ChevronDown, ChevronUp, RefreshCw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -49,6 +49,23 @@ function normalizeLegacyOptions(raw: unknown): LegacyOption[] {
   return normalized;
 }
 
+function normalizeQuestionItems(raw: unknown): QuestionItem[] {
+  if (!Array.isArray(raw)) return [];
+  const normalized: QuestionItem[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.question !== "string" || !candidate.question.trim()) return [];
+    if (typeof candidate.header !== "string" || !candidate.header.trim()) return [];
+    normalized.push({
+      ...(candidate as unknown as QuestionItem),
+      question: candidate.question.trim(),
+      header: candidate.header.trim(),
+    });
+  }
+  return normalized;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Legacy single-question UI                                          */
 /* ------------------------------------------------------------------ */
@@ -64,10 +81,8 @@ function LegacyQuestionPrompt({
   const [answer, setAnswer] = useState("");
   const isMobile = isRemoteMode();
 
-  const questionText =
-    (question.arguments?.question as string) ||
-    (question.arguments?.questions as string) ||
-    t("agentQuestion");
+  const rawQuestionText = question.arguments?.question ?? question.arguments?.questions;
+  const questionText = typeof rawQuestionText === "string" ? rawQuestionText.trim() : "";
 
   const options = normalizeLegacyOptions(question.arguments?.options);
 
@@ -89,11 +104,23 @@ function LegacyQuestionPrompt({
                 </h3>
                 <div className={`${isMobile ? "text-base" : "text-sm"} text-[var(--text-secondary)] mt-1 prose prose-sm prose-invert max-w-none [&>p]:m-0`}>
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {questionText}
+                    {questionText || t("agentQuestionMissing")}
                   </ReactMarkdown>
                 </div>
               </div>
 
+              {!questionText ? (
+                <Button
+                  size={isMobile ? "default" : "sm"}
+                  variant="outline"
+                  className="gap-1.5"
+                  onClick={() => onRespond(t("agentQuestionRetryAnswer"))}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {t("agentQuestionRequestAgain")}
+                </Button>
+              ) : (
+                <>
               {options.length > 0 && (
                 <div className="space-y-2">
                   {options.map((opt, i) => (
@@ -137,6 +164,8 @@ function LegacyQuestionPrompt({
                   {t("submit")}
                 </Button>
               </div>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -253,14 +282,14 @@ function MultiQuestionPrompt({
             <div className="flex items-center gap-2">
               <HelpCircle className="h-5 w-5 text-[var(--brand-primary)]" />
               <span className="text-base font-semibold text-[var(--text-primary)]">
-                {questions.length} questions
+                {t("questionMultiCount", { count: questions.length })}
               </span>
             </div>
             <button
               onClick={() => onRespond({ __cancelled__: "true" })}
               className="px-3 py-1.5 text-sm text-[var(--text-tertiary)] active:text-[var(--text-primary)]"
             >
-              Cancel
+              {t("cancel")}
             </button>
           </div>
 
@@ -419,7 +448,7 @@ function MultiQuestionPrompt({
             <button
               onClick={() => onRespond({ __cancelled__: "true" })}
               className="ml-auto px-3 py-2 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors"
-              aria-label="Close"
+              aria-label={t("cancel")}
             >
               &times;
             </button>
@@ -635,8 +664,8 @@ function OtherOption({
 export function QuestionPrompt({ question, onRespond, onRecover, onStop }: QuestionPromptProps) {
   const responseState = question.responseState ?? "idle";
   const rawQuestions = question.arguments?.questions;
-  const isMultiMode =
-    Array.isArray(rawQuestions) && rawQuestions.length > 0;
+  const normalizedQuestions = normalizeQuestionItems(rawQuestions);
+  const isMultiMode = normalizedQuestions.length > 0;
 
   return (
     <>
@@ -652,7 +681,7 @@ export function QuestionPrompt({ question, onRespond, onRecover, onStop }: Quest
       <div className={responseState === "idle" ? "contents" : "hidden"}>
         {isMultiMode ? (
           <MultiQuestionPrompt
-            questions={rawQuestions as QuestionItem[]}
+            questions={normalizedQuestions}
             onRespond={onRespond}
           />
         ) : (

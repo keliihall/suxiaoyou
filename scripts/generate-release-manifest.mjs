@@ -56,16 +56,19 @@ export function releaseIdentityFromVersion(version) {
 }
 
 export function resolveReleaseProfile(version, requestedProfile) {
-  const { channel } = releaseIdentityFromVersion(version);
+  const { appVersion, channel } = releaseIdentityFromVersion(version);
   const defaultProfile =
-    version === "1.1.0"
+    appVersion === "1.1.0"
       ? RELEASE_PROFILES.UNSIGNED_DEGRADED
       : channel === "stable"
         ? RELEASE_PROFILES.OFFICIAL
         : RELEASE_PROFILES.RC_ADHOC;
   const profile = String(requestedProfile ?? "").trim() || defaultProfile;
-  const expectedChannel =
-    profile === RELEASE_PROFILES.RC_ADHOC ? "prerelease" : "stable";
+  const expectedChannel = profile === RELEASE_PROFILES.RC_ADHOC
+    ? "prerelease"
+    : profile === RELEASE_PROFILES.OFFICIAL
+      ? "stable"
+      : channel;
   if (!Object.values(RELEASE_PROFILES).includes(profile)) {
     throw new Error(
       `unsupported release profile ${JSON.stringify(profile)}; expected official, rc-adhoc, or unsigned-degraded`,
@@ -78,15 +81,15 @@ export function resolveReleaseProfile(version, requestedProfile) {
   }
   if (
     profile === RELEASE_PROFILES.UNSIGNED_DEGRADED &&
-    version !== "1.1.0"
+    appVersion !== "1.1.0"
   ) {
     throw new Error(
-      `release profile ${profile} is defined only for v1.1.0, got v${version}`,
+      `release profile ${profile} is defined only for v1.1.0 release line tags, got v${version}`,
     );
   }
-  if (version === "1.1.0" && profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
+  if (appVersion === "1.1.0" && profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
     throw new Error(
-      "v1.1.0 is defined by the unsigned-degraded release contract",
+      "v1.1.0 release line tags are defined by the unsigned-degraded release contract",
     );
   }
   return profile;

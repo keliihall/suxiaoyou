@@ -24,20 +24,20 @@ import type { ArtifactType } from "@/types/artifact";
 
 const ARTIFACT_TYPE_CONFIG: Record<
   string,
-  { icon: React.ComponentType<{ className?: string }>; label: string }
+  { icon: React.ComponentType<{ className?: string }>; labelKey: string; format?: string }
 > = {
-  react:    { icon: LayoutDashboard, label: "Component \u00b7 TSX" },
-  html:     { icon: Globe,           label: "Page \u00b7 HTML" },
-  svg:      { icon: Image,           label: "Image \u00b7 SVG" },
-  image:    { icon: Image,           label: "Image" },
-  code:     { icon: Code,            label: "Code" },
-  markdown: { icon: FileText,        label: "Document \u00b7 MD" },
-  mermaid:  { icon: GitBranch,       label: "Diagram \u00b7 Mermaid" },
-  docx:     { icon: FileText,        label: "Document \u00b7 Word" },
-  xlsx:     { icon: FileSpreadsheet, label: "Spreadsheet \u00b7 Excel" },
-  pdf:      { icon: FileText,        label: "Document \u00b7 PDF" },
-  pptx:     { icon: Presentation,    label: "Presentation \u00b7 PPTX" },
-  csv:      { icon: FileSpreadsheet, label: "Spreadsheet \u00b7 CSV" },
+  react:    { icon: LayoutDashboard, labelKey: "artifactTypeComponent", format: "TSX" },
+  html:     { icon: Globe,           labelKey: "artifactTypePage", format: "HTML" },
+  svg:      { icon: Image,           labelKey: "artifactTypeImage", format: "SVG" },
+  image:    { icon: Image,           labelKey: "artifactTypeImage" },
+  code:     { icon: Code,            labelKey: "artifactTypeCode" },
+  markdown: { icon: FileText,        labelKey: "artifactTypeDocument", format: "MD" },
+  mermaid:  { icon: GitBranch,       labelKey: "artifactTypeDiagram", format: "Mermaid" },
+  docx:     { icon: FileText,        labelKey: "artifactTypeDocument", format: "Word" },
+  xlsx:     { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet", format: "Excel" },
+  pdf:      { icon: FileText,        labelKey: "artifactTypeDocument", format: "PDF" },
+  pptx:     { icon: Presentation,    labelKey: "artifactTypePresentation", format: "PPTX" },
+  csv:      { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet", format: "CSV" },
 };
 
 interface ArtifactCardProps {
@@ -64,12 +64,19 @@ export function ArtifactCard({ data }: ArtifactCardProps) {
 
   const config = ARTIFACT_TYPE_CONFIG[artifactType] ?? ARTIFACT_TYPE_CONFIG.code;
   const TypeIcon = config.icon;
+  const localizedBaseLabel = config.format
+    ? `${t(config.labelKey)} \u00b7 ${config.format}`
+    : t(config.labelKey);
   const baseLabel =
     artifactType === "code" && language
-      ? `Code \u00b7 ${language.charAt(0).toUpperCase() + language.slice(1)}`
-      : config.label;
+      ? `${t("artifactTypeCode")} \u00b7 ${language.charAt(0).toUpperCase() + language.slice(1)}`
+      : localizedBaseLabel;
   const commandSuffix =
-    command === "update" ? " (edited)" : command === "rewrite" ? " (rewritten)" : "";
+    command === "update"
+      ? ` (${t("artifactEdited")})`
+      : command === "rewrite"
+        ? ` (${t("artifactRewritten")})`
+        : "";
   const typeLabel = baseLabel + commandSuffix;
 
   const handleClick = useCallback(() => {

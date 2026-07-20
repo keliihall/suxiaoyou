@@ -22,6 +22,7 @@ import { verifyReleaseManifest } from "./verify-release-manifest.mjs";
 const TAG = "v0.8.0";
 const RC_TAG = "v0.8.0-rc.1";
 const UNSIGNED_DEGRADED_TAG = "v1.1.0";
+const UNSIGNED_DEGRADED_RC_TAG = "v1.1.0-rc.2";
 const COMMIT = "a".repeat(40);
 const REPOSITORY = "keliihall/suxiaoyou";
 
@@ -165,6 +166,27 @@ test("generates and verifies the explicit v1.1 unsigned-degraded profile", (t) =
       "suyo-1.1.0-linux-arm64-UNSIGNED-DEGRADED.deb",
       "suyo-1.1.0-linux-aarch64-UNSIGNED-DEGRADED.rpm",
     ],
+  );
+});
+
+test("generates and verifies a synchronized v1.1 unsigned-degraded RC profile", (t) => {
+  const data = fixture(t, UNSIGNED_DEGRADED_RC_TAG, "unsigned-degraded");
+  const verified = verifyReleaseManifest({
+    ...data,
+    expectedTag: UNSIGNED_DEGRADED_RC_TAG,
+    expectedCommit: COMMIT,
+    expectedRepository: REPOSITORY,
+  });
+
+  assert.equal(verified.version, "1.1.0-rc.2");
+  assert.equal(verified.appVersion, "1.1.0");
+  assert.equal(verified.channel, "prerelease");
+  assert.equal(verified.releaseProfile, "unsigned-degraded");
+  assert.ok(
+    verified.assets.every((asset) =>
+      asset.name.includes("1.1.0-rc.2") &&
+      asset.name.includes("-UNSIGNED-DEGRADED."),
+    ),
   );
 });
 
@@ -331,7 +353,7 @@ test("rejects unsupported prerelease tag shapes", () => {
   }
 });
 
-test("unsigned-degraded is restricted to the stable v1.1.0 contract", () => {
+test("unsigned-degraded is restricted to the v1.1.0 release line", () => {
   assert.deepEqual(
     expectedReleaseAssets("1.1.0"),
     expectedReleaseAssets("1.1.0", "unsigned-degraded"),
@@ -344,8 +366,8 @@ test("unsigned-degraded is restricted to the stable v1.1.0 contract", () => {
     () => expectedReleaseAssets("1.0.0", "unsigned-degraded"),
     /defined only for v1\.1\.0/u,
   );
-  assert.throws(
-    () => expectedReleaseAssets("1.1.0-rc.1", "unsigned-degraded"),
-    /requires a stable tag/u,
+  assert.deepEqual(
+    expectedReleaseAssets("1.1.0-rc.1", "unsigned-degraded"),
+    expectedReleaseAssets("1.1.0-rc.1"),
   );
 });

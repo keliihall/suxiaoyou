@@ -2466,10 +2466,16 @@ class OfficeTool(ToolDefinition):
                 coordinator = _office_precommit_coordinator(ctx)
                 if coordinator is None:
                     raise OfficeInputError(
-                        "Office v1.1 权威预提交验证运行时不可用，原文件未更改。",
+                        (
+                            "Office v1.1 权威预提交验证运行时不可用，原文件未更改。"
+                            "不要重试 office；请改用 code_execute 中内置的 "
+                            "python-docx、openpyxl 或 python-pptx。"
+                        ),
                         (
                             "The authoritative Office v1.1 precommit validator is "
-                            "unavailable; the original file was not changed."
+                            "unavailable; the original file was not changed. Do not "
+                            "retry office; use the bundled python-docx, openpyxl, or "
+                            "python-pptx package through code_execute."
                         ),
                     )
                 request = _office_precommit_request(

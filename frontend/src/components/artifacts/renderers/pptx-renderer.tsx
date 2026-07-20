@@ -950,7 +950,7 @@ export function PptxRenderer({ filePath }: PptxRendererProps) {
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1">
         {preview.slides.length > 1 && (
           <aside className="w-28 shrink-0 overflow-y-auto border-r border-[var(--border-default)] bg-[var(--surface-secondary)] p-2" aria-label={t("pptxThumbnails")}>
             <div className="flex flex-col gap-2">

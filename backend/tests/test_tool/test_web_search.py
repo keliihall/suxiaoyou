@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-from app.tool.builtin.web_search import WebSearchTool, _parse_ddg_results
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from app.tool.builtin import web_search as web_search_module
+from app.tool.builtin.web_search import (
+    WebSearchTool,
+    _parse_bing_rss_results,
+    _parse_ddg_results,
+    _system_search_proxy,
+)
 
 
 class TestParseDdgResults:
@@ -47,6 +58,136 @@ class TestParseDdgResults:
         '''
         results = _parse_ddg_results(html, 10)
         assert results[0]["title"] == "Bold Title"
+
+
+class TestParseBingRssResults:
+    def test_extracts_and_cleans_results(self):
+        xml = """
+        <rss><channel><item>
+          <title>Example &amp; Result</title>
+          <link>https://example.com/article</link>
+          <description>&lt;b&gt;Useful&lt;/b&gt; snippet</description>
+        </item></channel></rss>
+        """
+        results = _parse_bing_rss_results(xml, 10)
+        assert results == [{
+            "title": "Example & Result",
+            "url": "https://example.com/article",
+            "snippet": "Useful snippet",
+        }]
+
+    def test_respects_max_results(self):
+        xml = """
+        <rss><channel>
+          <item><title>One</title><link>https://one.example</link></item>
+          <item><title>Two</title><link>https://two.example</link></item>
+        </channel></rss>
+        """
+        assert len(_parse_bing_rss_results(xml, 1)) == 1
+
+
+def test_search_uses_valid_macos_system_https_proxy(monkeypatch):
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(web_search_module, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(
+        web_search_module,
+        "getproxies",
+        lambda: {"https": "127.0.0.1:7897"},
+    )
+
+    assert _system_search_proxy("https://html.duckduckgo.com") == (
+        "http://127.0.0.1:7897"
+    )
+
+
+def test_search_rejects_unsupported_system_proxy_scheme(monkeypatch):
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(web_search_module, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(
+        web_search_module,
+        "getproxies",
+        lambda: {"https": "socks5://127.0.0.1:7897"},
+    )
+
+    assert _system_search_proxy("https://html.duckduckgo.com") is None
+
+
+class _FakeSearchResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _FakeSearchClient:
+    def __init__(self, *, bing_fails: bool = False, **_kwargs) -> None:
+        self._bing_fails = bing_fails
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+    async def get(self, url: str, **_kwargs):
+        if "duckduckgo" in url:
+            raise httpx.ConnectTimeout("duckduckgo timeout")
+        if self._bing_fails:
+            raise httpx.ConnectError("bing failed")
+        return _FakeSearchResponse("""
+            <rss><channel><item>
+              <title>Fallback result</title>
+              <link>https://fallback.example</link>
+              <description>Available through Bing RSS</description>
+            </item></channel></rss>
+        """)
+
+
+@pytest.mark.asyncio
+async def test_ddg_timeout_falls_back_to_bing_rss(monkeypatch):
+    monkeypatch.setattr(web_search_module.httpx, "AsyncClient", _FakeSearchClient)
+    ctx = SimpleNamespace(language="zh", tr=lambda zh, _en: zh)
+
+    result = await WebSearchTool()._search_ddg("test query", 10, ctx)
+
+    assert result.success
+    assert "Fallback result" in result.output
+    assert result.metadata["provider"] == "bing_rss"
+    assert result.metadata["fallback_from"] == "duckduckgo"
+
+
+@pytest.mark.asyncio
+async def test_all_public_backends_report_actionable_failure(monkeypatch):
+    class FailingSearchClient(_FakeSearchClient):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(bing_fails=True, **kwargs)
+
+    monkeypatch.setattr(web_search_module.httpx, "AsyncClient", FailingSearchClient)
+    ctx = SimpleNamespace(language="zh", tr=lambda zh, _en: zh)
+
+    result = await WebSearchTool()._search_ddg("test query", 10, ctx)
+
+    assert not result.success
+    assert "DuckDuckGo 连接超时" in result.error
+    assert "Bing 连接失败" in result.error
+    assert result.metadata["error_code"] == "search_backends_unavailable"
 
 
 class TestFormatSerperResults:

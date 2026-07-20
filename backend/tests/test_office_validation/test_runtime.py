@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.datastructures import State
 
 from app import release_features
 from app.office_rendering import RendererDescriptor
@@ -107,3 +108,15 @@ def test_runtime_installs_one_shared_attested_composition(
     uninstall_office_v11_runtime(state)
     assert get_office_precommit_coordinator() is None
     assert not hasattr(state, "office_v11_runtime")
+
+
+def test_runtime_uninstall_is_idempotent_for_starlette_state() -> None:
+    state = State()
+
+    uninstall_office_v11_runtime(state)
+    uninstall_office_v11_runtime(state)
+
+    assert not hasattr(state, "office_v11_runtime")
+    assert not hasattr(state, "office_precommit_coordinator")
+    assert not hasattr(state, "office_preview_service")
+    assert not hasattr(state, "office_user_template_service")

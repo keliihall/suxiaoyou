@@ -158,6 +158,21 @@ def test_create_refuses_dirty_source_repository(
     assert not (service.managed_root / "dirty-source").exists()
 
 
+def test_non_git_directory_is_an_ineligible_repository_not_a_git_failure(
+    tmp_path: Path,
+) -> None:
+    ordinary_folder = tmp_path / "普通文件夹"
+    ordinary_folder.mkdir()
+    service = _service(tmp_path)
+
+    with pytest.raises(RepositoryValidationError, match="not a Git worktree"):
+        service.validate_source(ordinary_folder)
+    with pytest.raises(RepositoryValidationError, match="not a Git worktree"):
+        service.create(ordinary_folder, workspace_instance_id="not-a-repository")
+
+    assert not (service.managed_root / "not-a-repository").exists()
+
+
 def test_remove_refuses_dirty_managed_worktree(
     tmp_path: Path, repository: Path
 ) -> None:

@@ -412,6 +412,18 @@ class WorktreeService:
                     pass
                 raise
 
+    def validate_source(self, repository: str | os.PathLike[str]) -> None:
+        """Check whether a source can safely create a managed worktree.
+
+        This is the path-free, read-only preflight used by the local runtime
+        controls.  It intentionally applies the same clean-repository policy
+        as ``create`` so the UI never advertises an operation that the service
+        will immediately refuse.
+        """
+
+        self._prepare()
+        self._validate_repository(repository, require_clean=True)
+
     def bind(
         self,
         workspace_instance_id: str,
@@ -717,11 +729,17 @@ class WorktreeService:
         root = _canonical_directory(repository, label="repository")
         if _is_link_or_junction(Path(repository).expanduser()):
             raise RepositoryValidationError("Repository root must not be a symlink")
-        inside = self._run_git(
+        inside_result = self._run_git(
             "rev-parse worktree",
             ["-C", os.fspath(root), "rev-parse", "--is-inside-work-tree"],
-        ).stdout_text()
-        if inside != "true":
+            # A normal directory is a valid preflight input, not a broken Git
+            # process. Git reports that case with 128 (and some versions use
+            # 1), which must become a repository eligibility failure rather
+            # than a misleading supervised-command 502.
+            allowed_returncodes=(0, 1, 128),
+        )
+        inside = inside_result.stdout_text()
+        if inside_result.returncode != 0 or inside != "true":
             raise RepositoryValidationError("Repository is not a Git worktree")
         top = self._run_git(
             "rev-parse top-level",

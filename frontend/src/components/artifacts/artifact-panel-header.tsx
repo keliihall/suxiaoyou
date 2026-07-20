@@ -1,29 +1,31 @@
 "use client";
 
 import { X, ChevronLeft, ChevronRight, Code, FileText, FileSpreadsheet, Globe, Image, LayoutDashboard, GitBranch, Music, Presentation, Video } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { useArtifactStore } from "@/stores/artifact-store";
 import type { ArtifactType } from "@/types/artifact";
 
-const TYPE_CONFIG: Record<ArtifactType, { icon: React.ComponentType<{ className?: string }>; label: string }> = {
-  react: { icon: LayoutDashboard, label: "React" },
-  html: { icon: Globe, label: "HTML" },
-  svg: { icon: Image, label: "SVG" },
-  image: { icon: Image, label: "Image" },
-  audio: { icon: Music, label: "Audio" },
-  video: { icon: Video, label: "Video" },
-  code: { icon: Code, label: "Code" },
-  markdown: { icon: FileText, label: "Markdown" },
-  mermaid: { icon: GitBranch, label: "Diagram" },
-  docx: { icon: FileText, label: "Document" },
-  xlsx: { icon: FileSpreadsheet, label: "Spreadsheet" },
-  pdf: { icon: FileText, label: "PDF" },
-  pptx: { icon: Presentation, label: "Slides" },
-  csv: { icon: FileSpreadsheet, label: "CSV" },
-  "file-preview": { icon: FileText, label: "File" },
+const TYPE_CONFIG: Record<ArtifactType, { icon: React.ComponentType<{ className?: string }>; labelKey: string }> = {
+  react: { icon: LayoutDashboard, labelKey: "artifactTypeComponent" },
+  html: { icon: Globe, labelKey: "artifactTypePage" },
+  svg: { icon: Image, labelKey: "artifactTypeImage" },
+  image: { icon: Image, labelKey: "artifactTypeImage" },
+  audio: { icon: Music, labelKey: "artifactTypeAudio" },
+  video: { icon: Video, labelKey: "artifactTypeVideo" },
+  code: { icon: Code, labelKey: "artifactTypeCode" },
+  markdown: { icon: FileText, labelKey: "artifactTypeDocument" },
+  mermaid: { icon: GitBranch, labelKey: "artifactTypeDiagram" },
+  docx: { icon: FileText, labelKey: "artifactTypeDocument" },
+  xlsx: { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet" },
+  pdf: { icon: FileText, labelKey: "artifactTypeDocument" },
+  pptx: { icon: Presentation, labelKey: "artifactTypePresentation" },
+  csv: { icon: FileSpreadsheet, labelKey: "artifactTypeSpreadsheet" },
+  "file-preview": { icon: FileText, labelKey: "artifactTypeFile" },
 };
 
 export function ArtifactPanelHeader() {
+  const { t } = useTranslation("chat");
   const activeArtifact = useArtifactStore((s) => s.activeArtifact);
   const artifacts = useArtifactStore((s) => s.artifacts);
   const activeIndex = useArtifactStore((s) => s.activeIndex);
@@ -53,7 +55,7 @@ export function ArtifactPanelHeader() {
         {/* Type badge */}
         <span className="flex items-center gap-1 rounded-md bg-[var(--surface-tertiary)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-secondary)] uppercase tracking-wide shrink-0">
           <TypeIcon className="h-3 w-3" />
-          {config.label}
+          {t(config.labelKey)}
         </span>
         {/* Title */}
         <span className="text-sm font-medium text-[var(--text-primary)] truncate">
@@ -72,7 +74,7 @@ export function ArtifactPanelHeader() {
               <ChevronLeft className="h-3 w-3" />
             </Button>
             <span className="text-[10px] text-[var(--text-tertiary)] tabular-nums whitespace-nowrap">
-              v{activeVersionIndex + 1} of {versions.length}
+              {t("artifactVersionPosition", { current: activeVersionIndex + 1, total: versions.length })}
             </span>
             <Button
               variant="ghost"

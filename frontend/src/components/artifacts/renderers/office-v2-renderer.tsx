@@ -241,12 +241,12 @@ export function OfficeV2Renderer({ filePath, fallback }: OfficeV2RendererProps) 
 
   if (useFallback) {
     return (
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden">
         <div className="flex items-center gap-2 border-b border-amber-300/50 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
           <span>{t("officeApproximatePreviewNotice")}</span>
         </div>
-        <div className="flex min-h-0 flex-1 flex-col">{fallback}</div>
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{fallback}</div>
       </div>
     );
   }
@@ -281,7 +281,7 @@ export function OfficeV2Renderer({ filePath, fallback }: OfficeV2RendererProps) 
   const pageCount = binding.manifest.pages.length;
   const authoritative = binding.preview_quality === "authoritative";
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-[var(--surface-secondary)]">
+    <div className="flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden bg-[var(--surface-secondary)]">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-default)] bg-[var(--surface-primary)] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 text-[11px]">
           <span className={authoritative ? "font-semibold text-emerald-600" : "font-semibold text-amber-600"}>

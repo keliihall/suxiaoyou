@@ -30,6 +30,7 @@ from app.runtime.rewind import (
     RewindResult,
 )
 from app.security.audit import AuditPersistenceError
+from app.session.managed_workspace import managed_workspace_for_session
 from app.tool.workspace import APP_PRIVATE_DIR_ENV
 from app.validation_agent.contracts import (
     ValidationBudgetReport,
@@ -205,8 +206,10 @@ async def test_runtime_context_resolves_only_server_owned_workspace_identity(
     app_client,
     session_factory,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     released_runtime_gates: None,
 ) -> None:
+    monkeypatch.setenv(APP_PRIVATE_DIR_ENV, str(tmp_path / "private"))
     workspace = tmp_path / "workspace"
     await _seed_workspace(
         session_factory,
@@ -226,6 +229,8 @@ async def test_runtime_context_resolves_only_server_owned_workspace_identity(
         "workspace_kind": "direct",
         "checkpoint_rewind_released": True,
         "managed_worktrees_released": True,
+        "worktree_creation_available": False,
+        "worktree_creation_reason": "repository_not_supported",
         "external_side_effects_reverted": False,
     }
     assert response.headers["cache-control"] == "no-store"
@@ -242,6 +247,185 @@ async def test_runtime_context_resolves_only_server_owned_workspace_identity(
     )
     assert replaced.status_code == 404
     assert replaced.json()["code"] == "runtime_workspace_not_found"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="Git is required")
+async def test_runtime_context_reports_clean_git_creation_eligibility(
+    app_client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    released_runtime_gates: None,
+) -> None:
+    monkeypatch.setenv(APP_PRIVATE_DIR_ENV, str(tmp_path / "private"))
+    workspace = tmp_path / "git-workspace"
+    await _seed_workspace(
+        session_factory,
+        workspace,
+        session_id="git-context-session",
+        workspace_instance_id="git-context-workspace",
+    )
+    _git(workspace, "init")
+    _git(workspace, "config", "user.email", "runtime@example.invalid")
+    _git(workspace, "config", "user.name", "Runtime API")
+    (workspace / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(workspace, "add", "tracked.txt")
+    _git(workspace, "commit", "-m", "base")
+
+    response = await app_client.get(
+        "/api/runtime/context",
+        params={"session_id": "git-context-session"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["worktree_creation_available"] is True
+    assert response.json()["worktree_creation_reason"] is None
+
+
+async def test_non_git_worktree_create_is_a_clear_eligibility_failure(
+    app_client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    released_runtime_gates: None,
+) -> None:
+    monkeypatch.setenv(APP_PRIVATE_DIR_ENV, str(tmp_path / "private"))
+    workspace = tmp_path / "ordinary-folder"
+    await _seed_workspace(
+        session_factory,
+        workspace,
+        session_id="ordinary-session",
+        workspace_instance_id="ordinary-workspace",
+    )
+
+    response = await app_client.post(
+        "/api/runtime/worktrees/create-bind",
+        json={"session_id": "ordinary-session"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "worktree_repository_invalid"
+    assert "supervised Git" not in response.json()["detail"]
+
+
+async def test_runtime_context_resolves_folderless_managed_workspace(
+    app_client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    released_runtime_gates: None,
+) -> None:
+    monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(tmp_path / "managed"))
+    root = managed_workspace_for_session("managed-session")
+    info = root.stat()
+    async with session_factory() as db:
+        async with db.begin():
+            db.add(
+                Session(
+                    id="managed-session",
+                    directory=".",
+                    title="managed-session",
+                    version="1.1.0",
+                )
+            )
+            db.add(
+                WorkspaceInstance(
+                    id="managed-workspace",
+                    created_by_session_id="managed-session",
+                    kind="managed",
+                    root_path=str(root.resolve()),
+                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    status="active",
+                    details={"managed": True},
+                )
+            )
+
+    response = await app_client.get(
+        "/api/runtime/context",
+        params={"session_id": "managed-session"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_instance_id"] == "managed-workspace"
+    assert response.json()["workspace_kind"] == "managed"
+    assert response.json()["worktree_creation_available"] is False
+    assert response.json()["worktree_creation_reason"] == "workspace_not_supported"
+
+
+async def test_runtime_context_hides_uninitialized_folderless_workspace(
+    app_client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    released_runtime_gates: None,
+) -> None:
+    monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(tmp_path / "managed"))
+    async with session_factory() as db:
+        async with db.begin():
+            db.add(
+                Session(
+                    id="empty-session",
+                    directory=".",
+                    title="empty-session",
+                    version="1.1.0",
+                )
+            )
+
+    response = await app_client.get(
+        "/api/runtime/context",
+        params={"session_id": "empty-session"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "runtime_workspace_not_found"
+
+
+async def test_runtime_context_rejects_foreign_managed_workspace(
+    app_client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    released_runtime_gates: None,
+) -> None:
+    monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(tmp_path / "managed"))
+    root = managed_workspace_for_session("managed-session")
+    info = root.stat()
+    async with session_factory() as db:
+        async with db.begin():
+            db.add_all([
+                Session(
+                    id="managed-session",
+                    directory=".",
+                    title="managed-session",
+                    version="1.1.0",
+                ),
+                Session(
+                    id="foreign-session",
+                    directory=".",
+                    title="foreign-session",
+                    version="1.1.0",
+                ),
+            ])
+            await db.flush()
+            db.add(
+                WorkspaceInstance(
+                    id="foreign-workspace",
+                    created_by_session_id="foreign-session",
+                    kind="managed",
+                    root_path=str(root.resolve()),
+                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    status="active",
+                    details={"managed": True},
+                )
+            )
+
+    response = await app_client.get(
+        "/api/runtime/context",
+        params={"session_id": "managed-session"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "runtime_workspace_not_found"
 
 
 async def test_runtime_routes_require_local_session_and_trusted_origin(

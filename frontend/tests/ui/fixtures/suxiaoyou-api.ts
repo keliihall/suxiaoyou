@@ -1333,6 +1333,10 @@ async function makeDocxBase64() {
         "<w:body>" +
         "<w:p><w:r><w:t>苏小有 DOCX workflow</w:t></w:r></w:p>" +
         "<w:p><w:r><w:t>Real Office preview path exercised by GUI preflight.</w:t></w:r></w:p>" +
+        '<w:p><w:r><w:br w:type="page"/></w:r></w:p>' +
+        "<w:p><w:r><w:t>Word preview page two</w:t></w:r></w:p>" +
+        '<w:p><w:r><w:br w:type="page"/></w:r></w:p>' +
+        "<w:p><w:r><w:t>Word preview page three</w:t></w:r></w:p>" +
         '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>' +
         "</w:body>" +
         "</w:document>",
@@ -1806,6 +1810,20 @@ function sseStreamBody(streamId: string) {
             { label: "Beta", description: "Include preview releases" },
           ],
         },
+      }),
+      "",
+    ].join("\n");
+  }
+
+  if (streamId === "stream-empty-question") {
+    return [
+      sseEvent(1, "text-delta", {
+        text: "I need one detail before continuing.",
+      }),
+      sseEvent(2, "question", {
+        call_id: "question-empty-payload",
+        tool: "question",
+        arguments: {},
       }),
       "",
     ].join("\n");
@@ -2625,6 +2643,7 @@ export async function mock苏小有Api(
       if (/auto compress/i.test(text)) streamId = "stream-auto-compact";
       if (/permission/i.test(text)) streamId = "stream-permission";
       if (/question/i.test(text)) streamId = "stream-question";
+      if (/empty question/i.test(text)) streamId = "stream-empty-question";
       if (/plan review/i.test(text)) streamId = "stream-plan";
       if (/slow stream|stop generation/i.test(text)) streamId = "stream-slow";
       return fulfillJson(route, {

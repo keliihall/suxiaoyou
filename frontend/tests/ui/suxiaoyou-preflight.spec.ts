@@ -930,6 +930,25 @@ test.describe("苏小有 UI preflight", () => {
     await expect(page.getByText(/Confirmed|Answer submitted/)).toBeVisible();
   });
 
+  test("desktop interactive path: malformed empty question offers recovery instead of a blank input", async ({
+    page,
+  }) => {
+    await openNewChat(page);
+    await sendPrompt(page, "Trigger empty question flow for release setup");
+
+    await expect(page.getByText("Agent is asking")).toBeVisible();
+    await expect(
+      page.getByText("The question did not load correctly. Ask the AI to restate it before answering."),
+    ).toBeVisible();
+    await expect(page.getByPlaceholder("Type your answer...")).toHaveCount(0);
+
+    const respond = page.waitForResponse(
+      (res) => res.url().includes("/api/chat/respond") && res.status() === 200,
+    );
+    await page.getByRole("button", { name: "Ask the AI to restate it" }).click();
+    await respond;
+  });
+
   test("desktop interactive path: plan review is accepted through the GUI", async ({
     page,
   }) => {

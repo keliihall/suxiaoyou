@@ -169,3 +169,21 @@ test("acknowledgement labels are localized", () => {
   assert.equal(zh.interactionRecoveryNeeded, "确认已提交，但暂未收到继续执行状态。");
   assert.equal(en.interactionRecoverAction, "Reconnect");
 });
+
+test("empty question events show a recovery action instead of a blank answer field", () => {
+  const question = readFileSync(
+    "src/components/interactive/question-prompt.tsx",
+    "utf8",
+  );
+  const registry = readFileSync("src/lib/session-stream-registry.ts", "utf8");
+  const zh = JSON.parse(readFileSync("src/i18n/locales/zh/chat.json", "utf8"));
+  const en = JSON.parse(readFileSync("src/i18n/locales/en/chat.json", "utf8"));
+
+  assert.match(question, /questionText \|\| t\("agentQuestionMissing"\)/);
+  assert.match(question, /onRespond\(t\("agentQuestionRetryAnswer"\)\)/);
+  assert.match(question, /normalizeQuestionItems/);
+  assert.doesNotMatch(question, /\|\|\s*t\("agentQuestion"\)/);
+  assert.match(registry, /const questionArguments:[\s\S]*data\.question/);
+  assert.equal(zh.agentQuestionRequestAgain, "让 AI 重新提问");
+  assert.ok(en.agentQuestionMissing);
+});

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.datastructures import State
 
 from app import release_features
 from app.office_rendering import (
@@ -139,6 +140,29 @@ async def test_closed_preview_gate_clears_stale_state_without_loading_renderer(
     assert result.authoring_installed is False
     assert not hasattr(state, "office_preview_service")
     assert get_office_precommit_coordinator() is None
+
+
+@pytest.mark.asyncio
+async def test_closed_preview_gate_initializes_with_empty_starlette_state(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_features, "V11_OFFICE_V2_RELEASED", False)
+    state = State()
+
+    result = await initialize_office_v11_runtime(
+        state,
+        session_factory,
+        data_dir=tmp_path,
+    )
+
+    assert result.preview_installed is False
+    assert result.authoring_installed is False
+    assert not hasattr(state, "office_v11_runtime")
+    assert not hasattr(state, "office_precommit_coordinator")
+    assert not hasattr(state, "office_preview_service")
+    assert not hasattr(state, "office_user_template_service")
 
 
 @pytest.mark.asyncio

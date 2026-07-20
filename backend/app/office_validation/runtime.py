@@ -180,7 +180,7 @@ def uninstall_office_v11_runtime(app_state: object) -> None:
     ):
         try:
             delattr(app_state, name)
-        except AttributeError:
+        except (AttributeError, KeyError):
             pass
 
 

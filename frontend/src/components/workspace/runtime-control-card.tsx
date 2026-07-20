@@ -6,7 +6,7 @@ import { BadgeCheck, ChevronDown, GitBranch, History, Loader2, RotateCcw, Shield
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { ApiError, api, apiErrorMessage } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -17,6 +17,8 @@ interface RuntimeContext {
   workspace_kind: string;
   checkpoint_rewind_released: boolean;
   managed_worktrees_released: boolean;
+  worktree_creation_available?: boolean;
+  worktree_creation_reason?: string | null;
   external_side_effects_reverted: false;
 }
 
@@ -100,6 +102,82 @@ function validationBadge(
   return status === "not_requested" ? null : validationBadges[status];
 }
 
+function workspaceKindLabelKey(kind: string): string {
+  switch (kind) {
+    case "direct":
+      return "runtimeWorkspaceKindDirect";
+    case "git_worktree":
+      return "runtimeWorkspaceKindIsolated";
+    case "managed":
+      return "runtimeWorkspaceKindManaged";
+    default:
+      return "runtimeWorkspaceKindUnknown";
+  }
+}
+
+function checkpointStateLabelKey(state: string): string {
+  switch (state) {
+    case "prepared":
+      return "runtimeCheckpointStatePrepared";
+    case "committing":
+      return "runtimeCheckpointStateSaving";
+    case "finalized":
+      return "runtimeCheckpointStateSaved";
+    case "rewinding":
+      return "runtimeCheckpointStateRestoring";
+    case "rewound":
+      return "runtimeCheckpointStateRestored";
+    case "failed":
+      return "runtimeCheckpointStateFailed";
+    default:
+      return "runtimeCheckpointStateUnknown";
+  }
+}
+
+function worktreeUnavailableLabelKey(reason: string | null | undefined): string {
+  switch (reason) {
+    case "repository_not_supported":
+      return "runtimeWorktreeUnavailableRepository";
+    case "workspace_dirty":
+      return "runtimeWorktreeUnavailableDirty";
+    case "git_unavailable":
+      return "runtimeWorktreeUnavailableGit";
+    case "git_timeout":
+      return "runtimeWorktreeUnavailableTimeout";
+    case "storage_unavailable":
+      return "runtimeWorktreeUnavailableStorage";
+    case "workspace_not_supported":
+      return "runtimeWorktreeUnavailableWorkspace";
+    default:
+      return "runtimeWorktreeUnavailableGeneric";
+  }
+}
+
+function worktreeErrorLabelKey(code: string | null): string {
+  switch (code) {
+    case "worktree_repository_invalid":
+      return "runtimeWorktreeErrorRepository";
+    case "worktree_dirty":
+      return "runtimeWorktreeErrorDirty";
+    case "worktree_active":
+      return "runtimeWorktreeErrorActive";
+    case "worktree_ownership_mismatch":
+    case "worktree_path_invalid":
+    case "worktree_conflict":
+      return "runtimeWorktreeErrorConflict";
+    case "git_unavailable":
+      return "runtimeWorktreeErrorGitUnavailable";
+    case "git_timeout":
+      return "runtimeWorktreeErrorTimeout";
+    case "git_failed":
+      return "runtimeWorktreeErrorGitFailed";
+    case "runtime_audit_unavailable":
+      return "runtimeWorktreeErrorAudit";
+    default:
+      return "runtimeWorktreeFailed";
+  }
+}
+
 export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) {
   const { t } = useTranslation("chat");
   const [context, setContext] = useState<RuntimeContext | null>(null);
@@ -131,7 +209,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
               { signal },
             )
           : Promise.resolve({ checkpoints: [], external_side_effects_are_reverted: false as const }),
-        nextContext.managed_worktrees_released && nextContext.workspace_kind === "worktree"
+        nextContext.managed_worktrees_released && nextContext.workspace_kind === "git_worktree"
           ? api.get<WorktreeInspection>(
               API.RUNTIME.WORKTREE_INSPECT(sessionId, nextContext.workspace_instance_id),
               { signal },
@@ -144,9 +222,17 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
       if (signal?.aborted) return;
       setContext(null);
       const code = runtimeErrorCode(error);
-      const gateClosed = code === "v11_runtime_not_available";
-      setUnavailable(gateClosed);
-      setFailure(gateClosed ? null : apiErrorMessage(error, t("runtimeLoadFailed")));
+      const optionalSurfaceUnavailable =
+        code === "v11_runtime_not_available" ||
+        code === "runtime_workspace_not_found";
+      setUnavailable(optionalSurfaceUnavailable);
+      setFailure(
+        optionalSurfaceUnavailable
+          ? null
+          : code === "runtime_workspace_provenance_mismatch"
+            ? t("runtimeWorkspaceIdentityMismatch")
+            : t("runtimeLoadFailed"),
+      );
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
@@ -174,8 +260,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
       };
       const preview = await api.post<RewindPreview>(API.RUNTIME.REWIND_PREVIEW, request);
       if (!preview.can_execute) {
-        const reason = [...preview.blockers, ...preview.conflicts.map((item) => item.reason)].join(" · ");
-        toast.error(reason || t("runtimeRewindBlocked"));
+        toast.error(t("runtimeRewindBlocked"));
         return;
       }
       const warning = preview.external_side_effects.length > 0
@@ -185,8 +270,8 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
       await api.post(API.RUNTIME.REWIND_EXECUTE, request);
       toast.success(t("runtimeRewindComplete"));
       reloadApplicationState();
-    } catch (error) {
-      toast.error(apiErrorMessage(error, t("runtimeRewindFailed")));
+    } catch {
+      toast.error(t("runtimeRewindFailed"));
     } finally {
       setBusyAction(null);
     }
@@ -201,7 +286,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
       toast.success(t("runtimeWorktreeCreated"));
       reloadApplicationState();
     } catch (error) {
-      toast.error(apiErrorMessage(error, t("runtimeWorktreeFailed")));
+      toast.error(t(worktreeErrorLabelKey(runtimeErrorCode(error))));
     } finally {
       setBusyAction(null);
     }
@@ -219,7 +304,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
       toast.success(t("runtimeWorktreeReleased"));
       reloadApplicationState();
     } catch (error) {
-      toast.error(apiErrorMessage(error, t("runtimeWorktreeFailed")));
+      toast.error(t(worktreeErrorLabelKey(runtimeErrorCode(error))));
     } finally {
       setBusyAction(null);
     }
@@ -263,33 +348,15 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
         {!collapsed && context && (
           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
             <div className="space-y-3 border-t border-white/6 px-4 py-3">
-              <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-tertiary)]">
+              <div className="rounded-xl border border-emerald-500/15 bg-emerald-500/[0.04] px-3 py-2.5">
+                <p className="flex items-center gap-2 text-xs font-medium text-[var(--text-primary)]">
                 <BadgeCheck className="h-3.5 w-3.5 text-emerald-500" />
-                <span>{t("runtimeWorkspaceVerified")}</span>
-                <span className="rounded-full border border-white/10 px-2 py-0.5">{context.workspace_kind}</span>
-                {context.managed_worktrees_released && <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-500">Beta</span>}
+                  {t("runtimeProtectionReady")}
+                </p>
+                <p className="mt-1 pl-5.5 text-[11px] text-[var(--text-tertiary)]">
+                  {t("runtimeProtectionReadyDesc")}
+                </p>
               </div>
-
-              {context.managed_worktrees_released && (
-                <div className="rounded-xl border border-white/8 p-2.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]"><GitBranch className="h-3.5 w-3.5" />{t("runtimeWorktreeTitle")}</p>
-                      <p className="mt-1 truncate text-[11px] text-[var(--text-tertiary)]">
-                        {context.workspace_kind === "worktree"
-                          ? t("runtimeWorktreeActive", { state: worktree?.state ?? "active" })
-                          : t("runtimeWorktreeDirect")}
-                      </p>
-                    </div>
-                    {context.workspace_kind === "worktree" ? (
-                      <Button size="sm" variant="outline" disabled={busyAction !== null || worktree?.clean === false} onClick={() => void releaseWorktree()}>{busyAction === "worktree-release" ? <Loader2 className="animate-spin" /> : null}{t("runtimeWorktreeRelease")}</Button>
-                    ) : (
-                      <Button size="sm" variant="outline" disabled={busyAction !== null} onClick={() => void createWorktree()}>{busyAction === "worktree-create" ? <Loader2 className="animate-spin" /> : null}{t("runtimeWorktreeCreate")}</Button>
-                    )}
-                  </div>
-                  {worktree?.clean === false && <p className="mt-2 text-[11px] text-amber-500">{t("runtimeWorktreeDirty")}</p>}
-                </div>
-              )}
 
               {checkpoints.length === 0 ? (
                 <p className="py-2 text-[12px] text-[var(--text-quaternary)]">{t("runtimeNoCheckpoints")}</p>
@@ -301,7 +368,7 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
                         <div className="min-w-0">
                           <p className="text-xs font-medium text-[var(--text-primary)]">{t("runtimeCheckpointLabel", { sequence: checkpoint.sequence })}</p>
                           <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                            <p className="font-mono text-[10px] text-[var(--text-tertiary)]">{checkpoint.checkpoint_id.slice(0, 12)} · {checkpoint.state}</p>
+                            <p className="text-[10px] text-[var(--text-tertiary)]">{t(checkpointStateLabelKey(checkpoint.state))}</p>
                             {(() => {
                               const badge = validationBadge(checkpoint.validation.overall_status);
                               return badge ? (
@@ -327,6 +394,88 @@ export function RuntimeControlCard({ sessionId }: { sessionId: string | null }) 
                   ))}
                 </ul>
               )}
+
+              <details className="group rounded-xl border border-white/8">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-[var(--text-primary)]">{t("runtimeAdvancedOptions")}</p>
+                    <p className="mt-0.5 text-[10px] text-[var(--text-tertiary)]">{t("runtimeAdvancedOptionsDesc")}</p>
+                  </div>
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)] transition-transform group-open:rotate-180" />
+                </summary>
+                <div className="space-y-2.5 border-t border-white/6 px-3 py-3">
+                  {context.managed_worktrees_released && (
+                    <div className="rounded-xl border border-white/8 p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]">
+                            <GitBranch className="h-3.5 w-3.5" />
+                            {t("runtimeWorktreeTitle")}
+                            <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-normal text-amber-500">
+                              {t("runtimePreviewFeature")}
+                            </span>
+                          </p>
+                          <p className="mt-1 text-[11px] text-[var(--text-tertiary)]">
+                            {context.workspace_kind === "git_worktree"
+                              ? t("runtimeWorktreeActive")
+                              : t("runtimeWorktreeDirect")}
+                          </p>
+                        </div>
+                        {context.workspace_kind === "git_worktree" ? (
+                          <Button size="sm" variant="outline" disabled={busyAction !== null || worktree?.clean === false} onClick={() => void releaseWorktree()}>
+                            {busyAction === "worktree-release" ? <Loader2 className="animate-spin" /> : null}
+                            {t("runtimeWorktreeRelease")}
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busyAction !== null || context.worktree_creation_available !== true}
+                            onClick={() => void createWorktree()}
+                          >
+                            {busyAction === "worktree-create" ? <Loader2 className="animate-spin" /> : null}
+                            {t("runtimeWorktreeCreate")}
+                          </Button>
+                        )}
+                      </div>
+                      {context.workspace_kind !== "git_worktree" && context.worktree_creation_available !== true && (
+                        <p className="mt-2 text-[11px] text-amber-500">
+                          {t(worktreeUnavailableLabelKey(context.worktree_creation_reason))}
+                        </p>
+                      )}
+                      {worktree?.clean === false && <p className="mt-2 text-[11px] text-amber-500">{t("runtimeWorktreeDirty")}</p>}
+                    </div>
+                  )}
+
+                  <details className="rounded-lg border border-white/8 px-2.5 py-2">
+                    <summary className="cursor-pointer list-none text-[11px] font-medium text-[var(--text-secondary)] [&::-webkit-details-marker]:hidden">
+                      {t("runtimeTechnicalDetails")}
+                    </summary>
+                    <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 text-[10px] text-[var(--text-tertiary)]">
+                      <dt>{t("runtimeTechnicalWorkspaceType")}</dt>
+                      <dd>{t(workspaceKindLabelKey(context.workspace_kind))}</dd>
+                      <dt>{t("runtimeTechnicalWorkspaceId")}</dt>
+                      <dd className="truncate font-mono" title={context.workspace_instance_id}>{context.workspace_instance_id.slice(0, 16)}</dd>
+                      {worktree?.branch && (
+                        <>
+                          <dt>{t("runtimeTechnicalBranch")}</dt>
+                          <dd className="truncate font-mono" title={worktree.branch}>{worktree.branch}</dd>
+                        </>
+                      )}
+                    </dl>
+                    {checkpoints.length > 0 && (
+                      <ul className="mt-2 space-y-1 border-t border-white/6 pt-2 text-[10px] text-[var(--text-tertiary)]">
+                        {checkpoints.slice(0, 20).map((checkpoint) => (
+                          <li key={`technical-${checkpoint.checkpoint_id}`} className="flex items-center justify-between gap-2">
+                            <span>{t("runtimeCheckpointLabel", { sequence: checkpoint.sequence })}</span>
+                            <span className="truncate font-mono" title={checkpoint.checkpoint_id}>{checkpoint.checkpoint_id.slice(0, 12)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </details>
+                </div>
+              </details>
             </div>
           </motion.div>
         )}

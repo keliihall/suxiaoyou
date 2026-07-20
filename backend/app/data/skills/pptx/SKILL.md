@@ -10,13 +10,19 @@ Use the built-in `office` tool for its supported declarative operations. Use
 `python-pptx` for advanced slide creation and edits, and start from a user
 template whenever brand fidelity matters.
 
-For title/bullet slides, text boxes, tables, workspace-local images, slide
-appends, and exact text replacements, use the built-in `office` tool first. It
-is available on macOS, Windows, and Linux, stays inside the selected workspace,
-versions an existing destination, and validates a temporary PPTX before atomic
-installation. The restricted tool does not accept external templates; use the
-advanced workflow only when the requested fidelity cannot be expressed by its
-declarative schema.
+If the built-in `office` tool reports that its authoritative Office v1.1
+runtime is unavailable, do not retry it. Continue with `code_execute` and the
+bundled `python-pptx` package, then reopen the presentation in the same call to
+verify slide count, titles, and media relationships. Do not create a virtual
+environment or install packages.
+
+When its runtime is available, use the built-in `office` tool first for
+title/bullet slides, text boxes, tables, workspace-local images, slide appends,
+and exact text replacements. It is available on macOS, Windows, and Linux,
+stays inside the selected workspace, versions an existing destination, and
+validates a temporary PPTX before atomic installation. The restricted tool
+does not accept external templates; use the advanced workflow only when the
+requested fidelity cannot be expressed by its declarative schema.
 
 ## Procedure
 
