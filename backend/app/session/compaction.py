@@ -8,7 +8,7 @@ Phase 1 (prune): Mark old tool outputs as truncated
 Phase 2 (summarize): LLM generates structured summary
   Goal → Instructions → Discoveries → Accomplished → Relevant files
 
-Auto-continue: Append "Continue if you have next steps"
+Auto-continue: Append a process-language-aware continuation instruction
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.agent import AgentRegistry
+from app.i18n import localize, synthetic_process_instruction
 from app.models.message import Message, Part
 from app.provider.registry import ProviderRegistry
 from app.session.manager import create_message, create_part
@@ -124,6 +125,12 @@ async def run_compaction(
         return result
 
     if result.summary:
+        summary_header = localize(job.language, "[上下文摘要]", "[Context Summary]")
+        continuation = synthetic_process_instruction(
+            job.language,
+            "如有后续步骤，请继续执行。",
+            "Continue if you have next steps.",
+        )
         # Auto compaction keeps the injected summary invisible so it doesn't
         # interrupt the normal assistant flow. Manual compaction should surface
         # the summary so the user can see what the AI actually compressed.
@@ -146,9 +153,12 @@ async def run_compaction(
                     data={
                         "type": "text",
                         "text": (
-                            f"[Context Summary]\n\n{result.summary}"
+                            f"{summary_header}\n\n{result.summary}"
                             if visible_summary
-                            else f"[Context Summary]\n\n{result.summary}\n\nContinue if you have next steps."
+                            else (
+                                f"{summary_header}\n\n{result.summary}\n\n"
+                                f"{continuation}"
+                            )
                         ),
                         "synthetic": True,
                     },
@@ -277,6 +287,7 @@ async def _phase2_summarize(
                 session_id,
                 provider_id=provider.id,
                 model_id=model_id,
+                process_language=job.language,
             )
 
     if not llm_messages:
@@ -325,11 +336,17 @@ async def _phase2_summarize(
 
     # Ask compaction agent to summarize
     try:
-        summary_prompt = (
-            "This is a system-generated compaction instruction, not a genuine user "
-            "message. Summarize the conversation above and follow the format in "
-            "your system prompt. Preserve the language of the latest genuine "
-            "user-authored message for continuation handoff."
+        summary_prompt = synthetic_process_instruction(
+            job.language,
+            (
+                "总结上方对话并遵循 system prompt 指定的格式。为了后续交接，摘要语言"
+                "必须保持为最近一条真实用户消息的语言。"
+            ),
+            (
+                "Summarize the conversation above and follow the format in your "
+                "system prompt. Preserve the language of the latest genuine "
+                "user-authored message for continuation handoff."
+            ),
         )
         messages = llm_messages + [{"role": "user", "content": summary_prompt}]
 

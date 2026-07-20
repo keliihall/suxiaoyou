@@ -19,7 +19,8 @@ class Message(Base, TimestampMixin):
 
     The `data` JSON column stores the full MessageInfo payload:
     - User: {role, model:{provider_id, model_id}, agent, system?, variant?, tools?}
-    - Assistant: {role, parent_id, agent, model_id, provider_id, cost, tokens, error?, finish?}
+    - Assistant: {role, parent_id, agent, model_id, provider_id,
+      process_language, turn_run_id, goal_run_id?, cost, tokens, error?, finish?}
     """
 
     __tablename__ = "message"

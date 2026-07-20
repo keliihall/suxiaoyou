@@ -45,8 +45,10 @@ class PromptRequest(BaseModel):
     reasoning: bool | None = None  # Explicitly enable/disable reasoning
     workspace: str | None = None  # Workspace directory restriction
     format: dict[str, Any] | None = None  # e.g. {"type": "json_schema", "json_schema": {...}}
-    # Request-scoped backend display language.  API handlers derive this from
-    # Accept-Language; exclude it from wire serialization/idempotency hashes.
+    # Request-scoped process/UI language. API handlers derive this from
+    # Accept-Language; it drives backend-generated activity and the model's
+    # explicit visible-process language contract, never final-response language.
+    # Exclude it from wire serialization/idempotency hashes.
     language: Literal["zh", "en"] = Field("zh", exclude=True)
 
     @property

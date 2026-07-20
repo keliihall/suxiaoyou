@@ -376,10 +376,12 @@ async def test_autonomous_resume_returns_new_stream_and_is_idempotent(
                 ])
             )
     started: list[str] = []
+    resumed_requests: list[tuple[str, str]] = []
 
     async def fake_runner(job, request, *, initial_run_id, **kwargs):
-        del request, kwargs
+        del kwargs
         started.append(initial_run_id)
+        resumed_requests.append((request.language, request.text))
         job.complete()
 
     monkeypatch.setattr(goals_api, "run_goal_generation", fake_runner)
@@ -390,6 +392,7 @@ async def test_autonomous_resume_returns_new_stream_and_is_idempotent(
     response = await app_client.post(
         "/api/sessions/resume-goal-session/goal/resume",
         json=body,
+        headers={"Accept-Language": "en-US"},
     )
     assert response.status_code == 200
     payload = response.json()
@@ -401,6 +404,9 @@ async def test_autonomous_resume_returns_new_stream_and_is_idempotent(
 
     await asyncio.sleep(0)
     assert started == [payload["run"]["id"]]
+    assert resumed_requests[0][0] == "en"
+    assert "Continue working autonomously" in resumed_requests[0][1]
+    assert "not a genuine user message" in resumed_requests[0][1]
     replay = await app_client.post(
         "/api/sessions/resume-goal-session/goal/resume",
         json=body,

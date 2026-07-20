@@ -45,6 +45,24 @@ def test_goal_prompt_tolerates_legacy_or_partial_snapshots() -> None:
     assert "<definition-of-done>" not in rendered
 
 
+def test_goal_prompt_uses_current_process_language() -> None:
+    rendered = render_goal_prompt(
+        {
+            "objective": "完成领导汇报材料",
+            "status": "active",
+            "run_state": "running",
+            "revision": 3,
+        },
+        language="zh",
+    )
+
+    assert "# 持久目标" in rendered
+    assert "目标执行协议" in rendered
+    assert "所有用户可见思考和过程说明必须继续使用简体中文" in rendered
+    assert "# Persistent Goal" not in rendered
+    assert "Goal protocol:" not in rendered
+
+
 def test_goal_section_is_dynamic_and_never_provider_cached() -> None:
     section = render_goal_prompt({"objective": "Finish", "revision": 2})
     prompt = assemble(
@@ -58,6 +76,7 @@ def test_goal_section_is_dynamic_and_never_provider_cached() -> None:
         now=datetime(2026, 7, 15, 9, 0),
         tz_name="Asia/Shanghai",
         platform_name="Darwin",
+        process_language="en",
         goal_section=section,
     )
 

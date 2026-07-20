@@ -12,7 +12,7 @@ use tauri::{
     AppHandle, Emitter, Manager,
 };
 
-use crate::menu::UiLanguage;
+use crate::{menu::UiLanguage, window_lifecycle};
 
 const TRAY_ID: &str = "main-tray";
 const RECENT_PREFIX: &str = "recent:";
@@ -50,8 +50,7 @@ pub fn create_tray(app: &AppHandle, language: UiLanguage) -> tauri::Result<()> {
             } = event
             {
                 if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                    window_lifecycle::show_and_focus(&window);
                 }
             }
         })
@@ -214,9 +213,7 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
     };
 
     let show_and_focus = || {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        window_lifecycle::show_and_focus(&window);
     };
 
     if let Some(session_id) = event_id.strip_prefix(RECENT_PREFIX) {

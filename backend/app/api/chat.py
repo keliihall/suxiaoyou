@@ -72,7 +72,7 @@ from app.streaming.events import (
 )
 from app.streaming.manager import GenerationJob, SessionBusyError, StreamManager
 from app.utils.id import generate_ulid
-from app.i18n import request_language
+from app.i18n import Language, localize, request_language
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +122,19 @@ def _create_session_job(
         ) from exc
 
 
-def _unsupported_images_error() -> HTTPException:
+def _unsupported_images_error(language: Language | str = "en") -> HTTPException:
     return HTTPException(
         status_code=400,
         detail={
             "code": MODEL_DOES_NOT_SUPPORT_IMAGES,
-            "message": "The selected model does not support images. Choose a vision model and try again.",
+            "message": localize(
+                language,
+                "当前所选模型不支持图片，请选择支持视觉的模型后重试。",
+                (
+                    "The selected model does not support images. "
+                    "Choose a vision model and try again."
+                ),
+            ),
         },
     )
 
@@ -138,21 +145,22 @@ def _ensure_image_attachments_supported(
     provider_registry,
     model_id: str | None,
     provider_id: str | None,
+    language: Language | str = "en",
 ) -> None:
     """Reject image inputs unless the requested model is explicitly vision-capable."""
     if not has_image_attachments(attachments):
         return
 
     if not model_id:
-        raise _unsupported_images_error()
+        raise _unsupported_images_error(language)
 
     resolved = provider_registry.resolve_model(model_id, provider_id)
     if resolved is None:
-        raise _unsupported_images_error()
+        raise _unsupported_images_error(language)
 
     _provider, model_info = resolved
     if not model_info.capabilities.vision:
-        raise _unsupported_images_error()
+        raise _unsupported_images_error(language)
 
 
 def _on_task_done(task: asyncio.Task[None], *, job: GenerationJob) -> None:
@@ -405,6 +413,7 @@ async def start_prompt(
             provider_registry=provider_registry,
             model_id=body.model,
             provider_id=body.provider_id,
+            language=body.language,
         )
 
         if body.session_id and release_features.GOALS_RELEASED:
@@ -695,6 +704,7 @@ async def edit_and_resend(
         provider_registry=provider_registry,
         model_id=body.model,
         provider_id=body.provider_id,
+        language=body.language,
     )
 
     stream_id = generate_ulid()

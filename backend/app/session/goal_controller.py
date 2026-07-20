@@ -18,6 +18,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
+from app.i18n import Language, synthetic_process_instruction
 from app.models.goal_run import GoalRun
 from app.models.message import Part
 from app.models.session import Session
@@ -106,6 +107,10 @@ async def _execute_goal_slice(
 
     from app.session.prompt import SessionPrompt
 
+    # The active job locale is the hand-off source for the next autonomous
+    # slice. A queued input can therefore switch process language without the
+    # following auto continuation reverting to the Goal's creation locale.
+    job.language = request.language
     event_start_id = job._event_counter
     started = time.monotonic()
     wait_started = job.goal_wait_seconds
@@ -387,6 +392,7 @@ def _request_for_continuation(
     session: Session,
     *,
     item: Any | None,
+    process_language: Language | None = None,
 ) -> PromptRequest:
     from app.agent.permission import (
         intersect_permission_rulesets,
@@ -422,12 +428,31 @@ def _request_for_continuation(
 
     rules = serialize_permission_snapshot(ceiling)["rules"]
 
+    language = (
+        item.language
+        if item is not None
+        else process_language or goal.language
+    )
     request = PromptRequest(
         session_id=goal.session_id,
         text=(
-            "Continue working autonomously toward the persistent Goal. "
-            "Verify the result and update the Goal only when its completion "
-            "contract is satisfied."
+            synthetic_process_instruction(
+                language,
+                (
+                    "继续自主推进持久目标。验证结果，并且仅在目标完成"
+                    "条件确实满足时更新目标状态。所有用户可见的思考、"
+                    "进度和状态说明必须使用简体中文；不得因历史思考、"
+                    "工具结果或系统协议中含有英文而切换语言。"
+                ),
+                (
+                    "Continue working autonomously toward the persistent Goal. "
+                    "Verify the result and update the Goal only when its "
+                    "completion contract is satisfied. Keep all user-visible "
+                    "reasoning, progress, and status narration in English; do "
+                    "not switch language because historical reasoning, tool "
+                    "results, or system protocols use another language."
+                ),
+            )
             if item is None
             else item.text
         ),
@@ -442,7 +467,7 @@ def _request_for_continuation(
         permission_rules=rules,
         reasoning=(goal.reasoning if item is None else item.reasoning),
         workspace=(session.directory if session.directory != "." else None),
-        language=(goal.language if item is None else item.language),
+        language=language,
     )
     request._permission_rules_authoritative = True
     request._trusted_permission_ruleset = ceiling
@@ -503,6 +528,7 @@ async def _reserve_next_run(
                     reservation.goal,
                     session,
                     item=item,
+                    process_language=job.language,
                 )
                 return NextGoalRun(
                     run_id=reservation.run.id,
@@ -899,6 +925,10 @@ async def run_goal_generation(
                             if failed_message and failure_kind == "usage_limited"
                             else "retryable_generation_error"
                             if failed_message and failure_kind == "retryable"
+                            else result.agent_error_code
+                            if failed_message
+                            and failure_kind == "terminal"
+                            and result.agent_error_code
                             else "generation_error"
                             if failed_message
                             else None

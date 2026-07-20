@@ -3992,9 +3992,13 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "suxiaoyou-desktop"
 version = "1.1.0"
 dependencies = [
+ "block2",
  "env_logger",
  "libc",
  "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "portpicker",
  "reqwest 0.12.28",
  "serde",

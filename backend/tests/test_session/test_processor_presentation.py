@@ -8,6 +8,7 @@ import pytest
 from app.session import processor as processor_module
 from app.session.middleware import MiddlewareContext
 from app.session.middlewares.factory import build_middleware_chain
+from app.session.manager import create_message, create_part, create_session, get_messages
 from app.session.processor import (
     SessionProcessor,
     _artifact_delivery_paths,
@@ -32,6 +33,17 @@ def test_presentation_reminder_for_code_execute_deliverables():
     assert "final_report.md" in reminder
     assert "final_summary.csv" in reminder
     assert "analyze_helper.py" not in reminder
+
+
+def test_presentation_reminder_follows_process_language():
+    reminder = _presentation_reminder(
+        "code_execute",
+        {"written_files": ["/workspace/suxiaoyou_written/final_report.md"]},
+        language="zh",
+    )
+
+    assert "检测到可能的最终交付文件" in reminder
+    assert "Potential final deliverable" not in reminder
 
 
 def test_presentation_reminder_for_shell_generated_audio():
@@ -207,11 +219,55 @@ async def test_todo_reminder_is_added_exactly_once_until_todo_state_changes():
         tool, {}, result, loop_result,
     )
 
-    assert first.count("<reminder>You have an active todo list.") == 1
-    assert "<reminder>You have an active todo list." not in unchanged
+    assert first.count("<reminder>当前仍有未完成的待办。") == 1
+    assert "<reminder>You have an active todo list." not in first
+    assert "<reminder>当前仍有未完成的待办。" not in unchanged
 
     todos[0]["status"] = "completed"
     changed = await next_processor._build_tool_persist_output(
         tool, {}, result, loop_result,
     )
-    assert changed.count("<reminder>You have an active todo list.") == 1
+    assert changed.count("<reminder>当前仍有未完成的待办。") == 1
+
+
+@pytest.mark.asyncio
+async def test_reasoning_flush_precedes_tool_part_in_reloaded_history(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        async with db.begin():
+            session = await create_session(db, title="Reasoning tool ordering")
+            message = await create_message(
+                db,
+                session_id=session.id,
+                data={"role": "assistant"},
+            )
+
+    job = GenerationJob("reasoning-order-stream", session.id)
+    prompt = SimpleNamespace(job=job, session_factory=session_factory)
+    processor = SessionProcessor(prompt, [], message.id)
+    processor._init_step_state()
+    processor._accumulated_reasoning = "先分析，再调用工具。"
+
+    await processor._persist_pending_reasoning()
+    async with session_factory() as db:
+        async with db.begin():
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={
+                    "type": "tool",
+                    "tool": "artifact",
+                    "call_id": "artifact-1",
+                    "state": {"status": "completed", "input": {}, "output": "完成"},
+                },
+            )
+
+    async with session_factory() as db:
+        messages = await get_messages(db, session.id)
+
+    assert [part.data["type"] for part in messages[0].parts] == [
+        "reasoning",
+        "tool",
+    ]

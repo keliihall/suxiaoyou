@@ -31,6 +31,11 @@ from app.agent.permission import (
     serialize_permission_snapshot,
     tightening_permission_ceiling,
 )
+from app.i18n import (
+    localize,
+    process_language_handoff,
+    synthetic_process_instruction,
+)
 from app.models.message import Message, Part
 from app.models.todo import Todo
 from app.provider.registry import ProviderRegistry
@@ -747,7 +752,9 @@ class SessionPrompt:
                 from app.memory.injection import build_workspace_memory_section
 
                 self.workspace_memory_section = await build_workspace_memory_section(
-                    self.session_factory, self.workspace
+                    self.session_factory,
+                    self.workspace,
+                    language=self.request.language,
                 )
             except Exception:
                 logger.debug("Workspace memory injection skipped", exc_info=True)
@@ -1684,6 +1691,15 @@ class SessionPrompt:
             # only after the durable input was applied successfully.
             self.job.language = item.language
             self.request.language = item.language
+            # Language-sensitive Goal/process sections are dynamic. Rebuild
+            # them immediately so a steer that switches UI language affects
+            # the very next model step rather than the next Goal run.
+            if getattr(self, "goal_snapshot", None) is not None:
+                self.goal_prompt_section = render_goal_prompt(
+                    self._goal_snapshot_payload(self.goal_snapshot),
+                    language=self.request.language,
+                )
+            self.system_prompt_parts = self._build_system_prompt_parts()
             self.job.publish(
                 SSEEvent(
                     INPUT_APPLIED,
@@ -1722,9 +1738,15 @@ class SessionPrompt:
             self.job.session_id,
         )
         await self._inject_system_message(
-            "[System: You have reached the maximum number of steps. "
-            "Stop using tools and provide a final summary of what you "
-            "have accomplished and any remaining work.]"
+            synthetic_process_instruction(
+                self.request.language,
+                "已达到最大执行步数。停止使用工具，并总结已完成事项和剩余工作。",
+                (
+                    "You have reached the maximum number of steps. Stop using "
+                    "tools and provide a final summary of what you accomplished "
+                    "and any remaining work."
+                ),
+            )
         )
         return False
 
@@ -1746,6 +1768,8 @@ class SessionPrompt:
                     self.job.session_id,
                     provider_id=provider_id,
                     model_id=self.model_id,
+                    process_language=self.request.language,
+                    turn_run_id=self.job.turn_run_id,
                 )
         llm_messages = _sanitize_llm_messages_for_request(
             llm_messages,
@@ -1755,13 +1779,20 @@ class SessionPrompt:
                 if self.model_info
                 else None
             ),
+            language=self.request.language,
         )
 
         # --- Zero-cost context compression (inspired by Claude Code) ---
         # Layer 1: Replace old tool outputs from specific tools with stubs
-        llm_messages = microcompact_messages(llm_messages)
+        llm_messages = microcompact_messages(
+            llm_messages,
+            language=self.request.language,
+        )
         # Layer 2: Enforce aggregate tool result size budget
-        llm_messages = apply_tool_result_budget(llm_messages)
+        llm_messages = apply_tool_result_budget(
+            llm_messages,
+            language=self.request.language,
+        )
 
         # Goal creation and autonomous continuations use an ephemeral user
         # instruction: it reaches the Provider but is never persisted as a
@@ -1780,6 +1811,17 @@ class SessionPrompt:
         llm_messages = await self.middleware_chain.run_before_llm_call(
             llm_messages, mw_ctx,
         )
+        # Internal sub-turns are the observed language-drift boundary for
+        # thinking models (notably DeepSeek). Tool results, agent switches,
+        # empty-output retries, and Goal substeps can all replace the genuine
+        # user message at the tail of the request. Add a fresh, ephemeral
+        # process-language guard on every internal step. It is never persisted
+        # and explicitly cannot determine final-response language.
+        if self.step > 1:
+            llm_messages.append({
+                "role": "user",
+                "content": process_language_handoff(self.request.language),
+            })
         return llm_messages, mw_ctx
 
     async def _create_assistant_message_shell(self) -> None:
@@ -1796,6 +1838,9 @@ class SessionPrompt:
                         "agent": self.agent.name,
                         "model_id": self.model_id,
                         "provider_id": self.provider.id,
+                        "process_language": self.request.language,
+                        "turn_run_id": self.job.turn_run_id,
+                        "goal_run_id": self.job.goal_run_id,
                     },
                 )
         self.assistant_msg_id = assistant_msg.id
@@ -1922,7 +1967,10 @@ class SessionPrompt:
                         collapse_msgs = await get_message_history_for_llm(
                             db, self.job.session_id
                         )
-                collapsed, tokens_saved = context_collapse(collapse_msgs)
+                collapsed, tokens_saved = context_collapse(
+                    collapse_msgs,
+                    language=self.request.language,
+                )
                 if tokens_saved > 0:
                     await _persist_context_collapse(
                         self.job.session_id,
@@ -2043,8 +2091,9 @@ class SessionPrompt:
             if t.get("status") in ("pending", "in_progress")
         ]
         if incomplete:
+            unnamed = localize(self.request.language, "未命名", "unnamed")
             todo_summary = "\n".join(
-                f"  - [{t.get('status', '?')}] {t.get('content', 'unnamed')}"
+                f"  - [{t.get('status', '?')}] {t.get('content', unnamed)}"
                 for t in incomplete[:10]
             )
             logger.info(
@@ -2052,10 +2101,20 @@ class SessionPrompt:
                 len(incomplete),
             )
             await self._inject_system_message(
-                "[System: Context was compacted. Your active todo list:\n"
-                f"{todo_summary}\n"
-                "Continue working on these tasks. Call the todo tool to "
-                "update status as you complete each one.]"
+                synthetic_process_instruction(
+                    self.request.language,
+                    (
+                        "上下文已压缩。当前未完成的待办如下：\n"
+                        f"{todo_summary}\n"
+                        "继续处理这些任务，并在完成时调用 todo 工具更新状态。"
+                    ),
+                    (
+                        "Context was compacted. Your active todo list:\n"
+                        f"{todo_summary}\n"
+                        "Continue working on these tasks. Call the todo tool to "
+                        "update status as you complete each one."
+                    ),
+                )
             )
         return False
 
@@ -2112,8 +2171,14 @@ class SessionPrompt:
                 len(self.request.attachments),
             )
             await self._inject_system_message(
-                "[System: You have access to tools. Please use them to "
-                "analyze the attached files and provide a thorough response.]"
+                synthetic_process_instruction(
+                    self.request.language,
+                    "你可以使用工具。请用工具分析附件，并给出完整答复。",
+                    (
+                        "You have access to tools. Use them to analyze the "
+                        "attached files and provide a thorough response."
+                    ),
+                )
             )
             return False
 
@@ -2124,8 +2189,9 @@ class SessionPrompt:
         ]
         if incomplete and self.continuation_attempts < _cfg().max_continuation_attempts:
             self.continuation_attempts += 1
+            unnamed = localize(self.request.language, "未命名", "unnamed")
             incomplete_names = ", ".join(
-                t.get("content", "unnamed") for t in incomplete[:5]
+                t.get("content", unnamed) for t in incomplete[:5]
             )
             logger.info(
                 "Completion guard: %d incomplete todo(s), attempt %d/%d",
@@ -2134,10 +2200,19 @@ class SessionPrompt:
                 _cfg().max_continuation_attempts,
             )
             await self._inject_system_message(
-                f"[System: You have {len(incomplete)} incomplete todo(s): "
-                f"{incomplete_names}. "
-                f"Continue working on them. Call the todo tool to update "
-                f"status, then use tools to complete each task.]"
+                synthetic_process_instruction(
+                    self.request.language,
+                    (
+                        f"仍有 {len(incomplete)} 个未完成待办：{incomplete_names}。"
+                        "继续处理；先调用 todo 工具更新状态，再使用工具完成每项任务。"
+                    ),
+                    (
+                        f"You have {len(incomplete)} incomplete todo(s): "
+                        f"{incomplete_names}. Continue working on them. Call the "
+                        "todo tool to update status, then use tools to complete "
+                        "each task."
+                    ),
+                )
             )
             return False
 
@@ -2158,11 +2233,18 @@ class SessionPrompt:
                 self.job.session_id,
             )
             await self._inject_system_message(
-                "[System: You completed your work but produced no visible "
-                "response text. The user cannot see your reasoning or tool "
-                "activity. Please provide a clear, helpful summary of what "
-                "you found and accomplished. Do NOT use any tools — just "
-                "respond with text.]"
+                synthetic_process_instruction(
+                    self.request.language,
+                    (
+                        "工作已经完成，但尚未产生用户可见的答复文本。请清晰总结发现和"
+                        "完成事项。不要再使用任何工具，只输出文本。"
+                    ),
+                    (
+                        "You completed your work but produced no visible response "
+                        "text. Provide a clear, helpful summary of what you found "
+                        "and accomplished. Do not use any tools; respond with text."
+                    ),
+                )
             )
             return False
 
@@ -2531,25 +2613,11 @@ class SessionPrompt:
                     return
 
                 self.goal_snapshot = goal
-                snapshot = {
-                    key: getattr(goal, key, None)
-                    for key in (
-                        "objective",
-                        "definition_of_done",
-                        "status",
-                        "run_state",
-                        "revision",
-                        "token_budget",
-                        "tokens_used",
-                        "cost_budget_microusd",
-                        "cost_used_microusd",
-                        "time_budget_seconds",
-                        "time_used_seconds",
-                        "max_continuations",
-                        "continuation_count",
-                    )
-                }
-                self.goal_prompt_section = render_goal_prompt(snapshot)
+                snapshot = self._goal_snapshot_payload(goal)
+                self.goal_prompt_section = render_goal_prompt(
+                    snapshot,
+                    language=self.request.language,
+                )
 
                 # Completion guards must survive top-level continuations.  The
                 # old in-memory-only Todo projection was reset for every
@@ -2582,6 +2650,29 @@ class SessionPrompt:
                 exc_info=True,
             )
 
+    @staticmethod
+    def _goal_snapshot_payload(goal: Any) -> dict[str, Any]:
+        """Return the language-neutral fields rendered into Goal context."""
+
+        return {
+            key: getattr(goal, key, None)
+            for key in (
+                "objective",
+                "definition_of_done",
+                "status",
+                "run_state",
+                "revision",
+                "token_budget",
+                "tokens_used",
+                "cost_budget_microusd",
+                "cost_used_microusd",
+                "time_budget_seconds",
+                "time_used_seconds",
+                "max_continuations",
+                "continuation_count",
+            )
+        }
+
     # ------------------------------------------------------------------
     # Internal: gather impure inputs and call the pure assemble().
     # ------------------------------------------------------------------
@@ -2604,6 +2695,7 @@ class SessionPrompt:
             now=default_now(),
             tz_name=default_tz_name(),
             platform_name=default_platform_name(),
+            process_language=self.request.language,
             goal_section=self.goal_prompt_section,
         )
 

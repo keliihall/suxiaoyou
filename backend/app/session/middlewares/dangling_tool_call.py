@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.i18n import localize
 from app.session.middleware import Middleware, MiddlewareContext
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,11 @@ class DanglingToolCallMiddleware(Middleware):
                     patched.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": "[Tool call was interrupted and did not return a result.]",
+                        "content": localize(
+                            ctx.job.language,
+                            "[工具调用已中断，未返回结果。]",
+                            "[Tool call was interrupted and did not return a result.]",
+                        ),
                     })
                     patched_ids.add(tc_id)
                     patch_count += 1

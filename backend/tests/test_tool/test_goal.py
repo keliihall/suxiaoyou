@@ -82,13 +82,23 @@ async def goal_tool_state(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_goal_returns_current_revision(goal_tool_state) -> None:
+@pytest.mark.parametrize(
+    ("language", "expected_title"),
+    [("zh", "目标：执行中"), ("en", "Goal: active")],
+)
+async def test_get_goal_returns_current_revision_in_process_language(
+    goal_tool_state,
+    language: str,
+    expected_title: str,
+) -> None:
     _factory, ctx, _tmp_path = goal_tool_state
+    ctx.language = language
     result = await GetGoalTool().execute({}, ctx)
     assert result.success
     assert result.metadata["goal"]["id"] == "goal"
     assert result.metadata["goal"]["revision"] == 2
     assert "Create a verified deliverable" in result.output
+    assert result.title == expected_title
 
 
 @pytest.mark.asyncio
@@ -113,7 +123,7 @@ async def test_complete_requires_finished_goal_todos_and_real_file_evidence(
 
     rejected = await UpdateGoalTool().execute(args, ctx)
     assert rejected.success is False
-    assert "Todo" in (rejected.error or "")
+    assert "仍有未完成项" in (rejected.error or "")
 
     async with factory() as db:
         async with db.begin():
@@ -123,6 +133,8 @@ async def test_complete_requires_finished_goal_todos_and_real_file_evidence(
 
     accepted = await UpdateGoalTool().execute(args, ctx)
     assert accepted.success
+    assert accepted.output == "目标完成状态已接受。"
+    assert accepted.title == "目标已完成"
     assert accepted.metadata["goal"]["status"] == "complete"
     async with factory() as db:
         goal = await db.get(SessionGoal, "goal")
@@ -137,8 +149,21 @@ async def test_complete_requires_finished_goal_todos_and_real_file_evidence(
 
 
 @pytest.mark.asyncio
-async def test_complete_rejects_model_only_text_evidence(goal_tool_state) -> None:
+@pytest.mark.parametrize(
+    ("language", "expected", "excluded"),
+    [
+        ("zh", "必须引用已验证的工作区文件路径", "Completion evidence"),
+        ("en", "Completion evidence must reference", "必须引用已验证"),
+    ],
+)
+async def test_complete_rejects_model_only_text_evidence_in_process_language(
+    goal_tool_state,
+    language: str,
+    expected: str,
+    excluded: str,
+) -> None:
     factory, ctx, _tmp_path = goal_tool_state
+    ctx.language = language
     async with factory() as db:
         async with db.begin():
             todo = await db.get(Todo, "todo")
@@ -161,7 +186,45 @@ async def test_complete_rejects_model_only_text_evidence(goal_tool_state) -> Non
     )
 
     assert result.success is False
-    assert "file path or a successful tool call_id" in (result.error or "")
+    assert expected in (result.error or "")
+    assert excluded not in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "expected", "excluded"),
+    [
+        ("zh", "必须包含完成条件和证据说明", "Each evidence item"),
+        ("en", "Each evidence item needs criterion and evidence text", "必须包含"),
+    ],
+)
+async def test_complete_rejects_incomplete_evidence_in_process_language(
+    goal_tool_state,
+    language: str,
+    expected: str,
+    excluded: str,
+) -> None:
+    factory, ctx, _tmp_path = goal_tool_state
+    ctx.language = language
+    async with factory() as db:
+        async with db.begin():
+            todo = await db.get(Todo, "todo")
+            assert todo is not None
+            todo.status = "completed"
+
+    result = await UpdateGoalTool().execute(
+        {
+            "status": "complete",
+            "expected_revision": 2,
+            "summary": "Verify localized validation",
+            "evidence": [{"criterion": "", "evidence": "proof"}],
+        },
+        ctx,
+    )
+
+    assert result.success is False
+    assert expected in (result.error or "")
+    assert excluded not in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -218,8 +281,21 @@ async def test_complete_accepts_server_bound_successful_tool_evidence(
 
 
 @pytest.mark.asyncio
-async def test_update_goal_rejects_non_goal_invocation(goal_tool_state) -> None:
+@pytest.mark.parametrize(
+    ("language", "expected", "excluded"),
+    [
+        ("zh", "只有当前正在执行目标的主运行器", "active Goal runner"),
+        ("en", "Only the active Goal runner", "主运行器"),
+    ],
+)
+async def test_update_goal_rejects_non_goal_invocation_in_process_language(
+    goal_tool_state,
+    language: str,
+    expected: str,
+    excluded: str,
+) -> None:
     _factory, ctx, _tmp_path = goal_tool_state
+    ctx.language = language
     ctx.invocation_source = "desktop"
     result = await UpdateGoalTool().execute(
         {
@@ -233,7 +309,8 @@ async def test_update_goal_rejects_non_goal_invocation(goal_tool_state) -> None:
         ctx,
     )
     assert result.success is False
-    assert "active Goal runner" in (result.error or "")
+    assert expected in (result.error or "")
+    assert excluded not in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -266,7 +343,7 @@ async def test_complete_rejects_file_evidence_outside_workspace(
     )
 
     assert result.success is False
-    assert "outside the active workspace" in (result.error or "")
+    assert "位于当前工作区之外" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -307,7 +384,7 @@ async def test_terminal_goal_update_rejects_already_queued_user_input(
     )
 
     assert result.success is False
-    assert "real user input is queued" in (result.error or "")
+    assert "已有真实用户输入排队" in (result.error or "")
     assert ctx._job.accepting_session_inputs is True  # type: ignore[attr-defined]
     assert ctx._job.execution_admission_open is True  # type: ignore[attr-defined]
     async with factory() as db:

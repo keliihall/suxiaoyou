@@ -17,6 +17,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.agent.agent import AgentRegistry
 from app.errors import Conflict, NotFound, UpstreamError
+from app.i18n import Language, localize
 from app.models.message import Message, Part
 from app.models.idempotency_record import IdempotencyRecord
 from app.models.session import Session
@@ -463,12 +464,71 @@ def _provider_uses_reasoning_content(provider_id: str | None, model_id: str | No
     return True
 
 
+def _has_substantive_assistant_parts(message: Message) -> bool:
+    """Return whether an assistant message establishes model provenance.
+
+    Empty assistant shells and accounting-only messages must not reset a valid
+    reasoning lineage.  Text, reasoning, and tool parts all originate from a
+    concrete model response and therefore do establish a lineage boundary.
+    """
+
+    return any(
+        part.data
+        and part.data.get("type") in {"text", "reasoning", "tool"}
+        for part in message.parts
+    )
+
+
+def _reasoning_lineage_start(
+    messages: list[Message],
+    *,
+    provider_id: str,
+    model_id: str,
+    process_language: Language | None,
+    turn_run_id: str | None,
+) -> int:
+    """Find the contiguous suffix for the active model, language, and run.
+
+    Reasoning passback is model-local state.  Walking backwards prevents an
+    A -> B -> A switch from resurrecting A's older reasoning after B has
+    already broken the chain.  User messages do not break the chain; only a
+    substantive assistant response with different or missing provenance does.
+    """
+
+    found_compatible = False
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        data = message.data or {}
+        if data.get("role", "user") != "assistant":
+            continue
+        if not _has_substantive_assistant_parts(message):
+            continue
+        if (
+            data.get("provider_id") == provider_id
+            and data.get("model_id") == model_id
+            and (
+                process_language is None
+                or data.get("process_language") == process_language
+            )
+            and (
+                turn_run_id is None
+                or data.get("turn_run_id") == turn_run_id
+            )
+        ):
+            found_compatible = True
+            continue
+        return index + 1 if found_compatible else len(messages)
+    return 0 if found_compatible else len(messages)
+
+
 async def get_message_history_for_llm(
     db: AsyncSession,
     session_id: str,
     *,
     provider_id: str | None = None,
     model_id: str | None = None,
+    process_language: Language | None = None,
+    turn_run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Load message history formatted for LLM consumption.
 
@@ -476,12 +536,19 @@ async def get_message_history_for_llm(
     [{role: "user", content: "..."}, {role: "assistant", content: "..."}, ...]
 
     For openai-compat-family providers that use DeepSeek's `reasoning_content`
-    convention, the prior assistant turn's accumulated reasoning is re-attached
-    as ``reasoning_content`` so thinking-mode multi-turn follow-ups (DeepSeek
-    v4 / Kimi K2 / Qwen3 / etc.) do not 400. Providers with their own reasoning
-    protocol (OpenRouter / Anthropic / Gemini / native OpenAI) and the legacy
-    `deepseek-reasoner` R1 model are skipped — see
-    ``_provider_uses_reasoning_content``.
+    convention, reasoning is re-attached only for the contiguous history suffix
+    produced by the exact active provider+model+process-language+TurnRun
+    lineage. A provider/model, process-language, or top-level run switch resets
+    the lineage. Incompatible
+    historical tool-call frames are removed atomically with their tool results:
+    keeping a tool call while stripping its required reasoning can make
+    thinking-mode APIs reject the entire request. Plain assistant text remains
+    available as conversation context. Callers that omit ``process_language``
+    retain provider+model-only matching for compatibility.
+
+    Providers with their own reasoning protocol (OpenRouter / Anthropic /
+    Gemini / native OpenAI) and the legacy `deepseek-reasoner` R1 model are
+    skipped — see ``_provider_uses_reasoning_content``.
     """
     messages = await get_messages(db, session_id)
     llm_messages = []
@@ -498,7 +565,9 @@ async def get_message_history_for_llm(
         has_summary_text = any(
             p.data
             and p.data.get("type") == "text"
-            and str(p.data.get("text", "")).startswith("[Context Summary]")
+            and str(p.data.get("text", "")).startswith(
+                ("[Context Summary]", "[上下文摘要]")
+            )
             for p in msg.parts
         )
         if has_compaction_part and has_summary_text:
@@ -508,6 +577,18 @@ async def get_message_history_for_llm(
         messages = messages[compaction_anchor:]
 
     echo_reasoning = _provider_uses_reasoning_content(provider_id, model_id)
+    lineage_guard_enabled = bool(echo_reasoning and provider_id and model_id)
+    lineage_start = (
+        _reasoning_lineage_start(
+            messages,
+            provider_id=provider_id,
+            model_id=model_id,
+            process_language=process_language,
+            turn_run_id=turn_run_id,
+        )
+        if lineage_guard_enabled and provider_id and model_id
+        else 0
+    )
 
     max_assistant_text_chars = 40_000
     max_tool_output_chars = 20_000
@@ -519,13 +600,19 @@ async def get_message_history_for_llm(
         tail_len = max(0, limit - head_len)
         head = text[:head_len]
         tail = text[-tail_len:] if tail_len > 0 else ""
-        return (
-            f"{head}\n\n"
-            f"[{kind} truncated for context: original {len(text)} chars, kept {limit}]\n\n"
-            f"{tail}"
+        kind_zh = {
+            "tool output": "工具输出",
+            "reasoning": "思考内容",
+            "assistant message": "助手消息",
+        }.get(kind, kind)
+        marker = localize(
+            process_language or "en",
+            f"[{kind_zh}已为上下文截断：原始 {len(text)} 个字符，保留 {limit} 个]",
+            f"[{kind} truncated for context: original {len(text)} chars, kept {limit}]",
         )
+        return f"{head}\n\n{marker}\n\n{tail}"
 
-    for msg in messages:
+    for message_index, msg in enumerate(messages):
         data = msg.data or {}
         role = data.get("role", "user")
 
@@ -551,6 +638,29 @@ async def get_message_history_for_llm(
                 llm_messages.append({"role": "user", "content": content})
 
         elif role == "assistant":
+            reasoning_compatible = bool(
+                lineage_guard_enabled
+                and message_index >= lineage_start
+                and data.get("provider_id") == provider_id
+                and data.get("model_id") == model_id
+                and (
+                    process_language is None
+                    or data.get("process_language") == process_language
+                )
+                and (
+                    turn_run_id is None
+                    or data.get("turn_run_id") == turn_run_id
+                )
+            )
+            # Thinking-mode providers can require reasoning_content for every
+            # assistant tool-call frame. Before a model/language boundary we
+            # therefore drop tool calls and their results together, rather than
+            # emitting an invalid half-frame. Other provider protocols retain
+            # their existing history behavior.
+            preserve_tool_protocol = bool(
+                not lineage_guard_enabled or message_index >= lineage_start
+            )
+
             # Collect assistant text, reasoning, and tool calls
             text_parts = []
             reasoning_parts: list[str] = []
@@ -565,7 +675,7 @@ async def get_message_history_for_llm(
                     text_parts.append(part_data.get("text", ""))
                 elif part_type == "reasoning":
                     reasoning_parts.append(part_data.get("text", ""))
-                elif part_type == "tool":
+                elif part_type == "tool" and preserve_tool_protocol:
                     tool_name = part_data.get("tool", "")
                     call_id = part_data.get("call_id", "")
                     state = part_data.get("state", {})
@@ -587,7 +697,11 @@ async def get_message_history_for_llm(
                     # Tool result
                     output = state.get("output", "")
                     if state.get("time_compacted"):
-                        output = "[truncated]"
+                        output = localize(
+                            process_language or "en",
+                            "[已截断]",
+                            "[truncated]",
+                        )
                     output = trim_for_context(output or "", max_tool_output_chars, "tool output")
 
                     # Check for image data in tool metadata (from read tool)
@@ -599,7 +713,14 @@ async def get_message_history_for_llm(
                             "role": "tool",
                             "tool_call_id": call_id,
                             "content": [
-                                {"type": "text", "text": output or "(image)"},
+                                {
+                                    "type": "text",
+                                    "text": output or localize(
+                                        process_language or "en",
+                                        "（图片）",
+                                        "(image)",
+                                    ),
+                                },
                                 {"type": "image_url", "image_url": {"url": image_data_url}},
                             ],
                         })
@@ -607,7 +728,11 @@ async def get_message_history_for_llm(
                         tool_results.append({
                             "role": "tool",
                             "tool_call_id": call_id,
-                            "content": output or "(no output)",
+                            "content": output or localize(
+                                process_language or "en",
+                                "（无输出）",
+                                "(no output)",
+                            ),
                         })
 
             # Build assistant message. A turn with only reasoning (no text and
@@ -615,7 +740,7 @@ async def get_message_history_for_llm(
             # being echoed so the assistant entry doesn't go missing from the
             # alternating role sequence.
             reasoning_text = ""
-            if echo_reasoning and reasoning_parts:
+            if reasoning_compatible and reasoning_parts:
                 joined = "\n".join(r for r in reasoning_parts if r)
                 if joined:
                     # Reasoning blocks can be tens of thousands of chars per

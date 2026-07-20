@@ -8,6 +8,7 @@ mod commands;
 mod lifecycle_smoke;
 mod menu;
 mod tray;
+mod window_lifecycle;
 
 use backend::BackendState;
 use log::{error, info};
@@ -114,11 +115,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Focus existing window when a second instance is launched
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-                if window.is_minimized().unwrap_or(false) {
-                    let _ = window.unminimize();
-                }
+                window_lifecycle::show_and_focus(&window);
             }
         }))
         .plugin(tauri_plugin_deep_link::init())
@@ -250,12 +247,18 @@ pub fn run() {
 
             // "Close to tray/dock" — hide window instead of quitting on all platforms.
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "macos")]
+                if let Err(error) = window_lifecycle::install_fullscreen_exit_observer(&window) {
+                    log::warn!("Failed to install fullscreen-exit observer: {error}");
+                }
                 let win = window.clone();
                 window.on_window_event(move |event| {
                     match event {
                         tauri::WindowEvent::CloseRequested { api, .. } => {
                             api.prevent_close();
-                            let _ = win.hide();
+                            if let Err(error) = window_lifecycle::hide_to_background(&win) {
+                                log::warn!("Failed to move window to background: {error}");
+                            }
                         }
                         #[cfg(not(target_os = "macos"))]
                         tauri::WindowEvent::Resized(_) => {
@@ -426,8 +429,7 @@ pub fn run() {
                 tauri::RunEvent::Reopen { .. } => {
                     // macOS: clicking Dock icon re-shows the hidden window
                     if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        window_lifecycle::show_and_focus(&window);
                     }
                 }
                 _ => {}
@@ -487,9 +489,7 @@ fn extract_route_from_url(raw: &str) -> Option<String> {
 
 fn focus_and_emit_navigation(app: &tauri::AppHandle, route: &str) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        window_lifecycle::show_and_focus(&window);
         let _ = window.emit("navigate", route);
     }
 }

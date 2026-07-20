@@ -18,6 +18,34 @@ export type GoalPresentationState =
   | "budget_limited"
   | "complete";
 
+const GOAL_BLOCKER_MESSAGE_KEYS: Readonly<Record<string, string>> = {
+  loop_detected: "goalBlockerLoopDetected",
+  generation_error: "goalBlockerGenerationError",
+  no_progress: "goalBlockerNoProgress",
+  provider_usage_limited: "goalBlockerProviderUsageLimited",
+  manual_goal_turn_complete: "goalBlockerManualTurnComplete",
+  session_archived: "goalBlockerSessionArchived",
+  security_emergency_stop: "goalBlockerSecurityEmergencyStop",
+  application_shutdown: "goalBlockerApplicationShutdown",
+  restart_uncertain: "goalBlockerRestartUncertain",
+  permission_required: "goalBlockerPermissionRequired",
+  permission_denied: "goalBlockerPermissionDenied",
+  permission_timeout: "goalBlockerPermissionTimeout",
+  immediate_stop: "goalBlockerImmediateStop",
+  worker_cancelled: "goalBlockerWorkerCancelled",
+  controller_error: "goalBlockerControllerError",
+  invocation_source_denied: "goalBlockerInvocationSourceDenied",
+  security_audit_unavailable: "goalBlockerSecurityAuditUnavailable",
+  MODEL_DOES_NOT_SUPPORT_IMAGES: "goalBlockerImagesUnsupported",
+  goal_edited: "goalBlockerGoalEdited",
+  user_pause: "goalBlockerUserPause",
+  blocked: "goalBlockerGenericBlocked",
+  failed: "goalBlockerGenericFailed",
+  interrupted: "goalBlockerGenericInterrupted",
+};
+
+const LEGACY_FORCED_LOOP_STOP = /^\[FORCED STOP\]\s+Repeated tool calls exceeded/i;
+
 /**
  * Resolve Goal status once so visible copy, icons, and tone cannot disagree.
  * A transient user/action boundary wins because it is what needs attention
@@ -26,7 +54,7 @@ export type GoalPresentationState =
 export function resolveGoalPresentationState(goal: SessionGoal): GoalPresentationState {
   if (goal.run_state === "waiting_user") return "waiting_user";
   if (goal.run_state === "pausing") return "pausing";
-  if (goal.run_state === "interrupted" || goal.needs_review) return "needs_review";
+  if (goal.run_state === "interrupted") return "needs_review";
   switch (goal.status) {
     case "active":
       return goal.run_state === "running" || goal.run_state === "reserved"
@@ -38,6 +66,25 @@ export function resolveGoalPresentationState(goal: SessionGoal): GoalPresentatio
     case "budget_limited": return "budget_limited";
     case "complete": return "complete";
   }
+}
+
+/**
+ * Resolve server-owned blocker codes to UI-localized copy.
+ *
+ * Arbitrary model-authored blockers deliberately fall back to their original
+ * text. The legacy message check upgrades Goals saved before loop_detected was
+ * preserved as the durable blocker code.
+ */
+export function goalBlockerMessageKey(goal: SessionGoal): string | null {
+  if (
+    goal.blocker_code === "generation_error"
+    && LEGACY_FORCED_LOOP_STOP.test(goal.blocker_message || "")
+  ) {
+    return "goalBlockerLoopDetected";
+  }
+  return goal.blocker_code
+    ? GOAL_BLOCKER_MESSAGE_KEYS[goal.blocker_code] || null
+    : null;
 }
 
 /** Bridge a slash command to the desktop panel or mobile Goal sheet. */

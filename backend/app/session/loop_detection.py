@@ -25,6 +25,8 @@ import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 
+from app.i18n import Language, localize
+
 logger = logging.getLogger(__name__)
 
 # Defaults — read from Settings when the singleton is created (see bottom of file)
@@ -33,13 +35,21 @@ _DEFAULT_MAX_SESSIONS = 200
 
 WARNING_MSG = (
     "[LOOP DETECTED] You are repeating the same tool calls with identical arguments. "
-    "Stop calling tools and produce your final answer now. If you cannot complete "
-    "the task, summarize what you accomplished so far."
+    "Stop calling tools, use the results already collected, and state any remaining "
+    "blocker."
+)
+WARNING_MSG_ZH = (
+    "[检测到循环] 正在使用相同参数重复调用同一工具。请停止调用工具，"
+    "基于已有结果作答，并明确说明仍未解决的问题。"
 )
 
 HARD_STOP_MSG = (
-    "[FORCED STOP] Repeated tool calls exceeded the safety limit. "
-    "Producing final answer with results collected so far."
+    "[SAFETY STOP] Repeated tool calls exceeded the safety limit. Further execution "
+    "was stopped; results produced earlier were preserved for review."
+)
+HARD_STOP_MSG_ZH = (
+    "[安全停止] 重复工具调用已超过安全上限，系统已停止继续执行；"
+    "此前产生的结果已保留，等待确认。"
 )
 
 WEB_FETCH_NON_PUBLIC_ERROR = "URL host resolves to a non-public network address"
@@ -51,6 +61,11 @@ WEB_FETCH_CIRCUIT_OPEN_MSG = (
     "source that is already known to be accessible, or clearly explain that "
     "the source could not be verified."
 )
+WEB_FETCH_CIRCUIT_OPEN_MSG_ZH = (
+    "网页抓取已跳过：本次回复中的 web_fetch 已连续 3 次因非公网地址策略被阻止。"
+    "本次回复中不要再次调用 web_fetch；请改用 web_search 的结果摘要、已知可访问的"
+    "其他来源，或明确说明该来源暂时无法核验。"
+)
 WEB_SEARCH_STREAM_LIMIT = 5
 WEB_SEARCH_LIMIT_MSG = (
     "Web search skipped: this response has already submitted 5 custom "
@@ -58,12 +73,20 @@ WEB_SEARCH_LIMIT_MSG = (
     "Synthesize the results already collected and answer from them; if the "
     "available evidence is insufficient, clearly state the remaining gap."
 )
+WEB_SEARCH_LIMIT_MSG_ZH = (
+    "网页搜索已跳过：本次回复已提交 5 次自定义 web_search 调用。请勿再次调用 "
+    "web_search；请综合已有结果作答，证据不足时明确说明剩余缺口。"
+)
 TOOL_FAILURE_LIMIT = 3
 WEB_SEARCH_FAILURE_LIMIT = 2
 TOOL_FAILURE_CIRCUIT_OPEN_MSG = (
     "This tool failed repeatedly in this response and is now disabled for the "
     "remainder of the response. Do not retry it with different arguments. "
     "Use a different available tool or report the concrete blocker."
+)
+TOOL_FAILURE_CIRCUIT_OPEN_MSG_ZH = (
+    "该工具在本次回复中已连续失败，现已停用至本次回复结束。请勿更换参数后重试；"
+    "请改用其他可用工具，或报告具体阻碍。"
 )
 
 
@@ -168,7 +191,14 @@ class LoopDetector:
         self._tool_failures: dict[tuple[str, str], int] = defaultdict(int)
         self._tool_failure_circuit_open: set[tuple[str, str]] = set()
 
-    def check(self, session_id: str, tool_name: str, tool_args: dict) -> LoopCheckResult:
+    def check(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_args: dict,
+        *,
+        language: Language | str = "en",
+    ) -> LoopCheckResult:
         """Check a tool call for loop patterns.
 
         Returns a LoopCheckResult indicating whether to allow, warn, or block.
@@ -194,7 +224,10 @@ class LoopDetector:
                 "Loop hard limit reached for session %s: %s called %d times",
                 session_id, tool_name, count,
             )
-            return LoopCheckResult(action="block", message=HARD_STOP_MSG)
+            return LoopCheckResult(
+                action="block",
+                message=localize(language, HARD_STOP_MSG_ZH, HARD_STOP_MSG),
+            )
 
         if count >= self.warn_threshold:
             warned = self._warned[session_id]
@@ -204,7 +237,10 @@ class LoopDetector:
                     "Repetitive tool calls detected for session %s: %s (%d times)",
                     session_id, tool_name, count,
                 )
-                return LoopCheckResult(action="warn", message=WARNING_MSG)
+                return LoopCheckResult(
+                    action="warn",
+                    message=localize(language, WARNING_MSG_ZH, WARNING_MSG),
+                )
 
         return LoopCheckResult(action="allow")
 

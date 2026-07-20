@@ -8,6 +8,7 @@ import {
 } from "../../src/lib/goal-state.ts";
 import {
   goalBudgetMaximumFromError,
+  goalBlockerMessageKey,
   goalNeedsBudgetIncrease,
   resolveGoalPresentationState,
 } from "../../src/lib/goal-ui.ts";
@@ -150,6 +151,45 @@ test("Goal presentation resolves one actionable state for copy, icon, and tone",
     resolveGoalPresentationState({ ...running, run_state: "interrupted" }),
     "needs_review",
   );
+  assert.equal(
+    resolveGoalPresentationState({
+      ...running,
+      status: "blocked",
+      run_state: "idle",
+      needs_review: true,
+    }),
+    "blocked",
+  );
+});
+
+test("Goal blocker copy uses stable codes and upgrades legacy loop stops", () => {
+  assert.equal(
+    goalBlockerMessageKey({
+      ...goal(5),
+      blocker_code: "loop_detected",
+      blocker_message: "server text in either language",
+    }),
+    "goalBlockerLoopDetected",
+  );
+  assert.equal(
+    goalBlockerMessageKey({
+      ...goal(5),
+      blocker_code: "generation_error",
+      blocker_message: (
+        "[FORCED STOP] Repeated tool calls exceeded the safety limit. "
+        + "Producing final answer with results collected so far."
+      ),
+    }),
+    "goalBlockerLoopDetected",
+  );
+  assert.equal(
+    goalBlockerMessageKey({
+      ...goal(5),
+      blocker_code: "model_reported_custom_blocker",
+      blocker_message: "Keep this model-authored detail",
+    }),
+    null,
+  );
 });
 
 test("goal controls are session-keyed and fail closed behind the release gate", () => {
@@ -230,9 +270,16 @@ test("goal controls expose localized actionable states", () => {
   for (const key of [
     "goalStatusRunning",
     "goalStatusWaitingUser",
+    "goalStatusNeedsReview",
     "goalStatusBlocked",
     "goalStatusBudgetLimited",
+    "goalNeedsReviewDescription",
     "goalBudgetLimitedDescription",
+    "goalBlockerLoopDetected",
+    "goalBlockerRestartUncertain",
+    "goalBlockerApplicationShutdown",
+    "goalBlockerSecurityEmergencyStop",
+    "goalBlockerPermissionDenied",
     "goalRevisionConflict",
     "goalTokenBudgetMaximumError",
     "goalTokenBudgetHint",
@@ -244,4 +291,7 @@ test("goal controls expose localized actionable states", () => {
     assert.equal(typeof zh[key], "string", `missing zh key ${key}`);
     assert.equal(typeof en[key], "string", `missing en key ${key}`);
   }
+  assert.equal(zh.goalStatusNeedsReview, "结果待确认");
+  assert.equal(en.goalStatusNeedsReview, "Results need confirmation");
+  assert.doesNotMatch(zh.goalBlockerLoopDetected, /FORCED STOP|Repeated tool calls/i);
 });

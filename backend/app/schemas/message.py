@@ -124,6 +124,9 @@ class AssistantMessageInfo(BaseModel):
     agent: str = "build"
     model_id: str | None = None
     provider_id: str | None = None
+    process_language: Literal["zh", "en"] | None = None
+    turn_run_id: str | None = None
+    goal_run_id: str | None = None
     cost: float = 0.0
     tokens: TokenUsage = TokenUsage()
     error: str | None = None

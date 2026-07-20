@@ -125,6 +125,11 @@ export interface AssistantMessageInfo {
   agent?: string;
   model_id?: string | null;
   provider_id?: string | null;
+  /** Requested language for user-visible reasoning/process text. */
+  process_language?: "zh" | "en" | null;
+  /** Durable top-level run identity used to isolate reasoning protocol state. */
+  turn_run_id?: string | null;
+  goal_run_id?: string | null;
   cost?: number;
   tokens?: TokenUsage;
   error?: string | null;

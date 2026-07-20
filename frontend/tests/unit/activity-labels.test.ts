@@ -194,6 +194,49 @@ test("localizes English reasoning trace text for Chinese UI", () => {
   );
 });
 
+test("does not leak mixed English reasoning after a tool boundary", () => {
+  const deepSeekTrace = [
+    "The user asked for a long poem about high summer (盛夏), and I've created it as a markdown artifact.",
+    "This is a self-contained creative piece, so presenting it as an artifact is the right approach.",
+    "Let me summarize what I've written.",
+  ].join("\n");
+
+  const localized = localizeVisibleProcessText(deepSeekTrace, "zh");
+  assert.equal(
+    localized,
+    [
+      "正在确认用户需求和交付目标。",
+      "正在继续分析并推进当前任务。",
+      "正在继续分析并推进当前任务。",
+    ].join("\n"),
+  );
+  assert.doesNotMatch(localized, /\b(?:The|This|Let me)\b/);
+});
+
+test("localizes the numbered Goal checklist seen after continuation", () => {
+  const trace = [
+    "I need to:",
+    "1. Verify all files exist and are complete",
+    "2. Check if any optimization is still needed",
+    "3. Decide whether to mark the goal as complete or continue working",
+  ].join("\n");
+
+  const localized = localizeVisibleProcessText(trace, "zh");
+  assert.doesNotMatch(localized, /\b(?:Verify|Check|Decide)\b/);
+  assert.match(localized, /^1\. 正在继续分析并推进当前任务。/m);
+});
+
+test("projects Chinese reasoning into an English UI without changing code", () => {
+  assert.equal(
+    localizeVisibleProcessText("我需要检查工作区并确认所有文件是否完整。", "en"),
+    "Continuing to analyze and advance the current task.",
+  );
+  assert.equal(
+    localizeVisibleProcessText("```ts\nconst 标题 = '盛夏';\n```", "en"),
+    "```ts\nconst 标题 = '盛夏';\n```",
+  );
+});
+
 test("localizes Python environment chatter for Chinese activity UI", () => {
   assert.equal(
     localizeVisibleProcessText(

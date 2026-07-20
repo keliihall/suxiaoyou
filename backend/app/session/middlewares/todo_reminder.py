@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.i18n import localize
 from app.session.middleware import Middleware, MiddlewareContext
 
 _MODIFYING_TOOLS = frozenset({"edit", "write", "bash", "code_execute"})
@@ -61,10 +62,16 @@ class TodoReminderMiddleware(Middleware):
         if signature == ctx.job.todo_reminder_signatures.get(ctx.session_id):
             return output
 
-        output += (
-            "\n\n<reminder>You have an active todo list. "
-            "Call the todo tool NOW to mark this task completed "
-            "and start the next one.</reminder>"
+        output += "\n\n" + localize(
+            ctx.job.language,
+            (
+                "<reminder>当前仍有未完成的待办。请立即调用 todo 工具将本项标记为"
+                "已完成，并开始下一项。</reminder>"
+            ),
+            (
+                "<reminder>You have an active todo list. Call the todo tool NOW "
+                "to mark this task completed and start the next one.</reminder>"
+            ),
         )
         ctx.job.todo_reminder_signatures[ctx.session_id] = signature
         return output

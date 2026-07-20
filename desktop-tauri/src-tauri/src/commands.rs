@@ -18,7 +18,7 @@ use std::process::Stdio;
 
 use crate::{
     backend::{BackendState, BackendStatus},
-    menu, tray, NativeUiState, PendingNavigationState,
+    menu, tray, window_lifecycle, NativeUiState, PendingNavigationState,
 };
 
 /// Get the backend URL (http://127.0.0.1:{port}).
@@ -72,7 +72,7 @@ pub fn window_maximize(window: WebviewWindow) -> Result<(), String> {
 /// Close the window (hides to tray/dock on all platforms).
 #[tauri::command]
 pub fn window_close(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())
+    window_lifecycle::hide_to_background(&window)
 }
 
 /// Check if window is maximized.

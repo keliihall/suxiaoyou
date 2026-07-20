@@ -91,6 +91,100 @@ def _slice(*, tokens=1, finish_reason="stop") -> GoalSliceResult:
     )
 
 
+@pytest.mark.parametrize(
+    ("language", "expected", "guard", "excluded"),
+    [
+        (
+            "zh",
+            "继续自主推进持久目标",
+            "所有用户可见的思考、进度和状态说明必须使用简体中文",
+            "Continue working autonomously",
+        ),
+        (
+            "en",
+            "Continue working autonomously",
+            "Keep all user-visible reasoning, progress, and status narration in English",
+            "继续自主推进持久目标",
+        ),
+    ],
+)
+async def test_auto_continuation_follows_process_language(
+    language: str,
+    expected: str,
+    guard: str,
+    excluded: str,
+) -> None:
+    permissions = serialize_permission_snapshot(
+        Ruleset(rules=[PermissionRule(action="allow", permission="*")])
+    )
+    goal = SessionGoal(
+        id=f"goal-{language}",
+        session_id=f"session-{language}",
+        objective="Keep going",
+        agent="build",
+        language="zh",
+        permission_snapshot=permissions,
+    )
+    session = Session(
+        id=goal.session_id,
+        directory=".",
+        permission_snapshot=permissions,
+    )
+
+    request = _request_for_continuation(
+        goal,
+        session,
+        item=None,
+        process_language=language,  # type: ignore[arg-type]
+    )
+
+    assert request.language == language
+    assert expected in request.text
+    assert guard in request.text
+    assert excluded not in request.text
+    assert (
+        "不是真实用户消息" in request.text
+        if language == "zh"
+        else "not a genuine user message" in request.text
+    )
+
+
+async def test_real_queued_input_is_never_translated() -> None:
+    permissions = serialize_permission_snapshot(
+        Ruleset(rules=[PermissionRule(action="allow", permission="*")])
+    )
+    goal = SessionGoal(
+        id="goal-real-input",
+        session_id="session-real-input",
+        objective="Keep going",
+        agent="build",
+        language="zh",
+        permission_snapshot=permissions,
+    )
+    session = Session(
+        id=goal.session_id,
+        directory=".",
+        permission_snapshot=permissions,
+    )
+    item = SessionInput(
+        session_id=goal.session_id,
+        client_request_id="input-language",
+        text="Keep this exact 用户 text",
+        language="en",
+        agent="build",
+    )
+
+    request = _request_for_continuation(
+        goal,
+        session,
+        item=item,
+        process_language="zh",
+    )
+
+    assert request.text == "Keep this exact 用户 text"
+    assert request.language == "en"
+
+
 async def test_continuation_intersects_old_goal_allow_with_current_session_deny() -> None:
     goal = SessionGoal(
         id="goal-permission-intersection",
@@ -306,6 +400,77 @@ async def test_real_user_input_is_claimed_before_auto_continuation(
     assert seen_text == ["start", "user correction wins"]
     assert [run.trigger for run in runs] == ["initial", "user_input"]
     assert queued.status == "consumed"
+
+
+async def test_queued_input_language_persists_into_following_auto_run(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_features, "AUTONOMOUS_GOALS_RELEASED", True)
+    goal_id, run_id = await _admit(session_factory)
+    sm = StreamManager()
+    job = _job(sm, goal_id, run_id)
+    seen: list[tuple[str, str]] = []
+
+    async def fake_slice(job, request, **kwargs):
+        del kwargs
+        # Mirror the production slice hand-off; the fake replaces that helper.
+        job.language = request.language
+        seen.append((request.language, request.text))
+        async with session_factory() as db:
+            async with db.begin():
+                run = await db.get(GoalRun, job.goal_run_id)
+                assert run is not None
+                run.side_effects_started = True
+                if len(seen) == 1:
+                    await enqueue_session_input(
+                        db,
+                        session_id=job.session_id,
+                        client_request_id="switch-process-language",
+                        mode="queue",
+                        text="continue in English",
+                        attachments=[],
+                        model_id=None,
+                        provider_id=None,
+                        agent="build",
+                        language="en",
+                        workspace=None,
+                        reasoning=None,
+                        permission_presets=None,
+                        permission_rules=None,
+                        target_stream_id=None,
+                    )
+                elif len(seen) == 3:
+                    goal = await get_goal_by_id(db, goal_id)
+                    assert goal is not None
+                    await transition_goal_status(
+                        db,
+                        goal_id=goal.id,
+                        expected_revision=goal.revision,
+                        target_status="complete",
+                        completion_summary="Language hand-off verified",
+                        completion_evidence=[{"kind": "test", "passed": True}],
+                    )
+        return _slice()
+
+    monkeypatch.setattr(
+        "app.session.goal_controller._execute_goal_slice",
+        fake_slice,
+    )
+    await run_goal_generation(
+        job,
+        PromptRequest(session_id=job.session_id, text="start", language="zh"),
+        initial_run_id=run_id,
+        stream_manager=sm,
+        session_factory=session_factory,
+        provider_registry=object(),
+        agent_registry=object(),
+        tool_registry=object(),
+    )
+
+    assert [language for language, _text in seen] == ["zh", "en", "en"]
+    assert seen[1][1] == "continue in English"
+    assert "Continue working autonomously" in seen[2][1]
 
 
 async def test_hard_token_budget_stops_before_an_auto_run(
@@ -667,6 +832,64 @@ async def test_retryable_provider_failures_trip_consecutive_error_breaker(
     assert goal is not None and goal.status == "blocked"
     assert goal.blocker_code == "generation_error"
     assert goal.consecutive_error_count == 3
+
+
+async def test_loop_stop_preserves_machine_reason_for_goal_localization(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_features, "AUTONOMOUS_GOALS_RELEASED", True)
+    goal_id, run_id = await _admit(session_factory)
+    sm = StreamManager()
+    job = _job(sm, goal_id, run_id)
+    calls = 0
+
+    async def loop_stopped_slice(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return GoalSliceResult(
+            tokens_used=0,
+            cost_used_microusd=0,
+            active_seconds=1,
+            finish_reason="error",
+            total_cost=0.0,
+            agent_error=(
+                "[安全停止] 重复工具调用已超过安全上限，系统已停止继续执行；"
+                "此前产生的结果已保留，等待确认。"
+            ),
+            agent_error_code="loop_detected",
+        )
+
+    monkeypatch.setattr(
+        "app.session.goal_controller._execute_goal_slice",
+        loop_stopped_slice,
+    )
+    await run_goal_generation(
+        job,
+        PromptRequest(session_id=job.session_id, text="start", language="zh"),
+        initial_run_id=run_id,
+        stream_manager=sm,
+        session_factory=session_factory,
+        provider_registry=object(),
+        agent_registry=object(),
+        tool_registry=object(),
+    )
+
+    async with session_factory() as db:
+        goal = await get_goal_by_id(db, goal_id)
+        run = await db.get(GoalRun, run_id)
+
+    assert calls == 1
+    assert run is not None
+    assert (run.status, run.error_code) == ("failed", "loop_detected")
+    assert goal is not None
+    assert (goal.status, goal.run_state, goal.needs_review) == (
+        "blocked",
+        "idle",
+        True,
+    )
+    assert goal.blocker_code == "loop_detected"
 
 
 async def test_provider_rate_limit_moves_goal_to_usage_limited_without_looping(

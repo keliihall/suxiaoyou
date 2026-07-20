@@ -45,6 +45,7 @@ _PINNED = {
     "tz_name": "PDT",
     "platform_name": "Darwin",
     "cwd": "/test/cwd",
+    "process_language": "zh",
 }
 
 
@@ -141,6 +142,9 @@ class TestDynamicSection:
             "<product_identity>"
         )
         assert parts.dynamic.index("<product_identity>") < parts.dynamic.index(
+            "<process_language"
+        )
+        assert parts.dynamic.index("<process_language") < parts.dynamic.index(
             "<response_language>"
         )
         assert parts.dynamic.rstrip().endswith("</response_language>")
@@ -191,6 +195,49 @@ class TestDynamicSection:
         assert "Current date: 2026-05-04 (15:30 PDT)" in parts.dynamic
         assert "Current year: 2026" in parts.dynamic
 
+    @pytest.mark.parametrize(
+        ("language", "locale", "required_text", "excluded_text"),
+        [
+            ("zh", "zh-CN", "所有向用户展示的思考过程", "user-visible process language is English"),
+            ("en", "en-US", "user-visible process language is English", "所有向用户展示的思考过程"),
+        ],
+    )
+    def test_process_language_is_explicit_and_dynamic(
+        self,
+        language: str,
+        locale: str,
+        required_text: str,
+        excluded_text: str,
+    ) -> None:
+        pinned = {**_PINNED, "process_language": language}
+        parts = assemble(
+            _agent(system_prompt="STATIC"),
+            workspace_memory_section="# Memory\nEnglish and 中文 mixed context",
+            **pinned,
+        )
+
+        assert f'<process_language locale="{locale}">' in parts.dynamic
+        assert required_text in parts.dynamic
+        assert excluded_text not in parts.dynamic
+        assert "<process_language" not in parts.cached
+        assert parts.dynamic.index("# Memory") < parts.dynamic.index(
+            "<process_language"
+        )
+        assert parts.dynamic.index("<process_language") < parts.dynamic.index(
+            "<response_language>"
+        )
+        assert parts.dynamic.rstrip().endswith("</response_language>")
+
+    def test_process_locale_does_not_change_cached_prompt(self) -> None:
+        zh = assemble(_agent(system_prompt="STATIC"), **_PINNED)
+        en = assemble(
+            _agent(system_prompt="STATIC"),
+            **{**_PINNED, "process_language": "en"},
+        )
+
+        assert zh.cached == en.cached
+        assert zh.dynamic != en.dynamic
+
 
 class TestEnvironmentDeterminism:
     def test_pinned_now_produces_pinned_strings(self) -> None:
@@ -201,6 +248,7 @@ class TestEnvironmentDeterminism:
             tz_name="UTC",
             platform_name="Linux",
             cwd="/srv",
+            process_language="en",
         )
         assert "Current date: 2030-01-02 (09:05 UTC)" in parts.dynamic
         assert "Current year: 2030" in parts.dynamic

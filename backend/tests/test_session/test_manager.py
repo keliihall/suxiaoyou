@@ -257,7 +257,15 @@ class TestMessageManager:
         )
 
         # Assistant message
-        asst_msg = await create_message(db, session_id=session.id, data={"role": "assistant"})
+        asst_msg = await create_message(
+            db,
+            session_id=session.id,
+            data={
+                "role": "assistant",
+                "provider_id": "deepseek",
+                "model_id": "thinking-model",
+            },
+        )
         await create_part(
             db, message_id=asst_msg.id, session_id=session.id,
             data={"type": "text", "text": "4"},
@@ -315,8 +323,19 @@ class TestMessageManager:
             "some-byok-id",  # GenericOpenAIProvider with a custom id
         )
         for provider_id in echo_providers:
+            asst_msg.data = {
+                "role": "assistant",
+                "provider_id": provider_id,
+                "model_id": "thinking-model",
+                "process_language": "zh",
+            }
+            await db.flush()
             history = await get_message_history_for_llm(
-                db, session.id, provider_id=provider_id,
+                db,
+                session.id,
+                provider_id=provider_id,
+                model_id="thinking-model",
+                process_language="zh",
             )
             assert history[1]["role"] == "assistant"
             assert history[1].get("reasoning_content") == expected_reasoning, (
@@ -331,7 +350,11 @@ class TestMessageManager:
         )
         for provider_id in skip_providers:
             history = await get_message_history_for_llm(
-                db, session.id, provider_id=provider_id,
+                db,
+                session.id,
+                provider_id=provider_id,
+                model_id="thinking-model",
+                process_language="zh",
             )
             assert "reasoning_content" not in history[1], (
                 f"{provider_id} must not receive reasoning_content"
@@ -339,18 +362,47 @@ class TestMessageManager:
 
         # Legacy deepseek-reasoner (R1) actively 400s when reasoning_content
         # is included on input — strip even though the provider is deepseek.
+        asst_msg.data = {
+            "role": "assistant",
+            "provider_id": "deepseek",
+            "model_id": "deepseek-reasoner",
+            "process_language": "zh",
+        }
+        await db.flush()
         history = await get_message_history_for_llm(
-            db, session.id, provider_id="deepseek", model_id="deepseek-reasoner",
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-reasoner",
+            process_language="zh",
         )
         assert "reasoning_content" not in history[1]
 
         # Match is exact, not prefix: a hypothetical future model whose name
         # starts with `deepseek-reasoner-` is not assumed to share R1's
         # rejection rule, so the echo still applies.
+        asst_msg.data = {
+            "role": "assistant",
+            "provider_id": "deepseek",
+            "model_id": "deepseek-reasoner-v2",
+            "process_language": "zh",
+        }
+        await db.flush()
         history = await get_message_history_for_llm(
-            db, session.id, provider_id="deepseek", model_id="deepseek-reasoner-v2",
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-reasoner-v2",
+            process_language="zh",
         )
         assert history[1].get("reasoning_content") == expected_reasoning
+
+        # Provenance matching is intentionally fail-closed when the caller
+        # cannot identify the exact active model.
+        history = await get_message_history_for_llm(
+            db, session.id, provider_id="deepseek", process_language="zh",
+        )
+        assert "reasoning_content" not in history[1]
 
     @pytest.mark.asyncio
     async def test_history_reasoning_only_assistant_turn_preserved(
@@ -368,14 +420,27 @@ class TestMessageManager:
             data={"type": "text", "text": "Continue thinking."},
         )
 
-        asst_msg = await create_message(db, session_id=session.id, data={"role": "assistant"})
+        asst_msg = await create_message(
+            db,
+            session_id=session.id,
+            data={
+                "role": "assistant",
+                "provider_id": "deepseek",
+                "model_id": "deepseek-v4-flash",
+                "process_language": "zh",
+            },
+        )
         await create_part(
             db, message_id=asst_msg.id, session_id=session.id,
             data={"type": "reasoning", "text": "Still working it out."},
         )
 
         echoed = await get_message_history_for_llm(
-            db, session.id, provider_id="deepseek",
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
         )
         assert echoed[-1]["role"] == "assistant"
         assert echoed[-1]["content"] == ""
@@ -401,7 +466,16 @@ class TestMessageManager:
         )
 
         huge = "x" * 200_000
-        asst_msg = await create_message(db, session_id=session.id, data={"role": "assistant"})
+        asst_msg = await create_message(
+            db,
+            session_id=session.id,
+            data={
+                "role": "assistant",
+                "provider_id": "deepseek",
+                "model_id": "deepseek-v4-flash",
+                "process_language": "zh",
+            },
+        )
         await create_part(
             db, message_id=asst_msg.id, session_id=session.id,
             data={"type": "reasoning", "text": huge},
@@ -412,11 +486,292 @@ class TestMessageManager:
         )
 
         history = await get_message_history_for_llm(
-            db, session.id, provider_id="deepseek",
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
         )
         reasoning = history[1]["reasoning_content"]
         assert len(reasoning) < len(huge)
-        assert "[reasoning truncated for context" in reasoning
+        assert "[思考内容已为上下文截断" in reasoning
+        assert "reasoning truncated for context" not in reasoning
+
+    @pytest.mark.asyncio
+    async def test_reasoning_lineage_resets_across_model_switches(
+        self, db: AsyncSession,
+    ):
+        """A -> B -> A must not resurrect A's pre-switch reasoning.
+
+        Tool frames before the active lineage are removed together so a
+        thinking-mode provider never receives tool_calls without their required
+        reasoning_content. Plain assistant text remains as useful context.
+        """
+
+        session = await create_session(db, title="Reasoning lineage")
+
+        async def add_user(text: str) -> None:
+            message = await create_message(
+                db, session_id=session.id, data={"role": "user"},
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "text", "text": text},
+            )
+
+        async def add_assistant(
+            provider_id: str,
+            model_id: str,
+            label: str,
+        ) -> None:
+            message = await create_message(
+                db,
+                session_id=session.id,
+                data={
+                    "role": "assistant",
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "process_language": "zh",
+                },
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "reasoning", "text": f"reasoning-{label}"},
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "text", "text": f"answer-{label}"},
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={
+                    "type": "tool",
+                    "tool": "read",
+                    "call_id": f"call-{label}",
+                    "state": {
+                        "status": "completed",
+                        "input": {"file_path": f"{label}.txt"},
+                        "output": f"output-{label}",
+                    },
+                },
+            )
+
+        await add_user("first")
+        await add_assistant("deepseek", "deepseek-v4-flash", "old-a")
+        await add_user("switch to B")
+        await add_assistant("kimi", "kimi-k3", "b")
+        await add_user("switch back to A")
+        await add_assistant("deepseek", "deepseek-v4-flash", "new-a")
+        await add_user("continue")
+
+        history = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
+        )
+        assistants = {
+            message.get("content"): message
+            for message in history
+            if message.get("role") == "assistant"
+        }
+
+        assert set(assistants) == {"answer-old-a", "answer-b", "answer-new-a"}
+        assert "reasoning_content" not in assistants["answer-old-a"]
+        assert "tool_calls" not in assistants["answer-old-a"]
+        assert "reasoning_content" not in assistants["answer-b"]
+        assert "tool_calls" not in assistants["answer-b"]
+        assert assistants["answer-new-a"]["reasoning_content"] == "reasoning-new-a"
+        assert assistants["answer-new-a"]["tool_calls"][0]["id"] == "call-new-a"
+        assert [
+            message["tool_call_id"]
+            for message in history
+            if message.get("role") == "tool"
+        ] == ["call-new-a"]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_lineage_resets_on_process_language_change(
+        self, db: AsyncSession,
+    ):
+        session = await create_session(db, title="Reasoning language lineage")
+
+        async def add_assistant(language: str | None, label: str) -> None:
+            data = {
+                "role": "assistant",
+                "provider_id": "deepseek",
+                "model_id": "deepseek-v4-flash",
+            }
+            if language is not None:
+                data["process_language"] = language
+            message = await create_message(
+                db, session_id=session.id, data=data,
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "reasoning", "text": f"reasoning-{label}"},
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "text", "text": f"answer-{label}"},
+            )
+
+        # Existing pre-upgrade records have no process-language provenance and
+        # must reset rather than perpetuate already polluted reasoning.
+        await add_assistant(None, "legacy")
+        zh_before_new = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
+        )
+        assert zh_before_new == [
+            {"role": "assistant", "content": "answer-legacy"},
+        ]
+
+        await add_assistant("zh", "zh")
+        zh_history = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
+        )
+        assert "reasoning_content" not in zh_history[0]
+        assert zh_history[1]["reasoning_content"] == "reasoning-zh"
+
+        # Switching the UI/process locale starts another clean lineage even
+        # though provider and model are unchanged.
+        en_before_new = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="en",
+        )
+        assert all("reasoning_content" not in message for message in en_before_new)
+
+        await add_assistant("en", "en")
+        en_history = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="en",
+        )
+        assert all(
+            "reasoning_content" not in message
+            for message in en_history[:-1]
+        )
+        assert en_history[-1]["reasoning_content"] == "reasoning-en"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_lineage_is_scoped_to_current_turn_run(
+        self, db: AsyncSession,
+    ) -> None:
+        session = await create_session(db, title="Reasoning run lineage")
+
+        async def add_tool_step(run_id: str, label: str) -> None:
+            message = await create_message(
+                db,
+                session_id=session.id,
+                data={
+                    "role": "assistant",
+                    "provider_id": "deepseek",
+                    "model_id": "deepseek-v4-flash",
+                    "process_language": "zh",
+                    "turn_run_id": run_id,
+                },
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={"type": "reasoning", "text": f"reasoning-{label}"},
+            )
+            await create_part(
+                db,
+                message_id=message.id,
+                session_id=session.id,
+                data={
+                    "type": "tool",
+                    "tool": "artifact",
+                    "call_id": f"call-{label}",
+                    "state": {
+                        "status": "completed",
+                        "input": {},
+                        "output": f"output-{label}",
+                    },
+                },
+            )
+
+        await add_tool_step("goal-run-old", "old")
+        await add_tool_step("goal-run-current", "current")
+
+        history = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
+            turn_run_id="goal-run-current",
+        )
+
+        assistant_frames = [
+            message for message in history if message.get("role") == "assistant"
+        ]
+        assert len(assistant_frames) == 1
+        assert assistant_frames[0]["reasoning_content"] == "reasoning-current"
+        assert assistant_frames[0]["tool_calls"][0]["id"] == "call-current"
+        assert [
+            message["tool_call_id"]
+            for message in history
+            if message.get("role") == "tool"
+        ] == ["call-current"]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_without_provenance_fails_closed(
+        self, db: AsyncSession,
+    ):
+        session = await create_session(db, title="Legacy reasoning")
+        assistant = await create_message(
+            db, session_id=session.id, data={"role": "assistant"},
+        )
+        await create_part(
+            db,
+            message_id=assistant.id,
+            session_id=session.id,
+            data={"type": "reasoning", "text": "unknown source"},
+        )
+        await create_part(
+            db,
+            message_id=assistant.id,
+            session_id=session.id,
+            data={"type": "text", "text": "legacy answer"},
+        )
+
+        history = await get_message_history_for_llm(
+            db,
+            session.id,
+            provider_id="deepseek",
+            model_id="deepseek-v4-flash",
+            process_language="zh",
+        )
+
+        assert history == [{"role": "assistant", "content": "legacy answer"}]
 
     @pytest.mark.asyncio
     async def test_history_with_tool_calls(self, db: AsyncSession):

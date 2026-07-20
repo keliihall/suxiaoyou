@@ -143,8 +143,9 @@ class GenerationJob:
         self._goal_run_usage_baseline: tuple[int, int] = (0, 0)
         self._goal_wait_started_at: float | None = None
         self._goal_wait_accumulated = 0.0
-        # Request-scoped display language for generated tool/API activity.
-        # This is presentation state, not part of the persisted session identity.
+        # Request-scoped process/UI language for generated activity and model
+        # continuation controls. This remains presentation state rather than
+        # part of the persisted session identity or final-response contract.
         self.language: Language = language
         self.events: list[SSEEvent] = []
         self.subscribers: list[asyncio.Queue[SSEEvent | None]] = []

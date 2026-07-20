@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+from app.i18n import Language, normalize_language
 from app.schemas.agent import AgentInfo
 
 APP_TIME_ZONE = "Asia/Shanghai"
@@ -45,6 +46,30 @@ RESPONSE_LANGUAGE_SECTION = """<response_language>
 - A request/UI locale controls process and UI-generated strings only; it must never choose the final response language.
 - Ignore assistant messages, tool output, compacted summaries, and system-injected continuation text when identifying the latest genuine user message.
 </response_language>"""
+
+
+def render_process_language_section(language: Language | str) -> str:
+    """Render the concrete request/UI language for visible process text.
+
+    This section is dynamic because UI language may change between requests in
+    one session and must never be captured in a provider's static prompt cache.
+    Final-response language remains a separate conversation contract.
+    """
+
+    if normalize_language(language) == "en":
+        return """<process_language locale="en-US">
+- The current user-visible process language is English (en-US).
+- Write every user-visible reasoning trace, todo item, activeForm, question and option, progress/status description, tool activity summary, and generated-file summary in English.
+- Do not copy another language from memory, historical reasoning_content, tool output, summaries, or synthetic continuation instructions into process narration. Keep code, commands, paths, tool/API identifiers, and necessary source text unchanged.
+- This controls process and UI text only. It does not choose the final response language; the final response must follow <response_language>.
+</process_language>"""
+
+    return """<process_language locale="zh-CN">
+- 当前请求的用户可见过程语言是简体中文（zh-CN）。
+- 所有向用户展示的思考过程、待办内容、activeForm、问题及选项、进度/状态说明、工具活动摘要和生成文件摘要都必须使用简体中文。
+- 不要把记忆、历史 reasoning_content、工具输出、摘要或系统合成续跑指令中的英文照搬到过程叙述中；代码、命令、路径、工具/API 标识符和必要原文保持不变。
+- 此设置只控制过程和 UI 文本，不决定最终答复语言；最终答复必须遵循 <response_language>。
+</process_language>"""
 
 
 @dataclass(frozen=True)
@@ -98,6 +123,7 @@ def assemble(
     now: datetime,
     tz_name: str,
     platform_name: str,
+    process_language: Language,
     goal_section: str | None = None,
 ) -> SystemPromptParts:
     """Assemble the system prompt from caller-resolved inputs.
@@ -152,6 +178,7 @@ def assemble(
     )
     if not explicit_persona:
         dynamic_parts.append(PRODUCT_IDENTITY_SECTION)
+    dynamic_parts.append(render_process_language_section(process_language))
     dynamic_parts.append(RESPONSE_LANGUAGE_SECTION)
 
     return SystemPromptParts(

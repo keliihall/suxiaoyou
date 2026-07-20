@@ -27,6 +27,7 @@ _PINNED = {
     "tz_name": "PDT",
     "platform_name": "Darwin",
     "cwd": "/test/cwd",
+    "process_language": "zh",
 }
 
 
@@ -52,6 +53,8 @@ class TestSystemPrompt:
         assert "Never call it a former name" in prompt
         assert "latest genuine user-authored message" in prompt
         assert "request/UI locale" in prompt
+        assert '<process_language locale="zh-CN">' in prompt
+        assert "所有向用户展示的思考过程" in prompt
         assert "Do not use the surrounding UI language to choose the final" in prompt
         assert "final response in Simplified Chinese" not in prompt
 
@@ -80,6 +83,9 @@ class TestSystemPrompt:
             prompt = parts.as_plain_text()
             assert "You are 苏小有 (suyo)" in prompt, name
             assert prompt.index("<product_identity>") < prompt.index(
+                "<process_language"
+            ), name
+            assert prompt.index("<process_language") < prompt.index(
                 "<response_language>"
             ), name
             assert prompt.rstrip().endswith("</response_language>"), name

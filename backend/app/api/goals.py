@@ -28,7 +28,7 @@ from app.dependencies import (
     StreamManagerDep,
     ToolRegistryDep,
 )
-from app.i18n import request_language
+from app.i18n import Language, request_language
 from app.models.idempotency_record import IdempotencyRecord
 from app.models.session import Session
 from app.models.session_goal import SessionGoal
@@ -240,6 +240,7 @@ async def _commit_goal_resume(
     body: GoalControlRequest,
     request_hash: str,
     stream_id: str,
+    process_language: Language,
 ) -> _GoalAdmission:
     scope = f"goal.resume.run:{session_id}"
     async with session_factory() as db:
@@ -328,6 +329,7 @@ async def _commit_goal_resume(
                     reservation.goal,
                     session,
                     item=item,
+                    process_language=process_language,
                 ),
                 input_id=item.id if item is not None else None,
             )
@@ -768,6 +770,7 @@ async def resume_goal(
         )
 
     scope = f"goal.resume.run:{session_id}"
+    process_language = request_language(request)
     request_hash = canonical_request_hash(
         body.model_dump(mode="json", exclude={"client_request_id"})
     )
@@ -827,6 +830,7 @@ async def resume_goal(
                         body=body,
                         request_hash=request_hash,
                         stream_id=stream_id,
+                        process_language=process_language,
                     ),
                     name=f"goal-resume-admission-{stream_id}",
                 )

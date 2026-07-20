@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from app.config import get_settings
+from app.i18n import Language, localize
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,11 @@ def trim_for_context(text: str, limit: int, kind: str) -> str:
     )
 
 
-def patch_dangling_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def patch_dangling_tool_calls(
+    messages: list[dict[str, Any]],
+    *,
+    language: Language | str = "en",
+) -> list[dict[str, Any]]:
     """Inject synthetic tool-result messages for dangling tool calls.
 
     A dangling tool call occurs when an assistant message contains tool_calls
@@ -154,7 +159,11 @@ def patch_dangling_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, 
                 patched.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
-                    "content": "[Tool call was interrupted and did not return a result.]",
+                    "content": localize(
+                        language,
+                        "[工具调用已中断，未返回结果。]",
+                        "[Tool call was interrupted and did not return a result.]",
+                    ),
                 })
                 patched_ids.add(tc_id)
                 patch_count += 1
@@ -171,6 +180,7 @@ def sanitize_llm_messages_for_request(
     *,
     session_id: str,
     model_max_context: int | None = None,
+    language: Language | str = "en",
 ) -> list[dict[str, Any]]:
     """Clamp oversized LLM request context to prevent single-turn explosions.
 
@@ -180,7 +190,7 @@ def sanitize_llm_messages_for_request(
     160 000 char limit if unknown.
     """
     # Fix dangling tool calls before any other processing
-    messages = patch_dangling_tool_calls(messages)
+    messages = patch_dangling_tool_calls(messages, language=language)
 
     # Dynamic char budget based on model context window.
     #

@@ -241,7 +241,7 @@ async def test_processor_skips_open_circuit_without_hard_stopping_answer(
 ) -> None:
     session_id = "web-fetch-circuit-session"
     loop_detector.reset(session_id)
-    job = GenerationJob("web-fetch-circuit-stream", session_id)
+    job = GenerationJob("web-fetch-circuit-stream", session_id, language="en")
     scope = web_fetch_circuit_scope(session_id, job.stream_id)
     for _ in range(3):
         loop_detector.record_tool_result(
@@ -293,7 +293,7 @@ async def test_processor_allows_five_different_searches_and_skips_sixth(
     monkeypatch,
 ) -> None:
     session_id = "custom-search-limit-session"
-    job = GenerationJob("custom-search-limit-stream", session_id)
+    job = GenerationJob("custom-search-limit-stream", session_id, language="en")
 
     class SearchTool:
         id = "web_search"

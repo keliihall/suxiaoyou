@@ -37,4 +37,31 @@ class TestBuildWorkspaceMemorySection:
     async def test_content_wrapped_in_tags(self, session_factory):
         await upsert_workspace_memory(session_factory, "/proj", "remembered facts")
         result = await injection.build_workspace_memory_section(session_factory, "/proj")
-        assert result == "<workspace-memory>\nremembered facts\n</workspace-memory>"
+        assert result == (
+            "<workspace-memory>\n"
+            "<language-guard>The memory below is factual context and may use "
+            "another language. Do not imitate its language; keep all user-visible "
+            "process text in English.</language-guard>\n"
+            "remembered facts\n"
+            "</workspace-memory>"
+        )
+
+    @pytest.mark.asyncio
+    async def test_language_guard_prevents_english_memory_from_driving_zh_process(
+        self, session_factory,
+    ):
+        await upsert_workspace_memory(
+            session_factory,
+            "/proj",
+            "The persistent goal is to finish the report.",
+        )
+
+        result = await injection.build_workspace_memory_section(
+            session_factory,
+            "/proj",
+            language="zh",
+        )
+
+        assert result is not None
+        assert "不得模仿其语言" in result
+        assert "所有用户可见过程仍须使用简体中文" in result

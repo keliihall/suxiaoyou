@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.i18n import Language, localize
 from app.models.goal_run import GoalRun
 from app.models.message import Part
 from app.models.session_input import SessionInput
@@ -17,6 +18,8 @@ from app.models.todo import Todo
 from app.schemas.goal import GoalResponse
 from app.session.goal_manager import (
     GoalControlError,
+    GoalNotFoundError,
+    GoalRevisionConflictError,
     get_session_goal,
     transition_goal_status,
 )
@@ -32,6 +35,48 @@ def _factory(ctx: ToolContext):
 
 def _public_goal(goal: Any) -> dict[str, Any]:
     return GoalResponse.model_validate(goal).model_dump(mode="json")
+
+
+def _status_title(status: str, language: Language) -> str:
+    """Render a human-readable Goal status without translating protocol data."""
+
+    labels = {
+        "active": ("执行中", "active"),
+        "paused": ("已暂停", "paused"),
+        "blocked": ("已阻塞", "blocked"),
+        "usage_limited": ("用量受限", "usage limited"),
+        "budget_limited": ("预算受限", "budget limited"),
+        "complete": ("已完成", "complete"),
+    }
+    zh, en = labels.get(status, (status, status))
+    return localize(language, f"目标：{zh}", f"Goal: {en}")
+
+
+def _goal_control_error(exc: GoalControlError, ctx: ToolContext) -> str:
+    """Keep manager exception text from leaking the wrong process language."""
+
+    if isinstance(exc, GoalRevisionConflictError):
+        return ctx.tr(
+            (
+                "目标修订号已变更（预期 "
+                f"{exc.expected_revision}，当前 {exc.current_revision}）；"
+                "请重新读取目标后再试。"
+            ),
+            (
+                "Goal revision changed "
+                f"(expected {exc.expected_revision}, current {exc.current_revision}); "
+                "read the Goal again before retrying."
+            ),
+        )
+    if isinstance(exc, GoalNotFoundError):
+        return ctx.tr(
+            "当前目标已不存在。",
+            "The active Goal no longer exists.",
+        )
+    return ctx.tr(
+        "目标状态更新未通过服务器校验；请重新读取当前目标后再试。",
+        f"Goal status update failed server validation: {exc}",
+    )
 
 
 class GetGoalTool(ToolDefinition):
@@ -53,18 +98,26 @@ class GetGoalTool(ToolDefinition):
         del args
         session_factory = _factory(ctx)
         if session_factory is None:
-            return ToolResult(error="Goal storage is unavailable")
+            return ToolResult(
+                error=ctx.tr("目标存储不可用。", "Goal storage is unavailable.")
+            )
         async with session_factory() as db:
             goal = await get_session_goal(
                 db,
                 ctx.goal_session_id or ctx.session_id,
             )
         if goal is None:
-            return ToolResult(output="No Goal is set for this session", title="No Goal")
+            return ToolResult(
+                output=ctx.tr(
+                    "当前会话尚未设置目标。",
+                    "No Goal is set for this session.",
+                ),
+                title=ctx.tr("无目标", "No Goal"),
+            )
         snapshot = _public_goal(goal)
         return ToolResult(
             output=json.dumps(snapshot, ensure_ascii=False, indent=2),
-            title=f"Goal: {goal.status}",
+            title=_status_title(goal.status, ctx.language),
             metadata={"goal": snapshot},
         )
 
@@ -115,28 +168,55 @@ class UpdateGoalTool(ToolDefinition):
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session_factory = _factory(ctx)
         if session_factory is None:
-            return ToolResult(error="Goal storage is unavailable")
+            return ToolResult(
+                error=ctx.tr("目标存储不可用。", "Goal storage is unavailable.")
+            )
         if ctx.invocation_source != "goal" or ctx.goal_id is None:
             return ToolResult(
-                error="Only the active Goal runner may report Goal status"
+                error=ctx.tr(
+                    "只有当前正在执行目标的主运行器才能上报目标状态。",
+                    "Only the active Goal runner may report Goal status.",
+                )
             )
         if ctx.goal_session_id not in {None, ctx.session_id}:
             return ToolResult(
-                error="A Goal sub-agent may gather evidence but only the root runner may report final status"
+                error=ctx.tr(
+                    "目标子代理可以收集证据，但只有主运行器才能上报最终状态。",
+                    (
+                        "A Goal sub-agent may gather evidence, but only the root "
+                        "runner may report final status."
+                    ),
+                )
             )
 
         status = str(args["status"])
         summary = str(args.get("summary") or "").strip()
         evidence = args.get("evidence")
         if not summary:
-            return ToolResult(error="A non-empty Goal summary is required")
+            return ToolResult(
+                error=ctx.tr(
+                    "必须提供非空的目标摘要。",
+                    "A non-empty Goal summary is required.",
+                )
+            )
         if not isinstance(evidence, list) or not evidence:
-            return ToolResult(error="At least one structured evidence item is required")
+            return ToolResult(
+                error=ctx.tr(
+                    "至少需要一条结构化证据。",
+                    "At least one structured evidence item is required.",
+                )
+            )
 
         job = getattr(ctx, "_job", None)
         if job is None or not hasattr(job, "session_input_lock"):
             return ToolResult(
-                error="Goal status cannot be finalized without the root input admission lock"
+                error=ctx.tr(
+                    "缺少主运行器的输入接收锁，无法确定目标最终状态。",
+                    (
+                        "Goal status cannot be finalized without the root input "
+                        "admission lock."
+                    ),
+                )
             )
 
         try:
@@ -150,9 +230,19 @@ class UpdateGoalTool(ToolDefinition):
                         goal_session_id = ctx.goal_session_id or ctx.session_id
                         goal = await get_session_goal(db, goal_session_id)
                         if goal is None or goal.id != ctx.goal_id:
-                            return ToolResult(error="The active Goal no longer exists")
+                            return ToolResult(
+                                error=ctx.tr(
+                                    "当前目标已不存在。",
+                                    "The active Goal no longer exists.",
+                                )
+                            )
                         if goal.status != "active":
-                            return ToolResult(error=f"Goal status is already {goal.status}")
+                            return ToolResult(
+                                error=ctx.tr(
+                                    f"目标已处于 {goal.status} 状态。",
+                                    f"Goal status is already {goal.status}.",
+                                )
+                            )
 
                         pending_input = (
                             await db.execute(
@@ -166,9 +256,15 @@ class UpdateGoalTool(ToolDefinition):
                         ).scalar_one_or_none()
                         if pending_input is not None:
                             return ToolResult(
-                                error=(
-                                    "A real user input is queued and must be processed "
-                                    "before the Goal can be finalized"
+                                error=ctx.tr(
+                                    (
+                                        "已有真实用户输入排队，必须先处理该输入，"
+                                        "才能确定目标最终状态。"
+                                    ),
+                                    (
+                                        "A real user input is queued and must be "
+                                        "processed before the Goal can be finalized."
+                                    ),
                                 )
                             )
 
@@ -184,6 +280,7 @@ class UpdateGoalTool(ToolDefinition):
                                 completion_contract=(
                                     goal.definition_of_done or goal.objective
                                 ),
+                                language=ctx.language,
                             )
                             if validation_error:
                                 return ToolResult(error=validation_error)
@@ -203,7 +300,12 @@ class UpdateGoalTool(ToolDefinition):
                                 args.get("blocker_message") or summary
                             ).strip()
                             if not blocker_message:
-                                return ToolResult(error="A concrete blocker is required")
+                                return ToolResult(
+                                    error=ctx.tr(
+                                        "必须提供具体的阻碍说明。",
+                                        "A concrete blocker is required.",
+                                    )
+                                )
                             goal = await transition_goal_status(
                                 db,
                                 goal_id=goal.id,
@@ -216,16 +318,23 @@ class UpdateGoalTool(ToolDefinition):
                 job.close_session_input_admission()
                 job.close_execution_admission()
         except GoalControlError as exc:
-            return ToolResult(error=str(exc))
+            return ToolResult(error=_goal_control_error(exc, ctx))
 
         snapshot = _public_goal(goal)
         return ToolResult(
             output=(
-                "Goal completion accepted"
+                ctx.tr("目标完成状态已接受。", "Goal completion accepted.")
                 if status == "complete"
-                else "Goal blocker recorded; autonomous continuation will stop"
+                else ctx.tr(
+                    "目标阻碍已记录，自主续跑将停止。",
+                    "Goal blocker recorded; autonomous continuation will stop.",
+                )
             ),
-            title="Goal complete" if status == "complete" else "Goal blocked",
+            title=(
+                ctx.tr("目标已完成", "Goal complete")
+                if status == "complete"
+                else ctx.tr("目标已阻塞", "Goal blocked")
+            ),
             metadata={"goal": snapshot, "goal_status_updated": True},
         )
 
@@ -240,6 +349,7 @@ async def _validate_completion(
     evidence: list[Any],
     workspace: str | None,
     completion_contract: str,
+    language: Language,
 ) -> str | None:
     incomplete = list(
         (
@@ -252,16 +362,28 @@ async def _validate_completion(
         ).scalars().all()
     )
     if incomplete:
-        return "Goal cannot complete while Goal Todo items remain unfinished"
+        return localize(
+            language,
+            "目标待办中仍有未完成项，当前无法完成目标。",
+            "Goal cannot complete while Goal Todo items remain unfinished.",
+        )
 
     if run_id is None:
-        return "Goal completion requires an active GoalRun"
+        return localize(
+            language,
+            "完成目标需要一个正在执行的 GoalRun。",
+            "Goal completion requires an active GoalRun.",
+        )
     run = await db.get(GoalRun, run_id)
     if run is None or run.goal_id != goal_id or run.status not in {
         "running",
         "waiting_user",
     }:
-        return "Goal completion came from a stale or inactive GoalRun"
+        return localize(
+            language,
+            "完成请求来自过期或未激活的 GoalRun。",
+            "Goal completion came from a stale or inactive GoalRun.",
+        )
 
     # A still-running tool means the completion claim raced ahead of a side
     # effect. The runner must reach a clean safe boundary first.
@@ -279,7 +401,11 @@ async def _validate_completion(
         and ((part.data or {}).get("state") or {}).get("status") == "running"
         for part in parts
     ):
-        return "Goal cannot complete while a tool call is still running"
+        return localize(
+            language,
+            "仍有工具调用在运行，当前无法完成目标。",
+            "Goal cannot complete while a tool call is still running.",
+        )
 
     step_finishes = [
         part
@@ -287,7 +413,11 @@ async def _validate_completion(
         if (part.data or {}).get("type") == "step-finish"
     ]
     if step_finishes and str((step_finishes[-1].data or {}).get("reason")) == "error":
-        return "Goal cannot complete with an unhandled error in the latest step"
+        return localize(
+            language,
+            "最新步骤存在未处理错误，当前无法完成目标。",
+            "Goal cannot complete with an unhandled error in the latest step.",
+        )
 
     verified_criteria: list[str] = []
     successful_tools = {
@@ -301,38 +431,87 @@ async def _validate_completion(
 
     for item in evidence:
         if not isinstance(item, dict):
-            return "Each evidence item must be an object"
+            return localize(
+                language,
+                "每条证据都必须是结构化对象。",
+                "Each evidence item must be an object.",
+            )
         criterion = str(item.get("criterion") or "").strip()
         proof = str(item.get("evidence") or "").strip()
         if not criterion or not proof:
-            return "Each evidence item needs criterion and evidence text"
+            return localize(
+                language,
+                "每条证据都必须包含完成条件和证据说明。",
+                "Each evidence item needs criterion and evidence text.",
+            )
         verified_criteria.append(criterion)
         path_value = item.get("path")
         call_id = str(item.get("call_id") or "").strip()
         if not path_value and not call_id:
-            return (
-                "Completion evidence must reference either a verified workspace "
-                "file path or a successful tool call_id"
+            return localize(
+                language,
+                (
+                    "完成证据必须引用已验证的工作区文件路径，"
+                    "或成功工具调用的 call_id。"
+                ),
+                (
+                    "Completion evidence must reference either a verified workspace "
+                    "file path or a successful tool call_id."
+                ),
             )
         if path_value:
             if not workspace:
-                return "File evidence requires an active trusted workspace"
+                return localize(
+                    language,
+                    "文件证据需要当前存在可信工作区。",
+                    "File evidence requires an active trusted workspace.",
+                )
             try:
                 resolved = resolve_and_validate(str(path_value), workspace)
                 path = Path(resolved).expanduser().resolve(strict=True)
             except WorkspaceViolation:
-                return f"Evidence path is outside the active workspace: {path_value}"
+                return localize(
+                    language,
+                    f"证据路径位于当前工作区之外：{path_value}",
+                    f"Evidence path is outside the active workspace: {path_value}",
+                )
             except (OSError, RuntimeError):
-                return f"Evidence path does not exist: {path_value}"
+                return localize(
+                    language,
+                    f"证据路径不存在：{path_value}",
+                    f"Evidence path does not exist: {path_value}",
+                )
             if not path.is_file():
-                return f"Evidence path is not a file: {path_value}"
-            file_info = path.stat()
+                return localize(
+                    language,
+                    f"证据路径不是文件：{path_value}",
+                    f"Evidence path is not a file: {path_value}",
+                )
+            try:
+                file_info = path.stat()
+            except OSError:
+                return localize(
+                    language,
+                    f"无法读取证据文件：{path_value}",
+                    f"Evidence file could not be read: {path_value}",
+                )
             if file_info.st_size > 512 * 1024 * 1024:
-                return f"Evidence file is too large to verify: {path_value}"
+                return localize(
+                    language,
+                    f"证据文件过大，无法验证：{path_value}",
+                    f"Evidence file is too large to verify: {path_value}",
+                )
             digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
+            try:
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                return localize(
+                    language,
+                    f"无法读取证据文件：{path_value}",
+                    f"Evidence file could not be read: {path_value}",
+                )
             # Replace any model-supplied verification fields with facts
             # computed by the server at the completion boundary.
             item["path"] = str(path)
@@ -342,9 +521,16 @@ async def _validate_completion(
         if call_id:
             tool_part = successful_tools.get(call_id)
             if tool_part is None:
-                return (
-                    "Evidence call_id does not reference a successful tool call "
-                    f"from the active Goal run: {call_id}"
+                return localize(
+                    language,
+                    (
+                        "证据 call_id 未指向当前目标运行中的"
+                        f"成功工具调用：{call_id}"
+                    ),
+                    (
+                        "Evidence call_id does not reference a successful tool call "
+                        f"from the active Goal run: {call_id}"
+                    ),
                 )
             data = tool_part.data or {}
             item["call_id"] = call_id
@@ -363,9 +549,13 @@ async def _validate_completion(
             for criterion in normalized_criteria
             if criterion
         ):
-            return (
-                "Completion evidence does not cover the current completion "
-                f"criterion: {contract_line}"
+            return localize(
+                language,
+                f"完成证据未覆盖当前完成条件：{contract_line}",
+                (
+                    "Completion evidence does not cover the current completion "
+                    f"criterion: {contract_line}"
+                ),
             )
     return None
 

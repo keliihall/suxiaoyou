@@ -23,7 +23,10 @@ class LoopDetectionMiddleware(Middleware):
         ctx: MiddlewareContext,
     ) -> ToolAction:
         result: LoopCheckResult = loop_detector.check(
-            ctx.session_id, tool_name, tool_args,
+            ctx.session_id,
+            tool_name,
+            tool_args,
+            language=ctx.job.language,
         )
         if result.action == "block":
             return ToolAction(

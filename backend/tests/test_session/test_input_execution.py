@@ -303,6 +303,10 @@ def _steer_prompt(job: GenerationJob, execution_db) -> SessionPrompt:
     prompt.job = job
     prompt.request = PromptRequest(session_id="session", text="initial", language="zh")
     prompt.session_factory = execution_db
+    prompt.system_prompt_parts = "prompt-zh"  # type: ignore[assignment]
+    prompt._build_system_prompt_parts = (  # type: ignore[method-assign]
+        lambda: f"prompt-{prompt.request.language}"
+    )
     return prompt
 
 
@@ -327,6 +331,7 @@ async def test_steer_safe_boundary_atomically_persists_message_and_parts(
     assert applied == 1
     assert prompt.request.language == "en"
     assert job.language == "en"
+    assert prompt.system_prompt_parts == "prompt-en"
     assert [event.event for event in job.events] == [INPUT_APPLIED]
     async with execution_db() as db:
         stored = await db.get(SessionInput, item.id)

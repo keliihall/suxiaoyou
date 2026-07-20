@@ -446,8 +446,9 @@ export function translatePersistedToolOutput(
 }
 
 export function localizeVisibleProcessText(text: string, language?: string): string {
-  if (!shouldUseChinese(language) || !text) return text;
+  if (!text) return text;
 
+  const target = shouldUseChinese(language) ? "zh" : "en";
   let inCodeFence = false;
   return text
     .split("\n")
@@ -457,21 +458,34 @@ export function localizeVisibleProcessText(text: string, language?: string): str
         return line;
       }
       if (inCodeFence) return line;
-      return localizeVisibleProcessLine(line);
+      return localizeVisibleProcessLine(line, target);
     })
     .join("\n");
 }
 
-function localizeVisibleProcessLine(line: string): string {
+function localizeVisibleProcessLine(line: string, target: "zh" | "en"): string {
   const match = line.match(/^(\s*(?:[-*•]|\d+[.)])?\s*)(.*?)(\s*)$/);
   if (!match) return line;
 
   const [, prefix, body, suffix] = match;
   if (!body) return line;
 
-  const translated = translateProcessBody(body.trim());
-  if (!translated && /[\u3400-\u9fff]/.test(body)) return line;
-  return translated ? `${prefix}${translated}${suffix}` : line;
+  const normalized = body.trim();
+  const observed = dominantProcessLanguage(normalized);
+
+  if (target === "zh") {
+    const translated = translateProcessBody(normalized);
+    if (translated) return `${prefix}${translated}${suffix}`;
+    if (observed === "en") {
+      return `${prefix}正在继续分析并推进当前任务。${suffix}`;
+    }
+    return line;
+  }
+
+  if (observed === "zh") {
+    return `${prefix}Continuing to analyze and advance the current task.${suffix}`;
+  }
+  return line;
 }
 
 function translateProcessBody(body: string): string | null {
@@ -508,8 +522,25 @@ function isEnglishProcessText(text: string): boolean {
   const letters = text.match(/[A-Za-z]/g)?.length ?? 0;
   if (letters < 8) return false;
   const cjk = text.match(/[\u3400-\u9fff]/g)?.length ?? 0;
-  if (cjk > 0) return false;
+  // A quoted Chinese title such as “(盛夏)” must not make an otherwise
+  // English reasoning sentence look Chinese.
+  if (cjk > Math.max(4, Math.floor(letters / 5))) return false;
   return /^(The user|The (?:web )?search|The fetch|Search|Let me|I need|I should|I'll|I will|I'm|Now I|Now let me|Actually)/i.test(text);
+}
+
+function dominantProcessLanguage(text: string): "zh" | "en" | null {
+  const letters = text.match(/[A-Za-z]/g)?.length ?? 0;
+  const cjk = text.match(/[\u3400-\u9fff]/g)?.length ?? 0;
+
+  if (letters >= 16 && letters >= Math.max(16, cjk * 4)) {
+    const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+    const looksLikeProse = /\s/.test(text) && (
+      /[.!?;:,，。！？；：]/.test(text) || wordCount >= 4
+    );
+    if (isEnglishProcessText(text) || looksLikeProse) return "en";
+  }
+  if (cjk >= 6 && cjk >= Math.max(6, Math.ceil(letters / 2))) return "zh";
+  return null;
 }
 
 function shouldUseChinese(language?: string): boolean {

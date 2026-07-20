@@ -31,7 +31,10 @@ import {
   useSessionGoalUsage,
 } from "@/hooks/use-session-goal";
 import { formatElapsedDuration } from "@/lib/duration";
-import { goalNeedsBudgetIncrease } from "@/lib/goal-ui";
+import {
+  goalBlockerMessageKey,
+  goalNeedsBudgetIncrease,
+} from "@/lib/goal-ui";
 import { cn } from "@/lib/utils";
 
 interface GoalCardProps {
@@ -144,9 +147,12 @@ export function GoalCard({ sessionId, variant = "panel", className }: GoalCardPr
     || goal.run_state === "interrupted"
     || goal.needs_review;
   const needsBudgetIncrease = goalNeedsBudgetIncrease(goal);
+  const blockerMessageKey = goalBlockerMessageKey(goal);
   const blockerMessage = goal.status === "budget_limited"
     ? t("goalBudgetLimitedDescription")
-    : goal.blocker_message;
+    : blockerMessageKey
+      ? t(blockerMessageKey)
+      : goal.blocker_message;
   const mustPauseBeforeClear = [
     "reserved",
     "running",

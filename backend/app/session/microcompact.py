@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.i18n import Language, localize
 from app.utils.token import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ def microcompact_messages(
     *,
     skip_recent_turns: int = DEFAULT_SKIP_RECENT_TURNS,
     max_tool_output_tokens: int = DEFAULT_MAX_TOOL_OUTPUT_TOKENS,
+    language: Language | str = "en",
 ) -> list[dict[str, Any]]:
     """Replace old tool results from specific tool types with compact stubs.
 
@@ -132,9 +134,16 @@ def microcompact_messages(
             tokens = estimate_tokens(content)
             if tokens > max_tool_output_tokens:
                 msg = dict(msg)
-                msg["content"] = (
-                    f"[Previous {tool_name} output cleared — "
-                    f"{tokens} tokens. Re-run tool if needed.]"
+                msg["content"] = localize(
+                    language,
+                    (
+                        f"[先前的 {tool_name} 输出已清理——共 {tokens} 个 token；"
+                        "如有需要请重新运行工具。]"
+                    ),
+                    (
+                        f"[Previous {tool_name} output cleared — {tokens} tokens. "
+                        "Re-run tool if needed.]"
+                    ),
                 )
                 replaced += 1
 
@@ -151,6 +160,7 @@ def apply_tool_result_budget(
     *,
     budget_tokens: int = DEFAULT_BUDGET_TOKENS,
     skip_recent_turns: int = DEFAULT_SKIP_RECENT_TURNS,
+    language: Language | str = "en",
 ) -> list[dict[str, Any]]:
     """Enforce aggregate size limit across all tool results.
 
@@ -219,9 +229,16 @@ def apply_tool_result_budget(
             tokens = estimate_tokens(msg.get("content", ""))
             tool_call_id = msg.get("tool_call_id", "")
             tool_name = call_id_map.get(tool_call_id, "tool")
-            msg["content"] = (
-                f"[{tool_name} output removed to stay within context budget — "
-                f"{tokens} tokens. Re-run tool if needed.]"
+            msg["content"] = localize(
+                language,
+                (
+                    f"[{tool_name} 输出已移除，以控制上下文预算——共 {tokens} 个 "
+                    "token；如有需要请重新运行工具。]"
+                ),
+                (
+                    f"[{tool_name} output removed to stay within context budget — "
+                    f"{tokens} tokens. Re-run tool if needed.]"
+                ),
             )
         result.append(msg)
 
@@ -243,6 +260,7 @@ def context_collapse(
     *,
     collapse_fraction: float = 0.33,
     min_messages_to_keep: int = 6,
+    language: Language | str = "en",
 ) -> tuple[list[dict[str, Any]], int]:
     """Drop the oldest portion of messages and insert a boundary marker.
 
@@ -298,11 +316,20 @@ def context_collapse(
     dropped_assistant_msgs = [m for m in dropped if m.get("role") == "assistant"]
     dropped_tool_msgs = [m for m in dropped if m.get("role") == "tool"]
 
-    boundary_text = (
-        f"[Context collapsed: {len(dropped)} earlier messages removed "
-        f"({len(dropped_user_msgs)} user, {len(dropped_assistant_msgs)} assistant, "
-        f"{len(dropped_tool_msgs)} tool results — ~{tokens_saved:,} tokens freed). "
-        f"If you need earlier context, ask the user or re-read relevant files.]"
+    boundary_text = localize(
+        language,
+        (
+            f"[上下文已折叠：已移除较早的 {len(dropped)} 条消息（用户消息 "
+            f"{len(dropped_user_msgs)} 条、助手消息 {len(dropped_assistant_msgs)} 条、"
+            f"工具结果 {len(dropped_tool_msgs)} 条，释放约 {tokens_saved:,} 个 token）。"
+            "如需更早的信息，请询问用户或重新读取相关文件。]"
+        ),
+        (
+            f"[Context collapsed: {len(dropped)} earlier messages removed "
+            f"({len(dropped_user_msgs)} user, {len(dropped_assistant_msgs)} assistant, "
+            f"{len(dropped_tool_msgs)} tool results — ~{tokens_saved:,} tokens freed). "
+            "If you need earlier context, ask the user or re-read relevant files.]"
+        ),
     )
 
     boundary_msg: dict[str, Any] = {

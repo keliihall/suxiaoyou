@@ -12,6 +12,7 @@ from app.models.session import Session
 from app.models.session_goal import SessionGoal
 from app.schemas.provider import ModelInfo, ModelPricing, StreamChunk
 from app.session.compaction import _phase2_summarize, should_compact
+from app.session.microcompact import context_collapse
 from app.streaming.manager import GenerationJob
 
 
@@ -52,7 +53,11 @@ class _CompactionRegistry:
         return self.provider, self.model
 
 
-async def _seed_goal_compaction(session_factory) -> GenerationJob:
+async def _seed_goal_compaction(
+    session_factory,
+    *,
+    language: str = "zh",
+) -> GenerationJob:
     async with session_factory() as db:
         async with db.begin():
             db.add(Session(id="compact-session", directory=".", title="Compact"))
@@ -101,14 +106,25 @@ async def _seed_goal_compaction(session_factory) -> GenerationJob:
         invocation_source="goal",
         goal_id="compact-goal",
         goal_run_id="compact-run",
+        language=language,  # type: ignore[arg-type]
     )
 
 
+@pytest.mark.parametrize(
+    ("language", "expected", "excluded"),
+    [
+        ("zh", "总结上方对话", "Summarize the conversation above"),
+        ("en", "Summarize the conversation above", "总结上方对话"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_goal_compaction_persists_usage_in_same_durable_ledger(
     session_factory,
+    language: str,
+    expected: str,
+    excluded: str,
 ) -> None:
-    job = await _seed_goal_compaction(session_factory)
+    job = await _seed_goal_compaction(session_factory, language=language)
     provider = _CompactionProvider()
 
     summary = await _phase2_summarize(
@@ -128,9 +144,13 @@ async def test_goal_compaction_persists_usage_in_same_durable_ledger(
     assert provider.messages is not None
     compaction_request = provider.messages[-1]
     assert compaction_request["role"] == "user"
-    assert "system-generated compaction instruction" in compaction_request["content"]
-    assert "not a genuine user message" in compaction_request["content"]
-    assert "latest genuine user-authored message" in compaction_request["content"]
+    assert expected in compaction_request["content"]
+    assert excluded not in compaction_request["content"]
+    assert (
+        "不是真实用户消息" in compaction_request["content"]
+        if language == "zh"
+        else "not a genuine user message" in compaction_request["content"]
+    )
     async with session_factory() as db:
         records = list((await db.execute(select(GoalUsageRecord))).scalars())
         usage_message = (
@@ -170,6 +190,38 @@ async def test_goal_pause_closes_compaction_provider_admission(
     assert provider.started is False
     async with session_factory() as db:
         assert list((await db.execute(select(GoalUsageRecord))).scalars()) == []
+
+
+@pytest.mark.parametrize(
+    ("language", "expected", "excluded"),
+    [
+        ("zh", "上下文已折叠", "Context collapsed"),
+        ("en", "Context collapsed", "上下文已折叠"),
+    ],
+)
+def test_context_collapse_boundary_follows_process_language(
+    language: str,
+    expected: str,
+    excluded: str,
+) -> None:
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message-{index}-" + ("x" * 100),
+        }
+        for index in range(12)
+    ]
+
+    collapsed, tokens_saved = context_collapse(
+        messages,
+        collapse_fraction=0.5,
+        min_messages_to_keep=4,
+        language=language,
+    )
+
+    assert tokens_saved > 0
+    assert expected in collapsed[0]["content"]
+    assert excluded not in collapsed[0]["content"]
 
 
 class TestShouldCompact:

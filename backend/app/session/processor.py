@@ -35,6 +35,7 @@ from app.agent.permission import (
     evaluate,
     serialize_permission_snapshot,
 )
+from app.i18n import Language, localize
 from app.provider.registry import ProviderRegistry
 from app.security.audit import AuditPersistenceError, record_security_event
 from app.security.capabilities import (
@@ -404,8 +405,11 @@ async def _audit_provider_event(
 # Loop detection: two-stage warn-then-stop (replaces old doom loop)
 from app.session.loop_detection import (
     WEB_FETCH_CIRCUIT_OPEN_MSG,
+    WEB_FETCH_CIRCUIT_OPEN_MSG_ZH,
     WEB_SEARCH_LIMIT_MSG,
+    WEB_SEARCH_LIMIT_MSG_ZH,
     TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+    TOOL_FAILURE_CIRCUIT_OPEN_MSG_ZH,
     LoopCheckResult,
     loop_detector,
     web_fetch_circuit_scope,
@@ -632,7 +636,12 @@ def _artifact_delivery_paths(
     return list(dict.fromkeys(files))
 
 
-def _presentation_reminder(tool_id: str, metadata: dict[str, Any] | None) -> str:
+def _presentation_reminder(
+    tool_id: str,
+    metadata: dict[str, Any] | None,
+    *,
+    language: Language | str = "en",
+) -> str:
     """Return an LLM-only reminder when a tool produced likely deliverables."""
     # image_generate returns a persisted attachment and the frontend renders
     # its file card directly from this tool result. Asking the model to call
@@ -657,13 +666,23 @@ def _presentation_reminder(tool_id: str, metadata: dict[str, Any] | None) -> str
         return ""
 
     joined = ", ".join(candidates[:5])
-    return (
-        "\n\n<reminder>Potential final deliverable file(s) were created: "
-        f"{joined}. If these are final files the user asked for, call present_file "
-        "for each user-facing deliverable before your final response. Mention "
-        "supporting data files separately unless the user asked to open or share "
-        "them. Do not present temporary scripts, scratch files, logs, helper "
-        "files, or intermediate outputs.</reminder>"
+    return "\n\n" + localize(
+        language,
+        (
+            "<reminder>检测到可能的最终交付文件："
+            f"{joined}。若这些是用户要求的最终文件，请在最终答复前逐个调用 "
+            "present_file 展示面向用户的交付物。除非用户要求打开或分享，否则请将"
+            "支撑数据文件单独说明。不要展示临时脚本、草稿文件、日志、辅助文件或"
+            "中间产物。</reminder>"
+        ),
+        (
+            "<reminder>Potential final deliverable file(s) were created: "
+            f"{joined}. If these are final files the user asked for, call "
+            "present_file for each user-facing deliverable before your final "
+            "response. Mention supporting data files separately unless the user "
+            "asked to open or share them. Do not present temporary scripts, "
+            "scratch files, logs, helper files, or intermediate outputs.</reminder>"
+        ),
     )
 
 
@@ -1064,6 +1083,7 @@ class SessionProcessor:
 
         self._accumulated_text: str = ""
         self._accumulated_reasoning: str = ""
+        self._reasoning_persisted_chars: int = 0
         self._tool_calls_in_step: list[dict[str, Any]] = []
         self._has_tool_calls: bool = False
         self._native_search_ids: set[str] = set()
@@ -1663,9 +1683,13 @@ class SessionProcessor:
         ):
             return None
 
-        message = (
-            "The selected model does not support images. "
-            "Choose a vision model and try again."
+        message = localize(
+            sp.request.language,
+            "当前所选模型不支持图片，请选择支持视觉的模型后重试。",
+            (
+                "The selected model does not support images. "
+                "Choose a vision model and try again."
+            ),
         )
         logger.info(
             "Blocked image content for non-vision model=%s session=%s",
@@ -1706,6 +1730,7 @@ class SessionProcessor:
         """Reset per-attempt accumulators between retries (mirrors original local reset)."""
         self._accumulated_text = ""
         self._accumulated_reasoning = ""
+        self._reasoning_persisted_chars = 0
         self._tool_calls_in_step = []
         self._has_tool_calls = False
 
@@ -1726,9 +1751,29 @@ class SessionProcessor:
         ta = tc.get("arguments", {})
         ci = tc.get("id", generate_ulid())
         tn, ta = _repair_tool_call_payload(tn, ta)
+        # Tool parts are persisted while the provider is still streaming,
+        # whereas reasoning used to be persisted only after the stream ended.
+        # Flush the reasoning prefix first so a history reload preserves the
+        # same reasoning -> tool boundary the live SSE UI displayed.
+        await self._persist_pending_reasoning()
         response_scope = web_fetch_circuit_scope(
             job.session_id,
             job.stream_id,
+        )
+        web_fetch_circuit_msg = localize(
+            job.language,
+            WEB_FETCH_CIRCUIT_OPEN_MSG_ZH,
+            WEB_FETCH_CIRCUIT_OPEN_MSG,
+        )
+        tool_failure_circuit_msg = localize(
+            job.language,
+            TOOL_FAILURE_CIRCUIT_OPEN_MSG_ZH,
+            TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+        )
+        web_search_limit_msg = localize(
+            job.language,
+            WEB_SEARCH_LIMIT_MSG_ZH,
+            WEB_SEARCH_LIMIT_MSG,
         )
         hook_gate = getattr(sp, "hooks_runtime_active", None)
         hooks_active = bool(callable(hook_gate) and hook_gate())
@@ -1746,7 +1791,7 @@ class SessionProcessor:
                 TOOL_ERROR,
                 {
                     "call_id": ci,
-                    "error": WEB_FETCH_CIRCUIT_OPEN_MSG,
+                    "error": web_fetch_circuit_msg,
                     "tool": "web_fetch",
                 },
             ))
@@ -1757,7 +1802,7 @@ class SessionProcessor:
                 "web_fetch",
                 ci,
                 ta,
-                WEB_FETCH_CIRCUIT_OPEN_MSG,
+                web_fetch_circuit_msg,
             )
             return
 
@@ -1770,7 +1815,7 @@ class SessionProcessor:
                 TOOL_ERROR,
                 {
                     "call_id": ci,
-                    "error": TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+                    "error": tool_failure_circuit_msg,
                     "tool": tn,
                 },
             ))
@@ -1781,7 +1826,7 @@ class SessionProcessor:
                 tn,
                 ci,
                 ta,
-                TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+                tool_failure_circuit_msg,
             )
             return
 
@@ -1798,7 +1843,7 @@ class SessionProcessor:
                 TOOL_ERROR,
                 {
                     "call_id": ci,
-                    "error": WEB_SEARCH_LIMIT_MSG,
+                    "error": web_search_limit_msg,
                     "tool": "web_search",
                 },
             ))
@@ -1809,7 +1854,7 @@ class SessionProcessor:
                 "web_search",
                 ci,
                 ta,
-                WEB_SEARCH_LIMIT_MSG,
+                web_search_limit_msg,
             )
             return
 
@@ -1821,7 +1866,12 @@ class SessionProcessor:
             self._mw_ctx is None
             or getattr(sp, "middleware_chain", None) is None
         ):
-            lr = loop_detector.check(job.session_id, tn, ta)
+            lr = loop_detector.check(
+                job.session_id,
+                tn,
+                ta,
+                language=job.language,
+            )
             if lr.action == "block":
                 job.publish(SSEEvent(AGENT_ERROR, {
                     "error_type": "loop_detected",
@@ -2332,6 +2382,11 @@ class SessionProcessor:
 
         sp = self._sp
         job = sp.job
+        web_search_limit_msg = localize(
+            job.language,
+            WEB_SEARCH_LIMIT_MSG_ZH,
+            WEB_SEARCH_LIMIT_MSG,
+        )
         if (
             tool.id.lower() == "web_search"
             and not loop_detector.admit_custom_web_search(response_scope)
@@ -2341,7 +2396,7 @@ class SessionProcessor:
                     TOOL_ERROR,
                     {
                         "call_id": call_id,
-                        "error": WEB_SEARCH_LIMIT_MSG,
+                        "error": web_search_limit_msg,
                         "tool": "web_search",
                     },
                 )
@@ -2353,14 +2408,19 @@ class SessionProcessor:
                 "web_search",
                 call_id,
                 tool_args,
-                WEB_SEARCH_LIMIT_MSG,
+                web_search_limit_msg,
             )
             return None
 
         result = LoopCheckResult(action="allow")
         middleware_chain = getattr(sp, "middleware_chain", None)
         if self._mw_ctx is None or middleware_chain is None:
-            result = loop_detector.check(job.session_id, tool.id, tool_args)
+            result = loop_detector.check(
+                job.session_id,
+                tool.id,
+                tool_args,
+                language=job.language,
+            )
             if result.action == "block":
                 job.publish(
                     SSEEvent(
@@ -2790,6 +2850,7 @@ class SessionProcessor:
         job = sp.job
         self.finish_reason = "error"
         self.has_text = bool(self._accumulated_text.strip())
+        await self._persist_pending_reasoning()
 
         if self._accumulated_text:
             async with sp.session_factory() as db:
@@ -2829,6 +2890,7 @@ class SessionProcessor:
         logger.exception("LLM stream error (not retryable or retries exhausted)")
         self.has_text = bool(self._accumulated_text.strip())
         self.finish_reason = "error"
+        await self._persist_pending_reasoning()
         if self._accumulated_text or self._accumulated_reasoning:
             async with sp.session_factory() as db:
                 async with db.begin():
@@ -2838,13 +2900,6 @@ class SessionProcessor:
                             message_id=self._assistant_msg_id,
                             session_id=job.session_id,
                             data={"type": "text", "text": self._accumulated_text},
-                        )
-                    if self._accumulated_reasoning:
-                        await create_part(
-                            db,
-                            message_id=self._assistant_msg_id,
-                            session_id=job.session_id,
-                            data={"type": "reasoning", "text": self._accumulated_reasoning},
                         )
                     await create_part(
                         db,
@@ -2916,6 +2971,7 @@ class SessionProcessor:
         """Persist accumulated text + reasoning as parts on the assistant message."""
         sp = self._sp
         self.has_text = bool(self._accumulated_text.strip())
+        await self._persist_pending_reasoning()
         async with sp.session_factory() as db:
             async with db.begin():
                 if self._accumulated_text.strip():
@@ -2925,13 +2981,23 @@ class SessionProcessor:
                         session_id=sp.job.session_id,
                         data={"type": "text", "text": self._accumulated_text},
                     )
-                if self._accumulated_reasoning:
-                    await create_part(
-                        db,
-                        message_id=self._assistant_msg_id,
-                        session_id=sp.job.session_id,
-                        data={"type": "reasoning", "text": self._accumulated_reasoning},
-                    )
+
+    async def _persist_pending_reasoning(self) -> None:
+        """Persist only the reasoning suffix not already flushed before tools."""
+
+        pending = self._accumulated_reasoning[self._reasoning_persisted_chars :]
+        if not pending:
+            return
+        sp = self._sp
+        async with sp.session_factory() as db:
+            async with db.begin():
+                await create_part(
+                    db,
+                    message_id=self._assistant_msg_id,
+                    session_id=sp.job.session_id,
+                    data={"type": "reasoning", "text": pending},
+                )
+        self._reasoning_persisted_chars = len(self._accumulated_reasoning)
 
     # ------------------------------------------------------------------
     # process() phases — tool dispatch
@@ -3243,7 +3309,11 @@ class SessionProcessor:
 
         persist_output = result.output or result.error or ""
         if result.success:
-            persist_output += _presentation_reminder(tool.id, result.metadata)
+            persist_output += _presentation_reminder(
+                tool.id,
+                result.metadata,
+                language=sp.job.language,
+            )
 
         # Inject loop warning into output so LLM sees it
         if loop_result.action == "warn" and loop_result.message:
@@ -3257,7 +3327,11 @@ class SessionProcessor:
             not result.success
             and loop_detector.is_tool_failure_circuit_open(response_scope, tool.id)
         ):
-            persist_output += f"\n\n{TOOL_FAILURE_CIRCUIT_OPEN_MSG}"
+            persist_output += "\n\n" + localize(
+                sp.job.language,
+                TOOL_FAILURE_CIRCUIT_OPEN_MSG_ZH,
+                TOOL_FAILURE_CIRCUIT_OPEN_MSG,
+            )
 
         # Run middleware after_tool_exec hooks
         if self._mw_ctx is not None:
