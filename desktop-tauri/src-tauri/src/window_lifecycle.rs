@@ -17,6 +17,7 @@ impl BackgroundHideIntent {
     }
 
     /// Return true only for the first request in the current transition.
+    #[cfg(any(target_os = "macos", test))]
     fn request(&self) -> bool {
         !self.0.swap(true, Ordering::AcqRel)
     }
@@ -25,11 +26,13 @@ impl BackgroundHideIntent {
         self.0.store(false, Ordering::Release);
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn is_pending(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 
     /// Atomically consume a pending request. A concurrent show wins.
+    #[cfg(any(target_os = "macos", test))]
     fn take(&self) -> bool {
         self.0
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
