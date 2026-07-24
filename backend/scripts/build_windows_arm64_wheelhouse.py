@@ -388,7 +388,7 @@ def locked_network_environment() -> dict[str, str]:
 
 
 def initialize_native_arm64_msvc_environment() -> None:
-    """Replace any ambient VS environment with the latest native ARM64 one."""
+    """Replace ambient VS state with the latest native ARM64 toolchain."""
 
     candidates = [
         shutil.which("vswhere.exe"),
@@ -431,13 +431,26 @@ def initialize_native_arm64_msvc_environment() -> None:
     cmd = shutil.which("cmd.exe")
     if cmd is None:
         raise SupplyChainError("cmd.exe is required to initialize MSVC")
-    command = (
-        f'""{vsdevcmd}" -no_logo -arch=arm64 -host_arch=arm64 && set"'
-    )
-    environment_result = run_checked(
-        [cmd, "/d", "/s", "/c", command],
-        capture_output=True,
-    )
+    # Visual Studio 2022 17.4+ provides a native HostARM64 toolchain.  A local
+    # wrapper avoids cmd.exe's fragile nested quoting for a setup path with
+    # spaces, preserves batch-file control flow with `call`, and gives cmd.exe
+    # a guaranteed drive-backed working directory.
+    with tempfile.TemporaryDirectory(prefix="suxiaoyou-vsdevcmd-") as temporary:
+        wrapper_root = Path(temporary)
+        wrapper = wrapper_root / "capture-arm64-environment.cmd"
+        wrapper.write_bytes(
+            (
+                "@echo off\r\n"
+                f'call "{vsdevcmd}" -no_logo -arch=arm64 -host_arch=arm64\r\n'
+                "if errorlevel 1 exit /b %errorlevel%\r\n"
+                "set\r\n"
+            ).encode("utf-8")
+        )
+        environment_result = run_checked(
+            [cmd, "/d", "/c", wrapper.name],
+            cwd=wrapper_root,
+            capture_output=True,
+        )
     captured: dict[str, str] = {}
     for line in environment_result.stdout.splitlines():
         if "=" not in line or line.startswith("="):
@@ -447,6 +460,13 @@ def initialize_native_arm64_msvc_environment() -> None:
             captured[key] = value
     if not captured.get("PATH"):
         raise SupplyChainError("VsDevCmd did not emit a usable environment")
+    host_arch = captured.get("VSCMD_ARG_HOST_ARCH", "").lower()
+    target_arch = captured.get("VSCMD_ARG_TGT_ARCH", "").lower()
+    if host_arch != "arm64" or target_arch != "arm64":
+        raise SupplyChainError(
+            "VsDevCmd selected the wrong compiler architecture: "
+            f"host={host_arch!r}, target={target_arch!r}"
+        )
     os.environ.update(captured)
 
 

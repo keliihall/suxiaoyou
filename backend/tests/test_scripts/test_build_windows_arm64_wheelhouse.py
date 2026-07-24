@@ -256,25 +256,84 @@ def test_msvc_environment_is_initialized_for_native_arm64(
         }.get(name)
 
     calls: list[list[str]] = []
+    wrappers: list[str] = []
 
-    def fake_run(command, **_kwargs):
+    def fake_run(command, **kwargs):
         rendered = [str(part) for part in command]
         calls.append(rendered)
         if rendered[0] == str(vswhere):
             return SimpleNamespace(stdout=f"{installation}\n", stderr="")
+        wrappers.append(
+            (Path(kwargs["cwd"]) / rendered[-1]).read_text(encoding="utf-8")
+        )
         return SimpleNamespace(
-            stdout="PATH=C:\\VS\\ARM64\nVSCMD_ARG_TGT_ARCH=arm64\n",
+            stdout=(
+                "PATH=C:\\VS\\ARM64\n"
+                "VSCMD_ARG_HOST_ARCH=arm64\n"
+                "VSCMD_ARG_TGT_ARCH=arm64\n"
+            ),
             stderr="",
         )
 
     monkeypatch.setattr(wheelhouse.shutil, "which", fake_which)
     monkeypatch.setattr(wheelhouse, "run_checked", fake_run)
     monkeypatch.setenv("PATH", os.environ["PATH"])
+    monkeypatch.delenv("VSCMD_ARG_HOST_ARCH", raising=False)
     monkeypatch.delenv("VSCMD_ARG_TGT_ARCH", raising=False)
     wheelhouse.initialize_native_arm64_msvc_environment()
+    assert os.environ["VSCMD_ARG_HOST_ARCH"] == "arm64"
     assert os.environ["VSCMD_ARG_TGT_ARCH"] == "arm64"
-    assert any("-arch=arm64" in part for part in calls[1])
-    assert any("-host_arch=arm64" in part for part in calls[1])
+    assert calls[1][1:3] == ["/d", "/c"]
+    assert calls[1][-1] == "capture-arm64-environment.cmd"
+    assert (
+        f'call "{vsdevcmd}" -no_logo -arch=arm64 -host_arch=arm64'
+        in wrappers[0]
+    )
+    assert "if errorlevel 1 exit /b %errorlevel%" in wrappers[0]
+
+
+@pytest.mark.parametrize(
+    ("host_arch", "target_arch"),
+    [("x64", "arm64"), ("arm64", "x64")],
+)
+def test_msvc_environment_rejects_wrong_host_or_target_architecture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_arch: str,
+    target_arch: str,
+) -> None:
+    vswhere = tmp_path / "vswhere.exe"
+    vswhere.write_bytes(b"")
+    installation = tmp_path / "Visual Studio"
+    vsdevcmd = installation / "Common7" / "Tools" / "VsDevCmd.bat"
+    vsdevcmd.parent.mkdir(parents=True)
+    vsdevcmd.write_text("@echo off", encoding="utf-8")
+    cmd = tmp_path / "cmd.exe"
+    cmd.write_bytes(b"")
+
+    def fake_which(name: str):
+        return {
+            "vswhere.exe": str(vswhere),
+            "cmd.exe": str(cmd),
+        }.get(name)
+
+    def fake_run(command, **_kwargs):
+        if str(command[0]) == str(vswhere):
+            return SimpleNamespace(stdout=f"{installation}\n", stderr="")
+        return SimpleNamespace(
+            stdout=(
+                "PATH=C:\\VS\\ARM64\n"
+                f"VSCMD_ARG_HOST_ARCH={host_arch}\n"
+                f"VSCMD_ARG_TGT_ARCH={target_arch}\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(wheelhouse.shutil, "which", fake_which)
+    monkeypatch.setattr(wheelhouse, "run_checked", fake_run)
+
+    with pytest.raises(wheelhouse.SupplyChainError, match="wrong compiler"):
+        wheelhouse.initialize_native_arm64_msvc_environment()
 
 
 def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:

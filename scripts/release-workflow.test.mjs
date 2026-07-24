@@ -1517,7 +1517,7 @@ test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed o
     ],
     [
       "backend/scripts/build_windows_arm64_wheelhouse.py",
-      "97a812ab3ce3668251093d639712379abab1c2786cdd2364ac867736cc7d760b",
+      "fc5920e6a72ad738500966317a1218b5491f09c314a59c0173afefd442f351d3",
     ],
   ]);
   for (const [path, digest] of sealedInputs) {
