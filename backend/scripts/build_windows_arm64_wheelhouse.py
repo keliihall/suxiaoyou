@@ -1217,6 +1217,34 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "Scripts" / "python.exe"
 
 
+def activated_venv_environment(
+    python: Path,
+    base_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return an environment that exposes the selected venv's entry points."""
+
+    scripts = python.parent
+    if not python.is_file() or not scripts.is_dir():
+        raise SupplyChainError(
+            f"cannot activate an incomplete build environment: {python}"
+        )
+    env = dict(
+        base_environment
+        if base_environment is not None
+        else locked_network_environment()
+    )
+    inherited_path = ""
+    for key in tuple(env):
+        if key.upper() == "PATH":
+            inherited_path = env.pop(key)
+    env["PATH"] = (
+        f"{scripts}{os.pathsep}{inherited_path}"
+        if inherited_path
+        else str(scripts)
+    )
+    return env
+
+
 def create_locked_build_environment(
     venv_dir: Path,
     build_wheelhouse: Path,
@@ -1226,7 +1254,7 @@ def create_locked_build_environment(
     python = venv_python(venv_dir)
     if not python.is_file():
         raise SupplyChainError(f"venv did not create {python}")
-    env = locked_network_environment()
+    env = activated_venv_environment(python)
     env["PIP_NO_INDEX"] = "1"
     run_checked(
         [
@@ -1247,6 +1275,36 @@ def create_locked_build_environment(
         ],
         env=env,
     )
+    maturin = python.parent / "maturin.exe"
+    if not maturin.is_file():
+        raise SupplyChainError(
+            f"locked build environment did not install {maturin}"
+        )
+    maturin_machine = pe_machine(
+        maturin.read_bytes(), member=str(maturin)
+    )
+    if maturin_machine != PE_MACHINE_ARM64:
+        raise SupplyChainError(
+            f"{maturin}: expected PE machine {hex(PE_MACHINE_ARM64)}, "
+            f"got {hex(maturin_machine)}"
+        )
+    expected_maturin = parse_requirement_lock(build_install_lock).get(
+        "maturin"
+    )
+    if expected_maturin is None:
+        raise SupplyChainError(
+            f"{build_install_lock}: missing locked maturin build frontend"
+        )
+    maturin_version = run_checked(
+        [maturin, "--version"],
+        env=env,
+        capture_output=True,
+    ).stdout.strip()
+    if maturin_version != f"maturin {expected_maturin.version}":
+        raise SupplyChainError(
+            f"{maturin}: expected maturin {expected_maturin.version}, "
+            f"got {maturin_version!r}"
+        )
     return python
 
 
@@ -1260,7 +1318,10 @@ def build_native_wheel(
     extra_environment: Mapping[str, str] | None = None,
 ) -> WheelEvidence:
     before = set(output_directory.glob("*.whl"))
-    env = locked_network_environment()
+    # PEP 517 imports maturin as a Python backend, then that backend launches
+    # the bare `maturin` command.  Invoking the venv's Python does not activate
+    # its Scripts directory, so expose the exact locked ARM64 frontend here.
+    env = activated_venv_environment(python)
     env.update(
         {
             "CARGO_HOME": str(cargo_home),

@@ -302,6 +302,136 @@ def test_ambient_package_manager_and_openssl_inputs_are_removed(
     assert "DEP_OPENSSL_VERSION_NUMBER" not in env
 
 
+def test_locked_build_environment_activates_and_verifies_arm64_maturin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venv_dir = tmp_path / "build-venv"
+    scripts = venv_dir / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    python.write_bytes(b"python")
+    maturin = scripts / "maturin.exe"
+    maturin.write_bytes(_fake_pe(wheelhouse.PE_MACHINE_ARM64))
+    install_lock = tmp_path / "build-install.txt"
+    install_lock.write_text(
+        "maturin==1.14.1 \\\n"
+        f"    --hash=sha256:{'a' * 64}\n",
+        encoding="utf-8",
+    )
+    build_wheelhouse = tmp_path / "wheels"
+    build_wheelhouse.mkdir()
+
+    monkeypatch.setattr(
+        wheelhouse.venv.EnvBuilder,
+        "create",
+        lambda _self, _path: None,
+    )
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(
+            (
+                [str(part) for part in command],
+                dict(kwargs.get("env", {})),
+            )
+        )
+        return SimpleNamespace(
+            stdout="maturin 1.14.1\n"
+            if str(command[0]) == str(maturin)
+            else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr(wheelhouse, "run_checked", fake_run)
+    monkeypatch.setattr(
+        wheelhouse,
+        "locked_network_environment",
+        lambda: {"Path": "C:\\locked-tools", "SAFE": "1"},
+    )
+
+    assert (
+        wheelhouse.create_locked_build_environment(
+            venv_dir, build_wheelhouse, install_lock
+        )
+        == python
+    )
+    assert calls[0][1]["PATH"].split(os.pathsep)[0] == str(scripts)
+    assert "Path" not in calls[0][1]
+    assert calls[1][0] == [str(maturin), "--version"]
+    assert calls[1][1]["PATH"].split(os.pathsep)[0] == str(scripts)
+
+
+def test_locked_build_environment_rejects_non_arm64_maturin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venv_dir = tmp_path / "build-venv"
+    scripts = venv_dir / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"python")
+    (scripts / "maturin.exe").write_bytes(_fake_pe(0x8664))
+    install_lock = tmp_path / "build-install.txt"
+    install_lock.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        wheelhouse.venv.EnvBuilder,
+        "create",
+        lambda _self, _path: None,
+    )
+    monkeypatch.setattr(
+        wheelhouse,
+        "run_checked",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="", stderr=""),
+    )
+
+    with pytest.raises(wheelhouse.SupplyChainError, match="expected PE machine"):
+        wheelhouse.create_locked_build_environment(
+            venv_dir, tmp_path / "wheels", install_lock
+        )
+
+
+def test_native_wheel_build_exposes_locked_venv_entry_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scripts = tmp_path / "build-venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    python.write_bytes(b"python")
+    source_root = tmp_path / "demo-source"
+    source_root.mkdir()
+    output = tmp_path / "native-wheels"
+    output.mkdir()
+    cargo_home = tmp_path / "cargo-home"
+    cargo_home.mkdir()
+    captured: dict[str, str] = {}
+
+    def fake_run(_command, **kwargs):
+        captured.update(kwargs["env"])
+        _wheel(output, "demo-1.0-py3-none-any.whl")
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(wheelhouse, "run_checked", fake_run)
+    monkeypatch.setattr(
+        wheelhouse,
+        "locked_network_environment",
+        lambda: {"Path": "C:\\locked-tools"},
+    )
+
+    built = wheelhouse.build_native_wheel(
+        python,
+        source_root,
+        output,
+        cargo_home=cargo_home,
+        source_date_epoch=1,
+    )
+
+    assert built.normalized_name == "demo"
+    assert captured["PATH"].split(os.pathsep)[0] == str(scripts)
+    assert "Path" not in captured
+
+
 def test_msvc_environment_is_initialized_for_native_arm64(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
