@@ -29,6 +29,8 @@
   签名、公证或 staple；Linux DEB/RPM 未做包或仓库签名。
 - Cloudflare 官方当前没有 Windows ARM64 原生 `cloudflared` 资产；ARM64 包不会用 x64 下载冒充，
   未自行提供兼容隧道二进制时 Quick Tunnel 会失败关闭，本地功能仍可使用。
+- 前端升级到 Next.js `15.5.21`，并锁定已修复的 DOMPurify `3.4.12`、PostCSS `8.5.22` 与
+  Sharp `0.35.3`，使生产依赖审计恢复为零已知漏洞。
 - 冻结 authoritative Office renderer、真实集成和受控 Beta 证据仍不包含在公开包中；文件名和机器可读
   清单持续显式标注 `UNSIGNED-DEGRADED`。
 
