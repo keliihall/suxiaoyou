@@ -14,6 +14,7 @@ on:
           - macos-aarch64
           - macos-x64
           - windows-x64
+          - windows-arm64
           - linux-x64
           - linux-arm64
 
@@ -32,6 +33,8 @@ jobs:
       evidence_contract: ${{ steps.release-context.outputs.evidence_contract }}
       is_stable: ${{ steps.release-context.outputs.is_stable }}
       macos_artifact_profile: ${{ steps.release-context.outputs.macos_artifact_profile }}
+      run_windows: ${{ steps.release-context.outputs.run_windows }}
+      windows_matrix: ${{ steps.release-context.outputs.windows_matrix }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -53,6 +56,8 @@ jobs:
 
       - name: Resolve and validate release context
         id: release-context
+        env:
+          RELEASE_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           APP_VERSION="$(node -p "require('./package.json').version")"
@@ -66,7 +71,7 @@ jobs:
               EVIDENCE_CONTRACT="v1.0"
               RELEASE_PROFILE="authoritative"
               ;;
-            1.1.0)
+            1.1.*)
               EVIDENCE_CONTRACT="v1.1"
               RELEASE_PROFILE="unsigned-degraded"
               ;;
@@ -121,6 +126,21 @@ jobs:
           echo "is_stable=$IS_STABLE" >> "$GITHUB_OUTPUT"
           echo "macos_artifact_profile=$MACOS_ARTIFACT_PROFILE" >> "$GITHUB_OUTPUT"
 
+          RUN_WINDOWS="false"
+          WINDOWS_MATRIX='{"include":[]}'
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            RUN_WINDOWS="true"
+            WINDOWS_MATRIX='{"include":[{"target":"windows-x64","architecture":"x64","runner":"windows-latest","pythonArchitecture":"x64","officeLockName":"SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64"},{"target":"windows-arm64","architecture":"arm64","runner":"windows-11-arm","pythonArchitecture":"arm64","officeLockName":"SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64"}]}'
+          elif [[ "$RELEASE_TARGET" == "windows-x64" ]]; then
+            RUN_WINDOWS="true"
+            WINDOWS_MATRIX='{"include":[{"target":"windows-x64","architecture":"x64","runner":"windows-latest","pythonArchitecture":"x64","officeLockName":"SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64"}]}'
+          elif [[ "$RELEASE_TARGET" == "windows-arm64" ]]; then
+            RUN_WINDOWS="true"
+            WINDOWS_MATRIX='{"include":[{"target":"windows-arm64","architecture":"arm64","runner":"windows-11-arm","pythonArchitecture":"arm64","officeLockName":"SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64"}]}'
+          fi
+          echo "run_windows=$RUN_WINDOWS" >> "$GITHUB_OUTPUT"
+          echo "windows_matrix=$WINDOWS_MATRIX" >> "$GITHUB_OUTPUT"
+
       - name: Preflight v1.1 Office renderer CI configuration
         if: startsWith(steps.release-context.outputs.app_version, '1.1.') && steps.release-context.outputs.release_profile == 'authoritative'
         env:
@@ -129,6 +149,7 @@ jobs:
           SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
           SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
           SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64 }}
+          SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64 }}
           SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64 }}
           SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64 }}
           SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64 }}
@@ -151,6 +172,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
             required_lock_names=(
               "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64"
+              "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64"
               "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64"
               "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64"
               "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64"
@@ -159,6 +181,7 @@ jobs:
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             case "$RELEASE_TARGET" in
               windows-x64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64") ;;
+              windows-arm64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64") ;;
               macos-aarch64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64") ;;
               macos-x64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64") ;;
               linux-arm64) required_lock_names=("SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64") ;;
@@ -381,14 +404,17 @@ jobs:
           retention-days: 1
 
   build-windows:
-    name: Build Windows x64
+    name: Build Windows ${{ matrix.architecture }}
     needs: validate-release
-    if: github.event_name == 'push' || inputs.target == 'windows-x64'
-    runs-on: windows-latest
+    if: needs.validate-release.outputs.run_windows == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate-release.outputs.windows_matrix) }}
+    runs-on: ${{ matrix.runner }}
     env:
       VERIFY_BUNDLE_V11_GATE_MODE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && 'released' || 'closed' }}
       VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE: ${{ startsWith(needs.validate-release.outputs.app_version, '1.1.') && (needs.validate-release.outputs.release_profile == 'unsigned-degraded' && 'unsigned-degraded' || 'signed-authoritative') || '' }}
-      VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
+      VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -399,6 +425,7 @@ jobs:
           # CPython 3.12.10 is the final 3.12 release with an official
           # Windows binary; later 3.12 security releases are source-only.
           python-version: "3.12.10"
+          architecture: ${{ matrix.pythonArchitecture }}
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -411,6 +438,88 @@ jobs:
       - name: Verify release checkout before dependency installation
         shell: bash
         run: node scripts/verify-release-checkout.mjs "$GITHUB_SHA"
+
+      - name: Verify Windows ARM64 wheelhouse input seals
+        if: matrix.target == 'windows-arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expectedHashes = [ordered]@{
+            "backend/requirements-windows-arm64.txt" = "ba428376d5dec539a510a0253595262b30957b9bffbc0c9906179d5a9ee553c8"
+            "backend/requirements-windows-arm64-build.in" = "cfe41dac66e12c04dedaeb55e7e66c85e0a2c4ca1300b06382730304e98344a7"
+            "backend/requirements-windows-arm64-build.txt" = "267cd1b54c8824d809691686baa64746cb3c3a315fc89fd40960b1083d894f36"
+            "backend/requirements-release-tools-windows-arm64.txt" = "c2d9acd90b6229e99b8527bb262002785397ecbfeec4319babca9fa805a4db7f"
+            "backend/requirements-windows-arm64-overrides.txt" = "8cf1bc48daa284c96510dfb547a0a04e3d681b7670c412709d3db5e07f1b4bd3"
+            "backend/requirements-windows-arm64-sources.json" = "7083f14d1a0f0805c1da38cba159d5de8a700d2dbc3e0392dfda3ce6d52e4fef"
+            "backend/requirements-windows-arm64-tiktoken.Cargo.lock" = "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3"
+            "backend/requirements-windows-arm64-wheelhouse-approval.json" = "ef6af7758b7a8afa7f40df452dbff3af9c9563345893a3b612c8f5025a137789"
+            "backend/scripts/build_windows_arm64_wheelhouse.py" = "c035c3710a690a4695073760e4cfc5bc5fb94a70b9f0c52ec29870dbe1635083"
+          }
+          foreach ($entry in $expectedHashes.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Key -PathType Leaf)) {
+              throw "Windows ARM64 supply-chain input is missing: $($entry.Key)"
+            }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $entry.Key).Hash.ToLowerInvariant()
+            if ($actual -ne $entry.Value) {
+              throw "Windows ARM64 supply-chain input hash mismatch for $($entry.Key): $actual"
+            }
+          }
+
+      - name: Build approved Windows ARM64 wheelhouse
+        id: windows-arm64-wheelhouse
+        if: matrix.target == 'windows-arm64'
+        shell: pwsh
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $approvalPath = "backend/requirements-windows-arm64-wheelhouse-approval.json"
+          $approval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json
+          $zeroSha256 = "0" * 64
+          $approvedDigest = [string]$approval.content_sha256
+          $validApprovedDigest = (
+            $approval.status -eq "approved" -and
+            $approvedDigest -match "^[0-9a-f]{64}$" -and
+            $approvedDigest -ne $zeroSha256
+          )
+          $wheelhouseRoot = Join-Path $env:RUNNER_TEMP "suxiaoyou-windows-arm64-wheelhouse"
+          $arguments = @(
+            "backend/scripts/build_windows_arm64_wheelhouse.py",
+            "build",
+            "--output",
+            $wheelhouseRoot
+          )
+          if ($env:RELEASE_EVENT_NAME -eq "workflow_dispatch") {
+            if (
+              $approval.status -eq "bootstrap-required" -and
+              $approvedDigest -eq $zeroSha256
+            ) {
+              $arguments += "--bootstrap"
+            } elseif (-not $validApprovedDigest) {
+              throw "workflow_dispatch Windows ARM64 approval is neither bootstrap-required nor approved"
+            }
+          } elseif ($env:RELEASE_EVENT_NAME -eq "push") {
+            if (-not $validApprovedDigest) {
+              throw "tagged Windows ARM64 releases require a nonzero tracked approved content SHA-256"
+            }
+          } else {
+            throw "unsupported Windows ARM64 release event: $env:RELEASE_EVENT_NAME"
+          }
+          & python @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows ARM64 wheelhouse builder exited with code $LASTEXITCODE"
+          }
+          $manifest = Join-Path $wheelhouseRoot "windows-arm64-wheelhouse-manifest.json"
+          $manifestDigest = "${manifest}.sha256"
+          if (
+            -not (Test-Path -LiteralPath $manifest -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $manifestDigest -PathType Leaf)
+          ) {
+            throw "Windows ARM64 wheelhouse manifest evidence is missing"
+          }
+          "root=$wheelhouseRoot" >> $env:GITHUB_OUTPUT
+          "manifest=$manifest" >> $env:GITHUB_OUTPUT
+          "manifest_digest=$manifestDigest" >> $env:GITHUB_OUTPUT
 
       - name: Install locked JavaScript dependencies
         shell: bash
@@ -435,8 +544,8 @@ jobs:
         if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: suxiaoyou-office-renderer-windows-x64-${{ github.sha }}
-          path: ${{ runner.temp }}/suxiaoyou-office-renderer-source-windows-x64
+          name: suxiaoyou-office-renderer-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target }}
           repository: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_REPOSITORY }}
           run-id: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_RUN_ID }}
           github-token: ${{ secrets.SUXIAOYOU_OFFICE_RENDERER_ARTIFACT_TOKEN }}
@@ -446,15 +555,16 @@ jobs:
         if: startsWith(needs.validate-release.outputs.app_version, '1.1.') && needs.validate-release.outputs.release_profile == 'authoritative'
         shell: bash
         env:
-          OFFICE_RENDERER_SOURCE: ${{ runner.temp }}/suxiaoyou-office-renderer-source-windows-x64
-          OFFICE_RENDERER_LOCK_SHA256: ${{ vars.SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64 }}
+          OFFICE_RENDERER_SOURCE: ${{ runner.temp }}/suxiaoyou-office-renderer-source-${{ matrix.target }}
+          OFFICE_RENDERER_LOCK_SHA256: ${{ vars[matrix.officeLockName] }}
+          OFFICE_RENDERER_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           if [[ -z "$OFFICE_RENDERER_LOCK_SHA256" ]]; then
-            echo "::error::v1.1 windows-x64 requires an authenticated per-commit Office renderer artifact and its reviewed lock SHA-256"
+            echo "::error::v1.1 $OFFICE_RENDERER_TARGET requires an authenticated per-commit Office renderer artifact and its reviewed lock SHA-256"
             exit 1
           fi
-          TARGET="windows-x64"
+          TARGET="$OFFICE_RENDERER_TARGET"
           umask 077
           STAGING_PARENT="$RUNNER_TEMP/suxiaoyou-office-renderer-$TARGET-$GITHUB_RUN_ATTEMPT"
           mkdir "$STAGING_PARENT"
@@ -588,11 +698,35 @@ jobs:
           print(digest.hexdigest())
           PY
           }
-          python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
-          RELEASE_TOOL_LOCK="backend/requirements-release-tools-windows-x64.txt"
-          RELEASE_TOOL_LOCK_SHA256="f2e389ca75cf41fe8a45bc40ab5eaffaa4808c3a572f49bccc419c93450c8f9b"
-          python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
-          python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
+          if [[ "${{ matrix.target }}" == "windows-arm64" ]]; then
+            WHEELHOUSE_ROOT="${{ steps.windows-arm64-wheelhouse.outputs.root }}"
+            if [[ -z "$WHEELHOUSE_ROOT" || ! -d "$WHEELHOUSE_ROOT" ]]; then
+              echo "::error::Windows ARM64 wheelhouse output is unavailable" >&2
+              exit 1
+            fi
+            python -m pip install \
+              --no-index \
+              --no-deps \
+              --require-hashes \
+              --only-binary=:all: \
+              --find-links "$WHEELHOUSE_ROOT/production-wheelhouse" \
+              -r "$WHEELHOUSE_ROOT/install-locks/requirements-windows-arm64-install.txt"
+            python -m pip install \
+              --no-index \
+              --no-deps \
+              --require-hashes \
+              --only-binary=:all: \
+              --find-links "$WHEELHOUSE_ROOT/release-tools-wheelhouse" \
+              -r "$WHEELHOUSE_ROOT/install-locks/requirements-release-tools-windows-arm64-install.txt"
+          else
+            python -m pip install --require-hashes --only-binary=cryptography -r backend/requirements.txt
+            RELEASE_TOOL_LOCK="backend/requirements-release-tools-windows-x64.txt"
+            RELEASE_TOOL_LOCK_SHA256="f2e389ca75cf41fe8a45bc40ab5eaffaa4808c3a572f49bccc419c93450c8f9b"
+            python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
+            python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
+          fi
+          python -m pip check
+          python -m pytest -q -m workspace_identity_v2 backend/tests
           python -m pytest -q backend/tests/test_run.py backend/tests/test_scripts/test_download_node.py backend/tests/test_tool/test_windows_process.py backend/tests/test_tool/test_windows_mutation_safety.py backend/tests/test_tool/test_sandbox.py backend/tests/test_tool/test_sandbox_self_test.py backend/tests/test_tool/test_bash.py backend/tests/test_tool/test_code_execute.py backend/tests/test_tool/test_registry.py
           node scripts/release-input-seal.mjs verify \
             "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
@@ -611,11 +745,19 @@ jobs:
           fi
 
       - name: Audit Windows backend production dependency graph
-        run: python -m pip_audit --strict --require-hashes -r backend/requirements.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "windows-arm64" ]]; then
+            AUDIT_LOCK="backend/requirements-windows-arm64.txt"
+          else
+            AUDIT_LOCK="backend/requirements.txt"
+          fi
+          python -m pip_audit --strict --require-hashes -r "$AUDIT_LOCK"
 
       - name: Verify backend bundle
         env:
-          VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
         run: node scripts/verify-bundle.mjs backend/dist/suxiaoyou-backend
 
       - name: Download verified Node.js runtime
@@ -654,6 +796,16 @@ jobs:
             "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
             "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
 
+      - name: Verify native Windows PE architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-windows-pe.mjs \
+            "${{ matrix.architecture }}" \
+            backend/dist/suxiaoyou-backend/suxiaoyou-backend.exe \
+            backend/resources/nodejs/node.exe \
+            desktop-tauri/src-tauri/target/release/suxiaoyou-desktop.exe
+
       - name: Verify Windows artifact completeness
         shell: bash
         run: |
@@ -663,9 +815,11 @@ jobs:
 
       - name: Install NSIS package and verify packaged Node.js toolchain
         env:
-          VERIFY_BUNDLE_OFFICE_PLATFORM: windows-x64
-          VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-windows/office-contract.json
-          VERIFY_BUNDLE_OFFICE_RENDERER_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-windows/office-renderer.json
+          VERIFY_BUNDLE_OFFICE_PLATFORM: ${{ matrix.target }}
+          VERIFY_BUNDLE_OFFICE_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}/office-contract.json
+          VERIFY_BUNDLE_OFFICE_RENDERER_REPORT: ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}/office-renderer.json
+          WINDOWS_RELEASE_TARGET: ${{ matrix.target }}
+          WINDOWS_RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -902,7 +1056,7 @@ jobs:
             --artifact-size $preinstallArtifactSize `
             --artifact-sha256 $preinstallArtifactSha256 `
             --release-commit $preinstallCommit `
-            --work-dir (Join-Path $env:RUNNER_TEMP "suxiaoyou-desktop-lifecycle-windows")
+            --work-dir (Join-Path $env:RUNNER_TEMP "suxiaoyou-desktop-lifecycle-$env:WINDOWS_RELEASE_TARGET")
           if ($LASTEXITCODE -ne 0) {
             throw "Installed Windows desktop lifecycle smoke failed with code $LASTEXITCODE"
           }
@@ -911,10 +1065,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-lifecycle-diagnostics-${{ github.run_attempt }}
+          name: ${{ matrix.target }}-lifecycle-diagnostics-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-windows
-            ${{ runner.temp }}/suxiaoyou-office-contract-windows
+            ${{ runner.temp }}/suxiaoyou-desktop-lifecycle-${{ matrix.target }}
+            ${{ runner.temp }}/suxiaoyou-office-contract-${{ matrix.target }}
+            ${{ runner.temp }}/suxiaoyou-windows-arm64-wheelhouse/windows-arm64-wheelhouse-manifest.json
+            ${{ runner.temp }}/suxiaoyou-windows-arm64-wheelhouse/windows-arm64-wheelhouse-manifest.json.sha256
           if-no-files-found: ignore
           retention-days: 30
 
@@ -930,7 +1086,7 @@ jobs:
             "$RUNNER_TEMP/suxiaoyou-tauri-inputs.json" \
             "$GITHUB_SHA" frontend/out backend/dist/suxiaoyou-backend backend/resources/nodejs
           node scripts/verify-desktop-lifecycle.mjs verify-artifact \
-            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-windows/result.json" \
+            --report "$RUNNER_TEMP/suxiaoyou-desktop-lifecycle-${{ matrix.target }}/result.json" \
             --artifact "${installers[0]}" \
             --release-commit "$GITHUB_SHA"
 
@@ -938,7 +1094,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
+          name: ${{ matrix.target }}-${{ github.event_name == 'workflow_dispatch' && 'UNSIGNED-TEST' || 'release' }}
           path: desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe
           overwrite: true
           if-no-files-found: error
@@ -1187,6 +1343,7 @@ jobs:
           fi
           python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
           python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
+          python -m pytest -q -m workspace_identity_v2 backend/tests
           python -m pytest -q \
             backend/tests/test_tool/test_posix_process.py \
             backend/tests/test_tool/test_sandbox.py \
@@ -1752,6 +1909,7 @@ jobs:
           fi
           python -c 'import hashlib, pathlib, sys; actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else f"release tool lock digest mismatch: {actual}")' "$RELEASE_TOOL_LOCK" "$RELEASE_TOOL_LOCK_SHA256"
           python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"
+          python -m pytest -q -m workspace_identity_v2 backend/tests
           node scripts/release-input-seal.mjs verify \
             "$RUNNER_TEMP/suxiaoyou-frontend-inputs.json" \
             "$GITHUB_SHA" frontend/out
@@ -2135,7 +2293,8 @@ jobs:
           }
 
           for prefix in \
-            windows-lifecycle-diagnostics \
+            windows-x64-lifecycle-diagnostics \
+            windows-arm64-lifecycle-diagnostics \
             macos-aarch64-lifecycle-diagnostics \
             macos-x64-lifecycle-diagnostics \
             linux-x64-lifecycle-diagnostics \
@@ -2205,14 +2364,16 @@ jobs:
             fi
           }
 
-          require_one "Windows NSIS installer (*.exe)" artifacts/windows-release "*.exe"
+          require_one "Windows x64 NSIS installer (*.exe)" artifacts/windows-x64-release "*.exe"
+          require_one "Windows ARM64 NSIS installer (*.exe)" artifacts/windows-arm64-release "*.exe"
           require_one "macOS Apple Silicon installer (*.dmg)" "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg"
           require_one "macOS Intel installer (*.dmg)" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg"
           require_one "Linux Debian installer (*.deb)" artifacts/linux-x64-release "*.deb"
           require_one "Linux RPM installer (*.rpm)" artifacts/linux-x64-release "*.rpm"
           require_one "Linux ARM64 Debian installer (*.deb)" artifacts/linux-arm64-release "*.deb"
           require_one "Linux ARM64 RPM installer (*.rpm)" artifacts/linux-arm64-release "*.rpm"
-          require_one "Windows NSIS installer for app $APP_VERSION" artifacts/windows-release "*${APP_VERSION}*.exe"
+          require_one "Windows x64 NSIS installer for app $APP_VERSION" artifacts/windows-x64-release "*${APP_VERSION}*.exe"
+          require_one "Windows ARM64 NSIS installer for app $APP_VERSION" artifacts/windows-arm64-release "*${APP_VERSION}*.exe"
           require_one "macOS Apple Silicon installer for app $APP_VERSION" "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_aarch64.dmg"
           require_one "macOS Intel installer for app $APP_VERSION" "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*${APP_VERSION}*_x64.dmg"
           require_one "Linux Debian installer for app $APP_VERSION" artifacts/linux-x64-release "*${APP_VERSION}*.deb"
@@ -2254,14 +2415,15 @@ jobs:
             [[ -n "$source" ]]
             cp -- "$source" "release-assets/$destination"
           }
-          copy_one artifacts/windows-release "*.exe" "suyo-${RELEASE_VERSION}-windows-x64-setup${INSTALLER_TRUST_SUFFIX}.exe"
+          copy_one artifacts/windows-x64-release "*.exe" "suyo-${RELEASE_VERSION}-windows-x64-setup${INSTALLER_TRUST_SUFFIX}.exe"
+          copy_one artifacts/windows-arm64-release "*.exe" "suyo-${RELEASE_VERSION}-windows-arm64-setup${INSTALLER_TRUST_SUFFIX}.exe"
           copy_one "artifacts/macos-aarch64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-aarch64${MACOS_TRUST_SUFFIX}.dmg"
           copy_one "artifacts/macos-x64-$MACOS_ARTIFACT_PROFILE" "*.dmg" "suyo-${RELEASE_VERSION}-macos-x64${MACOS_TRUST_SUFFIX}.dmg"
           copy_one artifacts/linux-x64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-amd64${INSTALLER_TRUST_SUFFIX}.deb"
           copy_one artifacts/linux-x64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-x86_64${INSTALLER_TRUST_SUFFIX}.rpm"
           copy_one artifacts/linux-arm64-release "*.deb" "suyo-${RELEASE_VERSION}-linux-arm64${INSTALLER_TRUST_SUFFIX}.deb"
           copy_one artifacts/linux-arm64-release "*.rpm" "suyo-${RELEASE_VERSION}-linux-aarch64${INSTALLER_TRUST_SUFFIX}.rpm"
-          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
+          [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" == "8" ]]
 
       - name: Generate SHA-256 checksums
         run: node scripts/generate-checksums.mjs release-assets CHECKSUMS.md
@@ -2338,7 +2500,7 @@ jobs:
               publicPrerelease: true,
               draft: false,
               latest: false,
-              installerCount: 7,
+              installerCount: 8,
               metadataCount: 4,
             },
             runtime: {
@@ -2381,7 +2543,7 @@ jobs:
 
           if (
             document.releaseProfile !== "unsigned-degraded" ||
-            !/^v1\.1\.0(?:-rc\.[1-9][0-9]*)?$/.test(document.releaseTag ?? "") ||
+            !/^v1\.1\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?$/.test(document.releaseTag ?? "") ||
             !/^[0-9a-f]{40}$/.test(document.releaseCommit ?? "")
           ) {
             throw new Error("invalid unsigned-degraded release identity");
@@ -2406,18 +2568,18 @@ jobs:
           ## v1.1 核心能力
 
           - ACP 会话、隔离 worktree、checkpoint/rewind、Hooks 与验证 Agent 随包提供；冻结后端和原生安装包按 v1.1 `released` 门禁验证。
-          - 七个安装包均来自同一 tag/commit，文件名带有 `UNSIGNED-DEGRADED`，避免与未来的权威签名包混淆。
+          - 八个安装包均来自同一 tag/commit，文件名带有 `UNSIGNED-DEGRADED`，避免与未来的权威签名包混淆。
 
           ## Office 降级边界
 
           - 本包不含权威 Office renderer；高保真预览、高保真编辑与视觉提交、视觉验证闭环、用户模板，以及图表和复杂格式保真均不可用或不作承诺。
-          - 仅保留五个原生目标已验证的受限 Office 兼容能力；机器可复核结果见 `OFFICE-RESTRICTED-COMPATIBILITY.json`。
+          - 仅保留六个原生目标已验证的受限 Office 兼容能力；机器可复核结果见 `OFFICE-RESTRICTED-COMPATIBILITY.json`。
           - 腾讯文档与 SiliconFlow 的 v1.0 live integration evidence 未在此 profile 中运行；不得从本 Release 推断其已通过。
 
           ## 签名与发布状态
 
           - Windows NSIS 未配置 Authenticode；macOS 应用仅使用 ad-hoc 签名，DMG 无 Developer ID 签名、无 Apple 公证、无 stapled ticket；Linux DEB/RPM 及仓库均未签名。
-          - Release 公开为 prerelease，固定包含七个安装包和四个元数据：`CHECKSUMS.md`、`release-manifest.json`、`OFFICE-RESTRICTED-COMPATIBILITY.json`、`DEGRADED-CAPABILITIES.json`。
+          - Release 公开为 prerelease，固定包含八个安装包和四个元数据：`CHECKSUMS.md`、`release-manifest.json`、`OFFICE-RESTRICTED-COMPATIBILITY.json`、`DEGRADED-CAPABILITIES.json`。
           - `DEGRADED-CAPABILITIES.json` 是本 profile 的机器可读能力与信任边界；`release-manifest.json` 仅用于可信版本发现与手动下载，不声明或执行自动更新。
 
           EOF
@@ -2434,7 +2596,7 @@ jobs:
             cat <<'EOF'
           ## 版本重点
 
-          - 文件与 Office：DOCX/XLSX/PPTX 的受限创建和编辑、写前版本、恢复与受守卫的目标文件提交由五个原生平台分别验证。
+          - 文件与 Office：DOCX/XLSX/PPTX 的受限创建和编辑、写前版本、恢复与受守卫的目标文件提交由六个原生平台分别验证。
           - 目标模式：目标、阶段进展和完成摘要保留在对话中，旧问答不再因目标状态消失；移除累计 Token 分解与累计上下文用量展示。
           - 对话体验：修复侧栏右键重命名失焦；简化多轮导航短横，移除总轮数按钮和“第 x 轮”文字。
           - 凭据：改为按需激活与聚合保存，覆盖环境变量引用解析及同进程重复请求回归。
@@ -2454,10 +2616,10 @@ jobs:
 
           - Windows NSIS：安装界面支持 English 与简体中文并提供语言选择；当前未配置 Authenticode 代码签名；已在原生 Windows runner 静默安装并验证内置运行时。
           - Linux x64/ARM64 DEB/RPM：当前未配置仓库签名；已在对应原生 runner 验证包元数据、完整解包、内置运行时和桌面生命周期。
-          - 七个安装包（Windows x64、macOS arm64/x64、Linux x64/ARM64）均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
-          - 五个原生目标均由冻结后端完成 DOCX/XLSX/PPTX 的创建、有限编辑、独立重开、原子安装和写前版本快照验证；机器可复核结果见 `OFFICE-COMPATIBILITY.json`。
+          - 八个安装包（Windows x64/ARM64、macOS arm64/x64、Linux x64/ARM64）均来自同一提交并通过统一前端功能门禁；生成文件菜单的 macOS、Windows 与 Linux 能力矩阵已执行回归。
+          - 六个原生目标均由冻结后端完成 DOCX/XLSX/PPTX 的创建、有限编辑、独立重开、原子安装和写前版本快照验证；机器可复核结果见 `OFFICE-COMPATIBILITY.json`。
           - 腾讯文档与 SiliconFlow 集成证据均绑定同一 tag/commit 且无跳过；RC 验证无凭据合同，稳定版还必须通过腾讯文档可逆写入和 SiliconFlow 真实工具闭环。manifest 与日志摘要见 `INTEGRATION-CONTRACTS.json`。
-          - Release 草稿固定包含十一个资产：七个安装包，以及 `CHECKSUMS.md`、`release-manifest.json`、`OFFICE-COMPATIBILITY.json`、`INTEGRATION-CONTRACTS.json`。
+          - Release 草稿固定包含十二个资产：八个安装包，以及 `CHECKSUMS.md`、`release-manifest.json`、`OFFICE-COMPATIBILITY.json`、`INTEGRATION-CONTRACTS.json`。
           - 所有安装包均由本次 tag 的隔离 runner 构建；以下 SHA-256 是下载后完整性校验依据。
           - `release-manifest.json` 仅提供可信版本发现与手动下载链接，不声明或执行自动更新。
 

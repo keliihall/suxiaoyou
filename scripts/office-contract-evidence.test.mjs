@@ -137,7 +137,7 @@ test("aggregates exactly one report for every native release platform", () => {
   }
 });
 
-test("rejects a duplicate platform even when five reports are present", () => {
+test("rejects a duplicate platform even when six reports are present", () => {
   const platforms = [...REQUIRED_OFFICE_PLATFORMS];
   platforms[platforms.length - 1] = platforms[0];
   const reports = platforms.map((platform, index) => {

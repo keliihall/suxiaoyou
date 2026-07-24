@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -31,6 +32,11 @@ from app.tool.workspace import (
     resolve_and_validate,
     resolve_for_write,
 )
+from app.storage.workspace_identity import (
+    WorkspaceIdentityError,
+    ensure_workspace_identity,
+    inspect_workspace_identity,
+)
 from app.utils.atomic_write import atomic_write_text
 from app.utils.guarded_file_mutation import (
     guarded_file_mutation_unavailable_reason,
@@ -44,13 +50,12 @@ from app.utils.windows_guarded_file import (
     open_regular_file_for_stable_read,
     validate_windows_relative_name,
     windows_lstat_is_reparse,
-    windows_path_identity,
 )
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_SCHEMA_VERSION: Final = 2
-SUPPORTED_MANIFEST_SCHEMA_VERSIONS: Final = frozenset({1, MANIFEST_SCHEMA_VERSION})
+MANIFEST_SCHEMA_VERSION: Final = 3
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS: Final = frozenset({1, 2, MANIFEST_SCHEMA_VERSION})
 DEFAULT_MAX_FILE_BYTES: Final = 100 * 1024 * 1024
 DEFAULT_MAX_WORKSPACE_BYTES: Final = 512 * 1024 * 1024
 DEFAULT_MAX_VERSIONS_PER_FILE: Final = 50
@@ -119,7 +124,9 @@ class FileVersion:
                 raise ValueError("unsafe object name")
             return result
         except (KeyError, TypeError, ValueError) as exc:
-            raise FileVersionError("File-version manifest contains an invalid entry") from exc
+            raise FileVersionError(
+                "File-version manifest contains an invalid entry"
+            ) from exc
 
     def public_dict(self) -> dict[str, Any]:
         """Return stable JSON data suitable for tool/API responses."""
@@ -174,43 +181,58 @@ class FileVersionStore:
         storage_root: str | os.PathLike[str] | None = None,
         limits: FileVersionLimits | None = None,
         expected_workspace_identity: tuple[int, int] | None = None,
+        expected_durable_workspace_identity: str | None = None,
+        legacy_workspace_identity: tuple[int, int] | None = None,
     ) -> None:
-        workspace_path = Path(workspace).expanduser().resolve(strict=True)
-        if not workspace_path.is_dir():
-            raise FileVersionError(f"Workspace is not a directory: {workspace_path}")
-        self.workspace = workspace_path
-        workspace_info = self.workspace.stat(follow_symlinks=False)
-        if sys.platform == "win32":
-            if windows_lstat_is_reparse(workspace_info):
-                raise FileVersionError("Workspace root is a Windows reparse point")
-            self._workspace_identity = windows_path_identity(
-                self.workspace, directory=True
+        try:
+            identity = (
+                inspect_workspace_identity(workspace)
+                if expected_durable_workspace_identity is not None
+                else ensure_workspace_identity(workspace)
             )
-        else:
-            self._workspace_identity = (workspace_info.st_dev, workspace_info.st_ino)
+        except WorkspaceIdentityError as exc:
+            raise FileVersionError(str(exc)) from exc
+        self.workspace = identity.canonical_path
+        self._workspace_identity = identity.volatile_identity
+        self._durable_workspace_identity = identity.durable_token
+        self._legacy_workspace_identity = legacy_workspace_identity
+        if (
+            expected_durable_workspace_identity is not None
+            and self._durable_workspace_identity != expected_durable_workspace_identity
+        ):
+            raise FileVersionError(
+                "Workspace durable identity changed before file-version operation"
+            )
         if (
             expected_workspace_identity is not None
             and self._workspace_identity != expected_workspace_identity
         ):
-            raise FileVersionError("Workspace root changed before file-version operation")
+            raise FileVersionError(
+                "Workspace root changed before file-version operation"
+            )
         self.limits = limits or FileVersionLimits()
         raw_storage_root = Path(
-            storage_root if storage_root is not None else default_file_version_storage_root()
+            storage_root
+            if storage_root is not None
+            else default_file_version_storage_root()
         ).expanduser()
         self.storage_root = Path(os.path.abspath(raw_storage_root))
-        # A pathname is not a workspace identity.  The directory at a selected
-        # path can be removed and recreated while an older history tree still
-        # exists.  Scope private history by both the canonical path and the
-        # filesystem object so a replacement directory cannot inherit or restore
-        # the previous directory's contents.
+        # A pathname is not a workspace identity.  Scope private history by the
+        # canonical path plus the app-owned durable marker.  The volatile native
+        # tuple remains an in-process TOCTOU guard only; persisting POSIX st_dev
+        # made valid APFS workspaces lose their history after a reboot/remount.
         workspace_key = _workspace_storage_key(
             self.workspace,
-            self._workspace_identity,
+            self._durable_workspace_identity,
         )
         self.root = self.storage_root / workspace_key
         self.objects_dir = self.root / "objects"
         self.manifest_path = self.root / "manifest-v1.json"
         self._lock = _lock_for_workspace(workspace_key)
+        self._retained_legacy_source_present = False
+        if legacy_workspace_identity is not None:
+            with self._lock:
+                self._adopt_legacy_store(legacy_workspace_identity)
 
     def capture_before_mutation(
         self,
@@ -343,9 +365,7 @@ class FileVersionStore:
                 retained = self._apply_retention(
                     versions,
                     newest=version,
-                    pinned_version_ids=frozenset(
-                        {*pinned_version_ids, *durable_pins}
-                    ),
+                    pinned_version_ids=frozenset({*pinned_version_ids, *durable_pins}),
                 )
                 self._write_manifest(retained, pins=manifest["pins"])
                 manifest_committed = True
@@ -431,6 +451,39 @@ class FileVersionStore:
                     f"File version not found in this workspace: {requested}"
                 )
             return version
+
+    def verify_integrity(
+        self,
+        version_ids: set[str] | frozenset[str] | None = None,
+    ) -> int:
+        """Verify retained metadata and blobs without changing workspace state."""
+
+        requested = None if version_ids is None else _safe_version_ids(version_ids)
+        with self._lock:
+            manifest = self._load_manifest(create=False)
+            versions = list(manifest["versions"])
+            available = {version.id for version in versions}
+            if requested is not None:
+                missing = requested - available
+                if missing:
+                    raise FileVersionNotFound(
+                        "Required file version is missing from this workspace: "
+                        + ", ".join(sorted(missing))
+                    )
+                versions = [version for version in versions if version.id in requested]
+            for version in versions:
+                self._verify_object(
+                    self._object_path(version),
+                    digest=version.sha256,
+                    size=version.size,
+                )
+            return len(versions)
+
+    @property
+    def retained_legacy_source_present(self) -> bool:
+        """Whether adoption found the retained stat-v1 history tree."""
+
+        return self._retained_legacy_source_present
 
     def materialize_version_in_transaction(
         self,
@@ -538,13 +591,12 @@ class FileVersionStore:
             except FileNotFoundError:
                 target_info = None
             except OSError as exc:
-                raise FileVersionError("Version destination cannot be inspected") from exc
+                raise FileVersionError(
+                    "Version destination cannot be inspected"
+                ) from exc
             if target_info is not None and (
                 stat.S_ISLNK(target_info.st_mode)
-                or (
-                    sys.platform == "win32"
-                    and windows_lstat_is_reparse(target_info)
-                )
+                or (sys.platform == "win32" and windows_lstat_is_reparse(target_info))
                 or not stat.S_ISREG(target_info.st_mode)
             ):
                 raise FileVersionError(
@@ -570,9 +622,10 @@ class FileVersionStore:
                 opened_source = os.fstat(source_fd)
                 if not stat.S_ISREG(opened_source.st_mode):
                     raise FileVersionError("Recovery object is not a regular file")
-                with os.fdopen(source_fd, "rb") as src, os.fdopen(
-                    temporary_fd, "wb"
-                ) as dst:
+                with (
+                    os.fdopen(source_fd, "rb") as src,
+                    os.fdopen(temporary_fd, "wb") as dst,
+                ):
                     source_fd = -1
                     temporary_fd = -1
                     while chunk := src.read(_COPY_CHUNK_BYTES):
@@ -582,19 +635,23 @@ class FileVersionStore:
                     dst.flush()
                     os.fsync(dst.fileno())
                 if copied != version.size or digest.hexdigest() != version.sha256:
-                    raise FileVersionError("Recovery object changed during materialization")
+                    raise FileVersionError(
+                        "Recovery object changed during materialization"
+                    )
                 if version.original_mode is not None:
                     os.chmod(temporary, version.original_mode)
                 current_stage = stage.lstat()
-                if (int(current_stage.st_dev), int(current_stage.st_ino)) != stage_identity:
-                    raise FileVersionError("Transaction stage changed during materialization")
+                if (
+                    int(current_stage.st_dev),
+                    int(current_stage.st_ino),
+                ) != stage_identity:
+                    raise FileVersionError(
+                        "Transaction stage changed during materialization"
+                    )
                 os.replace(temporary, target)
                 _fsync_directory(target.parent)
                 installed_digest, installed_size = _sha256_regular_file(target)
-                if (
-                    installed_digest != version.sha256
-                    or installed_size != version.size
-                ):
+                if installed_digest != version.sha256 or installed_size != version.size:
                     raise FileVersionError("Materialized version failed verification")
                 return version, target
             except FileVersionError:
@@ -827,9 +884,9 @@ class FileVersionStore:
                                     "Windows rollback parent must already exist: "
                                     f"{target.parent}"
                                 ) from exc
-                            if windows_lstat_is_reparse(parent_info) or not stat.S_ISDIR(
-                                parent_info.st_mode
-                            ):
+                            if windows_lstat_is_reparse(
+                                parent_info
+                            ) or not stat.S_ISDIR(parent_info.st_mode):
                                 raise FileVersionError(
                                     "Windows rollback parent is redirected or not a "
                                     f"directory: {target.parent}"
@@ -837,7 +894,9 @@ class FileVersionStore:
                         else:
                             target.parent.mkdir(parents=True, exist_ok=True)
                         if self._target_from_relative(version.relative_path) != target:
-                            raise FileVersionError("Rollback target changed during recovery")
+                            raise FileVersionError(
+                                "Rollback target changed during recovery"
+                            )
                         self._copy_object_atomically(
                             blob,
                             target,
@@ -1122,8 +1181,7 @@ class FileVersionStore:
                     source_streams = api.stream_inventory(source)
                     if (
                         any(name != "::$DATA" for name, _size in source_streams)
-                        or sum(size for _name, size in source_streams)
-                        != expected_size
+                        or sum(size for _name, size in source_streams) != expected_size
                     ):
                         raise FileVersionError(
                             "Recovery object has unaccounted Windows data streams"
@@ -1142,7 +1200,9 @@ class FileVersionStore:
                         )
                 prepared_info = api.path_info(temporary, directory=False)
                 if prepared_info.link_count != 1:
-                    raise FileVersionError("Prepared Windows restore gained a hard link")
+                    raise FileVersionError(
+                        "Prepared Windows restore gained a hard link"
+                    )
 
                 if expected_current is None:
                     try:
@@ -1257,7 +1317,9 @@ class FileVersionStore:
         except WorkspaceViolation as exc:
             raise FileVersionError(str(exc)) from exc
         except OSError as exc:
-            raise FileVersionError(f"Cannot resolve version target {raw}: {exc}") from exc
+            raise FileVersionError(
+                f"Cannot resolve version target {raw}: {exc}"
+            ) from exc
         target = Path(resolved)
         try:
             target.relative_to(self.workspace)
@@ -1267,20 +1329,22 @@ class FileVersionStore:
 
     def _assert_workspace_identity(self) -> None:
         try:
+            current = inspect_workspace_identity(self.workspace)
             info = self.workspace.stat(follow_symlinks=False)
-        except OSError as exc:
-            raise FileVersionError("Workspace root changed during file-version operation") from exc
-        identity = (
-            windows_path_identity(self.workspace, directory=True)
-            if sys.platform == "win32"
-            else (info.st_dev, info.st_ino)
-        )
+        except (OSError, WorkspaceIdentityError) as exc:
+            raise FileVersionError(
+                "Workspace root changed during file-version operation"
+            ) from exc
         if (
-            identity != self._workspace_identity
+            current.canonical_path != self.workspace
+            or current.durable_token != self._durable_workspace_identity
+            or current.volatile_identity != self._workspace_identity
             or not stat.S_ISDIR(info.st_mode)
             or (sys.platform == "win32" and windows_lstat_is_reparse(info))
         ):
-            raise FileVersionError("Workspace root changed during file-version operation")
+            raise FileVersionError(
+                "Workspace root changed during file-version operation"
+            )
 
     @staticmethod
     def _require_guarded_restore_support() -> None:
@@ -1314,13 +1378,305 @@ class FileVersionStore:
             except FileNotFoundError:
                 break
             except OSError as exc:
-                raise FileVersionError(f"Cannot inspect restore path: {current}") from exc
+                raise FileVersionError(
+                    f"Cannot inspect restore path: {current}"
+                ) from exc
         candidate = lexical if sys.platform == "win32" else lexical.resolve()
         try:
             candidate.relative_to(self.workspace)
         except ValueError as exc:
             raise FileVersionError("Restored path escaped the workspace") from exc
         return candidate
+
+    def _adopt_legacy_store(self, legacy_identity: tuple[int, int]) -> None:
+        """Copy a validated stat-v1 store into the durable marker namespace.
+
+        The legacy tree is deliberately retained.  Migration prepares and
+        fsyncs a sibling tree before publishing it with one rename, so a crash
+        can only leave the old source plus an expendable staging copy.
+        """
+
+        legacy_key = _legacy_workspace_storage_key(self.workspace, legacy_identity)
+        legacy_root = self.storage_root / legacy_key
+        if not legacy_root.exists() and not legacy_root.is_symlink():
+            return
+        self._retained_legacy_source_present = True
+        _require_plain_directory(self.storage_root, label="file-version storage")
+        _require_plain_directory(legacy_root, label="legacy file-version store")
+        versions, pins = self._read_legacy_manifest(
+            legacy_root,
+            expected_identity=legacy_identity,
+            verify_objects=False,
+        )
+        if self.root.exists() or self.root.is_symlink():
+            disposition = self._classify_durable_destination(
+                versions,
+                pins,
+                legacy_identity=legacy_identity,
+            )
+            if disposition == "valid":
+                # A prior attempt may have completed the atomic publish and
+                # failed only while making the parent-directory rename durable.
+                _fsync_plain_tree(self.root)
+                _fsync_directory_strict(self.storage_root)
+                return
+
+        staging = self.storage_root / f".{self.root.name}.identity-v2-migrating"
+        if staging.exists() or staging.is_symlink():
+            _remove_plain_tree(staging)
+        try:
+            shutil.copytree(legacy_root, staging, symlinks=True)
+            _require_plain_tree(staging)
+            copied_versions, copied_pins = self._read_legacy_manifest(
+                staging,
+                expected_identity=legacy_identity,
+                verify_objects=True,
+            )
+            if copied_versions != versions or copied_pins != pins:
+                raise FileVersionError(
+                    "Legacy file-version store changed while it was migrated"
+                )
+            payload = {
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "workspace": str(self.workspace),
+                "workspace_identity": {
+                    "token": self._durable_workspace_identity,
+                },
+                "versions": [asdict(version) for version in versions],
+                "pins": pins,
+            }
+            atomic_write_text(
+                staging / "manifest-v1.json",
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                mode=0o600,
+            )
+            _fsync_plain_tree(staging)
+
+            if self.root.exists() or self.root.is_symlink():
+                disposition = self._classify_durable_destination(
+                    versions,
+                    pins,
+                    legacy_identity=legacy_identity,
+                )
+                if disposition == "valid":
+                    # A previous attempt published the complete tree but may
+                    # have failed while syncing the parent directory.  Re-sync
+                    # it and leave both histories intact.
+                    _fsync_plain_tree(self.root)
+                    _fsync_directory_strict(self.storage_root)
+                    return
+                _remove_plain_tree(self.root)
+                _fsync_directory_strict(self.storage_root)
+
+            try:
+                os.rename(staging, self.root)
+            except OSError as exc:
+                # Never treat destination existence alone as success.  A
+                # concurrent/retried publisher is acceptable only after the
+                # complete durable store has been validated against the still
+                # authoritative legacy source.
+                if not (self.root.exists() or self.root.is_symlink()):
+                    raise FileVersionError(
+                        "Could not publish migrated file-version history"
+                    ) from exc
+                disposition = self._classify_durable_destination(
+                    versions,
+                    pins,
+                    legacy_identity=legacy_identity,
+                )
+                if disposition != "valid":
+                    raise FileVersionError(
+                        "Migrated file-version destination appeared incomplete"
+                    ) from exc
+            _fsync_directory_strict(self.storage_root)
+        finally:
+            if staging.exists() or staging.is_symlink():
+                _remove_plain_tree(staging)
+
+    def _read_legacy_manifest(
+        self,
+        root: Path,
+        *,
+        expected_identity: tuple[int, int],
+        verify_objects: bool,
+    ) -> tuple[list[FileVersion], dict[str, list[str]]]:
+        _require_plain_tree(root)
+        manifest_path = root / "manifest-v1.json"
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FileVersionError(
+                "Legacy file-version manifest is unreadable or corrupt"
+            ) from exc
+        raw_identity = raw.get("workspace_identity") if isinstance(raw, dict) else None
+        if (
+            not isinstance(raw, dict)
+            or type(raw.get("schema_version")) is not int
+            or raw["schema_version"] not in {1, 2}
+            or raw.get("workspace") != str(self.workspace)
+            or not isinstance(raw_identity, dict)
+            or type(raw_identity.get("dev")) is not int
+            or type(raw_identity.get("ino")) is not int
+            or (raw_identity["dev"], raw_identity["ino"]) != expected_identity
+            or not isinstance(raw.get("versions"), list)
+        ):
+            raise FileVersionError(
+                "Legacy file-version manifest has foreign workspace identity"
+            )
+        versions = [FileVersion.from_dict(value) for value in raw["versions"]]
+        pins = _parse_manifest_pins(raw.get("pins", {}), versions=versions)
+        objects = root / "objects"
+        _require_plain_directory(objects, label="legacy file-version objects")
+        if verify_objects:
+            for version in versions:
+                path = objects / (version.object_name or f"{version.sha256}.blob")
+                self._verify_object(path, digest=version.sha256, size=version.size)
+        return versions, pins
+
+    def _classify_durable_destination(
+        self,
+        expected_versions: list[FileVersion],
+        expected_pins: dict[str, list[str]],
+        *,
+        legacy_identity: tuple[int, int],
+    ) -> str:
+        """Return ``valid`` or ``partial``; raise for conflicting history.
+
+        Only a destination whose manifest describes the exact authoritative
+        legacy history can be reused or reconstructed.  An empty directory, a
+        manifest-free subset of expected objects, or an exact manifest with
+        missing/corrupt expected objects is an interrupted preparation and can
+        safely be rebuilt because the legacy source remains untouched.
+        """
+
+        _require_plain_tree(self.root)
+        if not self.manifest_path.exists():
+            if self._durable_destination_has_expected_shape(expected_versions):
+                return "partial"
+            raise FileVersionError(
+                "Durable file-version destination conflicts with legacy history"
+            )
+
+        try:
+            raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FileVersionError(
+                "Durable file-version destination manifest is corrupt"
+            ) from exc
+        raw_identity = raw.get("workspace_identity") if isinstance(raw, dict) else None
+        schema_version = raw.get("schema_version") if isinstance(raw, dict) else None
+        legacy_identity_matches = (
+            type(schema_version) is int
+            and schema_version in {1, 2}
+            and isinstance(raw_identity, dict)
+            and type(raw_identity.get("dev")) is int
+            and type(raw_identity.get("ino")) is int
+            and (raw_identity["dev"], raw_identity["ino"]) == legacy_identity
+        )
+        durable_identity_matches = (
+            type(schema_version) is int
+            and schema_version == MANIFEST_SCHEMA_VERSION
+            and isinstance(raw_identity, dict)
+            and raw_identity.get("token") == self._durable_workspace_identity
+        )
+        if (
+            not isinstance(raw, dict)
+            or raw.get("workspace") != str(self.workspace)
+            or not (legacy_identity_matches or durable_identity_matches)
+            or not isinstance(raw.get("versions"), list)
+        ):
+            raise FileVersionError(
+                "Durable file-version destination belongs to different history"
+            )
+        versions = [FileVersion.from_dict(value) for value in raw["versions"]]
+        pins = _parse_manifest_pins(raw.get("pins", {}), versions=versions)
+        if versions != expected_versions or pins != expected_pins:
+            raise FileVersionError(
+                "Durable file-version destination conflicts with legacy history"
+            )
+
+        try:
+            _require_plain_directory(
+                self.objects_dir,
+                label="durable file-version objects",
+            )
+            for version in versions:
+                self._verify_object(
+                    self._object_path(version),
+                    digest=version.sha256,
+                    size=version.size,
+                )
+        except FileVersionError:
+            if self._durable_destination_has_expected_shape(expected_versions):
+                return "partial"
+            raise
+        # A complete schema-1/2 copy under the new key is still only a partial
+        # migration: rewrite its persisted identity before the database can
+        # begin treating the durable token as authoritative.
+        return "partial" if legacy_identity_matches else "valid"
+
+    def _durable_destination_has_expected_shape(
+        self,
+        expected_versions: list[FileVersion],
+    ) -> bool:
+        """Whether an incomplete destination contains no conflicting names."""
+
+        expected_objects = {
+            version.object_name or f"{version.sha256}.blob"
+            for version in expected_versions
+        }
+        try:
+            root_entries = list(self.root.iterdir())
+        except OSError as exc:
+            raise FileVersionError(
+                "Cannot inspect partial durable file-version destination"
+            ) from exc
+        for entry in root_entries:
+            if entry.name == self.manifest_path.name:
+                try:
+                    info = entry.lstat()
+                except OSError as exc:
+                    raise FileVersionError(
+                        "Cannot inspect durable file-version manifest"
+                    ) from exc
+                if entry.is_symlink() or not stat.S_ISREG(info.st_mode):
+                    return False
+                continue
+            if entry.name != self.objects_dir.name:
+                return False
+            try:
+                info = entry.lstat()
+            except OSError as exc:
+                raise FileVersionError(
+                    "Cannot inspect durable file-version objects"
+                ) from exc
+            if entry.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                return False
+            try:
+                object_entries = list(entry.iterdir())
+            except OSError as exc:
+                raise FileVersionError(
+                    "Cannot inspect partial durable recovery objects"
+                ) from exc
+            for candidate in object_entries:
+                try:
+                    candidate_info = candidate.lstat()
+                except OSError as exc:
+                    raise FileVersionError(
+                        "Cannot inspect partial durable recovery object"
+                    ) from exc
+                if (
+                    candidate.name not in expected_objects
+                    or candidate.is_symlink()
+                    or (
+                        sys.platform == "win32"
+                        and windows_lstat_is_reparse(candidate_info)
+                    )
+                    or not stat.S_ISREG(candidate_info.st_mode)
+                ):
+                    return False
+        return True
 
     def _ensure_store(self) -> None:
         for directory in (self.storage_root, self.root, self.objects_dir):
@@ -1338,7 +1694,9 @@ class FileVersionStore:
                 ) from exc
             if (
                 directory.is_symlink()
-                or (sys.platform == "win32" and windows_lstat_is_reparse(directory_info))
+                or (
+                    sys.platform == "win32" and windows_lstat_is_reparse(directory_info)
+                )
                 or not directory.is_dir()
             ):
                 raise FileVersionError(
@@ -1369,7 +1727,9 @@ class FileVersionStore:
         except OSError as exc:
             if parent_fd >= 0:
                 os.close(parent_fd)
-            raise FileVersionError(f"Cannot safely open file for versioning: {target}") from exc
+            raise FileVersionError(
+                f"Cannot safely open file for versioning: {target}"
+            ) from exc
 
         temporary_fd = -1
         temporary_path: Path | None = None
@@ -1567,6 +1927,9 @@ class FileVersionStore:
             if create:
                 self._ensure_store()
             return {"versions": [], "pins": {}}
+        _require_plain_directory(self.storage_root, label="file-version storage")
+        _require_plain_directory(self.root, label="file-version workspace store")
+        _require_plain_directory(self.objects_dir, label="file-version objects")
         manifest_info = self.manifest_path.lstat()
         if self.manifest_path.is_symlink() or (
             sys.platform == "win32" and windows_lstat_is_reparse(manifest_info)
@@ -1575,25 +1938,35 @@ class FileVersionStore:
         try:
             raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise FileVersionError("File-version manifest is unreadable or corrupt") from exc
+            raise FileVersionError(
+                "File-version manifest is unreadable or corrupt"
+            ) from exc
         if (
             not isinstance(raw, dict)
-            or raw.get("schema_version") not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+            or type(raw.get("schema_version")) is not int
+            or raw["schema_version"] not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS
         ):
             raise FileVersionError("Unsupported file-version manifest schema")
         if raw.get("workspace") != str(self.workspace):
-            raise FileVersionError("File-version manifest belongs to a different workspace")
-        raw_identity = raw.get("workspace_identity")
-        if (
-            not isinstance(raw_identity, dict)
-            or type(raw_identity.get("dev")) is not int
-            or type(raw_identity.get("ino")) is not int
-            or (
-                raw_identity["dev"],
-                raw_identity["ino"],
+            raise FileVersionError(
+                "File-version manifest belongs to a different workspace"
             )
-            != self._workspace_identity
-        ):
+        raw_identity = raw.get("workspace_identity")
+        schema_version = int(raw["schema_version"])
+        durable_identity_matches = (
+            schema_version == MANIFEST_SCHEMA_VERSION
+            and isinstance(raw_identity, dict)
+            and raw_identity.get("token") == self._durable_workspace_identity
+        )
+        legacy_identity_matches = (
+            schema_version in {1, 2}
+            and isinstance(raw_identity, dict)
+            and type(raw_identity.get("dev")) is int
+            and type(raw_identity.get("ino")) is int
+            and (raw_identity["dev"], raw_identity["ino"])
+            == (self._legacy_workspace_identity or self._workspace_identity)
+        )
+        if not (durable_identity_matches or legacy_identity_matches):
             raise FileVersionError(
                 "File-version manifest belongs to a different workspace identity"
             )
@@ -1616,8 +1989,7 @@ class FileVersionStore:
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "workspace": str(self.workspace),
             "workspace_identity": {
-                "dev": self._workspace_identity[0],
-                "ino": self._workspace_identity[1],
+                "token": self._durable_workspace_identity,
             },
             "versions": [asdict(version) for version in versions],
             "pins": normalized_pins,
@@ -1640,7 +2012,9 @@ class FileVersionStore:
         available_ids = {version.id for version in ordered}
         missing_pins = pinned_version_ids - available_ids
         if missing_pins:
-            raise FileVersionError("A pinned restore source is missing from the manifest")
+            raise FileVersionError(
+                "A pinned restore source is missing from the manifest"
+            )
 
         # Required records are selected before ordinary newest-first retention.
         # This makes restore a safe two-record transaction: both the displaced
@@ -1690,7 +2064,9 @@ class FileVersionStore:
                 retained_bytes += version.size
 
         if not any(version.id == newest.id for version in retained):
-            raise FileVersionError("Could not retain the required pre-mutation snapshot")
+            raise FileVersionError(
+                "Could not retain the required pre-mutation snapshot"
+            )
         return sorted(retained, key=_version_sort_key)
 
     def _delete_unreferenced_objects(self, versions: list[FileVersion]) -> None:
@@ -1721,7 +2097,9 @@ class FileVersionStore:
                 )
             actual, actual_size = _sha256_regular_file(path)
             if actual_size != size:
-                raise FileVersionError(f"Recovery object is missing or has the wrong size: {path}")
+                raise FileVersionError(
+                    f"Recovery object is missing or has the wrong size: {path}"
+                )
         except OSError as exc:
             raise FileVersionError(f"Cannot read recovery object: {path}") from exc
         if actual != digest:
@@ -1758,14 +2136,15 @@ class FileVersionStore:
         try:
             source_fd = os.open(
                 source,
-                os.O_RDONLY
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
             source_stat = os.fstat(source_fd)
             if not stat.S_ISREG(source_stat.st_mode):
                 raise FileVersionError("Recovery object is not a regular file")
-            with os.fdopen(source_fd, "rb") as src, os.fdopen(temporary_fd, "wb") as dst:
+            with (
+                os.fdopen(source_fd, "rb") as src,
+                os.fdopen(temporary_fd, "wb") as dst,
+            ):
                 source_fd = -1
                 temporary_fd = -1
                 while True:
@@ -1801,6 +2180,17 @@ def _lock_for_workspace(workspace_key: str) -> threading.RLock:
 
 def _workspace_storage_key(
     workspace: Path,
+    durable_identity: str,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(os.fsencode(str(workspace)))
+    digest.update(b"\0")
+    digest.update(durable_identity.encode("ascii"))
+    return digest.hexdigest()
+
+
+def _legacy_workspace_storage_key(
+    workspace: Path,
     identity: tuple[int, int],
 ) -> str:
     digest = hashlib.sha256()
@@ -1810,6 +2200,106 @@ def _workspace_storage_key(
     digest.update(b"\0")
     digest.update(str(identity[1]).encode("ascii"))
     return digest.hexdigest()
+
+
+def _require_plain_directory(path: Path, *, label: str) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise FileVersionError(f"Cannot inspect {label}: {path}") from exc
+    if (
+        path.is_symlink()
+        or (sys.platform == "win32" and windows_lstat_is_reparse(info))
+        or not stat.S_ISDIR(info.st_mode)
+    ):
+        raise FileVersionError(f"{label.capitalize()} is redirected: {path}")
+
+
+def _require_plain_tree(root: Path) -> None:
+    _require_plain_directory(root, label="file-version migration tree")
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        for name in (*names, *filenames):
+            candidate = parent / name
+            try:
+                info = candidate.lstat()
+            except OSError as exc:
+                raise FileVersionError(
+                    f"Cannot inspect file-version migration entry: {candidate}"
+                ) from exc
+            if candidate.is_symlink() or (
+                sys.platform == "win32" and windows_lstat_is_reparse(info)
+            ):
+                raise FileVersionError(
+                    f"File-version migration tree contains a redirected entry: {candidate}"
+                )
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise FileVersionError(
+                    f"File-version migration tree contains a special entry: {candidate}"
+                )
+
+
+def _remove_plain_tree(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    _require_plain_directory(path, label="file-version migration staging tree")
+    shutil.rmtree(path)
+
+
+def _fsync_plain_tree(root: Path) -> None:
+    _require_plain_tree(root)
+    directories: list[Path] = []
+    for directory, _names, filenames in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        directories.append(parent)
+        for name in filenames:
+            path = parent / name
+            flags = (
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as exc:
+                raise FileVersionError(
+                    f"Cannot fsync migrated file-version entry: {path}"
+                ) from exc
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in reversed(directories):
+        _fsync_directory_strict(directory)
+
+
+def _fsync_directory_strict(directory: Path) -> None:
+    """Durably commit migration metadata or fail before the database commit.
+
+    Some Windows filesystems do not permit opening directories for fsync.  That
+    platform-specific lack of support is tolerated; I/O failures from an
+    opened descriptor (and all POSIX open/fsync failures) remain fatal.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        if sys.platform == "win32" and exc.errno in {
+            errno.EACCES,
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+        }:
+            return
+        raise FileVersionError(
+            f"Cannot open migrated file-version directory for fsync: {directory}"
+        ) from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise FileVersionError(
+            f"Cannot fsync migrated file-version directory: {directory}"
+        ) from exc
+    finally:
+        os.close(descriptor)
 
 
 def _safe_operation(value: str) -> str:
@@ -2010,7 +2500,9 @@ def _version_atomic_rename(
         function = libc.renameatx_np
         flags = 2 if exchange else 4
     else:
-        raise FileVersionError("Guarded file-version restore is unavailable on this platform")
+        raise FileVersionError(
+            "Guarded file-version restore is unavailable on this platform"
+        )
     function.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
@@ -2038,7 +2530,9 @@ def _version_entry_at(parent_fd: int, name: str) -> dict[str, object] | None:
             "size": 0,
             "sha256": None,
             "link_target": (
-                os.readlink(name, dir_fd=parent_fd) if stat.S_ISLNK(info.st_mode) else None
+                os.readlink(name, dir_fd=parent_fd)
+                if stat.S_ISLNK(info.st_mode)
+                else None
             ),
         }
     descriptor = os.open(
@@ -2152,19 +2646,21 @@ def _recover_partial_windows_restore(
                 if not rollback_exc.may_have_mutated:
                     raise
                 target_exists = _windows_version_name_exists(exchange.target)
-                if target_exists and api.path_info(
-                    exchange.target, directory=False
-                ).identity == displaced_info.identity:
+                if (
+                    target_exists
+                    and api.path_info(exchange.target, directory=False).identity
+                    == displaced_info.identity
+                ):
                     if _windows_version_name_exists(conflict):
                         preserved.add(conflict)
-                elif (
-                    not target_exists
-                    and _windows_version_name_exists(exchange.displaced)
+                elif not target_exists and _windows_version_name_exists(
+                    exchange.displaced
                 ):
                     api.move_noreplace(exchange.displaced, exchange.target)
-                    if api.path_info(
-                        exchange.target, directory=False
-                    ).identity != displaced_info.identity:
+                    if (
+                        api.path_info(exchange.target, directory=False).identity
+                        != displaced_info.identity
+                    ):
                         raise FileVersionError(
                             "Partial rollback restored a different Windows object"
                         )

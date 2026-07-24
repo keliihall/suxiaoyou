@@ -28,6 +28,28 @@ backend/.venv/bin/python backend/run.py --data-dir "/path/to/app-data" --restore
 `--database-url sqlite+aiosqlite:////absolute/path/suxiaoyou.db`。清单缺失、校验和不符、
 数据库损坏、revision 不匹配或来自当前版本不认识的 schema 时，恢复会拒绝执行。
 
+## 工作区身份 v2 升级边界
+
+`0012_v110_workspace_identity_v2` 是一个有意保持空操作的 Alembic revision：它不从
+SQLite 迁移外部文件系统状态，但会让升级流程在进入新存储协议前创建和校验
+数据库备份。数据库打开后，后端才逐个迁移活跃工作区的旧 `stat-v1` 记录：
+
+1. 先验证当前目录与旧身份是否能安全证明连续性；
+2. 在 POSIX 根目录建立优先使用 xattr 的 `marker-v2` （不支持时使用安全标记文件），
+   Windows 则读取 `winfile-v2` 原生卷序列号与文件 ID；
+3. 把旧文件版本树复制到 schema 3 目标，并校验全部对象、pin 与 checkpoint 引用；
+4. 再次确认工作区身份，最后才提交 SQLite 中的新 token。
+
+因此崩溃发生在前三步时，旧数据库记录仍是权威状态，下次启动可幂等重试；
+旧文件版本树也会保留。某个工作区缺失、被替换、身份不可证或历史损坏时，
+后端会保留它的旧 token、journal 和 pin，只阻断该工作区的恢复；其他工作区和本地服务
+仍可启动。不会因为“路径相同”就把旧 checkpoint 绑到新目录。
+
+数据库备份只包含 SQLite，不包含工作区上的 xattr/标记文件或应用私有的文件版本树。
+离线恢复到 `0011` 后若再启动 v2 后端，它会复用已建立的 durable token 并重试上述迁移；
+若要回滚到旧应用，必须先按下文恢复对应的旧 revision 数据库。不要手工删除身份表示
+或任何一份新旧文件版本树来“解锁”恢复。
+
 ## 进程互斥与支持边界
 
 正式后端会在迁移开始前取得数据库的 OS 级独占租约，并一直持有到服务停止且数据库 engine 完成

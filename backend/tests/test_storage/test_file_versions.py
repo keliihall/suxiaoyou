@@ -465,6 +465,7 @@ def test_store_is_outside_workspace_and_manifest_has_relative_paths(tmp_path: Pa
     assert str(target) not in store.manifest_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.workspace_identity_v2
 def test_recreated_workspace_path_is_isolated_from_previous_history(
     tmp_path: Path,
 ) -> None:
@@ -491,6 +492,7 @@ def test_recreated_workspace_path_is_isolated_from_previous_history(
     assert not (workspace / "secret.txt").exists()
 
 
+@pytest.mark.workspace_identity_v2
 def test_manifest_workspace_identity_mismatch_fails_closed(tmp_path: Path) -> None:
     workspace, store = _store(tmp_path)
     target = workspace / "identity.txt"
@@ -498,7 +500,7 @@ def test_manifest_workspace_identity_mismatch_fails_closed(tmp_path: Path) -> No
     version = store.capture_before_mutation(target, operation="write")
     assert version is not None
     manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
-    manifest["workspace_identity"]["ino"] += 1
+    manifest["workspace_identity"]["token"] = "marker-v2:" + ("0" * 64)
     store.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(FileVersionError, match="different workspace identity"):

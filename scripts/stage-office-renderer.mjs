@@ -43,6 +43,7 @@ export const SUPPORTED_OFFICE_RENDERER_TARGETS = Object.freeze([
   "darwin-x64",
   "linux-arm64",
   "linux-x64",
+  "windows-arm64",
   "windows-x64",
 ]);
 

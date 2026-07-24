@@ -27,6 +27,7 @@ from app.office_validation import (
     VisualDiffPolicy,
 )
 from app.schemas.agent import AgentInfo
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool import workspace_transaction as transaction_module
 from app.tool.context import ToolContext
 from app.tool.workspace_transaction import (
@@ -120,6 +121,7 @@ class _Policies:
 
 
 def _context(workspace: Path) -> ToolContext:
+    identity = ensure_workspace_identity(workspace)
     return ToolContext(
         session_id="session",
         message_id="message",
@@ -130,6 +132,7 @@ def _context(workspace: Path) -> ToolContext:
         turn_run_id="turn-run",
         checkpoint_id="checkpoint",
         workspace_instance_id="workspace-instance",
+        workspace_identity_token=identity.durable_token,
     )
 
 

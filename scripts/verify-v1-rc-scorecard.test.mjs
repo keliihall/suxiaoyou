@@ -113,16 +113,42 @@ test("complete RC evidence passes every machine-readable gate", () => {
   assert.equal(result.failures.length, 0);
 });
 
+test("release evidence covers six native targets and eight installers", () => {
+  assert.deepEqual(REQUIRED_OFFICE_PLATFORMS, [
+    "windows-x64",
+    "windows-arm64",
+    "macos-arm64",
+    "macos-x64",
+    "linux-x64",
+    "linux-arm64",
+  ]);
+  assert.deepEqual(REQUIRED_PACKAGE_KINDS, [
+    "windows-x64-nsis",
+    "windows-arm64-nsis",
+    "macos-arm64-dmg",
+    "macos-x64-dmg",
+    "linux-x64-deb",
+    "linux-x64-rpm",
+    "linux-arm64-deb",
+    "linux-arm64-rpm",
+  ]);
+});
+
 test("beta task quality, data loss, and package omissions fail closed", () => {
   const scorecard = passingScorecard();
   scorecard.beta.workflows.file_organization.succeeded = 0;
   scorecard.beta.workflows.office_create_edit.unrecoverable_data_loss = 1;
-  scorecard.packages = scorecard.packages.filter((item) => item.kind !== "linux-arm64-rpm");
+  scorecard.packages = scorecard.packages.filter(
+    (item) =>
+      item.kind !== "windows-arm64-nsis" &&
+      item.kind !== "linux-arm64-rpm",
+  );
   const result = evaluateV1RcScorecard(scorecard);
   const ids = new Set(result.failures.map((gate) => gate.id));
   assert.equal(result.ok, false);
   assert.ok(ids.has("beta.task_success_rate"));
   assert.ok(ids.has("beta.unrecoverable_data_loss"));
+  assert.ok(ids.has("package.windows-arm64-nsis.present"));
   assert.ok(ids.has("package.linux-arm64-rpm.present"));
 });
 
@@ -191,10 +217,13 @@ test("Office evidence must come from the frozen backend at the release commit", 
   scorecard.office_compatibility[1].source_commit = "c".repeat(40);
   scorecard.office_compatibility[2].pptx.independent_reopen_validated = false;
   delete scorecard.office_compatibility[3].report_sha256;
+  scorecard.office_compatibility = scorecard.office_compatibility.filter(
+    (item) => item.platform !== "windows-arm64",
+  );
   const result = evaluateV1RcScorecard(scorecard);
   const ids = new Set(result.failures.map((gate) => gate.id));
   assert.ok(ids.has(`office.${REQUIRED_OFFICE_PLATFORMS[0]}.frozen_backend`));
-  assert.ok(ids.has(`office.${REQUIRED_OFFICE_PLATFORMS[1]}.same_commit`));
+  assert.ok(ids.has("office.windows-arm64.present"));
   assert.ok(
     ids.has(`office.${REQUIRED_OFFICE_PLATFORMS[2]}.pptx.independent_reopen_validated`),
   );

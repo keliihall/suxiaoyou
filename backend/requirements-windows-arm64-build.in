@@ -1,0 +1,21 @@
+# Exact Python build frontends are selected by the generated hash lock.  The
+# ranges below are copied from the two pinned sdists' PEP 517 metadata:
+#
+# cryptography 48.0.1:
+#   maturin>=1.9.4,<2,!=1.12.0
+#   cffi>=2.0.0 (CPython)
+#   setuptools!=74.0.0,!=74.1.0,!=74.1.1,!=74.1.2
+#
+# tiktoken 0.8.0:
+#   setuptools>=62.4
+#   wheel
+#   setuptools-rust>=1.5.2
+#
+# pip is also locked because it is the PEP 517 build orchestrator.  The
+# interpreter's bundled pip is used only to install this locked toolset.
+cffi>=2.0.0
+maturin>=1.9.4,<2,!=1.12.0
+pip
+setuptools>=62.4,!=74.0.0,!=74.1.0,!=74.1.1,!=74.1.2
+setuptools-rust>=1.5.2
+wheel

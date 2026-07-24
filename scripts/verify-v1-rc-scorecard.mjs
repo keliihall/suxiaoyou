@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 export const REQUIRED_PACKAGE_KINDS = Object.freeze([
   "windows-x64-nsis",
+  "windows-arm64-nsis",
   "macos-arm64-dmg",
   "macos-x64-dmg",
   "linux-x64-deb",
@@ -16,6 +17,7 @@ export const REQUIRED_PACKAGE_KINDS = Object.freeze([
 
 export const REQUIRED_OFFICE_PLATFORMS = Object.freeze([
   "windows-x64",
+  "windows-arm64",
   "macos-arm64",
   "macos-x64",
   "linux-x64",

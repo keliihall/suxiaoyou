@@ -10,8 +10,8 @@ edits, deletes, moves, or restores an existing workspace file through the
 Snapshots are stored below the application-private data root:
 
 ```text
-<private-data>/file-versions/<sha256(canonical-workspace)>/
-  manifest-v1.json
+<private-data>/file-versions/<sha256(canonical-workspace + durable-identity)>/
+  manifest-v1.json  # schema 3
   objects/<content-sha256>.blob
 ```
 
@@ -24,6 +24,46 @@ limit, versioning failure, or commit conflict discards the copy. Only a clean
 exit can enter the version-and-atomic-install commit path. The manifest stores
 workspace-relative target paths and the canonical workspace identity; a
 version from one workspace cannot be restored through a different workspace.
+
+### Workspace identity v2
+
+Canonical paths are locations, not durable identities. POSIX `st_dev` values
+can change after a valid reboot or remount, while a deleted directory can later
+have its path or inode reused. suyo therefore separates durable ownership from
+the native tuple used to guard one live operation:
+
+- On POSIX, a random `marker-v2:<64-hex>` token is stored on the workspace root.
+  A directory extended attribute is preferred so a Git checkout stays clean.
+  Filesystems without usable xattrs fall back to the crash-safe
+  `.suxiaoyou/workspace-identity-v2` file. Existing representations always win
+  over creating a new one, and conflicting, missing, corrupt, or replaced
+  representations fail closed.
+- App-managed Git worktrees require the native xattr representation. They are
+  not created on a filesystem that would need the file fallback, because that
+  marker would make every checkout dirty. Ordinary selected folders continue
+  to support the file fallback.
+- On Windows, the durable token is
+  `winfile-v2:<volume-serial>:<file-id>`, obtained from the native directory
+  handle. No marker file is created.
+- A current device/inode or native file tuple is captured again for descriptor-
+  anchored TOCTOU checks while an operation runs. On POSIX it is deliberately
+  never used as durable continuity evidence across restarts.
+
+File-version manifest schema 3 stores the complete durable token and scopes its
+private storage key by both canonical path and token. Recreating the same path
+therefore cannot inherit an old workspace's history.
+
+At startup, active legacy `stat-v1` rows are migrated before transaction and
+checkpoint recovery. Exact native continuity is accepted on every platform;
+macOS also accepts the known APFS device-renumbering case only when the inode is
+unchanged and the directory birth time proves that it predates registration.
+The durable token is established first, the legacy schema 1/2 history is copied
+to a schema 3 store, every object and checkpoint-required version is verified,
+and only then is the database row updated. The old history tree is retained, so
+an interrupted migration or an intentional database rollback remains
+recoverable. A missing, replaced, ambiguous, or corrupt workspace is left
+untouched and blocked individually; it is never rebound to the current path and
+does not prevent unrelated workspaces or the local service from starting.
 
 Before the first real-workspace replacement in a multi-file command commit,
 suyo fsyncs a private recovery journal containing only relative paths,
@@ -40,7 +80,8 @@ new destinations and deletions use no-replace renames. A concurrent edit seen
 at any linearization point is preserved under either the destination or a
 reported conflict-temporary name and turns the transaction into a conflict;
 rollback never performs a second exchange after detecting a mismatch. Journals
-also pin the workspace device/inode identity, not only its canonical path.
+bind the durable workspace token and use a freshly inspected native tuple only
+as the guard for the recovery operation in progress.
 
 An inode that has ever occupied a visible destination is never automatically
 unlinked by transaction finalization or startup recovery. Another process may
@@ -54,6 +95,15 @@ both `recovery_sidecars` and
 `recovery_files` metadata, conflicts include the paths in the error, and crash
 recovery logs every sidecar it finds. A prepared journal cannot reliably prove
 that a temporary was never published, so startup preserves it conservatively.
+
+Transaction journal schema 5 persists the durable workspace token. Its recorded
+device/inode fields are diagnostic evidence from the original process, not
+restart-time ownership proof; recovery verifies the durable token and then
+captures a fresh native tuple for the current operation. Legacy journal schemas
+1-4 have no durable token and require an exact native match, so an ambiguous
+legacy journal is preserved rather than replayed. Startup isolates each blocked
+journal and checkpoint workspace, allowing safe siblings to recover without
+discarding the blocked journal or its pinned versions.
 
 This is an intentional v1 storage/UX tradeoff: hidden recovery files can
 accumulate inside the workspace and are not covered by version-blob retention.

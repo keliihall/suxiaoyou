@@ -29,8 +29,9 @@ const RELEASE_PROFILES = new Set([
 
 function resolveReleaseProfile(releaseChannel, version, requestedProfile) {
   const appVersion = version.replace(/-rc\.[1-9][0-9]*$/u, "");
+  const isV11ReleaseLine = /^1\.1\.(?:0|[1-9][0-9]*)$/u.test(appVersion);
   const defaultProfile =
-    appVersion === "1.1.0"
+    isV11ReleaseLine
       ? "unsigned-degraded"
       : releaseChannel === "stable"
         ? "official"
@@ -51,14 +52,14 @@ function resolveReleaseProfile(releaseChannel, version, requestedProfile) {
       `releaseProfile ${profile} requires releaseChannel ${expectedChannel}`,
     );
   }
-  if (profile === "unsigned-degraded" && appVersion !== "1.1.0") {
+  if (profile === "unsigned-degraded" && !isV11ReleaseLine) {
     throw new Error(
-      `releaseProfile ${profile} is defined only for v1.1.0 release line tags, got v${version}`,
+      `releaseProfile ${profile} is defined only for v1.1.x release line tags, got v${version}`,
     );
   }
-  if (appVersion === "1.1.0" && profile !== "unsigned-degraded") {
+  if (isV11ReleaseLine && profile !== "unsigned-degraded") {
     throw new Error(
-      "v1.1.0 release line tags are defined by the unsigned-degraded release contract",
+      "v1.1.x release line tags are defined by the unsigned-degraded release contract",
     );
   }
   return profile;
@@ -116,8 +117,20 @@ const PACKAGE_DEFINITIONS = Object.freeze([
         "exe",
         releaseProfile,
       ),
-    lifecycleArtifact: /^windows-lifecycle-diagnostics-[1-9][0-9]*$/,
-    lifecycleDirectory: "suxiaoyou-desktop-lifecycle-windows",
+    lifecycleArtifact: /^windows-x64-lifecycle-diagnostics-[1-9][0-9]*$/,
+    lifecycleDirectory: "suxiaoyou-desktop-lifecycle-windows-x64",
+  },
+  {
+    kind: "windows-arm64-nsis",
+    platform: "win32",
+    artifactName: (version, releaseProfile) =>
+      profiledInstallerName(
+        `suyo-${version}-windows-arm64-setup`,
+        "exe",
+        releaseProfile,
+      ),
+    lifecycleArtifact: /^windows-arm64-lifecycle-diagnostics-[1-9][0-9]*$/,
+    lifecycleDirectory: "suxiaoyou-desktop-lifecycle-windows-arm64",
   },
   {
     kind: "macos-arm64-dmg",
@@ -321,7 +334,7 @@ export async function collectNativePackageEvidence({
     unexpectedChecksums.length > 0
   ) {
     throw new Error(
-      `checksum table must contain exactly the seven native installers; ` +
+      `checksum table must contain exactly ${PACKAGE_DEFINITIONS.length} native installers; ` +
         `found ${checksumEntries.size}, unexpected=${unexpectedChecksums.join(",") || "none"}`,
     );
   }
@@ -430,7 +443,8 @@ export async function collectNativePackageEvidence({
     lifecycleResults.some((path) => !consumedReports.has(path))
   ) {
     throw new Error(
-      `expected exactly seven consumed native lifecycle results, found ${lifecycleResults.length}`,
+      `expected exactly ${PACKAGE_DEFINITIONS.length} consumed native lifecycle results, ` +
+        `found ${lifecycleResults.length}`,
     );
   }
   const packagesByKind = new Map(packages.map((item) => [item.kind, item]));

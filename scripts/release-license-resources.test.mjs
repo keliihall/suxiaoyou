@@ -34,6 +34,7 @@ const requiredThirdPartyFiles = [
   "TENCENT-WEIXIN-OPENCLAW-1.0.3-MIT.txt",
   "TQDM-4.68.4-LICENSE.txt",
   "WEBENCODINGS-0.5.1-BSD-3-CLAUSE.txt",
+  "WINDOWS-ARM64-PYTHON-OVERRIDES.md",
   "python-runtime",
 ];
 
@@ -151,6 +152,20 @@ test("the checked-in static license baseline contains every required text", () =
     read("release-licenses/WEBENCODINGS-0.5.1-BSD-3-CLAUSE.txt"),
     /Copyright \(c\) 2012 by Simon Sapin\. Some rights reserved\.[\s\S]*Redistribution and use in source and binary forms/,
   );
+  const windowsArm64Overrides = read(
+    "release-licenses/WINDOWS-ARM64-PYTHON-OVERRIDES.md",
+  );
+  for (const contract of [
+    /greenlet \| 3\.1\.1 → 3\.3\.1 \| `MIT AND Python-2\.0`/,
+    /MarkupSafe \| 3\.0\.2 → 3\.0\.3 \| `BSD-3-Clause`/,
+    /NumPy \| 1\.26\.4 → 2\.3\.0 \| `BSD-3-Clause`/,
+    /pandas \| 2\.3\.3 → 3\.0\.0 \| `BSD-3-Clause`/,
+    /PyYAML \| 6\.0\.2 → 6\.0\.3 \| `MIT`/,
+    /OpenSSL 4\.0\.1[\s\S]*Apache-2\.0/,
+    /2db3f3a0d6ea4b59e1f094ace2c8cd536dffb87cdc39084c5afa1e6f7f37dd09/,
+  ]) {
+    assert.match(windowsArm64Overrides, contract);
+  }
   assert.match(
     read("release-licenses/ANTHROPIC-SKILLS-APACHE-2.0.txt"),
     /Copyright 2026 Anthropic, PBC\./,

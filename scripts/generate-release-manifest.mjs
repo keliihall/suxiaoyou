@@ -57,8 +57,9 @@ export function releaseIdentityFromVersion(version) {
 
 export function resolveReleaseProfile(version, requestedProfile) {
   const { appVersion, channel } = releaseIdentityFromVersion(version);
+  const isV11ReleaseLine = /^1\.1\.(?:0|[1-9]\d*)$/u.test(appVersion);
   const defaultProfile =
-    appVersion === "1.1.0"
+    isV11ReleaseLine
       ? RELEASE_PROFILES.UNSIGNED_DEGRADED
       : channel === "stable"
         ? RELEASE_PROFILES.OFFICIAL
@@ -81,15 +82,15 @@ export function resolveReleaseProfile(version, requestedProfile) {
   }
   if (
     profile === RELEASE_PROFILES.UNSIGNED_DEGRADED &&
-    appVersion !== "1.1.0"
+    !isV11ReleaseLine
   ) {
     throw new Error(
-      `release profile ${profile} is defined only for v1.1.0 release line tags, got v${version}`,
+      `release profile ${profile} is defined only for v1.1.x release line tags, got v${version}`,
     );
   }
-  if (appVersion === "1.1.0" && profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
+  if (isV11ReleaseLine && profile !== RELEASE_PROFILES.UNSIGNED_DEGRADED) {
     throw new Error(
-      "v1.1.0 release line tags are defined by the unsigned-degraded release contract",
+      "v1.1.x release line tags are defined by the unsigned-degraded release contract",
     );
   }
   return profile;
@@ -114,6 +115,16 @@ export function expectedReleaseAssets(version, requestedProfile) {
       format: "nsis",
       name: profiledInstallerName(
         `suyo-${version}-windows-x64-setup`,
+        "exe",
+        profile,
+      ),
+    },
+    {
+      platform: "windows",
+      architecture: "arm64",
+      format: "nsis",
+      name: profiledInstallerName(
+        `suyo-${version}-windows-arm64-setup`,
         "exe",
         profile,
       ),
