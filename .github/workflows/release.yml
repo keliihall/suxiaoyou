@@ -453,7 +453,7 @@ jobs:
             "backend/requirements-windows-arm64-sources.json" = "7083f14d1a0f0805c1da38cba159d5de8a700d2dbc3e0392dfda3ce6d52e4fef"
             "backend/requirements-windows-arm64-tiktoken.Cargo.lock" = "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3"
             "backend/requirements-windows-arm64-wheelhouse-approval.json" = "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896"
-            "backend/scripts/build_windows_arm64_wheelhouse.py" = "276f19eee7cb13bd90496942a3b4b1cfd7286b1ccc1f383378f36d30129dccb3"
+            "backend/scripts/build_windows_arm64_wheelhouse.py" = "3ba6387400b8d34392355aeee2c7d5b0a7a00a61807c1e110096ee5e23003358"
           }
           foreach ($entry in $expectedHashes.GetEnumerator()) {
             if (-not (Test-Path -LiteralPath $entry.Key -PathType Leaf)) {

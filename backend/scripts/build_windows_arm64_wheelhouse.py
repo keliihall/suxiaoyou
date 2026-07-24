@@ -583,10 +583,11 @@ def preflight_native_builder(source_lock: Mapping[str, Any]) -> dict[str, str]:
             "nmake.exe is required to build the locked OpenSSL source"
         )
     nmake_result = run_checked([nmake, "/?"], capture_output=True)
+    nmake_banner = f"{nmake_result.stdout}\n{nmake_result.stderr}"
     nmake_line = next(
         (
             line.strip()
-            for line in nmake_result.stdout.splitlines()
+            for line in nmake_banner.splitlines()
             if "Program Maintenance Utility Version" in line
         ),
         "",

@@ -336,6 +336,77 @@ def test_msvc_environment_rejects_wrong_host_or_target_architecture(
         wheelhouse.initialize_native_arm64_msvc_environment()
 
 
+def test_native_builder_accepts_nmake_banner_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_lock = wheelhouse.load_sources_lock()
+    toolchain = source_lock["toolchain"]
+
+    monkeypatch.setattr(
+        wheelhouse, "EXPECTED_PYTHON", wheelhouse.sys.version_info[:3]
+    )
+    monkeypatch.setattr(wheelhouse.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(wheelhouse.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(
+        wheelhouse, "initialize_native_arm64_msvc_environment", lambda: None
+    )
+    monkeypatch.setattr(wheelhouse, "ensure_bootstrap_pip", lambda: None)
+
+    def fake_which(name: str):
+        return {
+            "cl.exe": "cl.exe",
+            "perl.exe": "perl.exe",
+            "nmake.exe": "nmake.exe",
+        }.get(name)
+
+    def fake_run(command, **_kwargs):
+        rendered = [str(part) for part in command]
+        if rendered == ["rustc", "--version"]:
+            return SimpleNamespace(
+                stdout=f"{toolchain['rustc_version']}\n", stderr=""
+            )
+        if rendered == ["cargo", "--version"]:
+            return SimpleNamespace(
+                stdout=f"{toolchain['cargo_version']}\n", stderr=""
+            )
+        if rendered == ["rustc", "-Vv"]:
+            return SimpleNamespace(
+                stdout=f"host: {wheelhouse.EXPECTED_RUST_HOST}\n", stderr=""
+            )
+        if rendered == ["cl.exe"]:
+            return SimpleNamespace(
+                stdout="",
+                stderr=(
+                    "Microsoft (R) C/C++ Optimizing Compiler "
+                    "Version 19.44.35207.1 for ARM64\n"
+                ),
+            )
+        if rendered == ["perl.exe", "-v"]:
+            return SimpleNamespace(
+                stdout="This is perl 5, version 40, subversion 2\n", stderr=""
+            )
+        if rendered == ["nmake.exe", "/?"]:
+            return SimpleNamespace(
+                stdout="",
+                stderr=(
+                    "Microsoft (R) Program Maintenance Utility "
+                    "Version 14.44.35207.1\n"
+                ),
+            )
+        raise AssertionError(f"unexpected command: {rendered!r}")
+
+    monkeypatch.setattr(wheelhouse.shutil, "which", fake_which)
+    monkeypatch.setattr(wheelhouse, "run_checked", fake_run)
+
+    evidence = wheelhouse.preflight_native_builder(source_lock)
+
+    assert evidence["msvc_arch"] == "arm64"
+    assert (
+        evidence["nmake"]
+        == "Microsoft (R) Program Maintenance Utility Version 14.44.35207.1"
+    )
+
+
 def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     source = Path(wheelhouse.__file__).read_text(encoding="utf-8")
     assert '"SOURCE_DATE_EPOCH": str(source_date_epoch)' in source
