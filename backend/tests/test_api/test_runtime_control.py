@@ -31,6 +31,7 @@ from app.runtime.rewind import (
 )
 from app.security.audit import AuditPersistenceError
 from app.session.managed_workspace import managed_workspace_for_session
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool.workspace import APP_PRIVATE_DIR_ENV
 from app.validation_agent.contracts import (
     ValidationBudgetReport,
@@ -63,7 +64,7 @@ async def _seed_workspace(
     project_id: str | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    info = root.stat()
+    identity = ensure_workspace_identity(root).durable_token
     async with session_factory() as db:
         async with db.begin():
             db.add(
@@ -82,7 +83,7 @@ async def _seed_workspace(
                     created_by_session_id=session_id,
                     kind="direct",
                     root_path=str(root.resolve()),
-                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    identity_token=identity,
                     status="active",
                     details={"managed": False},
                 )
@@ -235,18 +236,16 @@ async def test_runtime_context_resolves_only_server_owned_workspace_identity(
     }
     assert response.headers["cache-control"] == "no-store"
 
-    # Keep the original directory alive under a different name while creating
-    # its replacement.  An immediate remove-then-mkdir may legally reuse the
-    # just-freed inode on Linux, which would not actually create a different
-    # stat-v1 filesystem identity for this assertion.
+    # Keep the original marker with the original directory.  A replacement at
+    # the same canonical path must not inherit the registered durable identity.
     workspace.rename(tmp_path / "retired-workspace")
     workspace.mkdir()
     replaced = await app_client.get(
         "/api/runtime/context",
         params={"session_id": "context-session"},
     )
-    assert replaced.status_code == 404
-    assert replaced.json()["code"] == "runtime_workspace_not_found"
+    assert replaced.status_code == 409
+    assert replaced.json()["code"] == "runtime_workspace_provenance_mismatch"
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="Git is required")
@@ -317,7 +316,7 @@ async def test_runtime_context_resolves_folderless_managed_workspace(
 ) -> None:
     monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(tmp_path / "managed"))
     root = managed_workspace_for_session("managed-session")
-    info = root.stat()
+    identity = ensure_workspace_identity(root).durable_token
     async with session_factory() as db:
         async with db.begin():
             db.add(
@@ -334,7 +333,7 @@ async def test_runtime_context_resolves_folderless_managed_workspace(
                     created_by_session_id="managed-session",
                     kind="managed",
                     root_path=str(root.resolve()),
-                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    identity_token=identity,
                     status="active",
                     details={"managed": True},
                 )
@@ -389,7 +388,6 @@ async def test_runtime_context_rejects_foreign_managed_workspace(
 ) -> None:
     monkeypatch.setenv("SUXIAOYOU_MANAGED_WORKSPACE_ROOT", str(tmp_path / "managed"))
     root = managed_workspace_for_session("managed-session")
-    info = root.stat()
     async with session_factory() as db:
         async with db.begin():
             db.add_all([
@@ -413,7 +411,7 @@ async def test_runtime_context_rejects_foreign_managed_workspace(
                     created_by_session_id="foreign-session",
                     kind="managed",
                     root_path=str(root.resolve()),
-                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    identity_token=ensure_workspace_identity(root).durable_token,
                     status="active",
                     details={"managed": True},
                 )
@@ -844,7 +842,7 @@ async def test_worktree_reference_failure_is_fail_closed(
 ) -> None:
     root = tmp_path / "managed"
     root.mkdir()
-    info = root.stat()
+    identity = ensure_workspace_identity(root).durable_token
     async with session_factory() as db:
         async with db.begin():
             db.add(
@@ -861,7 +859,7 @@ async def test_worktree_reference_failure_is_fail_closed(
                     created_by_session_id="session",
                     kind="git_worktree",
                     root_path=str(root),
-                    identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                    identity_token=identity,
                     status="active",
                     details={"session_id": "session", "worktree_state": "bound"},
                 )

@@ -7,9 +7,11 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from app.worktree import service as service_module
 from app.worktree import (
     GitCommandError,
     GitCommandTimeout,
@@ -113,6 +115,7 @@ def test_git_nonzero_exit_surfaces_typed_error(
     assert raised.value.returncode != 0
 
 
+@pytest.mark.workspace_identity_v2
 def test_detached_create_bind_remove_and_gc_with_cjk_paths(
     tmp_path: Path, repository: Path
 ) -> None:
@@ -158,6 +161,185 @@ def test_create_refuses_dirty_source_repository(
     assert not (service.managed_root / "dirty-source").exists()
 
 
+@pytest.mark.workspace_identity_v2
+def test_create_rejects_filesystem_that_would_dirty_every_checkout(
+    tmp_path: Path,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    monkeypatch.setattr(
+        service_module,
+        "workspace_identity_uses_file_fallback",
+        lambda _path: True,
+    )
+
+    with pytest.raises(WorktreePathError, match="native durable identity"):
+        service.create(repository, workspace_instance_id="no-native-identity")
+
+    assert not (service.managed_root / "no-native-identity").exists()
+    assert (
+        len(_git(repository, "worktree", "list", "--porcelain").stdout.splitlines())
+        >= 1
+    )
+
+
+@pytest.mark.workspace_identity_v2
+def test_durable_worktree_identity_ignores_apfs_device_renumbering(
+    tmp_path: Path,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    created = service.create(repository, workspace_instance_id="device-renumbered")
+    assert all(
+        identity is not None and identity.durable_token is not None
+        for identity in (
+            created.instance_identity,
+            created.repository_identity,
+            created.common_dir_identity,
+            created.checkout_identity,
+        )
+    )
+    inspect_directory = service_module.FilesystemIdentity.inspect_directory.__func__
+
+    def renumbered_identity(cls, path: Path):
+        current = inspect_directory(cls, path)
+        return service_module.FilesystemIdentity(
+            device=current.device + 10_000,
+            inode=current.inode,
+            durable_token=current.durable_token,
+        )
+
+    monkeypatch.setattr(
+        service_module.FilesystemIdentity,
+        "inspect_directory",
+        classmethod(renumbered_identity),
+    )
+
+    inspection = service.inspect("device-renumbered")
+
+    assert inspection.record.workspace_instance_id == "device-renumbered"
+    assert inspection.clean is True
+
+
+@pytest.mark.workspace_identity_v2
+def test_mixed_schema_one_manifest_upgrades_without_downgrading_durable_fields(
+    tmp_path: Path,
+    repository: Path,
+) -> None:
+    service = _service(tmp_path)
+    created = service.create(repository, workspace_instance_id="mixed-manifest")
+    manifest = service.managed_root / "mixed-manifest" / "ownership-v1.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    original_instance_token = value["instance_identity"]["durable_token"]
+    value["repository_identity"].pop("durable_token")
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    inspection = service.inspect("mixed-manifest")
+
+    upgraded = json.loads(manifest.read_text(encoding="utf-8"))
+    assert upgraded["instance_identity"]["durable_token"] == original_instance_token
+    assert upgraded["repository_identity"]["durable_token"] == (
+        created.repository_identity.durable_token
+    )
+    assert inspection.record.repository_identity.durable_token is not None
+    assert not service_module.FilesystemIdentity(
+        device=1,
+        inode=2,
+        durable_token=original_instance_token,
+    ).matches(service_module.FilesystemIdentity(device=1, inode=2))
+
+
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(os.name == "nt", reason="simulates Darwin APFS stat semantics")
+def test_legacy_schema_one_manifest_safely_adopts_durable_tokens_after_apfs_renumber(
+    tmp_path: Path,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    created = service.create(repository, workspace_instance_id="legacy-renumbered")
+    manifest = service.managed_root / "legacy-renumbered" / "ownership-v1.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    identity_fields = (
+        "instance_identity",
+        "repository_identity",
+        "common_dir_identity",
+        "checkout_identity",
+    )
+    for field in identity_fields:
+        value[field].pop("durable_token")
+        value[field]["device"] += 10_000
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    real_snapshot = service_module._legacy_directory_snapshot
+
+    def darwin_snapshot(path: Path):
+        current, _birth_time = real_snapshot(path)
+        return current, 0.0
+
+    monkeypatch.setattr(
+        service_module,
+        "sys",
+        SimpleNamespace(platform="darwin"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_legacy_directory_snapshot",
+        darwin_snapshot,
+    )
+
+    inspection = service.inspect("legacy-renumbered")
+
+    upgraded = json.loads(manifest.read_text(encoding="utf-8"))
+    assert inspection.clean is True
+    for field in identity_fields:
+        assert upgraded[field]["durable_token"].startswith("marker-v2:")
+    assert inspection.record.instance_identity.durable_token == (
+        created.instance_identity.durable_token
+    )
+
+
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(os.name == "nt", reason="simulates Darwin APFS stat semantics")
+def test_legacy_schema_one_device_drift_with_late_birthtime_fails_closed(
+    tmp_path: Path,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    service.create(repository, workspace_instance_id="legacy-replaced")
+    manifest = service.managed_root / "legacy-replaced" / "ownership-v1.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["instance_identity"].pop("durable_token")
+    value["instance_identity"]["device"] += 10_000
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    real_snapshot = service_module._legacy_directory_snapshot
+
+    def late_birth_snapshot(path: Path):
+        current, _birth_time = real_snapshot(path)
+        return current, 9_999_999_999.0
+
+    monkeypatch.setattr(
+        service_module,
+        "sys",
+        SimpleNamespace(platform="darwin"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_legacy_directory_snapshot",
+        late_birth_snapshot,
+    )
+
+    with pytest.raises(WorktreeOwnershipError, match="identity changed"):
+        service.inspect("legacy-replaced")
+
+    retained = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "durable_token" not in retained["instance_identity"]
+
+
 def test_non_git_directory_is_an_ineligible_repository_not_a_git_failure(
     tmp_path: Path,
 ) -> None:
@@ -179,7 +361,9 @@ def test_remove_refuses_dirty_managed_worktree(
     service = _service(tmp_path)
     record = service.create(repository, workspace_instance_id="dirty-checkout")
     service.bind("dirty-checkout")
-    (Path(record.checkout_path) / "本地 修改.txt").write_text("keep me", encoding="utf-8")
+    (Path(record.checkout_path) / "本地 修改.txt").write_text(
+        "keep me", encoding="utf-8"
+    )
     service.detach("dirty-checkout")
 
     with pytest.raises(WorktreeDirtyError, match="dirty managed worktree"):
@@ -233,9 +417,7 @@ def test_missing_persistent_reference_adapter_fails_closed(
     assert Path(record.checkout_path).is_dir()
 
 
-def test_foreign_directory_is_never_removed(
-    tmp_path: Path, repository: Path
-) -> None:
+def test_foreign_directory_is_never_removed(tmp_path: Path, repository: Path) -> None:
     service = _service(tmp_path)
     service.create(repository, workspace_instance_id="owned")
     foreign = service.managed_root / "foreign"

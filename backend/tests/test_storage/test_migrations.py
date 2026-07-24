@@ -24,6 +24,7 @@ from app.storage.migrations import (
     restore_database_backup,
     upgrade_sqlite_database,
 )
+from app.version import APP_VERSION
 
 
 FIXTURE_SQL = (
@@ -202,7 +203,9 @@ def test_existing_database_closes_all_handles_before_windows_replace(
 
     token = "windows-existing-handle-order"
     staging = database.with_name(f".{database.name}.{token}.migrating")
-    backup = database.with_name(f"{database.name}.pre-v1.1.0-{token}.bak")
+    backup = database.with_name(
+        f"{database.name}.pre-v{APP_VERSION}-{token}.bak"
+    )
     real_connect = migrations.sqlite3.connect
     tracked: list[tuple[Path, sqlite3.Connection]] = []
 
@@ -513,7 +516,8 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     _materialize_v073_database(database)
 
     first = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
-    backups_after_first = sorted(tmp_path.glob("suxiaoyou.db.pre-v1.1.0-*.bak"))
+    backup_pattern = f"suxiaoyou.db.pre-v{APP_VERSION}-*.bak"
+    backups_after_first = sorted(tmp_path.glob(backup_pattern))
     second = upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
 
     assert first is not None and first.upgraded is True
@@ -522,7 +526,7 @@ def test_repeated_startup_is_idempotent_and_does_not_add_backups(
     assert second.created is False
     assert second.previous_revision == V080_HEAD_REVISION
     assert second.backup_path is None
-    assert sorted(tmp_path.glob("suxiaoyou.db.pre-v1.1.0-*.bak")) == backups_after_first
+    assert sorted(tmp_path.glob(backup_pattern)) == backups_after_first
     assert len(backups_after_first) == 1
     assert _revision(database) == V080_HEAD_REVISION
     with sqlite3.connect(database) as connection:
@@ -716,6 +720,64 @@ def test_v100_audit_database_adds_nullable_invocation_provenance(
     assert "ix_security_audit_invocation_source" in indexes
 
 
+@pytest.mark.workspace_identity_v2
+def test_workspace_identity_v2_revision_is_a_noop_release_boundary(
+    tmp_path: Path,
+) -> None:
+    assert migrations.CURRENT_HEAD_REVISION == (
+        migrations.V110_WORKSPACE_IDENTITY_V2_REVISION
+    )
+    assert {
+        migrations.V110_USER_OFFICE_TEMPLATES_REVISION,
+        migrations.V110_WORKSPACE_IDENTITY_V2_REVISION,
+    } <= migrations.SUPPORTED_REVISIONS
+
+    database = tmp_path / "v110-office-templates.db"
+    migrations._run_alembic_revision(
+        database,
+        stamp_revision=None,
+        target_revision=migrations.V110_USER_OFFICE_TEMPLATES_REVISION,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO workspace_memory "
+            "(id, workspace_path, content) VALUES (?, ?, ?)",
+            ("memory-before-identity-v2", "/workspace", "keep me"),
+        )
+        schema_before = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name != 'alembic_version' ORDER BY type, name"
+        ).fetchall()
+        data_before = connection.execute(
+            "SELECT id, workspace_path, content FROM workspace_memory"
+        ).fetchall()
+
+    result = upgrade_sqlite_database(
+        f"sqlite+aiosqlite:///{database}"
+    )
+
+    with sqlite3.connect(database) as connection:
+        schema_after = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name != 'alembic_version' ORDER BY type, name"
+        ).fetchall()
+        data_after = connection.execute(
+            "SELECT id, workspace_path, content FROM workspace_memory"
+        ).fetchall()
+
+    assert result is not None
+    assert result.previous_revision == (
+        migrations.V110_USER_OFFICE_TEMPLATES_REVISION
+    )
+    assert result.current_revision == (
+        migrations.V110_WORKSPACE_IDENTITY_V2_REVISION
+    )
+    assert result.backup_path is not None
+    assert _revision(database) == migrations.V110_WORKSPACE_IDENTITY_V2_REVISION
+    assert schema_after == schema_before
+    assert data_after == data_before
+
+
 def test_future_revision_is_rejected_without_backup_or_mutation(tmp_path: Path) -> None:
     database = tmp_path / "future.db"
     upgrade_sqlite_database(f"sqlite+aiosqlite:///{database}")
@@ -738,7 +800,7 @@ def test_upgrade_backup_has_checksum_manifest_and_is_listed(tmp_path: Path) -> N
     assert result is not None and result.backup_path is not None
     assert result.backup_metadata_path is not None
     manifest = json.loads(result.backup_metadata_path.read_text(encoding="utf-8"))
-    assert manifest["app_version"] == "1.1.0"
+    assert manifest["app_version"] == APP_VERSION
     assert manifest["database_name"] == database.name
     assert manifest["database_path"] == str(database.resolve())
     assert manifest["backup_file"] == result.backup_path.name

@@ -26,6 +26,7 @@ from app.office_validation import (
     ValidationCheck,
 )
 from app.office_validation.precommit import OfficePrecommitRequest
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool.builtin import office as office_module
 from app.tool.builtin.office import OfficeTool
 from app.tool.context import ToolContext
@@ -129,6 +130,7 @@ _TRUSTED_TEST_PRECOMMIT_COORDINATOR = _TrustedTestPrecommitCoordinator()
 
 
 def _context(workspace: Path) -> ToolContext:
+    identity = ensure_workspace_identity(workspace)
     context = ToolContext(
         session_id="office-v2-session",
         message_id="office-v2-message",
@@ -140,6 +142,7 @@ def _context(workspace: Path) -> ToolContext:
         turn_run_id="office-v2-turn-run",
         checkpoint_id="office-v2-checkpoint",
         workspace_instance_id="office-v2-workspace-instance",
+        workspace_identity_token=identity.durable_token,
     )
     context._app_state = {  # type: ignore[attr-defined]
         "office_precommit_coordinator": _TRUSTED_TEST_PRECOMMIT_COORDINATOR,

@@ -194,6 +194,7 @@ class _PlanEntry:
 class _RewindPlan:
     session_id: str
     workspace_instance_id: str
+    workspace_identity_token: str
     workspace_root: str
     target_checkpoint_id: str
     target_turn_run_id: str
@@ -241,16 +242,6 @@ def _canonical_relative(value: str) -> str:
     if path.parts[0] == ".suxiaoyou":
         raise RewindConflictError("Checkpoint ledger targets app-private workspace state")
     return path.as_posix()
-
-
-def _workspace_identity_tuple(identity_token: str) -> tuple[int, int]:
-    parts = str(identity_token).split(":")
-    if len(parts) != 3 or parts[0] != "stat-v1":
-        raise RewindProvenanceError("Workspace instance has an unknown identity token")
-    try:
-        return int(parts[1]), int(parts[2])
-    except ValueError as exc:
-        raise RewindProvenanceError("Workspace instance identity is invalid") from exc
 
 
 def _copy_change(change: CheckpointChange, checkpoint_sequence: int) -> _Change:
@@ -792,13 +783,14 @@ async def _load_plan(
 
     store = FileVersionStore(
         workspace_root,
-        expected_workspace_identity=_workspace_identity_tuple(identity),
+        expected_durable_workspace_identity=identity,
     )
     entries = await asyncio.to_thread(_build_entries, copied_changes, store)
     return (
         _RewindPlan(
             session_id=session_id,
             workspace_instance_id=workspace_instance_id,
+            workspace_identity_token=identity,
             workspace_root=workspace_root,
             target_checkpoint_id=checkpoint_id,
             target_turn_run_id=target_turn_run_id,
@@ -948,6 +940,7 @@ def _apply_files(plan: _RewindPlan) -> tuple[tuple[str, ...], str | None]:
         turn_run_id=plan.target_turn_run_id,
         checkpoint_id=plan.target_checkpoint_id,
         workspace_instance_id=plan.workspace_instance_id,
+        workspace_identity_token=plan.workspace_identity_token,
     )
     transaction = WorkspaceMutationTransaction(
         plan.workspace_root,
@@ -983,7 +976,10 @@ def _apply_files(plan: _RewindPlan) -> tuple[tuple[str, ...], str | None]:
                 "Workspace changed while rewind staging was prepared",
                 conflicts=preparation_conflicts,
             )
-        store = FileVersionStore(plan.workspace_root)
+        store = FileVersionStore(
+            plan.workspace_root,
+            expected_durable_workspace_identity=plan.workspace_identity_token,
+        )
         for entry in sorted(
             (
                 item
@@ -1182,7 +1178,10 @@ async def _complete_database(
 
     # DB is now the source of truth.  Manifest cleanup is idempotent and a
     # startup pin reconciliation can finish it after an abrupt exit.
-    store = FileVersionStore(plan.workspace_root)
+    store = FileVersionStore(
+        plan.workspace_root,
+        expected_durable_workspace_identity=plan.workspace_identity_token,
+    )
     for checkpoint_id in plan.affected_checkpoint_ids:
         try:
             store.unpin_versions(f"checkpoint:{checkpoint_id}")
@@ -1561,12 +1560,13 @@ async def _load_marked_plan(
             raise RewindProvenanceError("Marked rewind workspace identity changed")
     store = FileVersionStore(
         workspace_root,
-        expected_workspace_identity=_workspace_identity_tuple(identity),
+        expected_durable_workspace_identity=identity,
     )
     entries = await asyncio.to_thread(_build_entries, copied, store)
     return _RewindPlan(
         session_id=session_id,
         workspace_instance_id=workspace_instance_id,
+        workspace_identity_token=identity,
         workspace_root=workspace_root,
         target_checkpoint_id=target_id,
         target_turn_run_id=target.turn_run_id,

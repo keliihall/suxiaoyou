@@ -2256,6 +2256,7 @@ class SessionProcessor:
 
         # Persist "running" state
         tool_part_id = generate_ulid()
+        workspace_identity_token: str | None = None
         async with session_factory() as db:
             async with db.begin():
                 if job.goal_run_id is not None:
@@ -2267,6 +2268,15 @@ class SessionProcessor:
                         # can begin an external side effect. Recovery will
                         # require review rather than replaying the run.
                         run.side_effects_started = True
+                if job.workspace_instance_id is not None:
+                    from app.models.workspace_instance import WorkspaceInstance
+
+                    workspace_instance = await db.get(
+                        WorkspaceInstance,
+                        job.workspace_instance_id,
+                    )
+                    if workspace_instance is not None:
+                        workspace_identity_token = workspace_instance.identity_token
                 await create_part(
                     db, message_id=self._assistant_msg_id,
                     session_id=job.session_id, part_id=tool_part_id,
@@ -2319,6 +2329,7 @@ class SessionProcessor:
                 else None
             ),
             workspace_instance_id=job.workspace_instance_id,
+            workspace_identity_token=workspace_identity_token,
             _publish_fn=lambda et, d: job.publish(SSEEvent(et, d)),
         )
         if job.goal_id is not None:

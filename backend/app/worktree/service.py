@@ -18,6 +18,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -29,7 +30,14 @@ from pathlib import Path
 from typing import Final, Iterator, Protocol, Sequence
 
 from app.release_features import V11_WORKTREES_RELEASED
+from app.storage.workspace_identity import (
+    WorkspaceIdentityError,
+    ensure_workspace_identity,
+    inspect_workspace_identity,
+    workspace_identity_uses_file_fallback,
+)
 from app.tool.workspace import APP_PRIVATE_DIR_ENV
+from app.utils.windows_guarded_file import windows_path_identity
 
 from .errors import (
     GitCommandError,
@@ -69,13 +77,99 @@ class WorktreeState(StrEnum):
 class FilesystemIdentity:
     device: int
     inode: int
+    durable_token: str | None = None
 
     @classmethod
     def for_directory(cls, path: Path) -> "FilesystemIdentity":
-        info = path.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode):
+        """Establish identity for a directory entering managed ownership."""
+
+        return cls._from_workspace_identity(path, create=True)
+
+    @classmethod
+    def volatile_for_directory(cls, path: Path) -> "FilesystemIdentity":
+        """Read a preflight-only native identity without creating a marker."""
+
+        native, _birth_time = _legacy_directory_snapshot(path)
+        return cls(device=native[0], inode=native[1])
+
+    @classmethod
+    def inspect_directory(cls, path: Path) -> "FilesystemIdentity":
+        """Inspect an already-owned directory without adopting a replacement."""
+
+        return cls._from_workspace_identity(path, create=False)
+
+    @classmethod
+    def _from_workspace_identity(
+        cls,
+        path: Path,
+        *,
+        create: bool,
+    ) -> "FilesystemIdentity":
+        if _is_link_or_junction(path):
+            raise WorktreeOwnershipError(
+                f"Expected an owned directory, not a symlink: {path}"
+            )
+        try:
+            visible = path.stat(follow_symlinks=False)
+            canonical = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WorktreeOwnershipError(
+                f"Could not inspect owned directory: {path}"
+            ) from exc
+        if not stat.S_ISDIR(visible.st_mode) or not _same_path(canonical, path):
             raise WorktreeOwnershipError(f"Expected an owned directory: {path}")
-        return cls(device=int(info.st_dev), inode=int(info.st_ino))
+        try:
+            identity = (
+                ensure_workspace_identity(path)
+                if create
+                else inspect_workspace_identity(path)
+            )
+        except WorkspaceIdentityError as exc:
+            raise WorktreeOwnershipError(
+                f"Could not verify durable filesystem identity: {path}"
+            ) from exc
+        if not _same_path(identity.canonical_path, canonical):
+            raise WorktreeOwnershipError(
+                f"Owned directory changed during identity inspection: {path}"
+            )
+        return cls(
+            device=int(identity.volatile_identity[0]),
+            inode=int(identity.volatile_identity[1]),
+            durable_token=identity.durable_token,
+        )
+
+    def matches(self, current: "FilesystemIdentity") -> bool:
+        """Compare durable identity when available, else a legacy native tuple."""
+
+        if self.durable_token is not None or current.durable_token is not None:
+            return (
+                self.durable_token is not None
+                and current.durable_token is not None
+                and self.durable_token == current.durable_token
+            )
+        return (self.device, self.inode) == (current.device, current.inode)
+
+
+def _filesystem_identity_from_json(
+    value: object,
+    *,
+    label: str,
+) -> FilesystemIdentity:
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} identity is not an object")
+    raw_token = value.get("durable_token")
+    if raw_token is not None and (
+        not isinstance(raw_token, str)
+        or not raw_token
+        or len(raw_token) > 256
+        or any(character.isspace() or ord(character) < 0x20 for character in raw_token)
+    ):
+        raise ValueError(f"{label} durable identity token is invalid")
+    return FilesystemIdentity(
+        device=int(value["device"]),
+        inode=int(value["inode"]),
+        durable_token=raw_token,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,9 +182,7 @@ class WorktreeReferences:
 
     @property
     def blocked(self) -> bool:
-        return bool(
-            self.workspace_instance_ids or self.turn_ids or self.checkpoint_ids
-        )
+        return bool(self.workspace_instance_ids or self.turn_ids or self.checkpoint_ids)
 
     def describe(self) -> str:
         values: list[str] = []
@@ -185,22 +277,22 @@ class WorktreeRecord:
                     str(value["branch"]) if value.get("branch") is not None else None
                 ),
                 state=WorktreeState(str(value["state"])),
-                instance_identity=FilesystemIdentity(
-                    device=int(value["instance_identity"]["device"]),
-                    inode=int(value["instance_identity"]["inode"]),
+                instance_identity=_filesystem_identity_from_json(
+                    value["instance_identity"],
+                    label="instance",
                 ),
-                repository_identity=FilesystemIdentity(
-                    device=int(value["repository_identity"]["device"]),
-                    inode=int(value["repository_identity"]["inode"]),
+                repository_identity=_filesystem_identity_from_json(
+                    value["repository_identity"],
+                    label="repository",
                 ),
-                common_dir_identity=FilesystemIdentity(
-                    device=int(value["common_dir_identity"]["device"]),
-                    inode=int(value["common_dir_identity"]["inode"]),
+                common_dir_identity=_filesystem_identity_from_json(
+                    value["common_dir_identity"],
+                    label="common-dir",
                 ),
                 checkout_identity=(
-                    FilesystemIdentity(
-                        device=int(value["checkout_identity"]["device"]),
-                        inode=int(value["checkout_identity"]["inode"]),
+                    _filesystem_identity_from_json(
+                        value["checkout_identity"],
+                        label="checkout",
                     )
                     if value.get("checkout_identity") is not None
                     else None
@@ -320,6 +412,7 @@ class WorktreeService:
         """Create an owned checkout, detached unless an existing branch is explicit."""
 
         self._prepare()
+        self._require_native_identity_support()
         instance_id = _validate_instance_id(workspace_instance_id)
         requested_ref = _validate_ref(ref)
         repository_info = self._validate_repository(repository, require_clean=True)
@@ -354,6 +447,23 @@ class WorktreeService:
             )
             instance_dir.mkdir(mode=0o700)
             _fsync_directory(self.managed_root)
+            try:
+                file_fallback = workspace_identity_uses_file_fallback(instance_dir)
+            except WorkspaceIdentityError as exc:
+                shutil.rmtree(instance_dir)
+                _fsync_directory(self.managed_root)
+                raise WorktreePathError(
+                    "Managed worktree filesystem cannot persist workspace identity"
+                ) from exc
+            if file_fallback:
+                # The directory is still empty and wholly app-owned here, so
+                # cleanup is safe.  A marker inside a checkout would make Git
+                # treat every new worktree as dirty and refuse normal removal.
+                shutil.rmtree(instance_dir)
+                _fsync_directory(self.managed_root)
+                raise WorktreePathError(
+                    "Managed worktrees require native durable identity support"
+                )
             instance_identity = FilesystemIdentity.for_directory(instance_dir)
             now = _utc_now()
             record = WorktreeRecord(
@@ -422,7 +532,24 @@ class WorktreeService:
         """
 
         self._prepare()
-        self._validate_repository(repository, require_clean=True)
+        self._require_native_identity_support()
+        self._validate_repository(
+            repository,
+            require_clean=True,
+            establish_identity=False,
+        )
+
+    def _require_native_identity_support(self) -> None:
+        try:
+            file_fallback = workspace_identity_uses_file_fallback(self.managed_root)
+        except WorkspaceIdentityError as exc:
+            raise WorktreePathError(
+                "Managed worktree filesystem cannot persist workspace identity"
+            ) from exc
+        if file_fallback:
+            raise WorktreePathError(
+                "Managed worktrees require native durable identity support"
+            )
 
     def bind(
         self,
@@ -523,7 +650,9 @@ class WorktreeService:
                 raise WorktreeConflictError(
                     "Git reported success but the worktree remains registered"
                 )
-            updated = replace(record, state=WorktreeState.REMOVED, updated_at=_utc_now())
+            updated = replace(
+                record, state=WorktreeState.REMOVED, updated_at=_utc_now()
+            )
             self._write_manifest(manifest, updated)
             return updated
 
@@ -604,7 +733,7 @@ class WorktreeService:
                 if not manifest.exists() or _is_link_or_junction(manifest):
                     foreign.append(instance_id)
                     continue
-                record = self._read_owned_record(instance_id)
+                record, _ = self._locked_record(instance_id)
                 with self._operation_locks(self._record_lock_keys(record)):
                     record = self._read_owned_record(instance_id)
                     checkout = Path(record.checkout_path)
@@ -642,11 +771,16 @@ class WorktreeService:
                         else:
                             healthy.append(instance_id)
                         continue
-                    if not exists and not registered and record.state in {
-                        WorktreeState.CREATING,
-                        WorktreeState.DETACHED,
-                        WorktreeState.CREATE_FAILED,
-                    }:
+                    if (
+                        not exists
+                        and not registered
+                        and record.state
+                        in {
+                            WorktreeState.CREATING,
+                            WorktreeState.DETACHED,
+                            WorktreeState.CREATE_FAILED,
+                        }
+                    ):
                         try:
                             self._assert_unreferenced(record)
                         except WorktreeActiveError:
@@ -725,6 +859,7 @@ class WorktreeService:
         repository: str | os.PathLike[str],
         *,
         require_clean: bool,
+        establish_identity: bool = True,
     ) -> _RepositoryInfo:
         root = _canonical_directory(repository, label="repository")
         if _is_link_or_junction(Path(repository).expanduser()):
@@ -767,7 +902,11 @@ class WorktreeService:
         return _RepositoryInfo(
             root=root,
             common_dir=common,
-            common_identity=FilesystemIdentity.for_directory(common),
+            common_identity=(
+                FilesystemIdentity.for_directory(common)
+                if establish_identity
+                else FilesystemIdentity.volatile_for_directory(common)
+            ),
             head=head,
         )
 
@@ -839,6 +978,10 @@ class WorktreeService:
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude,top).suxiaoyou/workspace-identity-v2",
+                ":(exclude,glob,top).suxiaoyou/.workspace-identity-v2.*.tmp",
             ],
         )
         if status_result.stdout:
@@ -851,7 +994,9 @@ class WorktreeService:
         self._validate_owned_record_paths(record)
         checkout = Path(record.checkout_path)
         if record.state is WorktreeState.REMOVED:
-            raise WorktreeConflictError("Removed worktree cannot be inspected as active")
+            raise WorktreeConflictError(
+                "Removed worktree cannot be inspected as active"
+            )
         if _is_link_or_junction(checkout) or not checkout.is_dir():
             raise WorktreeOwnershipError("Owned checkout is missing or is a symlink")
         if record.checkout_identity is None:
@@ -860,13 +1005,17 @@ class WorktreeService:
                 WorktreeState.CREATE_FAILED,
             }:
                 raise WorktreeOwnershipError("Checkout identity is missing")
-        elif FilesystemIdentity.for_directory(checkout) != record.checkout_identity:
+        elif not record.checkout_identity.matches(
+            FilesystemIdentity.inspect_directory(checkout)
+        ):
             raise WorktreeOwnershipError("Checkout filesystem identity changed")
         common = Path(record.git_common_dir)
         if (
             not common.is_dir()
             or _is_link_or_junction(common)
-            or FilesystemIdentity.for_directory(common) != record.common_dir_identity
+            or not record.common_dir_identity.matches(
+                FilesystemIdentity.inspect_directory(common)
+            )
         ):
             raise WorktreeOwnershipError("Git common-dir identity changed")
         self._validate_repository_identity(record)
@@ -901,7 +1050,9 @@ class WorktreeService:
             )
         registered = self._is_registered(record)
         if not registered:
-            raise WorktreeConflictError("Checkout is not registered in Git worktree metadata")
+            raise WorktreeConflictError(
+                "Checkout is not registered in Git worktree metadata"
+            )
         clean = self._is_clean(checkout)
         if require_clean and not clean:
             raise WorktreeDirtyError("Refusing operation on dirty managed worktree")
@@ -923,13 +1074,15 @@ class WorktreeService:
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude,top).suxiaoyou/workspace-identity-v2",
+                ":(exclude,glob,top).suxiaoyou/.workspace-identity-v2.*.tmp",
             ],
         )
         return not result.stdout
 
-    def _branch_is_occupied(
-        self, repository: _RepositoryInfo, branch: str
-    ) -> bool:
+    def _branch_is_occupied(self, repository: _RepositoryInfo, branch: str) -> bool:
         branch_ref = f"refs/heads/{branch}"
         return any(
             entry.get("branch") == branch_ref
@@ -1002,7 +1155,9 @@ class WorktreeService:
         if not instance_dir.exists() and not _is_link_or_junction(instance_dir):
             raise WorktreeNotFoundError(f"Unknown worktree instance: {instance_id}")
         if _is_link_or_junction(instance_dir) or not instance_dir.is_dir():
-            raise WorktreeOwnershipError("Managed instance path is not an owned directory")
+            raise WorktreeOwnershipError(
+                "Managed instance path is not an owned directory"
+            )
         if not manifest.exists() and not _is_link_or_junction(manifest):
             raise WorktreeOwnershipError("Managed instance has no ownership manifest")
         if _is_link_or_junction(manifest) or not manifest.is_file():
@@ -1014,11 +1169,15 @@ class WorktreeService:
         try:
             descriptor = os.open(manifest, flags)
         except OSError as exc:
-            raise WorktreeOwnershipError("Could not safely open ownership manifest") from exc
+            raise WorktreeOwnershipError(
+                "Could not safely open ownership manifest"
+            ) from exc
         try:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_MANIFEST_BYTES:
-                raise WorktreeOwnershipError("Ownership manifest has an unsafe type/size")
+                raise WorktreeOwnershipError(
+                    "Ownership manifest has an unsafe type/size"
+                )
             if (int(info.st_dev), int(info.st_ino)) != (
                 int(manifest_identity.st_dev),
                 int(manifest_identity.st_ino),
@@ -1030,23 +1189,101 @@ class WorktreeService:
                 descriptor = -1
                 value = json.load(handle)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise WorktreeOwnershipError("Ownership manifest could not be decoded") from exc
+            raise WorktreeOwnershipError(
+                "Ownership manifest could not be decoded"
+            ) from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
         record = WorktreeRecord.from_json(value)
         if record.workspace_instance_id != instance_id:
-            raise WorktreeOwnershipError("Manifest instance ID does not match its directory")
+            raise WorktreeOwnershipError(
+                "Manifest instance ID does not match its directory"
+            )
         self._validate_owned_record_paths(record)
+        record = self._upgrade_legacy_record_identities(record, manifest)
         self._validate_instance_identity(record, instance_dir)
         return record
+
+    def _upgrade_legacy_record_identities(
+        self,
+        record: WorktreeRecord,
+        manifest: Path,
+    ) -> WorktreeRecord:
+        """Safely add durable tokens to a pre-v2 schema-1 manifest.
+
+        Schema 1 originally persisted only device/inode pairs.  The shape is
+        kept backward compatible by adding ``durable_token`` to each identity
+        object.  Every legacy path is proven against its old native identity
+        before any durable marker is established, and the manifest is written
+        only after all resulting markers match the preflight snapshots.
+        """
+
+        instance_dir = manifest.parent
+        candidates: list[tuple[str, Path, FilesystemIdentity]] = [
+            ("instance_identity", instance_dir, record.instance_identity),
+            (
+                "repository_identity",
+                Path(record.repository_root),
+                record.repository_identity,
+            ),
+            (
+                "common_dir_identity",
+                Path(record.git_common_dir),
+                record.common_dir_identity,
+            ),
+        ]
+        checkout = Path(record.checkout_path)
+        if record.checkout_identity is not None and (
+            checkout.exists() or _is_link_or_junction(checkout)
+        ):
+            candidates.append(("checkout_identity", checkout, record.checkout_identity))
+
+        legacy: list[tuple[str, Path, tuple[int, int]]] = []
+        for field, path, stored in candidates:
+            if stored.durable_token is not None:
+                if not stored.matches(FilesystemIdentity.inspect_directory(path)):
+                    raise WorktreeOwnershipError(
+                        f"{field.replace('_', ' ').capitalize()} changed"
+                    )
+                continue
+            native_identity = _validate_legacy_identity_continuity(
+                path,
+                stored=(stored.device, stored.inode),
+                created_at=record.created_at,
+            )
+            legacy.append((field, path, native_identity))
+
+        if not legacy:
+            return record
+
+        replacements: dict[str, object] = {}
+        for field, path, native_identity in legacy:
+            durable = FilesystemIdentity.for_directory(path)
+            if (durable.device, durable.inode) != native_identity:
+                raise WorktreeOwnershipError(
+                    "Filesystem identity changed while upgrading ownership manifest"
+                )
+            replacements[field] = durable
+        replacements["updated_at"] = _utc_now()
+        upgraded = replace(record, **replacements)
+        for field, path, _stored in candidates:
+            expected = getattr(upgraded, field)
+            if not expected.matches(FilesystemIdentity.inspect_directory(path)):
+                raise WorktreeOwnershipError(
+                    "Filesystem identity changed while upgrading ownership manifest"
+                )
+        self._write_manifest(manifest, upgraded)
+        return upgraded
 
     def _validate_owned_record_paths(self, record: WorktreeRecord) -> None:
         instance_dir, checkout, _ = self._owned_paths(record.workspace_instance_id)
         if not Path(record.checkout_path).is_absolute():
             raise WorktreeOwnershipError("Manifest checkout path must be absolute")
         if not _same_path(Path(record.checkout_path), checkout):
-            raise WorktreeOwnershipError("Manifest checkout path escaped managed ownership")
+            raise WorktreeOwnershipError(
+                "Manifest checkout path escaped managed ownership"
+            )
         if not _is_direct_child(instance_dir, self.managed_root):
             raise WorktreeOwnershipError("Managed instance escaped its ownership root")
         repository = Path(record.repository_root)
@@ -1055,12 +1292,12 @@ class WorktreeService:
             raise WorktreeOwnershipError("Manifest Git paths must be absolute")
 
     @staticmethod
-    def _validate_instance_identity(
-        record: WorktreeRecord, instance_dir: Path
-    ) -> None:
+    def _validate_instance_identity(record: WorktreeRecord, instance_dir: Path) -> None:
         if _is_link_or_junction(instance_dir):
             raise WorktreeOwnershipError("Managed instance directory became a symlink")
-        if FilesystemIdentity.for_directory(instance_dir) != record.instance_identity:
+        if not record.instance_identity.matches(
+            FilesystemIdentity.inspect_directory(instance_dir)
+        ):
             raise WorktreeOwnershipError("Managed instance filesystem identity changed")
 
     @staticmethod
@@ -1068,17 +1305,27 @@ class WorktreeService:
         repository = Path(record.repository_root)
         if _is_link_or_junction(repository) or not repository.is_dir():
             raise WorktreeOwnershipError("Source repository no longer exists safely")
-        if FilesystemIdentity.for_directory(repository) != record.repository_identity:
-            raise WorktreeOwnershipError("Source repository filesystem identity changed")
+        if not record.repository_identity.matches(
+            FilesystemIdentity.inspect_directory(repository)
+        ):
+            raise WorktreeOwnershipError(
+                "Source repository filesystem identity changed"
+            )
 
     def _write_manifest(self, manifest: Path, record: WorktreeRecord) -> None:
         instance_dir = manifest.parent
         self._validate_instance_identity(record, instance_dir)
         if manifest.exists() and _is_link_or_junction(manifest):
             raise WorktreeOwnershipError("Refusing to replace a symlink manifest")
-        payload = json.dumps(
-            record.to_json(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ) + "\n"
+        payload = (
+            json.dumps(
+                record.to_json(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
         encoded = payload.encode("utf-8")
         if len(encoded) > _MAX_MANIFEST_BYTES:
             raise WorktreeOwnershipError("Ownership manifest exceeds its size limit")
@@ -1331,13 +1578,13 @@ def _validate_ref(value: str) -> str:
     return result
 
 
-def _canonical_directory(
-    value: str | os.PathLike[str], *, label: str
-) -> Path:
+def _canonical_directory(value: str | os.PathLike[str], *, label: str) -> Path:
     try:
         path = Path(value).expanduser().resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise WorktreePathError(f"{label.capitalize()} path does not exist safely") from exc
+        raise WorktreePathError(
+            f"{label.capitalize()} path does not exist safely"
+        ) from exc
     if not path.is_dir():
         raise WorktreePathError(f"{label.capitalize()} path is not a directory")
     return path
@@ -1349,6 +1596,72 @@ def _path_key(path: Path) -> str:
 
 def _same_path(left: Path, right: Path) -> bool:
     return _path_key(left) == _path_key(right)
+
+
+def _validate_legacy_identity_continuity(
+    path: Path,
+    *,
+    stored: tuple[int, int],
+    created_at: str,
+) -> tuple[int, int]:
+    """Prove that a schema-1 native tuple still names the same directory."""
+
+    current, birth_time = _legacy_directory_snapshot(path)
+    if current == stored:
+        return current
+    if sys.platform != "darwin" or current[1] != stored[1]:
+        raise WorktreeOwnershipError("Legacy filesystem identity changed")
+    if not isinstance(birth_time, (int, float)):
+        raise WorktreeOwnershipError(
+            "Legacy macOS filesystem identity cannot be verified"
+        )
+    try:
+        registered = datetime.fromisoformat(created_at)
+        if registered.tzinfo is None:
+            registered = registered.replace(tzinfo=timezone.utc)
+        registered_at = registered.timestamp()
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise WorktreeOwnershipError(
+            "Legacy ownership creation time is invalid"
+        ) from exc
+    if birth_time < 0 or birth_time > registered_at + 2.0:
+        raise WorktreeOwnershipError("Legacy filesystem identity changed")
+    return current
+
+
+def _legacy_directory_snapshot(
+    path: Path,
+) -> tuple[tuple[int, int], int | float | None]:
+    """Read one no-follow native identity for schema-1 migration preflight."""
+
+    if _is_link_or_junction(path):
+        raise WorktreeOwnershipError("Legacy ownership path became a symlink")
+    try:
+        canonical = path.resolve(strict=True)
+        info = path.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise WorktreeOwnershipError(
+            "Legacy ownership path no longer exists safely"
+        ) from exc
+    if not _same_path(canonical, path) or not stat.S_ISDIR(info.st_mode):
+        raise WorktreeOwnershipError(
+            "Legacy ownership path no longer names its canonical directory"
+        )
+    try:
+        native = (
+            tuple(
+                int(part) for part in windows_path_identity(canonical, directory=True)
+            )
+            if sys.platform == "win32"
+            else (int(info.st_dev), int(info.st_ino))
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise WorktreeOwnershipError(
+            "Could not inspect legacy native filesystem identity"
+        ) from exc
+    if len(native) != 2 or any(part < 0 for part in native):
+        raise WorktreeOwnershipError("Legacy native filesystem identity is invalid")
+    return (native[0], native[1]), getattr(info, "st_birthtime", None)
 
 
 def _is_direct_child(child: Path, parent: Path) -> bool:

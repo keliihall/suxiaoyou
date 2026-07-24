@@ -30,7 +30,7 @@ const SCRIPT = fileURLToPath(
   new URL("./v11-office-corpus-evidence.mjs", import.meta.url),
 );
 const COMMIT = "a".repeat(40);
-const RELEASE_REF = "v1.1.0-rc.4";
+const RELEASE_REF = "v1.1.1-rc.1";
 const FROZEN_BACKEND_IDENTITY_SHA256 = digest("final-frozen-backend-matrix");
 const CORPUS_MANIFEST_SHA256 = digest("fixed-corpus-manifest");
 const RENDERER_IDENTITY_SHA256 = digest("authoritative-renderer-matrix");
@@ -206,10 +206,10 @@ function reportInputs(values = REQUIRED_OFFICE_CORPUS_TARGETS.map(passingReport)
   return values.map((value) => ({ raw: canonicalRaw(value) }));
 }
 
-test("accepts exactly the same 300 release-bound cases on all five native targets", () => {
+test("accepts exactly the same 300 release-bound cases on all six native targets", () => {
   const summary = aggregateOfficeCorpusEvidence(reportInputs(), expectedBindings());
   assert.equal(summary.status, "ok");
-  assert.equal(summary.target_count, 5);
+  assert.equal(summary.target_count, 6);
   assert.equal(summary.case_count, OFFICE_CORPUS_CASE_COUNT);
   assert.deepEqual(
     summary.targets.map((item) => item.target),
@@ -229,6 +229,18 @@ test("accepts exactly the same 300 release-bound cases on all five native target
   assert.equal(summary.renderer_identity_sha256, RENDERER_IDENTITY_SHA256);
   assert.equal(summary.fonts_manifest_sha256, FONTS_MANIFEST_SHA256);
   assert.equal(summary.parameters_manifest_sha256, PARAMETERS_MANIFEST_SHA256);
+});
+
+test("keeps the reviewed v1.1 corpus contract reusable for later patch releases", () => {
+  const report = passingReport("windows-arm64");
+  report.release_ref = "v1.1.42-rc.3";
+  const bindings = {
+    ...expectedBindings(),
+    expectedReleaseRef: report.release_ref,
+  };
+
+  const normalized = validateOfficeCorpusReport(report, bindings);
+  assert.equal(normalized.release_ref, "v1.1.42-rc.3");
 });
 
 test("publishes the digest of each exact raw report without paths or document content", () => {
@@ -324,8 +336,8 @@ test("binds tag, commit, final frozen backend, corpus, renderer, fonts, and para
 test("rejects missing targets, duplicate targets, and corpus descriptor drift", () => {
   assert.throws(
     () =>
-      aggregateOfficeCorpusEvidence(reportInputs().slice(0, 4), expectedBindings()),
-    /exactly 5/u,
+      aggregateOfficeCorpusEvidence(reportInputs().slice(0, -1), expectedBindings()),
+    /exactly 6/u,
   );
 
   const duplicateTargets = REQUIRED_OFFICE_CORPUS_TARGETS.map(passingReport);
@@ -544,7 +556,7 @@ test("strict schemas reject paths, content fields, multi-bucket arrays, and plac
   );
 });
 
-test("CLI discovers five regular reports and writes a new machine summary", (t) => {
+test("CLI discovers six regular reports and writes a new machine summary", (t) => {
   const root = mkdtempSync(join(tmpdir(), "suyo-v11-office-corpus-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const [index, target] of REQUIRED_OFFICE_CORPUS_TARGETS.entries()) {
@@ -571,10 +583,10 @@ test("CLI discovers five regular reports and writes a new machine summary", (t) 
   ];
   const result = spawnSync(process.execPath, args, { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /verified 300 cases on 5 native targets/u);
+  assert.match(result.stdout, /verified 300 cases on 6 native targets/u);
   const summary = JSON.parse(readFileSync(output, "utf8"));
   assert.equal(summary.case_count, 300);
-  assert.equal(summary.target_count, 5);
+  assert.equal(summary.target_count, 6);
 
   const overwrite = spawnSync(process.execPath, args, { encoding: "utf8" });
   assert.notEqual(overwrite.status, 0);

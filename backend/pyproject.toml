@@ -1,6 +1,6 @@
 [project]
 name = "suxiaoyou"
-version = "1.1.0"
+version = "1.1.1"
 description = "Your local AI assistant — private, powerful, personal"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -31,6 +31,8 @@ dependencies = [
 
     # Utilities
     "python-ulid>=3.0.0",
+    # Windows ARM64 has no upstream tiktoken wheel. Its exact sdist, Cargo
+    # graph, and native build contract live in requirements-windows-arm64-*.
     "tiktoken>=0.8.0",
     "aiofiles>=24.1.0",
     # OS-native credential vaults (Keychain, Credential Manager, Secret Service).
@@ -60,10 +62,14 @@ dependencies = [
     "reportlab>=4.4.0",
     # Ed25519 verification for the signed Office template catalog and WeChat
     # media encryption require cryptography. Version 48.0.1 retains an
-    # official universal2 wheel for Intel and Apple Silicon.
+    # official universal2 wheel for Intel and Apple Silicon. Windows ARM64
+    # builds this exact sdist against the locked static OpenSSL contract in
+    # requirements-windows-arm64-sources.json.
     "cryptography==48.0.1",
 
     # Data science (used by code_execute)
+    # The Windows ARM64 target lock overrides NumPy/pandas (and the indirect
+    # greenlet/MarkupSafe plus PyYAML pins) to first-party win_arm64 wheels.
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "matplotlib>=3.8.0",
@@ -95,3 +101,6 @@ packages = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "workspace_identity_v2: durable workspace identity, migration, and recovery contracts",
+]

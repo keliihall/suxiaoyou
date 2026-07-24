@@ -151,9 +151,14 @@ The corresponding bundled license reports are
 `release-licenses/PYTHON-LICENSES.txt`, and
 `release-licenses/RUST-LICENSES.html`.
 
+Windows ARM64 uses five newer official Python wheels and a locally built
+`cryptography` wheel statically linked to OpenSSL 4.0.1. Exact source and wheel
+hashes, SPDX identifiers, full-text locations, and OpenSSL build provenance
+are in `release-licenses/WINDOWS-ARM64-PYTHON-OVERRIDES.md`.
+
 The checked-in `release-licenses/` directory is a curated, mandatory baseline;
 it also contains generated JavaScript, Python, and Rust reports for the locked
-v1.1.0 production graphs. Platform-specific build-only JavaScript packages can
+v1.1.1 production graphs. Platform-specific build-only JavaScript packages can
 vary by build host and are not part of the installed static web application.
 Each dependency remains subject to its own license, and package-specific
 license files retained inside runtime payloads remain in force. Release

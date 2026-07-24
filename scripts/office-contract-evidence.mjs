@@ -17,6 +17,7 @@ export const OFFICE_CONTRACT_SCHEMA_VERSION = 1;
 export const OFFICE_CONTRACT_VERSION = "v1.0-restricted-office-1";
 export const REQUIRED_OFFICE_PLATFORMS = Object.freeze([
   "windows-x64",
+  "windows-arm64",
   "macos-arm64",
   "macos-x64",
   "linux-x64",

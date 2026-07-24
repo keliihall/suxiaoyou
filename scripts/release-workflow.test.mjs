@@ -188,6 +188,7 @@ test("preflights target-aware v1.1 renderer configuration before dependencies an
 
   const targetLocks = new Map([
     ["windows-x64", "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64"],
+    ["windows-arm64", "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64"],
     ["macos-aarch64", "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64"],
     ["macos-x64", "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64"],
     ["linux-arm64", "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64"],
@@ -249,6 +250,7 @@ test("renderer configuration preflight executes target selection without leaking
     .join("\n");
   const lockNames = [
     "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64",
+    "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_ARM64",
     "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_ARM64",
     "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_DARWIN_X64",
     "SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_LINUX_ARM64",
@@ -318,13 +320,21 @@ test("manual releases select one target while tags keep both native macOS builds
     "macos-aarch64",
     "macos-x64",
     "windows-x64",
+    "windows-arm64",
     "linux-x64",
     "linux-arm64",
   ]) {
     assert.match(workflow, new RegExp(`^\\s{10}- ${escapeRegExp(target)}$`, "m"));
   }
   assert.match(workflow, /^\s{8}default:\s*macos-aarch64$/m);
-  assert.match(job("build-windows"), /inputs\.target == 'windows-x64'/);
+  const windows = job("build-windows");
+  assert.match(windows, /needs\.validate-release\.outputs\.run_windows == 'true'/);
+  assert.match(windows, /fromJSON\(needs\.validate-release\.outputs\.windows_matrix\)/);
+  assert.match(windows, /runs-on:\s*\$\{\{ matrix\.runner \}\}/);
+  assert.match(windows, /architecture:\s*\$\{\{ matrix\.pythonArchitecture \}\}/);
+  const validate = job("validate-release");
+  assert.match(validate, /"target":"windows-x64"[^]*?"runner":"windows-latest"/);
+  assert.match(validate, /"target":"windows-arm64"[^]*?"runner":"windows-11-arm"/);
   const linux = job("build-linux");
   assert.match(linux, /startsWith\(inputs\.target, 'linux-'\)/);
   assert.match(linux, /fromJSON\([^\n]*linux-x64[^\n]*linux-arm64/);
@@ -392,7 +402,7 @@ test("installer artifacts expire after one day and lifecycle evidence spans the 
       "build-windows",
       "Upload Windows artifact",
       "Upload Windows lifecycle diagnostics",
-      "suxiaoyou-desktop-lifecycle-windows",
+      "suxiaoyou-desktop-lifecycle-${{ matrix.target }}",
     ],
     [
       "build-macos",
@@ -423,6 +433,18 @@ test("installer artifacts expire after one day and lifecycle evidence spans the 
     assert.equal(diagnosticPaths.has(diagnosticPath), false, diagnosticPath);
     diagnosticPaths.add(diagnosticPath);
   }
+  const windowsDiagnostics = step(
+    job("build-windows"),
+    "Upload Windows lifecycle diagnostics",
+  );
+  assert.match(
+    windowsDiagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse\/windows-arm64-wheelhouse-manifest\.json/,
+  );
+  assert.match(
+    windowsDiagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse\/windows-arm64-wheelhouse-manifest\.json\.sha256/,
+  );
 });
 
 test("sets the declared macOS minimum everywhere", () => {
@@ -568,7 +590,7 @@ test("preserves stable NSIS identity while localizing visible installer copy", (
   );
   assert.match(
     workflow,
-    /七个安装包（Windows x64、macOS arm64\/x64、Linux x64\/ARM64）均来自同一提交/,
+    /八个安装包（Windows x64\/ARM64、macOS arm64\/x64、Linux x64\/ARM64）均来自同一提交/,
   );
 });
 
@@ -614,7 +636,7 @@ test("separates app version from stable and RC release identities", () => {
   assert.match(context, /RC-ADHOC-NOT-NOTARIZED/);
   assert.match(context, /tag must be v\$APP_VERSION or v\$APP_VERSION-rc\.N/);
   assert.match(context, /1\.0\.0\)[\s\S]*?EVIDENCE_CONTRACT="v1\.0"[\s\S]*?RELEASE_PROFILE="authoritative"/);
-  assert.match(context, /1\.1\.0\)[\s\S]*?EVIDENCE_CONTRACT="v1\.1"[\s\S]*?RELEASE_PROFILE="unsigned-degraded"/);
+  assert.match(context, /1\.1\.\*\)[\s\S]*?EVIDENCE_CONTRACT="v1\.1"[\s\S]*?RELEASE_PROFILE="unsigned-degraded"/);
   assert.match(context, /tagged releases require a reviewed evidence contract/);
   assert.match(context, /RELEASE_CHANNEL="stable"[\s\S]*?IS_STABLE="false"[\s\S]*?MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"/);
   assert.doesNotMatch(context, /unsigned-degraded v1\.1 release uses the exact/);
@@ -877,10 +899,10 @@ test("v1.1 native builds stage one immutable target before PyInstaller", () => {
     [
       "build-windows",
       "Build backend with locked PyInstaller",
-      /TARGET="windows-x64"/,
-      /name:\s*suxiaoyou-office-renderer-windows-x64-\$\{\{ github\.sha \}\}/,
-      /suxiaoyou-office-renderer-source-windows-x64/,
-      /SUXIAOYOU_OFFICE_RENDERER_LOCK_SHA256_WINDOWS_X64/,
+      /TARGET="\$OFFICE_RENDERER_TARGET"/,
+      /name:\s*suxiaoyou-office-renderer-\$\{\{ matrix\.target \}\}-\$\{\{ github\.sha \}\}/,
+      /suxiaoyou-office-renderer-source-\$\{\{ matrix\.target \}\}/,
+      /vars\[matrix\.officeLockName\]/,
     ],
     [
       "build-macos",
@@ -1049,6 +1071,52 @@ test("native PyInstaller builds pin checkout and staged renderer inputs before a
       [...build.matchAll(/^\s+verify_release_checkout$/gm)].length,
       2,
       `${jobName} must check the checkout exactly before and after PyInstaller`,
+    );
+  }
+});
+
+test("gates native CI and every release package on durable workspace identity v2", () => {
+  assert.match(
+    backendProject,
+    /workspace_identity_v2: durable workspace identity, migration, and recovery contracts/,
+  );
+
+  for (const jobName of ["backend-windows-audit", "backend-macos-execution"]) {
+    const nativeJob = ciJob(jobName);
+    const gate = step(nativeJob, "Verify durable workspace identity v2");
+    assert.match(gate, /python -m pytest -q -m workspace_identity_v2/);
+    assert.ok(
+      nativeJob.indexOf("Install backend") <
+        nativeJob.indexOf("Verify durable workspace identity v2"),
+      `${jobName} must install the backend test graph before the identity gate`,
+    );
+  }
+
+  const releaseBuilds = [
+    ["build-windows", "Build backend with locked PyInstaller"],
+    ["build-macos", "Build native backend with locked PyInstaller"],
+    ["build-linux", "Build backend with locked PyInstaller"],
+  ];
+  for (const [jobName, stepName] of releaseBuilds) {
+    const build = step(job(jobName), stepName);
+    const toolInstall = build.indexOf(
+      'python -m pip install --require-hashes --only-binary=:all: -r "$RELEASE_TOOL_LOCK"',
+    );
+    const identityGate = build.indexOf(
+      "python -m pytest -q -m workspace_identity_v2 backend/tests",
+    );
+    const pyInstaller = build.indexOf("(cd backend && python -m PyInstaller");
+    assert.ok(
+      toolInstall >= 0 &&
+        toolInstall < identityGate &&
+        identityGate < pyInstaller,
+      `${jobName} must pass the identity v2 gate after locked tools are installed and before PyInstaller`,
+    );
+    assert.equal(
+      (build.match(/pytest -q -m workspace_identity_v2 backend\/tests/g) ?? [])
+        .length,
+      1,
+      `${jobName} must run exactly one release identity gate`,
     );
   }
 });
@@ -1314,7 +1382,7 @@ test("launches every installed desktop, waits for backend ready, and proves clea
   assert.match(windows, /--artifact-sha256 \$preinstallArtifactSha256/);
   assert.match(windows, /--release-commit \$preinstallCommit/);
   assert.match(windows, /verify-desktop-lifecycle\.mjs/);
-  assert.match(windows, /suxiaoyou-desktop-lifecycle-windows/);
+  assert.match(windows, /suxiaoyou-desktop-lifecycle-\$env:WINDOWS_RELEASE_TARGET/);
 
   const mac = step(job("build-macos"), "Verify final DMG contents");
   const copiedApp = mac.indexOf("ditto \"$MOUNT_DIRECTORY/苏小有.app\"");
@@ -1398,7 +1466,161 @@ test("Windows native build validates lifecycle primitives before packaging", () 
   );
   assert.match(
     auditBackend,
-    /python -m pip_audit --strict --require-hashes -r backend\/requirements\.txt/,
+    /python -m pip_audit --strict --require-hashes -r "\$AUDIT_LOCK"/,
+  );
+});
+
+test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed offline", () => {
+  const windows = job("build-windows");
+  const seals = step(windows, "Verify Windows ARM64 wheelhouse input seals");
+  const wheelhouse = step(windows, "Build approved Windows ARM64 wheelhouse");
+  const buildBackend = step(windows, "Build backend with locked PyInstaller");
+  const auditBackend = step(
+    windows,
+    "Audit Windows backend production dependency graph",
+  );
+  const diagnostics = step(windows, "Upload Windows lifecycle diagnostics");
+
+  assert.match(seals, /if:\s*matrix\.target == 'windows-arm64'/);
+  const sealedInputs = new Map([
+    [
+      "backend/requirements-windows-arm64.txt",
+      "ba428376d5dec539a510a0253595262b30957b9bffbc0c9906179d5a9ee553c8",
+    ],
+    [
+      "backend/requirements-windows-arm64-build.in",
+      "cfe41dac66e12c04dedaeb55e7e66c85e0a2c4ca1300b06382730304e98344a7",
+    ],
+    [
+      "backend/requirements-windows-arm64-build.txt",
+      "267cd1b54c8824d809691686baa64746cb3c3a315fc89fd40960b1083d894f36",
+    ],
+    [
+      "backend/requirements-release-tools-windows-arm64.txt",
+      "c2d9acd90b6229e99b8527bb262002785397ecbfeec4319babca9fa805a4db7f",
+    ],
+    [
+      "backend/requirements-windows-arm64-overrides.txt",
+      "8cf1bc48daa284c96510dfb547a0a04e3d681b7670c412709d3db5e07f1b4bd3",
+    ],
+    [
+      "backend/requirements-windows-arm64-sources.json",
+      "7083f14d1a0f0805c1da38cba159d5de8a700d2dbc3e0392dfda3ce6d52e4fef",
+    ],
+    [
+      "backend/requirements-windows-arm64-tiktoken.Cargo.lock",
+      "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3",
+    ],
+    [
+      "backend/requirements-windows-arm64-wheelhouse-approval.json",
+      "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896",
+    ],
+    [
+      "backend/scripts/build_windows_arm64_wheelhouse.py",
+      "97a812ab3ce3668251093d639712379abab1c2786cdd2364ac867736cc7d760b",
+    ],
+  ]);
+  for (const [path, digest] of sealedInputs) {
+    assert.match(
+      seals,
+      new RegExp(
+        `"${escapeRegExp(path)}"\\s*=\\s*"${escapeRegExp(digest)}"`,
+      ),
+    );
+  }
+  assert.match(seals, /Get-FileHash -Algorithm SHA256/);
+  assert.match(seals, /if \(\$actual -ne \$entry\.Value\)/);
+  assert.ok(
+    windows.indexOf("- name: Verify Windows ARM64 wheelhouse input seals") <
+      windows.indexOf("- name: Build approved Windows ARM64 wheelhouse"),
+  );
+
+  assert.match(wheelhouse, /if:\s*matrix\.target == 'windows-arm64'/);
+  assert.match(wheelhouse, /RELEASE_EVENT_NAME:\s*\$\{\{ github\.event_name \}\}/);
+  assert.match(
+    wheelhouse,
+    /\$approval\.status -eq "approved"[\s\S]*?\$approvedDigest -match "\^\[0-9a-f\]\{64\}\$"[\s\S]*?\$approvedDigest -ne \$zeroSha256/,
+  );
+  const dispatchStart = wheelhouse.indexOf(
+    'if ($env:RELEASE_EVENT_NAME -eq "workflow_dispatch")',
+  );
+  const pushStart = wheelhouse.indexOf(
+    '} elseif ($env:RELEASE_EVENT_NAME -eq "push")',
+  );
+  const unsupportedStart = wheelhouse.indexOf("} else {", pushStart);
+  assert.ok(dispatchStart >= 0);
+  assert.ok(pushStart > dispatchStart);
+  assert.ok(unsupportedStart > pushStart);
+  const dispatchBranch = wheelhouse.slice(dispatchStart, pushStart);
+  const pushBranch = wheelhouse.slice(pushStart, unsupportedStart);
+  assert.match(dispatchBranch, /\$approval\.status -eq "bootstrap-required"/);
+  assert.match(dispatchBranch, /\$approvedDigest -eq \$zeroSha256/);
+  assert.match(dispatchBranch, /\$arguments \+= "--bootstrap"/);
+  assert.equal((wheelhouse.match(/--bootstrap/g) ?? []).length, 1);
+  assert.doesNotMatch(pushBranch, /--bootstrap/);
+  assert.match(pushBranch, /if \(-not \$validApprovedDigest\)/);
+  assert.match(
+    pushBranch,
+    /tagged Windows ARM64 releases require a nonzero tracked approved content SHA-256/,
+  );
+  assert.match(
+    wheelhouse,
+    /backend\/scripts\/build_windows_arm64_wheelhouse\.py[\s\S]*?"build"[\s\S]*?"--output"/,
+  );
+  assert.match(wheelhouse, /windows-arm64-wheelhouse-manifest\.json/);
+  assert.match(wheelhouse, /manifest_digest=\$manifestDigest/);
+
+  const armBranchStart = buildBackend.indexOf(
+    'if [[ "${{ matrix.target }}" == "windows-arm64" ]]; then',
+  );
+  const x64BranchStart = buildBackend.indexOf("\n          else", armBranchStart);
+  assert.ok(armBranchStart >= 0);
+  assert.ok(x64BranchStart > armBranchStart);
+  const armBranch = buildBackend.slice(armBranchStart, x64BranchStart);
+  for (const flag of [
+    "--no-index",
+    "--no-deps",
+    "--require-hashes",
+    "--only-binary=:all:",
+  ]) {
+    assert.equal(
+      (armBranch.match(new RegExp(escapeRegExp(flag), "g")) ?? []).length,
+      2,
+      `${flag} must protect both Windows ARM64 offline installs`,
+    );
+  }
+  assert.match(
+    armBranch,
+    /--find-links "\$WHEELHOUSE_ROOT\/production-wheelhouse"/,
+  );
+  assert.match(
+    armBranch,
+    /install-locks\/requirements-windows-arm64-install\.txt/,
+  );
+  assert.match(
+    armBranch,
+    /--find-links "\$WHEELHOUSE_ROOT\/release-tools-wheelhouse"/,
+  );
+  assert.match(
+    armBranch,
+    /install-locks\/requirements-release-tools-windows-arm64-install\.txt/,
+  );
+
+  assert.match(
+    auditBackend,
+    /windows-arm64[\s\S]*?AUDIT_LOCK="backend\/requirements-windows-arm64\.txt"/,
+  );
+  assert.match(
+    auditBackend,
+    /python -m pip_audit --strict --require-hashes -r "\$AUDIT_LOCK"/,
+  );
+  assert.match(
+    diagnostics,
+    /windows-arm64-wheelhouse-manifest\.json(?:\s|$)/,
+  );
+  assert.match(
+    diagnostics,
+    /windows-arm64-wheelhouse-manifest\.json\.sha256/,
   );
 });
 
@@ -1446,7 +1668,7 @@ test("CI uses the portable arm64 Python path for macOS execution safety", () => 
 
 test("runs the frozen Office create-edit-reopen contract on every native target", () => {
   const nativeSteps = [
-    ["build-windows", "Verify backend bundle", /VERIFY_BUNDLE_OFFICE_PLATFORM:\s*windows-x64/],
+    ["build-windows", "Verify backend bundle", /VERIFY_BUNDLE_OFFICE_PLATFORM:\s*\$\{\{ matrix\.target \}\}/],
     [
       "build-linux",
       "Verify backend bundle",
@@ -1478,7 +1700,8 @@ test("runs the frozen Office create-edit-reopen contract on every native target"
     "Select latest evidence attempt per native target",
   );
   for (const prefix of [
-    "windows-lifecycle-diagnostics",
+    "windows-x64-lifecycle-diagnostics",
+    "windows-arm64-lifecycle-diagnostics",
     "macos-aarch64-lifecycle-diagnostics",
     "macos-x64-lifecycle-diagnostics",
     "linux-x64-lifecycle-diagnostics",
@@ -1503,7 +1726,7 @@ test("runs the frozen Office create-edit-reopen contract on every native target"
   assert.match(release, /files:[\s\S]*\$\{\{ env\.OFFICE_COMPATIBILITY_ASSET \}\}/);
 
   const packagedSteps = [
-    ["build-windows", "Install NSIS package and verify packaged Node.js toolchain", /windows-x64/],
+    ["build-windows", "Install NSIS package and verify packaged Node.js toolchain", /\$\{\{ matrix\.target \}\}/],
     [
       "build-macos",
       "Verify final DMG contents",
@@ -1561,7 +1784,13 @@ test("validates release metadata, production audits, and tests before building",
   assert.match(validate, /cargo clippy --locked --all-targets -- -D warnings/);
 
   const releaseToolLocks = new Map([
-    ["build-windows", ["requirements-release-tools-windows-x64.txt"]],
+    [
+      "build-windows",
+      [
+        "requirements-release-tools-windows-x64.txt",
+        "requirements-release-tools-windows-arm64.txt",
+      ],
+    ],
     [
       "build-macos",
       [
@@ -1629,51 +1858,70 @@ test("hash-locks the complete release Python toolchain for every native target",
       "3.12.10",
       "x86_64-pc-windows-msvc",
       "f2e389ca75cf41fe8a45bc40ab5eaffaa4808c3a572f49bccc419c93450c8f9b",
+      "backend/requirements.txt",
+    ],
+    [
+      "windows-arm64",
+      "3.12.10",
+      "aarch64-pc-windows-msvc",
+      "c2d9acd90b6229e99b8527bb262002785397ecbfeec4319babca9fa805a4db7f",
+      "backend/requirements-windows-arm64.txt",
     ],
     [
       "macos-arm64",
       "3.12.13",
       "aarch64-apple-darwin",
       "332b2249dfe9403ddc7fa1b23b2646e18777ebfd668d8543b022ff8a69b9a5d6",
+      "backend/requirements.txt",
     ],
     [
       "macos-x64",
       "3.12.13",
       "x86_64-apple-darwin",
       "e31a1f9bd91c64ad7805badd3d1a71d1cfc37211b28263d6930b0c3d154af5a7",
+      "backend/requirements.txt",
     ],
     [
       "linux-x64",
       "3.12.13",
       "x86_64-unknown-linux-gnu",
       "208305ef117280fed096c83876895872110ac23aa4df34b579f5b73f8236d6f3",
+      "backend/requirements.txt",
     ],
     [
       "linux-arm64",
       "3.12.13",
       "aarch64-unknown-linux-gnu",
       "773f5855f7b5d6a4395adc095064e0f7abb16067d7fba0b9d7af3343be290d5b",
+      "backend/requirements.txt",
     ],
   ];
   const normalizePackageName = (name) =>
     name.toLowerCase().replaceAll(/[_.]+/g, "-");
-  const productionPins = new Map(
-    [...backendRequirements.matchAll(/^([A-Za-z0-9_.-]+)==([^\s;]+).*\\$/gm)].map(
-      ([, name, version]) => [normalizePackageName(name), version],
-    ),
-  );
   for (const [
     target,
     pythonVersion,
     pythonPlatform,
     expectedDigest,
+    constraintPath,
   ] of lockTargets) {
     const lock = readFileSync(
       join(root, `backend/requirements-release-tools-${target}.txt`),
       "utf8",
     );
+    const productionLock = readFileSync(join(root, constraintPath), "utf8");
+    const productionPins = new Map(
+      [
+        ...productionLock.matchAll(
+          /^([A-Za-z0-9_.-]+)==([^\s;]+).*\\$/gm,
+        ),
+      ].map(([, name, version]) => [normalizePackageName(name), version]),
+    );
     assert.match(lock, /uvx --from uv==0\.11\.28 uv pip compile/);
-    assert.match(lock, /--constraints backend\/requirements\.txt/);
+    assert.match(
+      lock,
+      new RegExp(`--constraints ${escapeRegExp(constraintPath)}`),
+    );
     assert.match(
       lock,
       new RegExp(`--python-version ${pythonVersion.replaceAll(".", "\\.")}`),
@@ -1874,14 +2122,14 @@ test("native bundle verification rejects half-open v1.1 gate graphs", () => {
   assert.match(bundleVerifier, /status\.missing_dependencies\.length === 0/);
 });
 
-test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded public prereleases", () => {
+test("publishes reviewed v1.1 patch lines and RC iterations as synchronized unsigned-degraded public prereleases", () => {
   const validate = job("validate-release");
   const context = step(validate, "Resolve and validate release context");
   assert.match(
     validate,
     /release_profile:\s*\$\{\{ steps\.release-context\.outputs\.release_profile \}\}/,
   );
-  assert.match(context, /1\.1\.0\)[\s\S]*?RELEASE_PROFILE="unsigned-degraded"/);
+  assert.match(context, /1\.1\.\*\)[\s\S]*?RELEASE_PROFILE="unsigned-degraded"/);
   assert.match(
     context,
     /RELEASE_PROFILE" == "unsigned-degraded"[\s\S]*?RELEASE_CHANNEL="stable"[\s\S]*?IS_STABLE="false"[\s\S]*?MACOS_ARTIFACT_PROFILE="UNSIGNED-DEGRADED"/,
@@ -1907,8 +2155,8 @@ test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded p
       env: {
         ...process.env,
         GITHUB_EVENT_NAME: "push",
-        GITHUB_REF: "refs/tags/v1.1.0",
-        GITHUB_REF_NAME: "v1.1.0",
+        GITHUB_REF: "refs/tags/v1.1.1",
+        GITHUB_REF_NAME: "v1.1.1",
         GITHUB_OUTPUT: githubOutput,
       },
     });
@@ -1918,8 +2166,8 @@ test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded p
     rmSync(outputDirectory, { recursive: true, force: true });
   }
   for (const output of [
-    "app_version=1.1.0",
-    "release_version=1.1.0",
+    "app_version=1.1.1",
+    "release_version=1.1.1",
     "release_channel=stable",
     "release_profile=unsigned-degraded",
     "evidence_contract=v1.1",
@@ -1940,16 +2188,16 @@ test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded p
       env: {
         ...process.env,
         GITHUB_EVENT_NAME: "push",
-        GITHUB_REF: "refs/tags/v1.1.0-rc.2",
-        GITHUB_REF_NAME: "v1.1.0-rc.2",
+        GITHUB_REF: "refs/tags/v1.1.1-rc.1",
+        GITHUB_REF_NAME: "v1.1.1-rc.1",
         GITHUB_OUTPUT: githubOutput,
       },
     });
     assert.equal(resolved.status, 0, resolved.stderr);
     const output = readFileSync(githubOutput, "utf8");
     for (const expected of [
-      "app_version=1.1.0",
-      "release_version=1.1.0-rc.2",
+      "app_version=1.1.1",
+      "release_version=1.1.1-rc.1",
       "release_channel=prerelease",
       "release_profile=unsigned-degraded",
       "evidence_contract=v1.1",
@@ -2064,7 +2312,7 @@ test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded p
   assert.match(disclosure, /publicationChannel:\s*"prerelease"/);
   assert.match(disclosure, /publicPrerelease:\s*true/);
   assert.match(disclosure, /draft:\s*false/);
-  assert.match(disclosure, /installerCount:\s*7/);
+  assert.match(disclosure, /installerCount:\s*8/);
   assert.match(disclosure, /metadataCount:\s*4/);
   assert.match(disclosure, /workspaceIdentityScheme:\s*"stat-v1"/);
   assert.match(disclosure, /deletedDirectoryIdentifierReuse:\s*"not-detectable"/);
@@ -2089,7 +2337,7 @@ test("publishes v1.1.0 and its RC iterations as synchronized unsigned-degraded p
   assert.match(release, /make_latest:\s*false/);
 });
 
-test("verifies seven installers and publishes profile-aware seven-plus-four assets", () => {
+test("verifies eight installers and publishes profile-aware eight-plus-four assets", () => {
   const publish = job("publish");
   const completenessIndex = publish.indexOf("Verify artifact completeness");
   const checksumIndex = publish.indexOf("Generate SHA-256 checksums");
@@ -2107,12 +2355,14 @@ test("verifies seven installers and publishes profile-aware seven-plus-four asse
   assert.match(publish, /\*\$\{APP_VERSION\}\*_aarch64\.dmg/);
   assert.match(publish, /\*\$\{APP_VERSION\}\*_x64\.dmg/);
   assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-windows-x64-setup\$\{INSTALLER_TRUST_SUFFIX\}\.exe/);
+  assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-windows-arm64-setup\$\{INSTALLER_TRUST_SUFFIX\}\.exe/);
   assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-macos-aarch64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
   assert.match(publish, /suyo-\$\{RELEASE_VERSION\}-macos-x64\$\{MACOS_TRUST_SUFFIX\}\.dmg/);
   assert.match(publish, /MACOS_TRUST_SUFFIX="-ADHOC-NOT-NOTARIZED"/);
   assert.match(publish, /INSTALLER_TRUST_SUFFIX="-UNSIGNED-DEGRADED"/);
   for (const profiledName of [
     "windows-x64-setup${INSTALLER_TRUST_SUFFIX}.exe",
+    "windows-arm64-setup${INSTALLER_TRUST_SUFFIX}.exe",
     "linux-amd64${INSTALLER_TRUST_SUFFIX}.deb",
     "linux-x86_64${INSTALLER_TRUST_SUFFIX}.rpm",
     "linux-arm64${INSTALLER_TRUST_SUFFIX}.deb",
@@ -2121,7 +2371,7 @@ test("verifies seven installers and publishes profile-aware seven-plus-four asse
     assert.match(publish, new RegExp(escapeRegExp(profiledName)));
   }
   assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
-  assert.match(publish, /wc -l \| tr -d ' '\)" == "7"/);
+  assert.match(publish, /wc -l \| tr -d ' '\)" == "8"/);
 
   const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /name:[^\n]*UNSIGNED-DEGRADED/);
@@ -2157,8 +2407,8 @@ test("verifies seven installers and publishes profile-aware seven-plus-four asse
   assert.match(trust, /先卸载候选版，或显式执行覆盖安装/);
   assert.match(trust, /Windows NSIS[^\n]*未配置 Authenticode/);
   assert.match(trust, /Linux x64\/ARM64 DEB\/RPM[^\n]*未配置仓库签名/);
-  assert.match(trust, /十一个资产/);
-  assert.match(trust, /七个安装包和四个元数据/);
+  assert.match(trust, /十二个资产/);
+  assert.match(trust, /八个安装包和四个元数据/);
   assert.match(trust, /OFFICE-RESTRICTED-COMPATIBILITY\.json/);
   assert.match(trust, /DEGRADED-CAPABILITIES\.json/);
   assert.match(trust, /release-manifest\.json[^\n]*手动下载/);

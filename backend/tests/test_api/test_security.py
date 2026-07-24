@@ -16,6 +16,7 @@ from app.api import security as security_api
 from app.auth.local import require_local_session
 from app.hooks.config import register_project_hook_config
 from app.hooks.registry import HookRegistry
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.hooks.trust import HookTrustStore
 from app.models.session import Session
 from app.models.workspace_instance import WorkspaceInstance
@@ -93,7 +94,7 @@ async def _seed_project_hook(
         }),
         encoding="utf-8",
     )
-    info = workspace.stat()
+    identity = ensure_workspace_identity(workspace).durable_token
     async with session_factory() as db:
         async with db.begin():
             db.add(Session(
@@ -107,7 +108,7 @@ async def _seed_project_hook(
                 created_by_session_id=session_id,
                 kind="direct",
                 root_path=str(workspace.resolve()),
-                identity_token=f"stat-v1:{info.st_dev}:{info.st_ino}",
+                identity_token=identity,
                 status="active",
                 details={"managed": False},
             ))

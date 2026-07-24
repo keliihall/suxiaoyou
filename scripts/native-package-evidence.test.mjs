@@ -18,11 +18,12 @@ import { collectNativePackageEvidence } from "./native-package-evidence.mjs";
 const COMMIT = "a".repeat(40);
 const TAG = "v1.0.0-rc.7";
 const VERSION = TAG.slice(1);
-const UNSIGNED_DEGRADED_TAG = "v1.1.0";
-const UNSIGNED_DEGRADED_RC_TAG = "v1.1.0-rc.2";
+const UNSIGNED_DEGRADED_TAG = "v1.1.1";
+const UNSIGNED_DEGRADED_RC_TAG = "v1.1.1-rc.1";
 
 const FIXTURES = [
-  ["windows-x64-nsis", `suyo-${VERSION}-windows-x64-setup.exe`, "windows-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows", "win32"],
+  ["windows-x64-nsis", `suyo-${VERSION}-windows-x64-setup.exe`, "windows-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows-x64", "win32"],
+  ["windows-arm64-nsis", `suyo-${VERSION}-windows-arm64-setup.exe`, "windows-arm64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-windows-arm64", "win32"],
   ["macos-arm64-dmg", `suyo-${VERSION}-macos-aarch64-ADHOC-NOT-NOTARIZED.dmg`, "macos-aarch64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-aarch64", "darwin"],
   ["macos-x64-dmg", `suyo-${VERSION}-macos-x64-ADHOC-NOT-NOTARIZED.dmg`, "macos-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-macos-x64", "darwin"],
   ["linux-x64-deb", `suyo-${VERSION}-linux-amd64.deb`, "linux-x64-lifecycle-diagnostics-1", "suxiaoyou-desktop-lifecycle-linux-deb", "linux", "deb"],
@@ -167,7 +168,7 @@ async function collect(paths, overrides = {}) {
   });
 }
 
-test("aggregates seven checksum-bound installed lifecycle records", async (t) => {
+test("aggregates eight checksum-bound installed lifecycle records", async (t) => {
   const result = await collect(fixture(t));
   assert.equal(result.schema_version, 2);
   assert.equal(result.release_commit, COMMIT);
@@ -182,8 +183,11 @@ test("aggregates seven checksum-bound installed lifecycle records", async (t) =>
   assert.match(result.packages[0].lifecycle_report_sha256, /^[0-9a-f]{64}$/u);
   assert.match(result.packages[0].executable_sha256, /^[0-9a-f]{64}$/u);
   assert.ok(result.packages[0].executable_size > 0);
-  assert.equal(result.packages[1].artifact_profile, "rc-adhoc");
-  assert.equal(result.packages[1].trust_boundary_verified, true);
+  const macosArm64 = result.packages.find(
+    (item) => item.kind === "macos-arm64-dmg",
+  );
+  assert.equal(macosArm64.artifact_profile, "rc-adhoc");
+  assert.equal(macosArm64.trust_boundary_verified, true);
   const linuxX64 = result.packages.filter((item) => item.kind.startsWith("linux-x64-"));
   assert.notEqual(linuxX64[0].executable_sha256, linuxX64[1].executable_sha256);
   assert.equal(
@@ -194,10 +198,19 @@ test("aggregates seven checksum-bound installed lifecycle records", async (t) =>
 
 test("aggregates canonical Windows lifecycle evidence with win32 semantics", async (t) => {
   const result = await collect(fixture(t));
-  const windows = result.packages.find((item) => item.kind === "windows-x64-nsis");
+  const windowsX64 = result.packages.find(
+    (item) => item.kind === "windows-x64-nsis",
+  );
+  const windowsArm64 = result.packages.find(
+    (item) => item.kind === "windows-arm64-nsis",
+  );
   assert.equal(
-    windows.executable_path,
+    windowsX64.executable_path,
     "D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop-1.exe",
+  );
+  assert.equal(
+    windowsArm64.executable_path,
+    "D:\\a\\_temp\\suxiaoyou-nsis-install\\suxiaoyou-desktop-2.exe",
   );
 });
 
@@ -230,7 +243,7 @@ test("CLI writes the same scorecard-ready evidence contract", (t) => {
   );
   assert.equal(result.status, 0, result.stderr);
   const evidence = JSON.parse(readFileSync(output, "utf8"));
-  assert.equal(evidence.packages.length, 7);
+  assert.equal(evidence.packages.length, 8);
   assert.equal(evidence.release_commit, COMMIT);
   assert.equal(evidence.release_tag, TAG);
 });
@@ -277,7 +290,7 @@ test("v1.1 unsigned-degraded evidence makes every trust downgrade explicit", asy
   assert.equal(result.publication_channel, "prerelease");
   assert.equal(result.official_release_eligible, false);
   assert.equal(result.latest_eligible, false);
-  assert.equal(result.packages.length, 7);
+  assert.equal(result.packages.length, 8);
   assert.ok(
     result.packages.every((item) =>
       /-UNSIGNED-DEGRADED\.(?:exe|dmg|deb|rpm)$/u.test(item.artifact_name),
@@ -289,10 +302,13 @@ test("v1.1 unsigned-degraded evidence makes every trust downgrade explicit", asy
     ),
   );
 
-  const windows = result.packages.find(
-    (item) => item.kind === "windows-x64-nsis",
+  const windowsPackages = result.packages.filter((item) =>
+    item.kind.startsWith("windows-"),
   );
-  assert.equal(windows.authenticode_signed, false);
+  assert.equal(windowsPackages.length, 2);
+  assert.ok(
+    windowsPackages.every((item) => item.authenticode_signed === false),
+  );
   const macPackages = result.packages.filter((item) =>
     item.kind.startsWith("macos-"),
   );
@@ -390,7 +406,7 @@ test("unsigned-degraded native evidence supports synchronized v1.1 RC installers
   assert.equal(evidence.release_profile, "unsigned-degraded");
   assert.ok(
     evidence.packages.every((item) =>
-      item.artifact_name.includes("1.1.0-rc.2") &&
+      item.artifact_name.includes("1.1.1-rc.1") &&
       item.artifact_name.includes("-UNSIGNED-DEGRADED."),
     ),
   );
@@ -411,7 +427,7 @@ test("unsigned-degraded native evidence supports synchronized v1.1 RC installers
         releaseChannel: "stable",
         releaseProfile: "unsigned-degraded",
       }),
-    /defined only for v1\.1\.0/u,
+    /defined only for v1\.1\.x/u,
   );
 });
 
@@ -490,7 +506,15 @@ test("rejects duplicate or unexpected native lifecycle results", async (t) => {
 
 test("rejects DEB and RPM evidence that differs beyond the Tauri bundle marker", async (t) => {
   const paths = fixture(t);
-  const reportPath = join(paths.artifactsRoot, FIXTURES[3][2], FIXTURES[3][3], "result.json");
+  const linuxX64Deb = FIXTURES.find(
+    ([kind]) => kind === "linux-x64-deb",
+  );
+  const reportPath = join(
+    paths.artifactsRoot,
+    linuxX64Deb[2],
+    linuxX64Deb[3],
+    "result.json",
+  );
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
   report.executable_unpatched_sha256 = "f".repeat(64);
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);

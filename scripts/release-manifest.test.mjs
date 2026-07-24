@@ -21,8 +21,8 @@ import { verifyReleaseManifest } from "./verify-release-manifest.mjs";
 
 const TAG = "v0.8.0";
 const RC_TAG = "v0.8.0-rc.1";
-const UNSIGNED_DEGRADED_TAG = "v1.1.0";
-const UNSIGNED_DEGRADED_RC_TAG = "v1.1.0-rc.2";
+const UNSIGNED_DEGRADED_TAG = "v1.1.1";
+const UNSIGNED_DEGRADED_RC_TAG = "v1.1.1-rc.1";
 const COMMIT = "a".repeat(40);
 const REPOSITORY = "keliihall/suxiaoyou";
 
@@ -66,7 +66,7 @@ function fixture(t, tag = TAG, releaseProfile) {
   };
 }
 
-test("generates and verifies a seven-installer manual-download manifest", (t) => {
+test("generates and verifies an eight-installer manual-download manifest", (t) => {
   const data = fixture(t);
   const verified = verifyReleaseManifest({
     ...data,
@@ -78,7 +78,24 @@ test("generates and verifies a seven-installer manual-download manifest", (t) =>
   assert.equal(verified.schemaVersion, 2);
   assert.equal(verified.channel, "stable");
   assert.equal(verified.appVersion, "0.8.0");
-  assert.equal(verified.assets.length, 7);
+  assert.equal(verified.assets.length, 8);
+  assert.deepEqual(
+    verified.assets
+      .filter((asset) => asset.platform === "windows")
+      .map(({ architecture, format, name }) => ({ architecture, format, name })),
+    [
+      {
+        architecture: "x86_64",
+        format: "nsis",
+        name: "suyo-0.8.0-windows-x64-setup.exe",
+      },
+      {
+        architecture: "arm64",
+        format: "nsis",
+        name: "suyo-0.8.0-windows-arm64-setup.exe",
+      },
+    ],
+  );
   assert.deepEqual(
     verified.assets
       .filter((asset) => asset.platform === "linux" && asset.architecture === "arm64")
@@ -158,13 +175,14 @@ test("generates and verifies the explicit v1.1 unsigned-degraded profile", (t) =
   assert.deepEqual(
     verified.assets.map((asset) => asset.name),
     [
-      "suyo-1.1.0-windows-x64-setup-UNSIGNED-DEGRADED.exe",
-      "suyo-1.1.0-macos-aarch64-UNSIGNED-DEGRADED.dmg",
-      "suyo-1.1.0-macos-x64-UNSIGNED-DEGRADED.dmg",
-      "suyo-1.1.0-linux-amd64-UNSIGNED-DEGRADED.deb",
-      "suyo-1.1.0-linux-x86_64-UNSIGNED-DEGRADED.rpm",
-      "suyo-1.1.0-linux-arm64-UNSIGNED-DEGRADED.deb",
-      "suyo-1.1.0-linux-aarch64-UNSIGNED-DEGRADED.rpm",
+      "suyo-1.1.1-windows-x64-setup-UNSIGNED-DEGRADED.exe",
+      "suyo-1.1.1-windows-arm64-setup-UNSIGNED-DEGRADED.exe",
+      "suyo-1.1.1-macos-aarch64-UNSIGNED-DEGRADED.dmg",
+      "suyo-1.1.1-macos-x64-UNSIGNED-DEGRADED.dmg",
+      "suyo-1.1.1-linux-amd64-UNSIGNED-DEGRADED.deb",
+      "suyo-1.1.1-linux-x86_64-UNSIGNED-DEGRADED.rpm",
+      "suyo-1.1.1-linux-arm64-UNSIGNED-DEGRADED.deb",
+      "suyo-1.1.1-linux-aarch64-UNSIGNED-DEGRADED.rpm",
     ],
   );
 });
@@ -178,13 +196,13 @@ test("generates and verifies a synchronized v1.1 unsigned-degraded RC profile", 
     expectedRepository: REPOSITORY,
   });
 
-  assert.equal(verified.version, "1.1.0-rc.2");
-  assert.equal(verified.appVersion, "1.1.0");
+  assert.equal(verified.version, "1.1.1-rc.1");
+  assert.equal(verified.appVersion, "1.1.1");
   assert.equal(verified.channel, "prerelease");
   assert.equal(verified.releaseProfile, "unsigned-degraded");
   assert.ok(
     verified.assets.every((asset) =>
-      asset.name.includes("1.1.0-rc.2") &&
+      asset.name.includes("1.1.1-rc.1") &&
       asset.name.includes("-UNSIGNED-DEGRADED."),
     ),
   );
@@ -353,21 +371,29 @@ test("rejects unsupported prerelease tag shapes", () => {
   }
 });
 
-test("unsigned-degraded is restricted to the v1.1.0 release line", () => {
+test("unsigned-degraded is restricted to the v1.1.x release line", () => {
   assert.deepEqual(
     expectedReleaseAssets("1.1.0"),
     expectedReleaseAssets("1.1.0", "unsigned-degraded"),
   );
+  assert.deepEqual(
+    expectedReleaseAssets("1.1.1"),
+    expectedReleaseAssets("1.1.1", "unsigned-degraded"),
+  );
   assert.throws(
-    () => expectedReleaseAssets("1.1.0", "official"),
+    () => expectedReleaseAssets("1.1.1", "official"),
     /unsigned-degraded release contract/u,
   );
   assert.throws(
     () => expectedReleaseAssets("1.0.0", "unsigned-degraded"),
-    /defined only for v1\.1\.0/u,
+    /defined only for v1\.1\.x/u,
+  );
+  assert.throws(
+    () => expectedReleaseAssets("1.2.0", "unsigned-degraded"),
+    /defined only for v1\.1\.x/u,
   );
   assert.deepEqual(
-    expectedReleaseAssets("1.1.0-rc.1", "unsigned-degraded"),
-    expectedReleaseAssets("1.1.0-rc.1"),
+    expectedReleaseAssets("1.1.1-rc.1", "unsigned-degraded"),
+    expectedReleaseAssets("1.1.1-rc.1"),
   );
 });

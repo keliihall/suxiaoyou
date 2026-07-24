@@ -34,6 +34,11 @@ const REQUIRED_STATIC_ASSETS = [
     relativePath:
       "_internal/alembic/versions/0011_v110_user_office_templates.py",
   },
+  {
+    kind: "file",
+    relativePath:
+      "_internal/alembic/versions/0012_v110_workspace_identity_v2.py",
+  },
   { kind: "nonempty-dir", relativePath: "_internal/app/agent/prompts" },
   {
     kind: "file",
@@ -98,7 +103,7 @@ test("accepts a complete bundle when pure-Python SQLAlchemy only lives in PYZ", 
   const result = verifyBundle(dist);
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /static: 27 required assets present/);
+  assert.match(result.stdout, /static: 28 required assets present/);
   assert.doesNotMatch(result.stderr, /sqlalchemy/i);
 });
 
@@ -143,6 +148,7 @@ test("runtime smoke covers released ACP and both Office renderer profiles", () =
   assert.match(source, /VERIFY_BUNDLE_OFFICE_RENDERER_REPORT/);
   assert.match(source, /VERIFY_BUNDLE_OFFICE_RENDERER_PROFILE/);
   assert.match(source, /UNSIGNED_DEGRADED_PROFILE/);
+  assert.match(source, /"windows-arm64": "windows-arm64"/);
   assert.match(source, /office-renderer-profile\.json/);
   assert.match(source, /suxiaoyou-office-renderer-profile-v1/);
   assert.match(source, /unsignedDegradedOfficeRendererSmokeTest/);

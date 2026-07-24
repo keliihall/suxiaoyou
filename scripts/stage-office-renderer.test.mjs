@@ -314,20 +314,22 @@ test("atomically stages exactly one lock-bound native renderer target", () => {
   assert.ok(lockedPaths.includes("probe/authoritative-renderer-probe.docx"));
 });
 
-test("Windows staging requires the target-specific .exe components", () => {
-  const fixture = rendererFixture("windows-x64");
-  const expectedLockSha256 = fixture.writeLock();
+for (const target of ["windows-x64", "windows-arm64"]) {
+  test(`${target} staging requires the target-specific .exe components`, () => {
+    const fixture = rendererFixture(target);
+    const expectedLockSha256 = fixture.writeLock();
 
-  stage(fixture, expectedLockSha256);
+    stage(fixture, expectedLockSha256);
 
-  const paths = fixture.lock.files.map((entry) => entry.path);
-  assert.ok(paths.includes("bin/soffice.exe"));
-  assert.ok(paths.includes("bin/pdftoppm.exe"));
-  assert.ok(paths.includes("bin/suxiaoyou-office-sandbox-launcher.exe"));
-  assert.ok(paths.includes("bin/suxiaoyou-office-sandbox-probe.exe"));
-  assert.equal(paths.includes("bin/soffice"), false);
-  assert.equal(paths.includes("bin/pdftoppm"), false);
-});
+    const paths = fixture.lock.files.map((entry) => entry.path);
+    assert.ok(paths.includes("bin/soffice.exe"));
+    assert.ok(paths.includes("bin/pdftoppm.exe"));
+    assert.ok(paths.includes("bin/suxiaoyou-office-sandbox-launcher.exe"));
+    assert.ok(paths.includes("bin/suxiaoyou-office-sandbox-probe.exe"));
+    assert.equal(paths.includes("bin/soffice"), false);
+    assert.equal(paths.includes("bin/pdftoppm"), false);
+  });
+}
 
 test("rejects a release-configured lock digest mismatch", () => {
   const fixture = rendererFixture();

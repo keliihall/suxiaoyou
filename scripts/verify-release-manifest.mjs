@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-/** Independently verify a release-manifest.json and its seven installers. */
+/** Independently verify a release-manifest.json and its eight installers. */
 
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
