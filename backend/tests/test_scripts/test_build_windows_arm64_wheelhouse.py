@@ -268,9 +268,9 @@ def test_msvc_environment_is_initialized_for_native_arm64(
         )
         return SimpleNamespace(
             stdout=(
-                "PATH=C:\\VS\\ARM64\n"
-                "VSCMD_ARG_HOST_ARCH=arm64\n"
-                "VSCMD_ARG_TGT_ARCH=arm64\n"
+                "Path=C:\\VS\\ARM64\n"
+                "vscmd_arg_host_arch=arm64\n"
+                "Vscmd_Arg_Tgt_Arch=arm64\n"
             ),
             stderr="",
         )

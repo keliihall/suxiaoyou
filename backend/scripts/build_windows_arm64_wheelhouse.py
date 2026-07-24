@@ -457,7 +457,10 @@ def initialize_native_arm64_msvc_environment() -> None:
             continue
         key, value = line.split("=", 1)
         if key:
-            captured[key] = value
+            # Windows environment-variable names are case-insensitive, while
+            # a regular Python dict is not.  `set` commonly emits `Path=...`
+            # even though callers and Visual Studio use `PATH`.
+            captured[key.upper()] = value
     if not captured.get("PATH"):
         raise SupplyChainError("VsDevCmd did not emit a usable environment")
     host_arch = captured.get("VSCMD_ARG_HOST_ARCH", "").lower()
