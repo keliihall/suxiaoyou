@@ -62,6 +62,11 @@ _INSTANCE_ID_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _OBJECT_ID_RE: Final = re.compile(r"^[0-9a-f]{40,64}$")
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
+_SAFE_LINE_ENDING_CONFIG_KEYS: Final = (
+    "core.autocrlf",
+    "core.eol",
+    "core.safecrlf",
+)
 
 
 class WorktreeState(StrEnum):
@@ -169,6 +174,36 @@ def _filesystem_identity_from_json(
         device=int(value["device"]),
         inode=int(value["inode"]),
         durable_token=raw_token,
+    )
+
+
+def _normalize_line_ending_config(name: str, raw_value: str) -> str:
+    value = raw_value.strip().lower()
+    boolean = {
+        "": "true",
+        "1": "true",
+        "yes": "true",
+        "on": "true",
+        "true": "true",
+        "0": "false",
+        "no": "false",
+        "off": "false",
+        "false": "false",
+    }
+    if name == "core.autocrlf":
+        if value == "input":
+            return value
+        if value in boolean:
+            return boolean[value]
+    elif name == "core.eol" and value in {"lf", "crlf", "native"}:
+        return value
+    elif name == "core.safecrlf":
+        if value == "warn":
+            return value
+        if value in boolean:
+            return boolean[value]
+    raise RepositoryValidationError(
+        f"Unsupported Git line-ending configuration: {name}={raw_value!r}"
     )
 
 
@@ -1431,6 +1466,7 @@ class WorktreeService:
         if executable is None:
             raise GitUnavailableError("Git service was not prepared")
         hooks = self.managed_root / "_empty-hooks"
+        line_ending_overrides = self._line_ending_config_overrides(arguments)
         command = [
             executable,
             "--no-pager",
@@ -1442,6 +1478,7 @@ class WorktreeService:
             "protocol.allow=never",
             "-c",
             "core.quotepath=false",
+            *line_ending_overrides,
             *arguments,
         ]
         environment = self._minimal_git_environment()
@@ -1480,6 +1517,104 @@ class WorktreeService:
                 stderr=result.stderr_text(),
             )
         return result
+
+    def _line_ending_config_overrides(
+        self,
+        arguments: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Preserve safe user EOL policy inside the hardened Git environment.
+
+        Normal worktrees can inherit ``core.autocrlf`` and related scalar
+        settings from the user's global or system config.  The managed service
+        deliberately hides those config files so hooks, filters, credential
+        helpers, and other executable settings cannot enter supervised Git
+        commands.  Re-reading only this allowlisted data prevents a clean
+        Windows checkout from becoming spuriously dirty when the hardened
+        process would otherwise fall back to Git's different EOL defaults.
+        """
+
+        try:
+            directory_index = arguments.index("-C")
+            worktree = Path(arguments[directory_index + 1])
+        except (ValueError, IndexError, TypeError):
+            return ()
+        executable = self._git_executable
+        if executable is None:
+            raise GitUnavailableError("Git service was not prepared")
+        command = [
+            executable,
+            "--no-pager",
+            "-C",
+            os.fspath(worktree),
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^core\.(autocrlf|eol|safecrlf)$",
+        ]
+        environment = dict(os.environ)
+        for name in tuple(environment):
+            if name.startswith("GIT_") or name.startswith("GCM_"):
+                environment.pop(name, None)
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GCM_INTERACTIVE"] = "Never"
+        kwargs: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": environment,
+            "shell": False,
+            "timeout": self.timeout_seconds,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = int(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            result = subprocess.run(command, **kwargs)
+        except subprocess.TimeoutExpired:
+            raise GitCommandTimeout(
+                "read safe line-ending config",
+                timeout_seconds=self.timeout_seconds,
+            ) from None
+        except OSError as exc:
+            raise GitUnavailableError(f"Could not start Git: {exc}") from exc
+        if result.returncode not in (0, 1):
+            raise GitCommandError(
+                "read safe line-ending config",
+                returncode=int(result.returncode),
+                stderr=result.stderr.decode("utf-8", errors="replace"),
+            )
+        if result.returncode == 1:
+            return ()
+        try:
+            entries = result.stdout.decode("utf-8").split("\0")
+        except UnicodeDecodeError as exc:
+            raise RepositoryValidationError(
+                "Git line-ending configuration is not valid UTF-8"
+            ) from exc
+        resolved: dict[str, str] = {}
+        for entry in entries:
+            if not entry:
+                continue
+            try:
+                name, raw_value = entry.split("\n", 1)
+            except ValueError as exc:
+                raise RepositoryValidationError(
+                    "Git line-ending configuration is malformed"
+                ) from exc
+            if name not in _SAFE_LINE_ENDING_CONFIG_KEYS:
+                raise RepositoryValidationError(
+                    f"Unexpected Git line-ending configuration key: {name}"
+                )
+            resolved[name] = _normalize_line_ending_config(name, raw_value)
+        overrides: list[str] = []
+        for name in _SAFE_LINE_ENDING_CONFIG_KEYS:
+            if value := resolved.get(name):
+                overrides.extend(("-c", f"{name}={value}"))
+        return tuple(overrides)
 
     def _minimal_git_environment(self) -> dict[str, str]:
         environment = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import sys
 from typing import Callable
 
 import pytest
@@ -652,6 +653,10 @@ async def test_rewind_rechecks_final_state_after_transaction_preparation(
 
 @pytest.mark.asyncio
 @pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="exercises POSIX full-workspace transaction staging",
+)
 async def test_rewind_rejects_workspace_replacement_before_transaction_staging(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,

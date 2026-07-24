@@ -14,6 +14,9 @@
   缺失、损坏或身份不可证的工作区与 journal 会单独阻断并保留证据，不影响安全工作区和后端就绪。
 - checkpoint、rewind、文件版本、事务 journal、实时工具上下文与 Git worktree 统一绑定 durable token，
   同路径重建目录不能继承旧工作区历史。
+- 受控 Git worktree 继续隔离用户级 hooks、filters、凭据助手等可执行配置，同时对白名单中的
+  `core.autocrlf`、`core.eol`、`core.safecrlf` 做严格规范化并显式传入 Git；Windows 的正常 CRLF
+  工作树不再因安全隔离环境采用不同换行策略而被误报为脏仓库。
 
 ### 六目标与八个安装包
 

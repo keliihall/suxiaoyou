@@ -1950,6 +1950,10 @@ def test_startup_recovery_rolls_back_a_process_crash_mid_commit(
 
 
 @pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    transaction_module.sys.platform == "win32",
+    reason="exercises POSIX full-workspace marker recovery",
+)
 def test_schema_v5_recovery_uses_marker_not_persisted_device_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2076,6 +2080,10 @@ def test_legacy_recovery_blocks_ambiguous_macos_device_only_drift(
 
 
 @pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    transaction_module.sys.platform == "win32",
+    reason="exercises POSIX full-workspace journal isolation",
+)
 @pytest.mark.parametrize("blocked_kind", ["corrupt", "missing", "replaced"])
 def test_isolated_startup_recovery_preserves_bad_journal_and_recovers_sibling(
     tmp_path: Path,

@@ -162,6 +162,51 @@ def test_create_refuses_dirty_source_repository(
 
 
 @pytest.mark.workspace_identity_v2
+def test_global_autocrlf_is_preserved_by_hardened_git_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_home = tmp_path / "git-user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", os.fspath(user_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    repository = tmp_path / "windows-style-repository"
+    repository.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", os.fspath(repository)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        shell=False,
+    )
+    _git(repository, "config", "--global", "core.autocrlf", "true")
+    tracked = repository / "说明 文档.txt"
+    tracked.write_bytes("第一版\r\n".encode("utf-8"))
+    _git(repository, "add", "--", tracked.name)
+    _git(
+        repository,
+        "-c",
+        "user.name=Suxiaoyou Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "initial",
+    )
+    assert _git(repository, "status", "--porcelain=v1").stdout == b""
+
+    service = _service(tmp_path)
+    created = service.create(
+        repository,
+        workspace_instance_id="global-autocrlf",
+    )
+
+    assert service.inspect("global-autocrlf").clean is True
+    assert Path(created.checkout_path).is_dir()
+
+
+@pytest.mark.workspace_identity_v2
 def test_create_rejects_filesystem_that_would_dirty_every_checkout(
     tmp_path: Path,
     repository: Path,
@@ -185,6 +230,10 @@ def test_create_rejects_filesystem_that_would_dirty_every_checkout(
 
 
 @pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="simulates POSIX/APFS device renumbering with a stable marker token",
+)
 def test_durable_worktree_identity_ignores_apfs_device_renumbering(
     tmp_path: Path,
     repository: Path,

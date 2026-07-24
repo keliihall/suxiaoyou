@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import logging
+from contextlib import closing
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -738,7 +739,7 @@ def test_workspace_identity_v2_revision_is_a_noop_release_boundary(
         stamp_revision=None,
         target_revision=migrations.V110_USER_OFFICE_TEMPLATES_REVISION,
     )
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute(
             "INSERT INTO workspace_memory "
             "(id, workspace_path, content) VALUES (?, ?, ?)",
@@ -751,6 +752,7 @@ def test_workspace_identity_v2_revision_is_a_noop_release_boundary(
         data_before = connection.execute(
             "SELECT id, workspace_path, content FROM workspace_memory"
         ).fetchall()
+        connection.commit()
 
     result = upgrade_sqlite_database(
         f"sqlite+aiosqlite:///{database}"
