@@ -92,6 +92,11 @@ def test_checked_in_windows_arm64_locks_are_exact_and_complete() -> None:
 
     assert "--only-binary=:all:" in wheelhouse.BUILD_LOCK.read_text()
     assert "--only-binary=:all:" in wheelhouse.RELEASE_TOOLS_LOCK.read_text()
+    for lock in (build, release):
+        for digest, contract in wheelhouse.PURE_WHEEL_LAUNCHER_CONTRACTS.items():
+            distribution = str(contract["distribution"])
+            assert lock[distribution].version == contract["version"]
+            assert digest in lock[distribution].hashes
 
 
 def test_source_contract_locks_openssl_and_both_native_sdists() -> None:
@@ -187,6 +192,67 @@ def test_pure_wheel_cannot_hide_native_binary(tmp_path: Path) -> None:
         native_member="demo/native.pyd",
     )
     with pytest.raises(wheelhouse.SupplyChainError, match="pure wheel"):
+        wheelhouse.inspect_wheel(path)
+
+
+def test_exact_hash_locked_pure_wheel_launcher_contract_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _wheel(
+        tmp_path,
+        "demo-1.0-py3-none-any.whl",
+        native_member="demo/launcher-x64.exe",
+        machine=0x8664,
+    )
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setitem(
+        wheelhouse.PURE_WHEEL_LAUNCHER_CONTRACTS,
+        digest,
+        {
+            "distribution": "demo",
+            "members": {"demo/launcher-x64.exe": 0x8664},
+            "version": "1.0",
+        },
+    )
+
+    evidence = wheelhouse.inspect_wheel(path)
+
+    assert evidence.native_members == (
+        {
+            "member": "demo/launcher-x64.exe",
+            "pe_machine": "0x8664",
+            "role": "multi-architecture-launcher-template",
+            "sha256": hashlib.sha256(_fake_pe(0x8664)).hexdigest(),
+            "size": len(_fake_pe(0x8664)),
+        },
+    )
+
+
+def test_pure_wheel_launcher_contract_requires_every_reviewed_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _wheel(
+        tmp_path,
+        "demo-1.0-py3-none-any.whl",
+        native_member="demo/launcher-arm64.exe",
+    )
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setitem(
+        wheelhouse.PURE_WHEEL_LAUNCHER_CONTRACTS,
+        digest,
+        {
+            "distribution": "demo",
+            "members": {
+                "demo/launcher-arm64.exe": wheelhouse.PE_MACHINE_ARM64,
+                "demo/missing-launcher.exe": 0x8664,
+            },
+            "version": "1.0",
+        },
+    )
+
+    with pytest.raises(wheelhouse.SupplyChainError, match="incomplete"):
         wheelhouse.inspect_wheel(path)
 
 
@@ -409,6 +475,21 @@ def test_native_builder_accepts_nmake_banner_on_stderr(
 
 def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     source = Path(wheelhouse.__file__).read_text(encoding="utf-8")
+    openssl_lock = wheelhouse.load_sources_lock()["openssl"]
+    configure = wheelhouse.locked_openssl_configure_command(
+        "perl.exe", openssl_lock
+    )
+
+    assert configure == [
+        "perl.exe",
+        "Configure",
+        *openssl_lock["build_flags"],
+        "VC-WIN64-ARM",
+    ]
+    assert not any(
+        argument.startswith(("--prefix=", "--openssldir="))
+        for argument in configure
+    )
     assert '"SOURCE_DATE_EPOCH": str(source_date_epoch)' in source
     assert '"ARFLAGS": "/nologo /Brepro"' in source
     assert '"CL": "/FS /Brepro"' in source

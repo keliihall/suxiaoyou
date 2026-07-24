@@ -9,7 +9,8 @@ publish win_arm64 wheels.  This script:
 2. downloads the two exact sdists by immutable URL and verifies their SHA-256;
 3. vendors Cargo.lock-pinned crates, then disables the network;
 4. builds the two native wheels with a hash-locked Python build toolchain;
-5. verifies wheel tags and every PE binary's ARM64 machine field;
+5. verifies wheel tags, every target PE's ARM64 machine field, and the exact
+   hash-bound multi-architecture launcher templates in pip/setuptools;
 6. emits wheel-specific install locks plus a canonical manifest and SHA-256.
 
 ``verify`` requires an out-of-band approved content digest.  The raw manifest
@@ -62,6 +63,38 @@ PE_MACHINE_ARM64 = 0xAA64
 NATIVE_SOURCE_NAMES = frozenset({"cryptography", "tiktoken"})
 MAX_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_WHEEL_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+PURE_WHEEL_LAUNCHER_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
+    # pip and setuptools intentionally ship launcher templates for every
+    # Windows architecture inside their platform-independent wheels.  Admit
+    # only the exact hash-locked wheels and their complete reviewed payloads;
+    # every other native member in an `any` wheel remains forbidden.
+    "382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab": {
+        "distribution": "pip",
+        "members": {
+            "pip/_vendor/distlib/t32.exe": 0x14C,
+            "pip/_vendor/distlib/t64-arm.exe": PE_MACHINE_ARM64,
+            "pip/_vendor/distlib/t64.exe": 0x8664,
+            "pip/_vendor/distlib/w32.exe": 0x14C,
+            "pip/_vendor/distlib/w64-arm.exe": PE_MACHINE_ARM64,
+            "pip/_vendor/distlib/w64.exe": 0x8664,
+        },
+        "version": "26.1.2",
+    },
+    "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3": {
+        "distribution": "setuptools",
+        "members": {
+            "setuptools/cli-32.exe": 0x14C,
+            "setuptools/cli-64.exe": 0x8664,
+            "setuptools/cli-arm64.exe": PE_MACHINE_ARM64,
+            "setuptools/cli.exe": 0x14C,
+            "setuptools/gui-32.exe": 0x14C,
+            "setuptools/gui-64.exe": 0x8664,
+            "setuptools/gui-arm64.exe": PE_MACHINE_ARM64,
+            "setuptools/gui.exe": 0x14C,
+        },
+        "version": "83.0.0",
+    },
+}
 
 _REQUIREMENT_RE = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)"
@@ -780,7 +813,33 @@ def inspect_wheel(path: Path) -> WheelEvidence:
             f"{path.name}: forbidden platform tags {platform_tags!r}"
         )
 
+    wheel_sha256 = sha256_file(path)
+    is_pure_wheel = platform_tags == ("any",)
+    launcher_contract = (
+        PURE_WHEEL_LAUNCHER_CONTRACTS.get(wheel_sha256)
+        if is_pure_wheel
+        else None
+    )
+    launcher_members: Mapping[str, int] = {}
+    if launcher_contract is not None:
+        expected_distribution = str(launcher_contract["distribution"])
+        expected_version = str(launcher_contract["version"])
+        if (
+            normalize_distribution(distribution) != expected_distribution
+            or version != expected_version
+        ):
+            raise SupplyChainError(
+                f"{path.name}: launcher contract identity mismatch"
+            )
+        members = launcher_contract.get("members")
+        if not isinstance(members, Mapping):
+            raise SupplyChainError(
+                f"{path.name}: invalid launcher payload contract"
+            )
+        launcher_members = members
+
     native: list[dict[str, Any]] = []
+    seen_launcher_members: set[str] = set()
     seen_members: set[str] = set()
     total_uncompressed = 0
     try:
@@ -808,15 +867,28 @@ def inspect_wheel(path: Path) -> WheelEvidence:
                 machine = pe_machine(
                     data, member=f"{path.name}:{info.filename}"
                 )
-                if machine != PE_MACHINE_ARM64:
+                payload_role = "target-runtime"
+                expected_machine = PE_MACHINE_ARM64
+                if is_pure_wheel:
+                    payload_role = "multi-architecture-launcher-template"
+                    contracted_machine = launcher_members.get(info.filename)
+                    if not isinstance(contracted_machine, int):
+                        raise SupplyChainError(
+                            f"{path.name}: pure wheel contains unapproved "
+                            f"native PE member {info.filename!r}"
+                        )
+                    expected_machine = contracted_machine
+                    seen_launcher_members.add(info.filename)
+                if machine != expected_machine:
                     raise SupplyChainError(
                         f"{path.name}:{info.filename}: expected PE machine "
-                        f"{hex(PE_MACHINE_ARM64)}, got {hex(machine)}"
+                        f"{hex(expected_machine)}, got {hex(machine)}"
                     )
                 native.append(
                     {
                         "member": info.filename,
                         "pe_machine": hex(machine),
+                        "role": payload_role,
                         "sha256": hashlib.sha256(data).hexdigest(),
                         "size": len(data),
                     }
@@ -824,9 +896,11 @@ def inspect_wheel(path: Path) -> WheelEvidence:
     except zipfile.BadZipFile as exc:
         raise SupplyChainError(f"{path.name}: invalid wheel ZIP: {exc}") from exc
 
-    if platform_tags == ("any",) and native:
+    missing_launcher_members = set(launcher_members) - seen_launcher_members
+    if missing_launcher_members:
         raise SupplyChainError(
-            f"{path.name}: pure wheel contains native PE members"
+            f"{path.name}: launcher payload contract is incomplete; missing "
+            f"{sorted(missing_launcher_members)!r}"
         )
     return WheelEvidence(
         path=path,
@@ -836,7 +910,7 @@ def inspect_wheel(path: Path) -> WheelEvidence:
         python_tags=python_tags,
         abi_tags=abi_tags,
         platform_tags=platform_tags,
-        sha256=sha256_file(path),
+        sha256=wheel_sha256,
         size=path.stat().st_size,
         native_members=tuple(native),
     )
@@ -951,6 +1025,22 @@ def safe_extract_sdist(archive_path: Path, destination: Path) -> Path:
     return root
 
 
+def locked_openssl_configure_command(
+    perl: str, openssl_lock: Mapping[str, Any]
+) -> list[str]:
+    """Return the path-stable Configure contract used by upstream pyca."""
+
+    # Never pass a temporary --prefix or --openssldir here.  OpenSSL compiles
+    # those values into libcrypto, so the UUID-bearing build directory would
+    # make the static libraries and cryptography wheel differ on every run.
+    return [
+        perl,
+        "Configure",
+        *openssl_lock["build_flags"],
+        openssl_lock["configure_target"],
+    ]
+
+
 def build_locked_openssl(
     archive_path: Path,
     destination: Path,
@@ -987,14 +1077,7 @@ def build_locked_openssl(
         }
     )
     run_checked(
-        [
-            perl,
-            "Configure",
-            *openssl_lock["build_flags"],
-            openssl_lock["configure_target"],
-            f"--prefix={destination}",
-            f"--openssldir={destination / 'ssl'}",
-        ],
+        locked_openssl_configure_command(perl, openssl_lock),
         cwd=source_root,
         env=env,
     )
