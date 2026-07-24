@@ -452,7 +452,7 @@ jobs:
             "backend/requirements-windows-arm64-overrides.txt" = "8cf1bc48daa284c96510dfb547a0a04e3d681b7670c412709d3db5e07f1b4bd3"
             "backend/requirements-windows-arm64-sources.json" = "7083f14d1a0f0805c1da38cba159d5de8a700d2dbc3e0392dfda3ce6d52e4fef"
             "backend/requirements-windows-arm64-tiktoken.Cargo.lock" = "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3"
-            "backend/requirements-windows-arm64-wheelhouse-approval.json" = "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896"
+            "backend/requirements-windows-arm64-wheelhouse-approval.json" = "ef6af7758b7a8afa7f40df452dbff3af9c9563345893a3b612c8f5025a137789"
             "backend/scripts/build_windows_arm64_wheelhouse.py" = "c035c3710a690a4695073760e4cfc5bc5fb94a70b9f0c52ec29870dbe1635083"
           }
           foreach ($entry in $expectedHashes.GetEnumerator()) {

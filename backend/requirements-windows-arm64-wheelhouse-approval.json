@@ -1,6 +1,6 @@
 {
-  "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "content_sha256": "ab33ac48059bd75d644006ab7913fa1b8d52472e0c043d79bc8481c5d9bdfbb8",
   "contract_id": "suxiaoyou-cpython-3.12.10-windows-arm64-v1",
   "schema_version": 1,
-  "status": "bootstrap-required"
+  "status": "approved"
 }

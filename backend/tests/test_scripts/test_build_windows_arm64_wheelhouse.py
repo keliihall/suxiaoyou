@@ -630,10 +630,12 @@ def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     assert "CertificateBuilder" in source
 
 
-def test_approval_lock_requires_manual_bootstrap_then_nonzero_digest(
+def test_approval_lock_contains_reviewed_nonzero_digest(
     tmp_path: Path,
 ) -> None:
-    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) is None
+    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) == (
+        "ab33ac48059bd75d644006ab7913fa1b8d52472e0c043d79bc8481c5d9bdfbb8"
+    )
     digest = "a" * 64
     approved = tmp_path / "approval.json"
     approved.write_text(
@@ -656,8 +658,31 @@ def test_tag_style_build_fails_before_preflight_without_approval(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    bootstrap_required = tmp_path / "bootstrap-required.json"
+    bootstrap_required.write_text(
+        json.dumps(
+            {
+                "content_sha256": "0" * 64,
+                "contract_id": (
+                    "suxiaoyou-cpython-3.12.10-windows-arm64-v1"
+                ),
+                "schema_version": 1,
+                "status": "bootstrap-required",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     result = wheelhouse.main(
-        ["build", "--output", str(tmp_path / "artifact")]
+        [
+            "build",
+            "--output",
+            str(tmp_path / "artifact"),
+            "--approval-file",
+            str(bootstrap_required),
+        ]
     )
     assert result == 3
     assert "manual --bootstrap build" in capsys.readouterr().err
