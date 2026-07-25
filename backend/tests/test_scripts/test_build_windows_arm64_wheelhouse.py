@@ -289,17 +289,30 @@ def test_sdist_traversal_is_rejected(tmp_path: Path) -> None:
 def test_ambient_package_manager_and_openssl_inputs_are_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("PIP_INDEX_URL", "https://attacker.invalid")
-    monkeypatch.setenv("OPENSSL_DIR", "C:/attacker")
-    monkeypatch.setenv("OPENSSL_STATIC", "0")
-    monkeypatch.setenv("VCPKG_ROOT", "C:/attacker-vcpkg")
-    monkeypatch.setenv("DEP_OPENSSL_VERSION_NUMBER", "bad")
+    hostile = {
+        "PIP_INDEX_URL": "https://attacker.invalid",
+        "OPENSSL_DIR": "C:/attacker",
+        "OPENSSL_STATIC": "0",
+        "VCPKG_ROOT": "C:/attacker-vcpkg",
+        "DEP_OPENSSL_VERSION_NUMBER": "bad",
+        "CARGO_ENCODED_RUSTFLAGS": "malicious",
+        "CARGO_BUILD_RUSTFLAGS": "malicious",
+        "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS": "malicious",
+        "RUSTFLAGS": "malicious",
+        "RUSTDOCFLAGS": "malicious",
+        "RUSTC_WRAPPER": "C:/attacker/wrapper.exe",
+        "RUSTC_WORKSPACE_WRAPPER": "C:/attacker/workspace-wrapper.exe",
+        "CL": "/DATTACKER",
+        "_CL_": "/DATTACKER",
+        "LINK": "/INCLUDE:attacker",
+        "_LINK_": "/INCLUDE:attacker",
+        "ARFLAGS": "attacker",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
     env = wheelhouse.locked_network_environment()
-    assert "PIP_INDEX_URL" not in env
-    assert "OPENSSL_DIR" not in env
-    assert "OPENSSL_STATIC" not in env
-    assert "VCPKG_ROOT" not in env
-    assert "DEP_OPENSSL_VERSION_NUMBER" not in env
+    for key in hostile:
+        assert key not in env
 
 
 def test_locked_build_environment_activates_and_verifies_arm64_maturin(
@@ -430,6 +443,37 @@ def test_native_wheel_build_exposes_locked_venv_entry_points(
     assert built.normalized_name == "demo"
     assert captured["PATH"].split(os.pathsep)[0] == str(scripts)
     assert "Path" not in captured
+    rust_flags = captured["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+    assert rust_flags == [
+        (
+            f"--remap-path-prefix={tmp_path.resolve()}="
+            f"{wheelhouse.REPRODUCIBLE_BUILD_ROOT}"
+        ),
+        "-C",
+        "link-arg=/Brepro",
+        "-C",
+        "link-arg=/PDBALTPATH:%_PDB%",
+    ]
+    assert captured["CL"] == wheelhouse.reproducible_msvc_cl_flags(tmp_path)
+    assert captured["LINK"] == "/Brepro /PDBALTPATH:%_PDB%"
+    assert captured["SOURCE_DATE_EPOCH"] == "1"
+
+
+def test_native_output_rejects_real_build_root_in_utf8_or_utf16(
+    tmp_path: Path,
+) -> None:
+    for payload in (
+        f"prefix:{tmp_path.resolve()}".encode(),
+        f"prefix:{tmp_path.resolve()}".encode("utf-16-le"),
+    ):
+        with pytest.raises(
+            wheelhouse.SupplyChainError, match="embeds the private build root"
+        ):
+            wheelhouse.reject_build_path_leak(
+                payload,
+                label="native.pyd",
+                build_root=tmp_path,
+            )
 
 
 def test_msvc_environment_is_initialized_for_native_arm64(
@@ -622,20 +666,28 @@ def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     )
     assert '"SOURCE_DATE_EPOCH": str(source_date_epoch)' in source
     assert '"ARFLAGS": "/nologo /Brepro"' in source
-    assert '"CL": "/FS /Brepro"' in source
-    assert '"LINK": "/Brepro"' in source
+    assert (
+        wheelhouse.reproducible_msvc_cl_flags(Path("C:/private")).startswith(
+            "/FS /Brepro "
+        )
+    )
+    assert "/pathmap:" in wheelhouse.reproducible_msvc_cl_flags(
+        Path("C:/private")
+    )
+    assert "link-arg=/Brepro" in wheelhouse.reproducible_rust_flags(
+        Path("C:/private")
+    )
+    assert '"LINK": "/Brepro /PDBALTPATH:%_PDB%"' in source
     assert 'run_checked([nmake, "/E", "/NOLOGO", "test"]' in source
     assert "OpenSSL_version(0)" in source
     assert "AESGCM" in source
     assert "CertificateBuilder" in source
 
 
-def test_approval_lock_contains_reviewed_nonzero_digest(
+def test_approval_lock_requires_new_bootstrap_after_builder_contract_change(
     tmp_path: Path,
 ) -> None:
-    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) == (
-        "ab33ac48059bd75d644006ab7913fa1b8d52472e0c043d79bc8481c5d9bdfbb8"
-    )
+    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) is None
     digest = "a" * 64
     approved = tmp_path / "approval.json"
     approved.write_text(
@@ -652,6 +704,146 @@ def test_approval_lock_contains_reviewed_nonzero_digest(
         encoding="utf-8",
     )
     assert wheelhouse.approved_content_sha256(approved) == digest
+
+
+def test_build_artifact_uses_fixed_private_paths_and_promotes_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "wheelhouse"
+    expected_manifest = "a" * 64
+    expected_content = "b" * 64
+    observed: dict[str, Path] = {}
+
+    monkeypatch.setattr(wheelhouse, "load_sources_lock", lambda: {"locked": True})
+    monkeypatch.setattr(
+        wheelhouse,
+        "preflight_native_builder",
+        lambda _source_lock: {"toolchain": "locked"},
+    )
+
+    def fake_build_into(staging, work, source_lock, toolchain):
+        observed["staging"] = staging
+        observed["work"] = work
+        assert source_lock == {"locked": True}
+        assert toolchain == {"toolchain": "locked"}
+        assert staging.is_dir() and not any(staging.iterdir())
+        assert work.is_dir() and not any(work.iterdir())
+        (staging / wheelhouse.MANIFEST_NAME).write_text("manifest")
+        (staging / wheelhouse.MANIFEST_DIGEST_NAME).write_text("digest")
+        (staging / "payload.whl").write_bytes(b"payload")
+        (work / "private-build-file").write_bytes(b"private")
+        return expected_manifest, expected_content
+
+    monkeypatch.setattr(wheelhouse, "build_into", fake_build_into)
+    assert wheelhouse.build_artifact(
+        output,
+        expected_content_sha256=None,
+        expected_manifest_sha256=None,
+        approval_file=wheelhouse.APPROVAL_LOCK,
+        bootstrap=True,
+    ) == (expected_manifest, expected_content)
+
+    work, staging, diagnostics, diagnostics_staging = (
+        wheelhouse.artifact_auxiliary_paths(output)
+    )
+    assert observed == {"staging": staging, "work": work}
+    assert (output / "payload.whl").read_bytes() == b"payload"
+    assert not work.exists()
+    assert not staging.exists()
+    assert not diagnostics.exists()
+    assert not diagnostics_staging.exists()
+
+
+def test_digest_mismatch_preserves_only_manifest_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "wheelhouse"
+    actual_manifest = "c" * 64
+    actual_content = "d" * 64
+    monkeypatch.setattr(wheelhouse, "load_sources_lock", lambda: {})
+    monkeypatch.setattr(
+        wheelhouse, "preflight_native_builder", lambda _source_lock: {}
+    )
+
+    def fake_build_into(staging, work, _source_lock, _toolchain):
+        (staging / wheelhouse.MANIFEST_NAME).write_text("rejected-manifest")
+        (staging / wheelhouse.MANIFEST_DIGEST_NAME).write_text(
+            "rejected-sidecar"
+        )
+        (staging / "unapproved.whl").write_bytes(b"must-not-escape")
+        (work / "private").write_bytes(b"must-be-removed")
+        return actual_manifest, actual_content
+
+    monkeypatch.setattr(wheelhouse, "build_into", fake_build_into)
+    with pytest.raises(
+        wheelhouse.SupplyChainError, match="manifest evidence"
+    ):
+        wheelhouse.build_artifact(
+            output,
+            expected_content_sha256="e" * 64,
+            expected_manifest_sha256=None,
+            approval_file=wheelhouse.APPROVAL_LOCK,
+            bootstrap=False,
+        )
+
+    work, staging, diagnostics, diagnostics_staging = (
+        wheelhouse.artifact_auxiliary_paths(output)
+    )
+    assert not output.exists()
+    assert not work.exists()
+    assert not staging.exists()
+    assert not diagnostics_staging.exists()
+    assert sorted(path.name for path in diagnostics.iterdir()) == [
+        wheelhouse.MANIFEST_NAME,
+        wheelhouse.MANIFEST_DIGEST_NAME,
+    ]
+    assert (diagnostics / wheelhouse.MANIFEST_NAME).read_text() == (
+        "rejected-manifest"
+    )
+
+
+def test_preexisting_or_linked_private_build_path_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for linked in (False, True):
+        case = tmp_path / ("linked" if linked else "existing")
+        case.mkdir()
+        output = case / "wheelhouse"
+        work, _staging, _diagnostics, _diagnostics_staging = (
+            wheelhouse.artifact_auxiliary_paths(output)
+        )
+        if linked:
+            target = case / "owned-by-someone-else"
+            target.mkdir()
+            work.symlink_to(target, target_is_directory=True)
+        else:
+            work.mkdir()
+            (work / "owner-data").write_text("keep")
+
+        monkeypatch.setattr(
+            wheelhouse,
+            "preflight_native_builder",
+            lambda _source_lock: pytest.fail("preflight must not run"),
+        )
+        with pytest.raises(
+            wheelhouse.SupplyChainError,
+            match="refusing stale or concurrent state",
+        ):
+            wheelhouse.build_artifact(
+                output,
+                expected_content_sha256=None,
+                expected_manifest_sha256=None,
+                approval_file=wheelhouse.APPROVAL_LOCK,
+                bootstrap=True,
+            )
+        assert work.exists() or work.is_symlink()
+        if linked:
+            assert (target).is_dir()
+        else:
+            assert (work / "owner-data").read_text() == "keep"
 
 
 def test_tag_style_build_fails_before_preflight_without_approval(

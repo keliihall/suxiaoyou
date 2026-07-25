@@ -56,6 +56,7 @@ APPROVAL_LOCK = (
 
 MANIFEST_NAME = "windows-arm64-wheelhouse-manifest.json"
 MANIFEST_DIGEST_NAME = f"{MANIFEST_NAME}.sha256"
+REPRODUCIBLE_BUILD_ROOT = r"C:\suxiaoyou-build"
 EXPECTED_PYTHON = (3, 12, 10)
 EXPECTED_PLATFORM_TAG = "win_arm64"
 EXPECTED_RUST_HOST = "aarch64-pc-windows-msvc"
@@ -397,14 +398,22 @@ def locked_network_environment() -> dict[str, str]:
         if (
             upper.startswith("PIP_")
             or upper.startswith("UV_")
-            or upper.startswith("CARGO_REGISTRIES_")
+            or upper.startswith("CARGO_")
             or upper.startswith("OPENSSL_")
             or upper.startswith("DEP_OPENSSL_")
             or upper.startswith("VCPKG_")
             or upper
             in {
-                "CARGO_HOME",
+                "ARFLAGS",
+                "CL",
+                "_CL_",
+                "LINK",
+                "_LINK_",
+                "RUSTC",
+                "RUSTC_WRAPPER",
+                "RUSTC_WORKSPACE_WRAPPER",
                 "RUSTFLAGS",
+                "RUSTDOCFLAGS",
                 "VCPKGRS_DYNAMIC",
                 "VCPKGRS_TRIPLET",
             }
@@ -418,6 +427,65 @@ def locked_network_environment() -> dict[str, str]:
         }
     )
     return env
+
+
+def reproducible_msvc_cl_flags(build_root: Path) -> str:
+    """Return path-stable compiler flags for native Windows dependencies."""
+
+    return (
+        "/FS /Brepro "
+        f'/pathmap:"{build_root.resolve()}={REPRODUCIBLE_BUILD_ROOT}"'
+    )
+
+
+def reproducible_rust_flags(build_root: Path) -> str:
+    """Encode rustc arguments without Windows shell quoting ambiguity."""
+
+    return "\x1f".join(
+        (
+            (
+                f"--remap-path-prefix={build_root.resolve()}="
+                f"{REPRODUCIBLE_BUILD_ROOT}"
+            ),
+            "-C",
+            "link-arg=/Brepro",
+            "-C",
+            "link-arg=/PDBALTPATH:%_PDB%",
+        )
+    )
+
+
+def _path_leak_markers(build_root: Path) -> tuple[bytes, ...]:
+    rendered = str(build_root.resolve())
+    values = {
+        rendered,
+        rendered.replace("\\", "/"),
+        rendered.replace("/", "\\"),
+    }
+    values.update({value.lower() for value in tuple(values)})
+    values.update({value.upper() for value in tuple(values)})
+    markers: set[bytes] = set()
+    for value in values:
+        markers.add(value.encode("utf-8"))
+        markers.add(value.encode("utf-16-le"))
+    return tuple(sorted(markers))
+
+
+def reject_build_path_leak(
+    payload: bytes,
+    *,
+    label: str,
+    build_root: Path,
+) -> None:
+    """Fail closed when a native output embeds the real temporary root."""
+
+    if any(
+        marker and marker in payload
+        for marker in _path_leak_markers(build_root)
+    ):
+        raise SupplyChainError(
+            f"{label}: native output embeds the private build root"
+        )
 
 
 def initialize_native_arm64_msvc_environment() -> None:
@@ -1065,12 +1133,13 @@ def build_locked_openssl(
             "OpenSSL build requires perl, nmake.exe, and dumpbin.exe"
         )
 
+    build_root = destination.parent
     env = locked_network_environment()
     env.update(
         {
             "ARFLAGS": "/nologo /Brepro",
-            "CL": "/FS /Brepro",
-            "LINK": "/Brepro",
+            "CL": reproducible_msvc_cl_flags(build_root),
+            "LINK": "/Brepro /PDBALTPATH:%_PDB%",
             "SOURCE_DATE_EPOCH": str(source_date_epoch),
             "TZ": "UTC",
             "ZERO_AR_DATE": "1",
@@ -1096,6 +1165,11 @@ def build_locked_openssl(
             )
         destination_library = library_dir / name
         shutil.copy2(source_library, destination_library)
+        reject_build_path_leak(
+            destination_library.read_bytes(),
+            label=name,
+            build_root=build_root,
+        )
         headers = run_checked(
             [dumpbin, "/headers", destination_library],
             capture_output=True,
@@ -1321,19 +1395,25 @@ def build_native_wheel(
     # PEP 517 imports maturin as a Python backend, then that backend launches
     # the bare `maturin` command.  Invoking the venv's Python does not activate
     # its Scripts directory, so expose the exact locked ARM64 frontend here.
+    build_root = cargo_home.parent
     env = activated_venv_environment(python)
+    if extra_environment:
+        env.update(extra_environment)
+    # Apply the reproducibility contract last so a package-specific
+    # environment cannot override the supply-chain controls.
     env.update(
         {
+            "CARGO_ENCODED_RUSTFLAGS": reproducible_rust_flags(build_root),
             "CARGO_HOME": str(cargo_home),
             "CARGO_INCREMENTAL": "0",
             "CARGO_NET_OFFLINE": "true",
+            "CL": reproducible_msvc_cl_flags(build_root),
+            "LINK": "/Brepro /PDBALTPATH:%_PDB%",
             "PIP_NO_INDEX": "1",
             "PYTHONHASHSEED": "0",
             "SOURCE_DATE_EPOCH": str(source_date_epoch),
         }
     )
-    if extra_environment:
-        env.update(extra_environment)
     run_checked(
         [
             python,
@@ -1357,7 +1437,16 @@ def build_native_wheel(
             f"{source_root.name}: expected one built wheel, got "
             f"{sorted(path.name for path in created)!r}"
         )
-    return inspect_wheel(next(iter(created)))
+    built = inspect_wheel(next(iter(created)))
+    with zipfile.ZipFile(built.path) as archive:
+        for member in built.native_members:
+            member_name = str(member["member"])
+            reject_build_path_leak(
+                archive.read(member_name),
+                label=f"{built.path.name}:{member_name}",
+                build_root=build_root,
+            )
+    return built
 
 
 def verify_bundled_openssl(
@@ -1591,7 +1680,15 @@ def build_into(
                 f"{name} sdist SHA-256 is absent from production lock"
             )
 
-    output.mkdir(parents=True, exist_ok=False)
+    if (
+        not output.is_dir()
+        or output.is_symlink()
+        or getattr(output, "is_junction", lambda: False)()
+        or any(output.iterdir())
+    ):
+        raise SupplyChainError(
+            f"build output must be an owned, empty real directory: {output}"
+        )
     copy_input_locks(output)
 
     generated_locks = work / "download-locks"
@@ -1990,6 +2087,84 @@ def approved_content_sha256(path: Path) -> str | None:
     return digest
 
 
+def artifact_auxiliary_paths(output: Path) -> tuple[Path, Path, Path, Path]:
+    """Return fixed private build paths and the public mismatch evidence path."""
+
+    return (
+        output.parent / f".{output.name}.work",
+        output.parent / f".{output.name}.staging",
+        output.parent / f"{output.name}-diagnostics",
+        output.parent / f".{output.name}-diagnostics.staging",
+    )
+
+
+def _is_link_like(path: Path) -> bool:
+    return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+
+
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _claim_empty_directory(path: Path, *, role: str) -> None:
+    if _lexists(path):
+        raise SupplyChainError(
+            f"{role} path already exists; refusing stale or concurrent state: {path}"
+        )
+    try:
+        path.mkdir(mode=0o700, exist_ok=False)
+    except FileExistsError as exc:
+        raise SupplyChainError(
+            f"{role} path was claimed concurrently: {path}"
+        ) from exc
+    if _is_link_like(path) or not path.is_dir() or any(path.iterdir()):
+        raise SupplyChainError(
+            f"{role} path is not an owned empty directory: {path}"
+        )
+
+
+def _remove_owned_directory(path: Path, *, role: str) -> None:
+    if not _lexists(path):
+        return
+    if _is_link_like(path) or not path.is_dir():
+        raise SupplyChainError(
+            f"owned {role} path was replaced; refusing unsafe cleanup: {path}"
+        )
+    shutil.rmtree(path)
+
+
+def _preserve_mismatch_diagnostics(
+    staging: Path,
+    diagnostics: Path,
+    diagnostics_staging: Path,
+) -> None:
+    """Atomically retain only reviewed manifest evidence from a rejected build."""
+
+    _claim_empty_directory(
+        diagnostics_staging, role="mismatch diagnostics staging"
+    )
+    owned = True
+    try:
+        for name in (MANIFEST_NAME, MANIFEST_DIGEST_NAME):
+            source = staging / name
+            if not source.is_file() or source.is_symlink():
+                raise SupplyChainError(
+                    f"rejected build is missing validated evidence: {source}"
+                )
+            shutil.copy2(source, diagnostics_staging / name)
+        if _lexists(diagnostics):
+            raise SupplyChainError(
+                f"mismatch diagnostics already exist; refusing overwrite: {diagnostics}"
+            )
+        os.replace(diagnostics_staging, diagnostics)
+        owned = False
+    finally:
+        if owned:
+            _remove_owned_directory(
+                diagnostics_staging, role="mismatch diagnostics staging"
+            )
+
+
 def build_artifact(
     output: Path,
     *,
@@ -2032,41 +2207,81 @@ def build_artifact(
                 "expected manifest SHA-256 must be a 64-hex digest"
             )
     output.parent.mkdir(parents=True, exist_ok=True)
-    source_lock = load_sources_lock()
-    toolchain_evidence = preflight_native_builder(source_lock)
-
-    staging = output.parent / f".{output.name}.staging-{uuid.uuid4().hex}"
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix=f".{output.name}.work-", dir=output.parent
-        ) as work_name:
-            manifest_sha256, content_sha256 = build_into(
-                staging,
-                Path(work_name),
-                source_lock,
-                toolchain_evidence,
+    work, staging, diagnostics, diagnostics_staging = artifact_auxiliary_paths(
+        output
+    )
+    for reserved, role in (
+        (work, "build work"),
+        (staging, "build staging"),
+        (diagnostics, "mismatch diagnostics"),
+        (diagnostics_staging, "mismatch diagnostics staging"),
+    ):
+        if _lexists(reserved):
+            raise SupplyChainError(
+                f"{role} path already exists; refusing stale or concurrent "
+                f"state: {reserved}"
             )
+
+    work_owned = False
+    staging_owned = False
+    try:
+        _claim_empty_directory(work, role="build work")
+        work_owned = True
+        _claim_empty_directory(staging, role="build staging")
+        staging_owned = True
+        source_lock = load_sources_lock()
+        toolchain_evidence = preflight_native_builder(source_lock)
+        manifest_sha256, content_sha256 = build_into(
+            staging,
+            work,
+            source_lock,
+            toolchain_evidence,
+        )
         if (
             expected_content_sha256 is not None
             and content_sha256 != expected_content_sha256
         ):
+            _preserve_mismatch_diagnostics(
+                staging, diagnostics, diagnostics_staging
+            )
             raise SupplyChainError(
                 f"new wheelhouse content {content_sha256} does not match "
-                f"approved {expected_content_sha256}"
+                f"approved {expected_content_sha256}; manifest evidence: "
+                f"{diagnostics}"
             )
         if (
             expected_manifest_sha256 is not None
             and manifest_sha256 != expected_manifest_sha256
         ):
+            _preserve_mismatch_diagnostics(
+                staging, diagnostics, diagnostics_staging
+            )
             raise SupplyChainError(
                 f"new wheelhouse manifest {manifest_sha256} does not match "
-                f"expected {expected_manifest_sha256}"
+                f"expected {expected_manifest_sha256}; manifest evidence: "
+                f"{diagnostics}"
+            )
+        if _lexists(output):
+            raise SupplyChainError(
+                f"output appeared during build; refusing overwrite: {output}"
             )
         os.replace(staging, output)
+        staging_owned = False
         return manifest_sha256, content_sha256
     finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        cleanup_errors: list[str] = []
+        for owned, path, role in (
+            (staging_owned, staging, "build staging"),
+            (work_owned, work, "build work"),
+        ):
+            if not owned:
+                continue
+            try:
+                _remove_owned_directory(path, role=role)
+            except SupplyChainError as exc:
+                cleanup_errors.append(str(exc))
+        if cleanup_errors:
+            raise SupplyChainError("; ".join(cleanup_errors))
 
 
 def create_argument_parser() -> argparse.ArgumentParser:

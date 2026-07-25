@@ -445,6 +445,14 @@ test("installer artifacts expire after one day and lifecycle evidence spans the 
     windowsDiagnostics,
     /suxiaoyou-windows-arm64-wheelhouse\/windows-arm64-wheelhouse-manifest\.json\.sha256/,
   );
+  assert.match(
+    windowsDiagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse-diagnostics\/windows-arm64-wheelhouse-manifest\.json/,
+  );
+  assert.match(
+    windowsDiagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse-diagnostics\/windows-arm64-wheelhouse-manifest\.json\.sha256/,
+  );
 });
 
 test("sets the declared macOS minimum everywhere", () => {
@@ -1513,11 +1521,11 @@ test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed o
     ],
     [
       "backend/requirements-windows-arm64-wheelhouse-approval.json",
-      "ef6af7758b7a8afa7f40df452dbff3af9c9563345893a3b612c8f5025a137789",
+      "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896",
     ],
     [
       "backend/scripts/build_windows_arm64_wheelhouse.py",
-      "c035c3710a690a4695073760e4cfc5bc5fb94a70b9f0c52ec29870dbe1635083",
+      "189db217f0dd7f64a11db59665a9fb56a380d223a0bb1d66ca2930134ea69709",
     ],
   ]);
   for (const [path, digest] of sealedInputs) {
@@ -1621,6 +1629,14 @@ test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed o
   assert.match(
     diagnostics,
     /windows-arm64-wheelhouse-manifest\.json\.sha256/,
+  );
+  assert.match(
+    diagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse-diagnostics[\\/]windows-arm64-wheelhouse-manifest\.json/,
+  );
+  assert.match(
+    diagnostics,
+    /suxiaoyou-windows-arm64-wheelhouse-diagnostics[\\/]windows-arm64-wheelhouse-manifest\.json\.sha256/,
   );
 });
 
