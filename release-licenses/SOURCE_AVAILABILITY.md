@@ -1,7 +1,7 @@
 # Source availability and provenance
 
 This document tells recipients where to obtain the Source Code Form for
-MPL-2.0 components included in 苏小有 v1.1.0. The exact-version links below
+MPL-2.0 components included in 苏小有 v1.1.1. The exact-version links below
 provide the source without charge. 苏小有 does not intentionally modify the
 listed upstream MPL-covered source files.
 
@@ -89,6 +89,14 @@ The complete data-license agreement is in `CDLA-PERMISSIVE-2.0.txt`.
 - pywin32 312 (including the separately licensed `adodbapi` sources present
   in the upstream wheel but forbidden from the application bundle):
   <https://github.com/mhammond/pywin32/tree/b312>
+- Windows ARM64 Python override sources and official wheel hashes for
+  greenlet 3.3.1, MarkupSafe 3.0.3, NumPy 2.3.0, pandas 3.0.0, and PyYAML
+  6.0.3 are recorded in `WINDOWS-ARM64-PYTHON-OVERRIDES.md`.
+- OpenSSL 4.0.1 source, statically linked into the Windows ARM64
+  `cryptography` wheel:
+  <https://github.com/openssl/openssl/releases/download/openssl-4.0.1/openssl-4.0.1.tar.gz>
+  (SHA-256
+  `2db3f3a0d6ea4b59e1f094ace2c8cd536dffb87cdc39084c5afa1e6f7f37dd09`).
 
 If an exact-version link becomes unavailable, request the corresponding source
 through the 苏小有 public repository issue tracker:

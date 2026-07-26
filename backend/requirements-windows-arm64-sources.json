@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "target": {
+    "implementation": "CPython",
+    "python_version": "3.12.10",
+    "platform_tag": "win_arm64",
+    "rust_host": "aarch64-pc-windows-msvc",
+    "pe_machine": "0xaa64"
+  },
+  "toolchain": {
+    "cargo_version": "cargo 1.96.1 (356927216 2026-06-26)",
+    "rustc_version": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "source_date_epoch": 1781044351
+  },
+  "openssl": {
+    "build_flags": [
+      "no-zlib",
+      "no-shared",
+      "no-module",
+      "no-comp",
+      "no-apps",
+      "no-docs",
+      "no-sm2-precomp",
+      "no-atexit"
+    ],
+    "configure_target": "VC-WIN64-ARM",
+    "filename": "openssl-4.0.1.tar.gz",
+    "license": "Apache-2.0",
+    "pyca_infra_reference_commit": "bcb2ad33b83662257c619d8806a856533296a8d4",
+    "sha256": "2db3f3a0d6ea4b59e1f094ace2c8cd536dffb87cdc39084c5afa1e6f7f37dd09",
+    "url": "https://github.com/openssl/openssl/releases/download/openssl-4.0.1/openssl-4.0.1.tar.gz",
+    "version": "4.0.1"
+  },
+  "packages": [
+    {
+      "build_backend": "maturin",
+      "cargo_lock_path": "Cargo.lock",
+      "cargo_lock_sha256": "585b66741011c621f66405ee9392b9fd35b62a7dbdabba6e37edc8cbad5c5a9a",
+      "expected_abi_tags": [
+        "abi3"
+      ],
+      "expected_python_tags": [
+        "cp311",
+        "cp312"
+      ],
+      "filename": "cryptography-48.0.1.tar.gz",
+      "name": "cryptography",
+      "required_native_suffixes": [
+        ".pyd"
+      ],
+      "sha256": "266f4ee051abb2f725b74ef8072b521ce1feacf685a3364fa6a6b45548db791a",
+      "url": "https://files.pythonhosted.org/packages/12/45/870e7f4bef50e5f53b9f51d4428aee5290eedf58ba443f16b1ebb7ab8e66/cryptography-48.0.1.tar.gz",
+      "version": "48.0.1"
+    },
+    {
+      "build_backend": "setuptools.build_meta",
+      "cargo_lock_path": "Cargo.lock",
+      "cargo_lock_sha256": "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3",
+      "cargo_lock_template": "requirements-windows-arm64-tiktoken.Cargo.lock",
+      "expected_abi_tags": [
+        "cp312"
+      ],
+      "expected_python_tags": [
+        "cp312"
+      ],
+      "filename": "tiktoken-0.8.0.tar.gz",
+      "name": "tiktoken",
+      "required_native_suffixes": [
+        ".pyd"
+      ],
+      "sha256": "9ccbb2740f24542534369c5635cfd9b2b3c2490754a78ac8831d99f89f94eeb2",
+      "url": "https://files.pythonhosted.org/packages/37/02/576ff3a6639e755c4f70997b2d315f56d6d71e0d046f4fb64cb81a3fb099/tiktoken-0.8.0.tar.gz",
+      "version": "0.8.0"
+    }
+  ]
+}

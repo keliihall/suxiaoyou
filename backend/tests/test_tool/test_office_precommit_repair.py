@@ -29,6 +29,7 @@ from app.office_validation import (
     copy_replacement_args,
 )
 from app.schemas.agent import AgentInfo
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool.builtin import office as office_module
 from app.tool.builtin.office import OfficeTool
 from app.tool.context import ToolContext
@@ -45,6 +46,7 @@ def _context(
     *,
     repairer: object | None = None,
 ) -> ToolContext:
+    identity = ensure_workspace_identity(workspace)
     context = ToolContext(
         session_id="repair-session",
         message_id="repair-message",
@@ -56,6 +58,7 @@ def _context(
         turn_run_id="repair-turn-run",
         checkpoint_id="repair-checkpoint",
         workspace_instance_id="repair-workspace-instance",
+        workspace_identity_token=identity.durable_token,
     )
     state: dict[str, object] = {"office_precommit_coordinator": coordinator}
     if repairer is not None:
@@ -1130,6 +1133,7 @@ async def test_slow_repair_within_server_deadline_completes_normally(
 
 
 def _transaction_context(workspace: Path) -> ToolContext:
+    identity = ensure_workspace_identity(workspace)
     return ToolContext(
         session_id="session",
         message_id="message",
@@ -1140,6 +1144,7 @@ def _transaction_context(workspace: Path) -> ToolContext:
         turn_run_id="run",
         checkpoint_id="checkpoint",
         workspace_instance_id="workspace-instance",
+        workspace_identity_token=identity.durable_token,
     )
 
 

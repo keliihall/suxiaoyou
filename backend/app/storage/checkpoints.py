@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -27,8 +26,12 @@ from app.models.session_checkpoint import SessionCheckpoint
 from app.models.turn_run import TurnRun
 from app.models.workspace_instance import WorkspaceInstance
 from app.storage.file_versions import FileVersionStore
+from app.storage.workspace_identity import (
+    WorkspaceIdentityError,
+    ensure_workspace_identity as ensure_durable_workspace_identity,
+    inspect_workspace_identity as inspect_durable_workspace_identity,
+)
 from app.utils.id import generate_ulid
-from app.utils.windows_guarded_file import windows_path_identity
 
 
 TurnTerminalStatus = Literal["completed", "failed", "cancelled"]
@@ -151,19 +154,12 @@ def inspect_workspace_identity(
     """Return a canonical directory path and replacement-resistant identity."""
 
     try:
-        root = Path(root_path).expanduser().resolve(strict=True)
-        info = root.stat(follow_symlinks=False)
-    except OSError as exc:
+        identity = inspect_durable_workspace_identity(root_path)
+    except (OSError, WorkspaceIdentityError) as exc:
         raise CheckpointValidationError(
             f"Cannot inspect workspace directory: {root_path}"
         ) from exc
-    if not root.is_dir():
-        raise CheckpointValidationError(f"Workspace is not a directory: {root}")
-    if sys.platform == "win32":
-        device, inode = windows_path_identity(root, directory=True)
-    else:
-        device, inode = info.st_dev, info.st_ino
-    return str(root), f"stat-v1:{device}:{inode}"
+    return str(identity.canonical_path), identity.durable_token
 
 
 def checkpoint_pin_owner(checkpoint_id: str) -> str:
@@ -174,7 +170,10 @@ def _version_store(
     instance: WorkspaceInstance,
     supplied: FileVersionStore | None,
 ) -> FileVersionStore:
-    store = supplied or FileVersionStore(instance.root_path)
+    store = supplied or FileVersionStore(
+        instance.root_path,
+        expected_durable_workspace_identity=instance.identity_token,
+    )
     canonical, identity = inspect_workspace_identity(store.workspace)
     if canonical != instance.root_path or identity != instance.identity_token:
         raise CheckpointConflictError(
@@ -196,7 +195,14 @@ async def register_workspace_instance(
 ) -> WorkspaceInstance:
     """Get or create the durable identity for the current directory object."""
 
-    canonical, identity = inspect_workspace_identity(root_path)
+    try:
+        durable_identity = ensure_durable_workspace_identity(root_path)
+    except (OSError, WorkspaceIdentityError) as exc:
+        raise CheckpointValidationError(
+            f"Cannot establish workspace identity: {root_path}"
+        ) from exc
+    canonical = str(durable_identity.canonical_path)
+    identity = durable_identity.durable_token
     normalized_instance_id = _optional_text(
         instance_id,
         field="instance_id",

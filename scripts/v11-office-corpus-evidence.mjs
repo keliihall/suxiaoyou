@@ -22,6 +22,7 @@ export const OFFICE_CORPUS_MINIMUM_PER_FORMAT = 100;
 export const OFFICE_CORPUS_MINIMUM_PER_PRIMARY_BUCKET = 20;
 export const REQUIRED_OFFICE_CORPUS_TARGETS = Object.freeze([
   "windows-x64",
+  "windows-arm64",
   "macos-arm64",
   "macos-x64",
   "linux-x64",
@@ -39,7 +40,8 @@ export const REQUIRED_OFFICE_CORPUS_PRIMARY_BUCKETS = Object.freeze([
   "unsupported",
 ]);
 
-const RELEASE_REF_PATTERN = /^v1\.1\.0(?:-rc\.[1-9][0-9]*)?$/u;
+const RELEASE_REF_PATTERN =
+  /^v1\.1\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?$/u;
 const COMMIT_PATTERN = /^(?!0{40}$)[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^(?!0{64}$)[0-9a-f]{64}$/u;
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._:-]{0,94}[a-z0-9])?$/u;
@@ -915,7 +917,7 @@ export function aggregateOfficeCorpusEvidence(
   for (const { report } of normalized.slice(1)) {
     if (!sameJson(report.cases.map(descriptor), baselineDescriptors)) {
       throw new OfficeCorpusEvidenceError(
-        "all five native targets must execute identical case IDs and corpus descriptors",
+        "all six native targets must execute identical case IDs and corpus descriptors",
       );
     }
     const logicalIdentity = {
@@ -928,7 +930,7 @@ export function aggregateOfficeCorpusEvidence(
     };
     if (!sameJson(logicalIdentity, baselineLogicalIdentity)) {
       throw new OfficeCorpusEvidenceError(
-        "all five native targets must use one backend, renderer, font, and parameter identity",
+        "all six native targets must use one backend, renderer, font, and parameter identity",
       );
     }
   }

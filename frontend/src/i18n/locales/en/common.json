@@ -82,7 +82,7 @@
   "sessionRunning": "Running",
   "sessionCreatedAt": "Created {{time}}",
   "sessionUpdatedAt": "Updated {{time}}",
-  "poweredBy": "suyo v1.1.0",
+  "poweredBy": "suyo v1.1.1",
   "sortBy": "Sort",
   "name": "Name",
   "price": "Price",

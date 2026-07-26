@@ -119,6 +119,16 @@ const required = [
     ),
     why: "v1.1 user Office template migration",
   },
+  {
+    kind: "file",
+    path: join(
+      internal,
+      "alembic",
+      "versions",
+      "0012_v110_workspace_identity_v2.py",
+    ),
+    why: "v1.1 workspace identity v2 release boundary",
+  },
 
   // Agent prompt templates
   {
@@ -554,6 +564,7 @@ function expectedOfficePlatformTarget() {
   const officePlatform = String(env.VERIFY_BUNDLE_OFFICE_PLATFORM ?? "").trim();
   const platformTargets = {
     "windows-x64": "windows-x64",
+    "windows-arm64": "windows-arm64",
     "macos-arm64": "darwin-arm64",
     "macos-x64": "darwin-x64",
     "linux-x64": "linux-x64",

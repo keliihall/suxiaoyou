@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.1.1-rc.1 — 2026-07-24
+
+应用与安装包内部版本为 `1.1.1`，候选发布标签为 `v1.1.1-rc.1`。本候选版继续使用公开、
+非 latest 的 `UNSIGNED-DEGRADED` 配置；完整边界见
+[`docs/releases/v1.1.1-rc.1.md`](docs/releases/v1.1.1-rc.1.md)。
+
+### 工作区恢复根修复
+
+- 用耐重启的 workspace identity v2 取代 POSIX `st_dev` 持久身份。macOS/APFS 在重启或重新挂载后
+  改变 device 编号时，不再把原工作区误判为已被替换并导致本地服务启动失败。
+- 旧 `stat-v1` 数据以“建立 durable token、迁移并校验外部版本树、最后更新数据库”的顺序幂等升级；
+  缺失、损坏或身份不可证的工作区与 journal 会单独阻断并保留证据，不影响安全工作区和后端就绪。
+- checkpoint、rewind、文件版本、事务 journal、实时工具上下文与 Git worktree 统一绑定 durable token，
+  同路径重建目录不能继承旧工作区历史。
+- 受控 Git worktree 继续隔离用户级 hooks、filters、凭据助手等可执行配置，同时对白名单中的
+  `core.autocrlf`、`core.eol`、`core.safecrlf` 做严格规范化并显式传入 Git；Windows 的正常 CRLF
+  工作树不再因安全隔离环境采用不同换行策略而被误报为脏仓库。
+
+### 六目标与八个安装包
+
+- 新增原生 Windows ARM64 NSIS，与 Windows x64 分别构建和执行安装、启动、退出及无孤儿进程验证。
+- 发布矩阵现在覆盖 Windows x64/ARM64、macOS x64/ARM64、Linux x64/ARM64 六个目标；Linux 每个架构
+  同时提供 DEB 与 RPM，因此 Release 共包含八个安装包。
+- release manifest、CHECKSUMS 与 native package lifecycle evidence 要求八个安装包精确齐全，禁止
+  使用 x64 证据代替 Windows ARM64 或复用另一目标的生命周期报告。
+
+### 信任边界
+
+- Windows 安装包没有 Authenticode 发行方签名；macOS 应用仅为 ad-hoc 签名且 DMG 未做 Developer ID
+  签名、公证或 staple；Linux DEB/RPM 未做包或仓库签名。
+- Cloudflare 官方当前没有 Windows ARM64 原生 `cloudflared` 资产；ARM64 包不会用 x64 下载冒充，
+  未自行提供兼容隧道二进制时 Quick Tunnel 会失败关闭，本地功能仍可使用。
+- 前端升级到 Next.js `15.5.21`，并锁定已修复的 DOMPurify `3.4.12`、PostCSS `8.5.22` 与
+  Sharp `0.35.3`，使生产依赖审计恢复为零已知漏洞。
+- 冻结 authoritative Office renderer、真实集成和受控 Beta 证据仍不包含在公开包中；文件名和机器可读
+  清单持续显式标注 `UNSIGNED-DEGRADED`。
+
 ## v1.1.0 — 2026-07-18
 
 本版本以公开、非 latest 的 `UNSIGNED-DEGRADED` 预发布配置交付。七个安装包全部带有明确的降级文件名；

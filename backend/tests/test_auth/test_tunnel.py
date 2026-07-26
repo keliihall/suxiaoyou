@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.auth.tunnel import TunnelManager
+from app.auth.tunnel import TunnelManager, _DOWNLOAD_URLS
 
 
 pytestmark = pytest.mark.asyncio
@@ -143,3 +143,30 @@ async def test_repeated_start_reuses_healthy_tunnel(monkeypatch) -> None:
     assert first == second == "https://once.trycloudflare.com"
     assert popen_calls == 1
     await manager.stop()
+
+
+async def test_arm64_downloads_use_only_official_cloudflared_assets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    linux_url = (
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+        "cloudflared-linux-arm64"
+    )
+    darwin_url = (
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+        "cloudflared-darwin-arm64.tgz"
+    )
+    assert _DOWNLOAD_URLS[("Linux", "aarch64")] == linux_url
+    assert _DOWNLOAD_URLS[("Linux", "arm64")] == linux_url
+    assert _DOWNLOAD_URLS[("Darwin", "aarch64")] == darwin_url
+    assert _DOWNLOAD_URLS[("Darwin", "arm64")] == darwin_url
+
+    # Cloudflare's official release currently has no Windows ARM64 binary.
+    # Do not silently download the amd64 build into a native ARM64 package.
+    assert ("Windows", "ARM64") not in _DOWNLOAD_URLS
+    monkeypatch.setattr("app.auth.tunnel.platform.system", lambda: "Windows")
+    monkeypatch.setattr("app.auth.tunnel.platform.machine", lambda: "ARM64")
+    manager = TunnelManager(bin_dir=tmp_path)
+    with pytest.raises(RuntimeError, match=r"Windows/ARM64"):
+        await manager._download(tmp_path / "cloudflared.exe")

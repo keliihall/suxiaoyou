@@ -26,6 +26,7 @@ from app.models.turn_run import TurnRun
 from app.models.workspace_instance import WorkspaceInstance
 from app.storage.checkpoints import (
     CheckpointConflictError,
+    CheckpointLedgerError,
     create_child_turn,
     create_root_turn,
     finish_turn,
@@ -37,9 +38,11 @@ from app.storage.checkpoints import (
     release_checkpoint_pin,
     transition_checkpoint,
 )
+from app.storage.file_versions import FileVersionError
 
 if TYPE_CHECKING:
     from app.streaming.manager import GenerationJob
+    from app.tool.workspace_transaction import WorkspaceTransactionRecoveryReport
 
 
 TurnFinishStatus = Literal["completed", "failed", "cancelled"]
@@ -552,105 +555,179 @@ async def finish_turn_checkpoint(
 
 async def recover_checkpoint_runtime(
     session_factory: async_sessionmaker[AsyncSession],
+    *,
+    transaction_recovery: WorkspaceTransactionRecoveryReport | None = None,
 ) -> dict[str, int]:
-    """Converge crash-bridge journals, stale turns, and version pins at startup."""
+    """Converge independent crash bridges without trusting a bad sibling."""
 
     from app.streaming.manager import GenerationJob
     from app.tool.workspace_transaction import (
         committed_checkpoint_journal_action,
         committed_checkpoint_journal_metadata,
-        list_committed_checkpoint_journals,
+        describe_workspace_recovery_blocker,
+        scan_committed_checkpoint_journals_isolated,
     )
     from app.runtime.rewind import (
         recover_committed_rewind_journal,
         recover_stale_rewind_intents,
     )
 
-    journals = await asyncio.to_thread(list_committed_checkpoint_journals)
+    scan = await asyncio.to_thread(scan_committed_checkpoint_journals_isolated)
+    blocked_by_token = {
+        blocker.token: blocker
+        for blocker in (() if transaction_recovery is None else transaction_recovery.blocked)
+    }
+    for blocker in scan.blocked:
+        previous = blocked_by_token.get(blocker.token)
+        if previous is None or (
+            previous.provenance_unknown and not blocker.provenance_unknown
+        ):
+            blocked_by_token[blocker.token] = blocker
+
     recovered_journals = 0
     recovered_rewind_journals = 0
     committed_rewind_checkpoint_ids: set[str] = set()
-    for token, payload in journals:
-        action, rewind_checkpoint_ids = committed_checkpoint_journal_action(payload)
-        if action == "rewind":
-            # Capture every durable owner before recovery removes the journal.
-            # The set is also the exclusion list for compensating pre-commit
-            # rewind intents left behind by an unrelated crash.
-            committed_rewind_checkpoint_ids.update(rewind_checkpoint_ids)
-            await recover_committed_rewind_journal(
+    for token, payload in scan.journals:
+        # Transaction recovery is the authority for proving that a committed
+        # journal still belongs to the live workspace.  A journal can be
+        # structurally readable here even though that earlier pass preserved
+        # it after an identity or cleanup failure.  Replaying it would attach
+        # untrusted filesystem effects to the database and could then delete
+        # the only recovery evidence, so leave every pre-blocked token alone.
+        if token in blocked_by_token:
+            logger.error(
+                "Checkpoint journal %s remains blocked by transaction recovery",
+                token,
+            )
+            continue
+        trusted_provenance = False
+        try:
+            action, rewind_checkpoint_ids = committed_checkpoint_journal_action(payload)
+            if action == "rewind":
+                # Capture ownership before replay. A failed replay remains an
+                # exclusion for stale-intent compensation below.
+                committed_rewind_checkpoint_ids.update(rewind_checkpoint_ids)
+                await recover_committed_rewind_journal(
+                    session_factory,
+                    token,
+                    payload,
+                )
+                blocked_by_token.pop(token, None)
+                recovered_rewind_journals += 1
+                continue
+
+            runtime, metadata = committed_checkpoint_journal_metadata(payload)
+            async with session_factory() as db:
+                checkpoint = await db.get(SessionCheckpoint, runtime["checkpoint_id"])
+                turn = await db.get(TurnRun, runtime["turn_run_id"])
+                instance = await db.get(
+                    WorkspaceInstance,
+                    runtime["workspace_instance_id"],
+                )
+            if checkpoint is None or turn is None or instance is None:
+                raise CheckpointConflictError(
+                    "Committed filesystem journal has no matching database owner"
+                )
+            raw_workspace = payload.get("workspace")
+            if (
+                checkpoint.turn_run_id != turn.id
+                or checkpoint.workspace_instance_id != instance.id
+                or checkpoint.root_turn_id != runtime["root_turn_id"]
+                or turn.session_id != runtime["session_id"]
+                or instance.root_path != raw_workspace
+            ):
+                raise CheckpointConflictError(
+                    "Committed filesystem journal provenance does not match the ledger"
+                )
+            trusted_provenance = True
+            binding = TurnCheckpointBinding(
+                root_turn_id=turn.root_turn_id,
+                turn_run_id=turn.id,
+                checkpoint_id=checkpoint.id,
+                workspace_instance_id=instance.id,
+                workspace_root=instance.root_path,
+            )
+            recovery_job = GenerationJob(
+                turn.stream_id or f"recovery-{turn.id}",
+                turn.session_id,
+                invocation_source="unknown",
+                root_turn_id=turn.root_turn_id,
+                turn_run_id=turn.id,
+                parent_turn_id=turn.parent_turn_id,
+                workspace_instance_id=instance.id,
+            )
+            metadata["_checkpoint_journal"] = token
+            await record_tool_checkpoint_effects(
                 session_factory,
+                job=recovery_job,
+                binding=binding,
+                tool_id=runtime["tool_operation"],
+                call_id=runtime["call_id"],
+                metadata=metadata,
+            )
+            await finish_turn_checkpoint(
+                session_factory,
+                job=recovery_job,
+                binding=binding,
+                status="failed",
+                response_message_id=runtime["message_id"],
+            )
+            blocked_by_token.pop(token, None)
+            recovered_journals += 1
+        except Exception as exc:
+            blocker = describe_workspace_recovery_blocker(
                 token,
                 payload,
+                exc,
+                trusted_provenance=trusted_provenance,
             )
-            recovered_rewind_journals += 1
-            continue
+            blocked_by_token[token] = blocker
+            logger.error(
+                "Checkpoint journal %s was preserved during startup: %s",
+                token,
+                exc,
+            )
 
-        runtime, metadata = committed_checkpoint_journal_metadata(payload)
-        async with session_factory() as db:
-            checkpoint = await db.get(SessionCheckpoint, runtime["checkpoint_id"])
-            turn = await db.get(TurnRun, runtime["turn_run_id"])
-            instance = await db.get(
-                WorkspaceInstance,
-                runtime["workspace_instance_id"],
-            )
-        if checkpoint is None or turn is None or instance is None:
-            raise CheckpointConflictError(
-                "Committed filesystem journal has no matching database owner"
-            )
-        raw_workspace = payload.get("workspace")
-        if (
-            checkpoint.turn_run_id != turn.id
-            or checkpoint.workspace_instance_id != instance.id
-            or checkpoint.root_turn_id != runtime["root_turn_id"]
-            or turn.session_id != runtime["session_id"]
-            or instance.root_path != raw_workspace
-        ):
-            raise CheckpointConflictError(
-                "Committed filesystem journal provenance does not match the ledger"
-            )
-        binding = TurnCheckpointBinding(
-            root_turn_id=turn.root_turn_id,
-            turn_run_id=turn.id,
-            checkpoint_id=checkpoint.id,
-            workspace_instance_id=instance.id,
-            workspace_root=instance.root_path,
-        )
-        recovery_job = GenerationJob(
-            turn.stream_id or f"recovery-{turn.id}",
-            turn.session_id,
-            invocation_source="unknown",
-            root_turn_id=turn.root_turn_id,
-            turn_run_id=turn.id,
-            parent_turn_id=turn.parent_turn_id,
-            workspace_instance_id=instance.id,
-        )
-        metadata["_checkpoint_journal"] = token
-        await record_tool_checkpoint_effects(
-            session_factory,
-            job=recovery_job,
-            binding=binding,
-            tool_id=runtime["tool_operation"],
-            call_id=runtime["call_id"],
-            metadata=metadata,
-        )
-        await finish_turn_checkpoint(
-            session_factory,
-            job=recovery_job,
-            binding=binding,
-            status="failed",
-            response_message_id=runtime["message_id"],
-        )
-        recovered_journals += 1
-
-    compensated_rewind_intents = await recover_stale_rewind_intents(
-        session_factory,
-        committed_rewind_checkpoint_ids,
+    blockers = tuple(blocked_by_token.values())
+    blocked_checkpoint_ids = {
+        checkpoint_id
+        for blocker in blockers
+        for checkpoint_id in blocker.checkpoint_ids
+    }
+    blocked_turn_ids = {
+        turn_id for blocker in blockers for turn_id in blocker.turn_run_ids
+    }
+    blocked_owner_workspace_ids = {
+        workspace_id
+        for blocker in blockers
+        for workspace_id in blocker.workspace_instance_ids
+    }
+    unknown_journal_provenance = any(
+        blocker.provenance_unknown for blocker in blockers
     )
+    committed_rewind_checkpoint_ids.update(blocked_checkpoint_ids)
+
+    if unknown_journal_provenance:
+        compensated_rewind_intents = 0
+        logger.error(
+            "Deferred stale rewind compensation because a preserved journal "
+            "has unknown provenance"
+        )
+    else:
+        compensated_rewind_intents = await recover_stale_rewind_intents(
+            session_factory,
+            committed_rewind_checkpoint_ids,
+        )
 
     finalized_stale = 0
     failed_stale = 0
-    async with session_factory() as db:
-        async with db.begin():
+    if unknown_journal_provenance:
+        logger.error(
+            "Deferred stale turn cleanup because a preserved journal has "
+            "unknown provenance"
+        )
+    else:
+        async with session_factory() as db, db.begin():
             stale_turns = list(
                 (
                     await db.execute(
@@ -659,6 +736,11 @@ async def recover_checkpoint_runtime(
                 ).scalars()
             )
             for turn in stale_turns:
+                if (
+                    turn.id in blocked_turn_ids
+                    or turn.workspace_instance_id in blocked_owner_workspace_ids
+                ):
+                    continue
                 checkpoint = (
                     await db.execute(
                         select(SessionCheckpoint).where(
@@ -666,6 +748,12 @@ async def recover_checkpoint_runtime(
                         )
                     )
                 ).scalar_one_or_none()
+                if checkpoint is not None and (
+                    checkpoint.id in blocked_checkpoint_ids
+                    or checkpoint.workspace_instance_id
+                    in blocked_owner_workspace_ids
+                ):
+                    continue
                 if checkpoint is None:
                     await finish_turn(db, turn.id, status="failed")
                     failed_stale += 1
@@ -701,8 +789,15 @@ async def recover_checkpoint_runtime(
 
     # Failed empty checkpoints own no useful rewind state. Release their empty
     # pin owners before reconciling every remaining database owner.
-    async with session_factory() as db:
-        async with db.begin():
+    blocked_workspace_ids: set[str] = set(blocked_owner_workspace_ids)
+    reconciled_pins = 0
+    if unknown_journal_provenance:
+        logger.error(
+            "Deferred checkpoint pin cleanup because a preserved journal has "
+            "unknown provenance"
+        )
+    else:
+        async with session_factory() as db, db.begin():
             failed_checkpoints = list(
                 (
                     await db.execute(
@@ -714,6 +809,12 @@ async def recover_checkpoint_runtime(
                 ).scalars()
             )
             for checkpoint in failed_checkpoints:
+                if (
+                    checkpoint.id in blocked_checkpoint_ids
+                    or checkpoint.workspace_instance_id
+                    in blocked_owner_workspace_ids
+                ):
+                    continue
                 retained_change_count = int(
                     (
                         await db.execute(
@@ -724,7 +825,15 @@ async def recover_checkpoint_runtime(
                     ).scalar_one()
                 )
                 if not retained_change_count and not checkpoint.has_irreversible_side_effects:
-                    await release_checkpoint_pin(db, checkpoint.id)
+                    try:
+                        await release_checkpoint_pin(db, checkpoint.id)
+                    except (CheckpointLedgerError, FileVersionError, OSError) as exc:
+                        blocked_workspace_ids.add(checkpoint.workspace_instance_id)
+                        logger.error(
+                            "Checkpoint pin release deferred for unavailable workspace %s: %s",
+                            checkpoint.workspace_instance_id,
+                            exc,
+                        )
 
             workspace_ids = list(
                 (
@@ -733,12 +842,21 @@ async def recover_checkpoint_runtime(
                     )
                 ).scalars()
             )
-            reconciled_pins = 0
             for workspace_id in workspace_ids:
-                reconciled_pins += await reconcile_workspace_checkpoint_pins(
-                    db,
-                    workspace_id,
-                )
+                if workspace_id in blocked_owner_workspace_ids:
+                    continue
+                try:
+                    reconciled_pins += await reconcile_workspace_checkpoint_pins(
+                        db,
+                        workspace_id,
+                    )
+                except (CheckpointLedgerError, FileVersionError, OSError) as exc:
+                    blocked_workspace_ids.add(workspace_id)
+                    logger.error(
+                        "Checkpoint reconciliation deferred for unavailable workspace %s: %s",
+                        workspace_id,
+                        exc,
+                    )
 
     return {
         "journals": recovered_journals,
@@ -747,6 +865,9 @@ async def recover_checkpoint_runtime(
         "stale_finalized": finalized_stale,
         "stale_failed": failed_stale,
         "pins_reconciled": reconciled_pins,
+        "workspaces_blocked": len(blocked_workspace_ids)
+        + int(unknown_journal_provenance),
+        "journals_blocked": len(blockers),
     }
 
 

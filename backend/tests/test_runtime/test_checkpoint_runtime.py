@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import release_features
+from app.storage import workspace_identity as workspace_identity_module
 from app.agent.agent import AgentRegistry
 from app.models.checkpoint_change import CheckpointChange
 from app.models.session import Session
@@ -30,7 +31,11 @@ from app.streaming.events import DONE
 from app.streaming.manager import GenerationJob
 from app.tool.context import ToolContext
 from app.tool.workspace_transaction import (
+    CommittedCheckpointJournalScan,
+    WorkspaceMutationError,
     WorkspaceMutationTransaction,
+    WorkspaceRecoveryBlocker,
+    WorkspaceTransactionRecoveryReport,
     list_committed_checkpoint_journals,
 )
 from app.validation_agent import (
@@ -249,6 +254,9 @@ async def _record_prompt_files(
         turn_run_id=binding.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=(
+            workspace_identity_module.inspect_workspace_identity(workspace).durable_token
+        ),
     )
     transaction = WorkspaceMutationTransaction(
         workspace,
@@ -1033,6 +1041,9 @@ async def test_runtime_records_commit_before_finalizing_turn(
         turn_run_id=job.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=(
+            workspace_identity_module.inspect_workspace_identity(workspace).durable_token
+        ),
     )
     transaction = WorkspaceMutationTransaction(
         workspace,
@@ -1122,6 +1133,9 @@ async def test_runtime_persists_private_office_validation_on_exact_change(
         turn_run_id=binding.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=(
+            workspace_identity_module.inspect_workspace_identity(workspace).durable_token
+        ),
     )
     transaction = WorkspaceMutationTransaction(workspace, ctx, operation="office.create")
     staged = transaction.prepare()
@@ -1291,6 +1305,9 @@ async def test_startup_recovers_committed_filesystem_journal_into_database(
         turn_run_id=job.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=(
+            workspace_identity_module.inspect_workspace_identity(workspace).durable_token
+        ),
     )
     transaction = WorkspaceMutationTransaction(workspace, ctx, operation="bash")
     staged = transaction.prepare()
@@ -1323,6 +1340,74 @@ async def test_startup_recovers_committed_filesystem_journal_into_database(
 
 
 @pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    workspace_identity_module.sys.platform == "win32",
+    reason="simulates removal of the POSIX fallback marker",
+)
+async def test_startup_isolates_unavailable_workspace_without_blocking_healthy_one(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_features, "V11_CHECKPOINTS_RELEASED", True)
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(tmp_path / "private"))
+    # Exercise the portable marker fallback so the test can simulate identity
+    # loss without reaching into platform-specific xattr deletion APIs.
+    monkeypatch.setattr(
+        workspace_identity_module,
+        "_inspect_posix_xattr",
+        lambda _canonical, *, create: None,
+    )
+    bindings = []
+    for suffix in ("blocked", "healthy"):
+        workspace = tmp_path / suffix
+        workspace.mkdir()
+        session_id = f"{suffix}-session"
+        await _create_session(session_factory, session_id, workspace)
+        job = GenerationJob(f"{suffix}-stream", session_id, invocation_source="desktop")
+        binding = await admit_turn_checkpoint(
+            session_factory,
+            job=job,
+            workspace=str(workspace),
+            request_message_id=None,
+            todo_snapshot=[],
+        )
+        assert binding is not None
+        await finish_turn_checkpoint(
+            session_factory,
+            job=job,
+            binding=binding,
+            status="completed",
+            response_message_id=None,
+        )
+        bindings.append((workspace, binding))
+
+    blocked_workspace, blocked_binding = bindings[0]
+    (blocked_workspace / ".suxiaoyou" / "workspace-identity-v2").unlink()
+
+    recovered = await recover_checkpoint_runtime(session_factory)
+
+    assert recovered["workspaces_blocked"] == 1
+    async with session_factory() as db:
+        blocked_checkpoint = await db.get(
+            SessionCheckpoint,
+            blocked_binding.checkpoint_id,
+        )
+        healthy_checkpoint = await db.get(
+            SessionCheckpoint,
+            bindings[1][1].checkpoint_id,
+        )
+    assert blocked_checkpoint is not None
+    assert blocked_checkpoint.state == "finalized"
+    assert blocked_checkpoint.pin_state == "pinned"
+    assert healthy_checkpoint is not None
+    assert healthy_checkpoint.state == "finalized"
+    assert healthy_checkpoint.pin_state == "pinned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
 async def test_startup_dispatches_rewind_journal_before_compensating_intents(
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
@@ -1337,8 +1422,11 @@ async def test_startup_dispatches_rewind_journal_before_compensating_intents(
 
     monkeypatch.setattr(
         workspace_transaction,
-        "list_committed_checkpoint_journals",
-        lambda: [("owner/tx-rewind", payload)],
+        "scan_committed_checkpoint_journals_isolated",
+        lambda: CommittedCheckpointJournalScan(
+            (("owner/tx-rewind", payload),),
+            (),
+        ),
     )
     monkeypatch.setattr(
         workspace_transaction,
@@ -1388,6 +1476,216 @@ async def test_startup_dispatches_rewind_journal_before_compensating_intents(
     assert recovered["journals"] == 0
     assert recovered["rewind_journals"] == 1
     assert recovered["rewind_intents_compensated"] == 2
+    assert recovered["journals_blocked"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
+async def test_startup_recovers_healthy_journal_but_defers_for_bad_sibling(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.runtime import rewind as rewind_runtime
+    from app.tool import workspace_transaction
+
+    healthy_payload: dict[str, object] = {"state": "committed"}
+    blocked_payload: dict[str, object] = {
+        "schema_version": 5,
+        "state": "committed",
+        "runtime_checkpoint": {
+            "session_id": "claimed-session",
+            "checkpoint_id": "claimed-checkpoint",
+            "workspace_instance_id": "claimed-workspace",
+            "root_turn_id": "claimed-root-turn",
+            "turn_run_id": "claimed-turn",
+            "action": "turn_commit",
+            "rewind_checkpoint_ids": [],
+        },
+    }
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        workspace_transaction,
+        "scan_committed_checkpoint_journals_isolated",
+        lambda: CommittedCheckpointJournalScan(
+            (
+                ("owner/tx-blocked", blocked_payload),
+                ("owner/tx-healthy", healthy_payload),
+            ),
+            (),
+        ),
+    )
+
+    def journal_action(value: dict[str, object]) -> tuple[str, tuple[str, ...]]:
+        if value is blocked_payload:
+            raise WorkspaceMutationError("blocked journal is malformed")
+        assert value is healthy_payload
+        return "rewind", ("healthy-checkpoint",)
+
+    monkeypatch.setattr(
+        workspace_transaction,
+        "committed_checkpoint_journal_action",
+        journal_action,
+    )
+
+    async def recover_rewind(
+        factory: async_sessionmaker[AsyncSession],
+        token: str,
+        value: dict[str, object],
+    ) -> bool:
+        assert factory is session_factory
+        calls.append(("journal", token, value))
+        return True
+
+    async def unexpected_compensation(*_args: object, **_kwargs: object) -> int:
+        pytest.fail("untrusted blocked provenance must defer compensation")
+
+    monkeypatch.setattr(
+        rewind_runtime,
+        "recover_committed_rewind_journal",
+        recover_rewind,
+    )
+    monkeypatch.setattr(
+        rewind_runtime,
+        "recover_stale_rewind_intents",
+        unexpected_compensation,
+    )
+
+    recovered = await recover_checkpoint_runtime(session_factory)
+
+    assert calls == [("journal", "owner/tx-healthy", healthy_payload)]
+    assert recovered["rewind_journals"] == 1
+    assert recovered["rewind_intents_compensated"] == 0
+    assert recovered["journals_blocked"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
+async def test_startup_never_replays_journal_preblocked_by_transaction_recovery(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readable payload must not override the workspace identity gate."""
+
+    from app.runtime import rewind as rewind_runtime
+    from app.tool import workspace_transaction
+
+    token = "owner/tx-preblocked"
+    payload: dict[str, object] = {"state": "committed"}
+    blocker = WorkspaceRecoveryBlocker(
+        token=token,
+        checkpoint_ids=(),
+        turn_run_ids=(),
+        workspace_instance_ids=(),
+        provenance_unknown=True,
+        reason="workspace durable identity no longer matches",
+    )
+    transaction_report = WorkspaceTransactionRecoveryReport((), (blocker,))
+    monkeypatch.setattr(
+        workspace_transaction,
+        "scan_committed_checkpoint_journals_isolated",
+        lambda: CommittedCheckpointJournalScan(((token, payload),), ()),
+    )
+
+    def unexpected_action(_payload: dict[str, object]) -> tuple[str, tuple[str, ...]]:
+        pytest.fail("pre-blocked journal must not be interpreted or replayed")
+
+    async def unexpected_replay(*_args: object, **_kwargs: object) -> bool:
+        pytest.fail("pre-blocked journal must not be replayed")
+
+    async def unexpected_compensation(*_args: object, **_kwargs: object) -> int:
+        pytest.fail("unknown pre-blocked ownership must defer compensation")
+
+    monkeypatch.setattr(
+        workspace_transaction,
+        "committed_checkpoint_journal_action",
+        unexpected_action,
+    )
+    monkeypatch.setattr(
+        rewind_runtime,
+        "recover_committed_rewind_journal",
+        unexpected_replay,
+    )
+    monkeypatch.setattr(
+        rewind_runtime,
+        "recover_stale_rewind_intents",
+        unexpected_compensation,
+    )
+
+    recovered = await recover_checkpoint_runtime(
+        session_factory,
+        transaction_recovery=transaction_report,
+    )
+
+    assert recovered["journals"] == 0
+    assert recovered["rewind_journals"] == 0
+    assert recovered["rewind_intents_compensated"] == 0
+    assert recovered["journals_blocked"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
+async def test_unknown_blocked_journal_defers_all_ambiguous_owner_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.runtime import rewind as rewind_runtime
+    from app.tool import workspace_transaction
+
+    monkeypatch.setattr(release_features, "V11_CHECKPOINTS_RELEASED", True)
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(tmp_path / "private"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    await _create_session(session_factory, "session", workspace)
+    job = GenerationJob("stream", "session", invocation_source="desktop")
+    binding = await admit_turn_checkpoint(
+        session_factory,
+        job=job,
+        workspace=str(workspace),
+        request_message_id=None,
+        todo_snapshot=[],
+    )
+    assert binding is not None
+
+    async with session_factory() as db:
+        original_checkpoint = await db.get(SessionCheckpoint, binding.checkpoint_id)
+    assert original_checkpoint is not None
+    original_checkpoint_state = original_checkpoint.state
+
+    blocker = WorkspaceRecoveryBlocker(
+        token="unknown-owner/tx-corrupt",
+        checkpoint_ids=(),
+        turn_run_ids=(),
+        workspace_instance_ids=(),
+        provenance_unknown=True,
+        reason="journal is unreadable",
+    )
+    monkeypatch.setattr(
+        workspace_transaction,
+        "scan_committed_checkpoint_journals_isolated",
+        lambda: CommittedCheckpointJournalScan((), (blocker,)),
+    )
+
+    async def unexpected_compensation(*_args: object, **_kwargs: object) -> int:
+        pytest.fail("unknown journal ownership must defer rewind compensation")
+
+    monkeypatch.setattr(
+        rewind_runtime,
+        "recover_stale_rewind_intents",
+        unexpected_compensation,
+    )
+
+    recovered = await recover_checkpoint_runtime(session_factory)
+
+    assert recovered["journals_blocked"] == 1
+    assert recovered["stale_failed"] == 0
+    assert recovered["pins_reconciled"] == 0
+    async with session_factory() as db:
+        turn = await db.get(TurnRun, binding.turn_run_id)
+        checkpoint = await db.get(SessionCheckpoint, binding.checkpoint_id)
+    assert turn is not None and turn.status == "running"
+    assert checkpoint is not None and checkpoint.state == original_checkpoint_state
+    assert checkpoint.pin_state == "pinned"
 
 
 @pytest.mark.asyncio

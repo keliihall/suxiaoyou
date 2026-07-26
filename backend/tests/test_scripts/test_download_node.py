@@ -13,6 +13,140 @@ import pytest
 from scripts import download_node
 
 
+def _windows_replace_error(winerror: int, message: str) -> OSError:
+    error = PermissionError(message)
+    error.winerror = winerror
+    return error
+
+
+def test_directory_replace_retries_transient_windows_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    attempts = 0
+    sleeps: list[float] = []
+    real_replace = os.replace
+
+    def transient_replace(source_path, destination_path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            raise _windows_replace_error(5, "simulated antivirus handle")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(download_node.os, "replace", transient_replace)
+    monkeypatch.setattr(download_node.time, "sleep", sleeps.append)
+
+    download_node._replace_directory(source, destination)
+
+    assert attempts == 4
+    assert sleeps == list(download_node._WINDOWS_REPLACE_RETRY_DELAYS[:3])
+    assert destination.is_dir()
+    assert not source.exists()
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_directory_replace_exhausts_each_transient_windows_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def always_fail(_source, _destination) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise _windows_replace_error(winerror, "persistent Windows handle")
+
+    monkeypatch.setattr(download_node.os, "replace", always_fail)
+    monkeypatch.setattr(download_node.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError, match="persistent Windows handle"):
+        download_node._replace_directory(tmp_path / "source", tmp_path / "destination")
+
+    assert attempts == len(download_node._WINDOWS_REPLACE_RETRY_DELAYS) + 1
+    assert sleeps == list(download_node._WINDOWS_REPLACE_RETRY_DELAYS)
+
+
+def test_directory_replace_does_not_retry_nontransient_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fail_once(_source, _destination) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise _windows_replace_error(145, "destination is not empty")
+
+    monkeypatch.setattr(download_node.os, "replace", fail_once)
+    monkeypatch.setattr(download_node.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError, match="destination is not empty"):
+        download_node._replace_directory(tmp_path / "source", tmp_path / "destination")
+
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_install_retries_transient_windows_staging_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("Windows", "ARM64")
+    archive_url = download_node._URLS[key]
+    archive_name = archive_url.rsplit("/", 1)[-1]
+    archive = b"trusted Windows ARM64 Node archive"
+    checksum = hashlib.sha256(archive).hexdigest()
+    downloads = {
+        archive_url: archive,
+        download_node._shasums_url(archive_url): (
+            f"{checksum}  {archive_name}\n".encode()
+        ),
+    }
+    output = tmp_path / "nodejs"
+
+    def fake_extract(_data: bytes, staging: Path) -> None:
+        (staging / "node.exe").write_bytes(b"node")
+
+    real_replace = os.replace
+    staging_attempts = 0
+    sleeps: list[float] = []
+
+    def transient_staging_replace(source, destination) -> None:
+        nonlocal staging_attempts
+        if Path(source).name.startswith(".nodejs.staging-"):
+            staging_attempts += 1
+            if staging_attempts == 1:
+                raise _windows_replace_error(5, "staging directory still in use")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(download_node.os, "replace", transient_staging_replace)
+    monkeypatch.setattr(download_node.time, "sleep", sleeps.append)
+
+    download_node.install_node_runtime(
+        key,
+        output,
+        download=downloads.__getitem__,
+        extract_windows=fake_extract,
+        verify_runtime=lambda _staging, _key: {
+            "node": "v22.22.0",
+            "npm": "10.9.4",
+            "npx": "10.9.4",
+        },
+    )
+
+    assert staging_attempts == 2
+    assert sleeps == [download_node._WINDOWS_REPLACE_RETRY_DELAYS[0]]
+    assert (output / "node.exe").read_bytes() == b"node"
+    assert not list(tmp_path.glob(".nodejs.staging-*"))
+
+
 def test_matching_official_checksum_is_verified_before_extraction(tmp_path: Path) -> None:
     key = ("Darwin", "arm64")
     archive_url = download_node._URLS[key]
@@ -200,6 +334,72 @@ def test_double_replacement_failure_preserves_backup_directory(
         "preserve me"
     )
     assert not output.exists()
+
+
+def test_transient_rollback_failure_is_retried_and_restores_existing_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("Linux", "x86_64")
+    archive_url = download_node._URLS[key]
+    archive_name = archive_url.rsplit("/", 1)[-1]
+    archive = b"trusted replacement archive"
+    checksum = hashlib.sha256(archive).hexdigest()
+    downloads = {
+        archive_url: archive,
+        download_node._shasums_url(archive_url): (
+            f"{checksum}  {archive_name}\n".encode()
+        ),
+    }
+    output = tmp_path / "nodejs"
+    output.mkdir()
+    sentinel = output / "known-good-node"
+    sentinel.write_text("restore me", encoding="utf-8")
+
+    def fake_extract(_data: bytes, staging: Path) -> None:
+        (staging / "bin").mkdir(parents=True)
+        (staging / "bin" / "node").write_text("replacement", encoding="utf-8")
+
+    real_replace = os.replace
+    rollback_attempts = 0
+    sleeps: list[float] = []
+
+    def fail_install_then_transient_rollback(source, destination) -> None:
+        nonlocal rollback_attempts
+        source_path = Path(source)
+        if source_path.name.startswith(".nodejs.staging-"):
+            raise OSError("install failed")
+        if source_path.name.startswith(".nodejs.backup-"):
+            rollback_attempts += 1
+            if rollback_attempts == 1:
+                raise _windows_replace_error(32, "rollback handle still open")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        download_node.os,
+        "replace",
+        fail_install_then_transient_rollback,
+    )
+    monkeypatch.setattr(download_node.time, "sleep", sleeps.append)
+
+    with pytest.raises(OSError, match="install failed"):
+        download_node.install_node_runtime(
+            key,
+            output,
+            download=downloads.__getitem__,
+            extract_unix=fake_extract,
+            verify_runtime=lambda _staging, _key: {
+                "node": "v22.22.0",
+                "npm": "10.9.4",
+                "npx": "10.9.4",
+            },
+        )
+
+    assert rollback_attempts == 2
+    assert sleeps == [download_node._WINDOWS_REPLACE_RETRY_DELAYS[0]]
+    assert sentinel.read_text(encoding="utf-8") == "restore me"
+    assert not list(tmp_path.glob(".nodejs.staging-*"))
+    assert not list(tmp_path.glob(".nodejs.backup-*"))
 
 
 def test_checksum_mismatch_aborts_before_deleting_or_extracting(tmp_path: Path) -> None:

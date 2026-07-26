@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-/** Independently verify a release-manifest.json and its seven installers. */
+/** Independently verify a release-manifest.json and its eight installers. */
 
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -125,6 +125,11 @@ export function verifyReleaseManifest({
 
   const root = resolve(assetsDirectory);
   const expected = expectedReleaseAssets(version, profile);
+  if (manifest.assets.length !== expected.length) {
+    throw new Error(
+      `release manifest must contain exactly ${expected.length} assets`,
+    );
+  }
   const installerNames = readdirSync(root)
     .filter((name) => /\.(?:exe|dmg|deb|rpm)$/i.test(name))
     .sort();

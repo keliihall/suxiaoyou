@@ -36,6 +36,7 @@ from app.runtime.checkpoint_runtime import (
 from app.runtime.rewind import RewindService
 from app.schemas.agent import AgentInfo
 from app.storage.file_versions import FileVersionStore
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.streaming.manager import GenerationJob, StreamManager
 from app.tool import workspace_transaction as transaction_module
 from app.tool.builtin.office import OfficeTool
@@ -101,6 +102,7 @@ async def _admit(
         turn_run_id=binding.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=ensure_workspace_identity(workspace).durable_token,
     )
     context._app_state = {  # type: ignore[attr-defined]
         "office_precommit_coordinator": coordinator,
@@ -223,6 +225,7 @@ async def test_ordinary_create_uses_production_authoritative_policy_for_all_form
         turn_run_id=f"ordinary-{filename}-run",
         checkpoint_id=f"ordinary-{filename}-checkpoint",
         workspace_instance_id="ordinary-workspace",
+        workspace_identity_token=ensure_workspace_identity(workspace).durable_token,
     )
     context._app_state = {  # type: ignore[attr-defined]
         "office_precommit_coordinator": coordinator,

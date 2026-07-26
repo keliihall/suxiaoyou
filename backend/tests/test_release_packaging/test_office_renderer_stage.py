@@ -351,6 +351,25 @@ def _retarget_assets(
     )
 
 
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [
+        ("AMD64", "windows-x64"),
+        ("ARM64", "windows-arm64"),
+    ],
+)
+def test_windows_native_host_matches_supported_renderer_target(
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(packaging.os.sys, "platform", "win32")
+    monkeypatch.setattr(packaging.platform, "machine", lambda: machine)
+
+    assert packaging._native_target() == expected
+    assert expected in packaging.SUPPORTED_TARGETS
+
+
 def test_node_staged_renderer_is_admitted_by_pyinstaller_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

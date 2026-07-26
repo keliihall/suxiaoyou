@@ -23,7 +23,7 @@ import {
 } from "./v11-acp-soak-evidence.mjs";
 
 const COMMIT = "a".repeat(40);
-const RELEASE_REF = "v1.1.0-rc.3";
+const RELEASE_REF = "v1.1.1-rc.1";
 const AGENT_BINARY_IDENTITY_SHA256 = createHash("sha256")
   .update("v1.1 frozen backend matrix")
   .digest("hex");
@@ -115,6 +115,32 @@ test("accepts two distinct release-bound eight-hour ACP client soaks", () => {
     assert.equal(item.counts.orphan_processes, 0);
     assert.equal(item.privacy.file_paths_collected, false);
   }
+});
+
+test("accepts a release-bound Windows ARM64 ACP soak", () => {
+  const report = passingReport("client-arm64", 0);
+  report.platform = "windows-arm64";
+
+  const normalized = validateAcpSoakReport(report, {
+    expectedCommit: COMMIT,
+    expectedReleaseRef: RELEASE_REF,
+    expectedAgentBinaryIdentitySha256: AGENT_BINARY_IDENTITY_SHA256,
+  });
+
+  assert.equal(normalized.platform, "windows-arm64");
+});
+
+test("keeps the reviewed v1.1 contract reusable for later patch releases", () => {
+  const report = passingReport("client-future-patch", 0);
+  report.release_ref = "v1.1.42-rc.3";
+
+  const normalized = validateAcpSoakReport(report, {
+    expectedCommit: COMMIT,
+    expectedReleaseRef: report.release_ref,
+    expectedAgentBinaryIdentitySha256: AGENT_BINARY_IDENTITY_SHA256,
+  });
+
+  assert.equal(normalized.release_ref, "v1.1.42-rc.3");
 });
 
 test("validates the exact raw bytes that receive the published digest", () => {

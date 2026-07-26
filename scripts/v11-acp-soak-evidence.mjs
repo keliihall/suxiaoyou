@@ -55,12 +55,14 @@ const REQUIRED_ZERO_COUNTS = Object.freeze([
 ]);
 const SUPPORTED_PLATFORMS = new Set([
   "windows-x64",
+  "windows-arm64",
   "macos-arm64",
   "macos-x64",
   "linux-x64",
   "linux-arm64",
 ]);
-const RELEASE_REF_PATTERN = /^v1\.1\.0(?:-rc\.[1-9][0-9]*)?$/u;
+const RELEASE_REF_PATTERN =
+  /^v1\.1\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?$/u;
 const COMMIT_PATTERN = /^(?!0{40}$)[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^(?!0{64}$)[0-9a-f]{64}$/u;
 const CLIENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;

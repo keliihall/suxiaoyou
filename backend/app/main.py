@@ -552,21 +552,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         format="%(levelname)s:     %(name)s - %(message)s",
     )
 
-    # A hard process exit can interrupt a multi-file Linux command between
-    # otherwise atomic file installs. Recover its durable pre-commit journal
-    # before providers, schedulers, connectors, or Agent writers can run.
-    from app.tool.workspace_transaction import recover_pending_workspace_transactions
-
-    recovered_command_transactions = await asyncio.to_thread(
-        recover_pending_workspace_transactions,
-        preserve_committed_checkpoint_journals=V11_CHECKPOINTS_RELEASED,
-    )
-    if recovered_command_transactions:
-        logger.warning(
-            "Recovered %d interrupted command workspace transaction(s)",
-            len(recovered_command_transactions),
-        )
-
     # Install global asyncio exception handler
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_asyncio_exception_handler)
@@ -624,6 +609,49 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+    # stat-v1 persisted POSIX st_dev even though APFS can renumber it after a
+    # reboot.  Prepare durable workspace markers and migrated version stores
+    # first, then update each database row last.  The routine is idempotent and
+    # leaves missing/replaced workspaces blocked individually rather than
+    # preventing the local service from becoming ready.
+    from app.storage.workspace_identity_migration import (
+        migrate_legacy_workspace_identities,
+    )
+
+    workspace_identity_migration = await migrate_legacy_workspace_identities(
+        session_factory
+    )
+    if any(workspace_identity_migration.values()):
+        logger.warning(
+            "Workspace identity migration result: %s",
+            workspace_identity_migration,
+        )
+
+    # A hard process exit can interrupt a multi-file command between otherwise
+    # atomic installs.  Database/schema and identity migration must precede
+    # recovery so legacy journals can resolve the durable marker, while this
+    # still runs before any credential migration, provider, scheduler, or Agent
+    # writer can touch a selected workspace.
+    from app.tool.workspace_transaction import (
+        recover_pending_workspace_transactions_isolated,
+    )
+
+    command_transaction_recovery = await asyncio.to_thread(
+        recover_pending_workspace_transactions_isolated,
+        preserve_committed_checkpoint_journals=V11_CHECKPOINTS_RELEASED,
+    )
+    if command_transaction_recovery.recovered:
+        logger.warning(
+            "Recovered %d interrupted command workspace transaction(s)",
+            len(command_transaction_recovery.recovered),
+        )
+    if command_transaction_recovery.blocked:
+        logger.error(
+            "Preserved %d command workspace transaction journal(s) that "
+            "could not be safely recovered",
+            len(command_transaction_recovery.blocked),
+        )
+
     # v0.8 Google/MCP tokens were stored inside the workspace selected by each
     # exclude folderless/private-overlap entries, and inspect only the two
     # known <workspace>/.suxiaoyou credential files. This remains independent
@@ -638,7 +666,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if V11_CHECKPOINTS_RELEASED:
         from app.runtime.checkpoint_runtime import recover_checkpoint_runtime
 
-        checkpoint_recovery = await recover_checkpoint_runtime(session_factory)
+        checkpoint_recovery = await recover_checkpoint_runtime(
+            session_factory,
+            transaction_recovery=command_transaction_recovery,
+        )
         if any(checkpoint_recovery.values()):
             logger.warning(
                 "Recovered v1.1 checkpoint runtime state: %s",

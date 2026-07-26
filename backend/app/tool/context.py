@@ -70,6 +70,10 @@ class ToolContext:
     turn_run_id: str | None = None
     checkpoint_id: str | None = None
     workspace_instance_id: str | None = None
+    # Durable filesystem identity read from the server-owned WorkspaceInstance
+    # row.  A checkpoint-aware mutation must match this token before it may
+    # create a private stage or touch the visible workspace.
+    workspace_identity_token: str | None = None
 
     # Callbacks set by the session processor
     _publish_fn: Callable[[str, dict[str, Any]], None] | None = None

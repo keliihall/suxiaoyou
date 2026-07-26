@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import frontendPackage from "../../package.json";
 import { mock苏小有Api, seed苏小有Storage } from "./fixtures/suxiaoyou-api";
 
 const CJK = /[\u3400-\u9fff\uf900-\ufaff]/u;
@@ -69,7 +70,9 @@ test.describe("English localization guard", () => {
     await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
     await expect(page.getByRole("button", { name: "English" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Chinese" })).toBeVisible();
-    await expect(page.getByText(/suyo v1\.1\.0/)).toBeVisible();
+    await expect(
+      page.getByText(`suyo v${frontendPackage.version}`, { exact: true }),
+    ).toBeVisible();
     await expectNoVisibleCjk(page, "English general settings");
 
     await page.getByRole("button", { name: "Chinese", exact: true }).click();

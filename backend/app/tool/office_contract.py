@@ -35,6 +35,7 @@ OFFICE_CONTRACT_VERSION = "v1.0-restricted-office-1"
 SUPPORTED_PLATFORMS = frozenset(
     {
         "windows-x64",
+        "windows-arm64",
         "macos-arm64",
         "macos-x64",
         "linux-arm64",

@@ -108,6 +108,10 @@ jobs:
           tests/test_tool/test_registry.py
           tests/test_tool/test_subprocess_compat.py
 
+      - name: Verify durable workspace identity v2
+        working-directory: backend
+        run: python -m pytest -q -m workspace_identity_v2
+
   backend-macos-execution:
     name: Backend macOS Execution Safety
     runs-on: macos-14
@@ -150,6 +154,9 @@ jobs:
           tests/test_tool/test_code_execute.py
           tests/test_tool/test_code_execute_written_files.py
           tests/test_tool/test_registry.py
+
+      - name: Verify durable workspace identity v2
+        run: python -m pytest -q -m workspace_identity_v2
 
   frontend:
     name: Frontend Checks

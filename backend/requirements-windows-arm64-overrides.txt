@@ -1,0 +1,9 @@
+# Windows ARM64 has a smaller official-wheel set than Windows x64.  These are
+# the first upstream versions in the existing dependency families that publish
+# CPython 3.12 win_arm64 wheels.  Keep this file exact: it is an override input
+# to the hash-locked production graph, not an open-ended compatibility range.
+greenlet==3.3.1
+markupsafe==3.0.3
+numpy==2.3.0
+pandas==3.0.0
+pyyaml==6.0.3

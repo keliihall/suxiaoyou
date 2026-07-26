@@ -30,11 +30,20 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
 NODE_VERSION = "22.22.0"
+
+# Windows virus scanners and indexers can briefly retain handles after the
+# extracted runtime has been executed for verification. Directory renames then
+# fail with one of these native transient errors even though no process in this
+# script still owns a handle. Keep the retry set narrow so structural and
+# permission failures still fail closed immediately.
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
+_WINDOWS_REPLACE_RETRY_DELAYS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
 
 # Official Node.js download URLs per platform
 _URLS = {
@@ -357,6 +366,28 @@ def _verify_node_runtime(
     return versions
 
 
+def _replace_directory(source: Path, destination: Path) -> None:
+    """Atomically rename a directory, retrying only transient Windows errors."""
+    for attempt in range(len(_WINDOWS_REPLACE_RETRY_DELAYS) + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if (
+                winerror not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                or attempt == len(_WINDOWS_REPLACE_RETRY_DELAYS)
+            ):
+                raise
+            delay = _WINDOWS_REPLACE_RETRY_DELAYS[attempt]
+            print(
+                "WARNING: transient Windows directory replacement failure "
+                f"({winerror}) for {source} -> {destination}; "
+                f"retrying in {delay:g}s"
+            )
+            time.sleep(delay)
+
+
 def install_node_runtime(
     key: tuple[str, str],
     output: Path,
@@ -406,13 +437,13 @@ def install_node_runtime(
                 )
             )
             backup.rmdir()
-            os.replace(output, backup)
+            _replace_directory(output, backup)
         try:
-            os.replace(staging, output)
+            _replace_directory(staging, output)
         except Exception:
             if backup is not None and backup.exists():
                 try:
-                    os.replace(backup, output)
+                    _replace_directory(backup, output)
                 except Exception as rollback_error:
                     # Never delete the user's only known-good runtime after a
                     # double filesystem failure.  Leave it at the reported

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import sys
 from typing import Callable
 
 import pytest
@@ -37,12 +38,14 @@ from app.runtime.rewind import (
 from app.schemas.agent import AgentInfo
 from app.storage.checkpoints import (
     create_root_turn,
+    inspect_workspace_identity,
     record_irreversible_side_effect,
     transition_checkpoint,
 )
 from app.streaming.manager import GenerationJob, StreamManager
 from app.tool.context import ToolContext
 from app.tool.workspace_transaction import (
+    WorkspaceMutationError,
     WorkspaceMutationTransaction,
     committed_checkpoint_journal_action,
     list_committed_checkpoint_journals,
@@ -123,6 +126,7 @@ async def _commit_checkpoint(
         turn_run_id=binding.turn_run_id,
         checkpoint_id=binding.checkpoint_id,
         workspace_instance_id=binding.workspace_instance_id,
+        workspace_identity_token=inspect_workspace_identity(workspace)[1],
     )
     transaction = WorkspaceMutationTransaction(workspace, context, operation="test")
     staged = transaction.prepare()
@@ -645,6 +649,64 @@ async def test_rewind_rechecks_final_state_after_transaction_preparation(
         checkpoint = await db.get(SessionCheckpoint, binding.checkpoint_id)
     assert checkpoint is not None and checkpoint.state == "finalized"
     assert list_committed_checkpoint_journals() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="exercises POSIX full-workspace transaction staging",
+)
+async def test_rewind_rejects_workspace_replacement_before_transaction_staging(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    released_rewind: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    original = tmp_path / "original-workspace"
+    workspace.mkdir()
+    target = workspace / "file.txt"
+    target.write_text("before", encoding="utf-8")
+    await _setup_session(session_factory, workspace)
+    binding = await _commit_checkpoint(
+        session_factory,
+        workspace,
+        session_id="session",
+        stream_id="stream",
+        todo_snapshot=[],
+        mutate=lambda stage: (stage / "file.txt").write_text(
+            "after",
+            encoding="utf-8",
+        ),
+    )
+
+    async def replace_after_plan(*_args: object, **_kwargs: object) -> tuple[()]:
+        workspace.rename(original)
+        workspace.mkdir()
+        (workspace / "file.txt").write_text("replacement", encoding="utf-8")
+        return ()
+
+    monkeypatch.setattr(
+        rewind_module,
+        "_quiescence_blockers",
+        replace_after_plan,
+    )
+    service = RewindService(session_factory, stream_manager=StreamManager())
+
+    with pytest.raises(WorkspaceMutationError, match="durable identity"):
+        await service.execute(
+            session_id="session",
+            workspace_instance_id=binding.workspace_instance_id,
+            checkpoint_id=binding.checkpoint_id,
+        )
+
+    assert (workspace / "file.txt").read_text(encoding="utf-8") == "replacement"
+    assert not (workspace / ".suxiaoyou" / "workspace-identity-v2").exists()
+    async with session_factory() as db:
+        checkpoint = await db.get(SessionCheckpoint, binding.checkpoint_id)
+    assert checkpoint is not None
+    assert checkpoint.state == "finalized"
 
 
 @pytest.mark.asyncio

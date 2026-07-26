@@ -20,7 +20,7 @@ from app.models.turn_run import TurnRun
 from app.models.workspace_instance import WorkspaceInstance
 from app.schemas.agent import Ruleset
 from app.schemas.provider import ModelCapabilities, ModelInfo, StreamChunk
-from app.storage.checkpoints import inspect_workspace_identity
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.streaming.manager import GenerationJob
 from app.validation_agent import (
     DeterministicValidationFailure,
@@ -200,7 +200,9 @@ async def _seed_source(
     checkpoint_id: str = "checkpoint",
 ) -> GenerationJob:
     workspace.mkdir()
-    canonical_workspace, identity_token = inspect_workspace_identity(workspace)
+    identity = ensure_workspace_identity(workspace)
+    canonical_workspace = str(identity.canonical_path)
+    identity_token = identity.durable_token
     now = datetime.now(timezone.utc)
     async with session_factory() as db:
         async with db.begin():
@@ -1197,7 +1199,7 @@ async def test_replaced_workspace_directory_cannot_inherit_checkpoint_identity(
         ValidationRoundResult(_model_output("pass"), 1, successful_read_calls=1)
     )
 
-    with pytest.raises(ValidationSourceError, match="identity changed"):
+    with pytest.raises(ValidationSourceError, match="identity is unavailable"):
         await _service(session_factory, runner).validate(
             parent_job=parent,
             checkpoint_id="checkpoint",

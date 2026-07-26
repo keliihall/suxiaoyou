@@ -20,6 +20,7 @@ from app.acp.server import (
     SESSION_LIMIT_REACHED,
 )
 from app.acp.bridge import ReversePermissionUnavailable
+from app.version import APP_VERSION
 
 from .conftest import CaptureWriter, RecordingBridge, WireHarness
 
@@ -105,7 +106,7 @@ async def test_initialize_negotiates_v1_and_advertises_only_backed_capabilities(
             "agentInfo": {
                 "name": "suxiaoyou",
                 "title": "苏小有",
-                "version": "1.1.0",
+                "version": APP_VERSION,
             },
             "authMethods": [],
         },

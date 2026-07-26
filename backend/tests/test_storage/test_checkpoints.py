@@ -507,6 +507,7 @@ async def test_change_validation_and_database_require_before_sha256(
             await db.flush()
 
 
+@pytest.mark.workspace_identity_v2
 def test_durable_owner_pins_survive_retention_and_old_manifest_shape(
     tmp_path: Path,
 ) -> None:
@@ -530,7 +531,7 @@ def test_durable_owner_pins_survive_retention_and_old_manifest_shape(
     assert store.pin_versions("checkpoint:one", [version_a.id]) == frozenset()
     assert json.loads(store.manifest_path.read_text(encoding="utf-8"))[
         "schema_version"
-    ] == 2
+    ] == 3
 
     target.write_text("B", encoding="utf-8")
     version_b = store.capture_before_mutation(target, operation="edit")
@@ -555,6 +556,10 @@ def test_durable_owner_pins_survive_retention_and_old_manifest_shape(
     # v1 manifests written before checkpoint pins remain readable.
     manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
     manifest["schema_version"] = 1
+    manifest["workspace_identity"] = {
+        "dev": store._workspace_identity[0],
+        "ino": store._workspace_identity[1],
+    }
     manifest.pop("pins")
     store.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     assert store.list_pins() == {}
@@ -562,7 +567,7 @@ def test_durable_owner_pins_survive_retention_and_old_manifest_shape(
     assert store.capture_before_mutation(target, operation="edit") is not None
     assert json.loads(store.manifest_path.read_text(encoding="utf-8"))[
         "schema_version"
-    ] == 2
+    ] == 3
 
 
 def test_v100_head_migrates_to_current_v110_schema(tmp_path: Path) -> None:

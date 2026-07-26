@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -13,6 +15,7 @@ from app.schemas.agent import AgentInfo
 from app.office_validation.draft import OfficeDraftSeal
 from app.storage import file_versions as file_versions_module
 from app.storage.file_versions import FileVersionStore
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool.context import ToolContext
 from app.tool import workspace_transaction as transaction_module
 from app.tool.workspace_transaction import (
@@ -22,6 +25,7 @@ from app.tool.workspace_transaction import (
     committed_checkpoint_journal_action,
     list_committed_checkpoint_journals,
     recover_pending_workspace_transactions,
+    recover_pending_workspace_transactions_isolated,
 )
 
 
@@ -47,7 +51,31 @@ def _transaction(
     )
 
 
+def _single_pending_journal(private: Path) -> Path:
+    journals = list(
+        private.glob("execution-transactions/*/tx-*/journal-v1.json")
+    )
+    assert len(journals) == 1
+    return journals[0]
+
+
+def _rewrite_pending_journal(
+    private: Path,
+    transform: Callable[[dict[str, object]], None],
+) -> dict[str, object]:
+    journal = _single_pending_journal(private)
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    transform(payload)
+    journal.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _checkpoint_context(workspace: Path, *, checkpoint_id: str) -> ToolContext:
+    identity = ensure_workspace_identity(workspace)
     return ToolContext(
         session_id="session",
         message_id="message",
@@ -58,7 +86,47 @@ def _checkpoint_context(workspace: Path, *, checkpoint_id: str) -> ToolContext:
         turn_run_id="turn-run",
         checkpoint_id=checkpoint_id,
         workspace_instance_id="workspace-instance",
+        workspace_identity_token=identity.durable_token,
     )
+
+
+@pytest.mark.workspace_identity_v2
+def test_bound_transaction_rejects_replaced_workspace_before_staging(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    original = tmp_path / "original-workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    admitted = ensure_workspace_identity(workspace)
+    workspace.rename(original)
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_text("replacement", encoding="utf-8")
+    context = ToolContext(
+        session_id="session",
+        message_id="message",
+        agent=AgentInfo(name="test", description="", mode="primary"),
+        call_id="call",
+        workspace=str(workspace),
+        checkpoint_id="checkpoint",
+        workspace_instance_id="workspace-instance",
+        workspace_identity_token=admitted.durable_token,
+    )
+    transaction = WorkspaceMutationTransaction(
+        workspace,
+        context,
+        operation="test.command",
+        storage_root=private,
+    )
+
+    with pytest.raises(WorkspaceMutationError, match="durable identity"):
+        transaction.prepare_paths([target])
+
+    assert transaction.transaction_root is None
+    assert target.read_text(encoding="utf-8") == "replacement"
+    assert not (workspace / ".suxiaoyou" / "workspace-identity-v2").exists()
+    assert not (private / "execution-transactions").exists()
 
 
 def _office_seal(
@@ -275,7 +343,11 @@ def test_office_sealed_create_builds_fresh_workspace_output_parent(
 
     assert target.read_bytes() == b"validated create"
     assert result.written_files == (str(target),)
-    assert tuple(path.name for path in workspace.iterdir()) == (
+    assert tuple(
+        path.name
+        for path in workspace.iterdir()
+        if path.name != ".suxiaoyou"
+    ) == (
         "suxiaoyou_written",
     )
 
@@ -304,6 +376,7 @@ def test_office_sealed_create_builds_only_nested_missing_ancestor_chain(
     assert sorted(
         path.relative_to(workspace).as_posix()
         for path in workspace.rglob("*")
+        if ".suxiaoyou" not in path.relative_to(workspace).parts
     ) == [
         "deliverables",
         "deliverables/2026",
@@ -726,7 +799,15 @@ def test_checkpoint_journal_records_explicit_turn_commit_action(
 
     assert result.checkpoint_journal_token is not None
     assert len(journals) == 1
-    assert committed_checkpoint_journal_action(journals[0][1]) == (
+    payload = journals[0][1]
+    identity = transaction_module.inspect_workspace_identity(workspace)
+    assert payload["schema_version"] == 5
+    assert payload["workspace_identity"] == {
+        "token": identity.durable_token,
+        "dev": identity.volatile_identity[0],
+        "ino": identity.volatile_identity[1],
+    }
+    assert committed_checkpoint_journal_action(payload) == (
         "turn_commit",
         (),
     )
@@ -1868,6 +1949,216 @@ def test_startup_recovery_rolls_back_a_process_crash_mid_commit(
     assert not (private / "execution-transactions").exists()
 
 
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    transaction_module.sys.platform == "win32",
+    reason="exercises POSIX full-workspace marker recovery",
+)
+def test_schema_v5_recovery_uses_marker_not_persisted_device_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    target = workspace / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare()
+    (staged / target.name).write_text("command", encoding="utf-8")
+    real_exchange = transaction_module._exchange_prepared_at
+
+    def crash_after_exchange(workspace_fd: int, temporary: object) -> None:
+        real_exchange(workspace_fd, temporary)
+        raise KeyboardInterrupt("simulated process death")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_exchange_prepared_at",
+        crash_after_exchange,
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated process death"):
+        transaction.commit()
+    assert target.read_text(encoding="utf-8") == "command"
+
+    def rewrite_device_evidence(payload: dict[str, object]) -> None:
+        assert payload["schema_version"] == 5
+        raw_identity = payload["workspace_identity"]
+        assert isinstance(raw_identity, dict)
+        assert isinstance(raw_identity.get("token"), str)
+        raw_identity["dev"] = int(raw_identity["dev"]) + 1
+
+    _rewrite_pending_journal(private, rewrite_device_evidence)
+
+    recovered = recover_pending_workspace_transactions(storage_root=private)
+
+    assert len(recovered) == 1
+    assert target.read_text(encoding="utf-8") == "before"
+    assert not (private / "execution-transactions").exists()
+
+
+@pytest.mark.workspace_identity_v2
+def test_schema_v5_recovery_rejects_a_different_durable_marker(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    current = transaction_module.ensure_workspace_identity(workspace)
+    foreign_token = (
+        f"marker-v2:{'0' * 64}"
+        if current.durable_token != f"marker-v2:{'0' * 64}"
+        else f"marker-v2:{'1' * 64}"
+    )
+    payload = {
+        "schema_version": 5,
+        "workspace_identity": {
+            "token": foreign_token,
+            "dev": current.volatile_identity[0],
+            "ino": current.volatile_identity[1],
+        },
+    }
+
+    with pytest.raises(WorkspaceMutationError, match="Workspace root changed"):
+        transaction_module._journal_recovery_workspace_identity(
+            payload,
+            current.canonical_path,
+        )
+
+
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    transaction_module.sys.platform == "win32",
+    reason="exercises the legacy macOS device-renumbering path",
+)
+def test_legacy_recovery_blocks_ambiguous_macos_device_only_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    target = workspace / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    transaction = _transaction(workspace, private)
+    staged = transaction.prepare()
+    (staged / target.name).write_text("command", encoding="utf-8")
+    real_exchange = transaction_module._exchange_prepared_at
+
+    def crash_after_exchange(workspace_fd: int, temporary: object) -> None:
+        real_exchange(workspace_fd, temporary)
+        raise KeyboardInterrupt("simulated process death")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_exchange_prepared_at",
+        crash_after_exchange,
+    )
+    with pytest.raises(KeyboardInterrupt, match="simulated process death"):
+        transaction.commit()
+
+    def downgrade_with_device_drift(payload: dict[str, object]) -> None:
+        payload["schema_version"] = 4
+        raw_identity = payload["workspace_identity"]
+        assert isinstance(raw_identity, dict)
+        raw_identity.pop("token")
+        raw_identity["dev"] = int(raw_identity["dev"]) + 1
+
+    _rewrite_pending_journal(private, downgrade_with_device_drift)
+    monkeypatch.setattr(transaction_module.sys, "platform", "darwin")
+
+    with pytest.raises(WorkspaceMutationError, match="Workspace root changed"):
+        recover_pending_workspace_transactions(storage_root=private)
+
+    report = recover_pending_workspace_transactions_isolated(storage_root=private)
+
+    assert report.recovered == ()
+    assert len(report.blocked) == 1
+    assert target.read_text(encoding="utf-8") == "command"
+    assert (private / "execution-transactions").exists()
+
+
+@pytest.mark.workspace_identity_v2
+@pytest.mark.skipif(
+    transaction_module.sys.platform == "win32",
+    reason="exercises POSIX full-workspace journal isolation",
+)
+@pytest.mark.parametrize("blocked_kind", ["corrupt", "missing", "replaced"])
+def test_isolated_startup_recovery_preserves_bad_journal_and_recovers_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_kind: str,
+) -> None:
+    private = tmp_path / "private"
+    monkeypatch.setenv("SUXIAOYOU_PRIVATE_DATA_DIR", str(private))
+    workspaces = {
+        name: tmp_path / name for name in ("blocked-workspace", "healthy-workspace")
+    }
+    for workspace in workspaces.values():
+        workspace.mkdir()
+        (workspace / "target.txt").write_text("before", encoding="utf-8")
+
+    real_exchange = transaction_module._exchange_prepared_at
+
+    def crash_after_exchange(workspace_fd: int, temporary: object) -> None:
+        real_exchange(workspace_fd, temporary)
+        raise KeyboardInterrupt("simulated process death")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_exchange_prepared_at",
+        crash_after_exchange,
+    )
+    for workspace in workspaces.values():
+        transaction = _transaction(workspace, private)
+        staged = transaction.prepare()
+        (staged / "target.txt").write_text("command", encoding="utf-8")
+        with pytest.raises(KeyboardInterrupt, match="simulated process death"):
+            transaction.commit()
+
+    blocked_workspace = workspaces["blocked-workspace"]
+    blocked_key = hashlib.sha256(
+        os.fsencode(str(blocked_workspace.resolve()))
+    ).hexdigest()
+    blocked_root = private / "execution-transactions" / blocked_key
+    blocked_journals = list(blocked_root.glob("tx-*/journal-v1.json"))
+    assert len(blocked_journals) == 1
+    blocked_journal = blocked_journals[0]
+    moved_workspace = tmp_path / "moved-blocked-workspace"
+    if blocked_kind == "corrupt":
+        blocked_journal.write_text("{not-json", encoding="utf-8")
+    elif blocked_kind == "missing":
+        blocked_journal.unlink()
+    else:
+        blocked_workspace.rename(moved_workspace)
+        blocked_workspace.mkdir()
+        (blocked_workspace / "target.txt").write_text(
+            "replacement root",
+            encoding="utf-8",
+        )
+
+    report = recover_pending_workspace_transactions_isolated(storage_root=private)
+
+    assert len(report.recovered) == 1
+    assert len(report.blocked) == 1
+    assert blocked_root.exists()
+    assert (
+        workspaces["healthy-workspace"] / "target.txt"
+    ).read_text(encoding="utf-8") == "before"
+    if blocked_kind == "replaced":
+        assert (blocked_workspace / "target.txt").read_text(encoding="utf-8") == (
+            "replacement root"
+        )
+        assert (moved_workspace / "target.txt").read_text(encoding="utf-8") == (
+            "command"
+        )
+    else:
+        assert (blocked_workspace / "target.txt").read_text(encoding="utf-8") == (
+            "command"
+        )
+
+
 def test_startup_recovery_leaves_matching_undeleted_directory_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2075,9 +2366,11 @@ def test_startup_recovery_keeps_a_fully_committed_journal(
     assert not (private / "execution-transactions").exists()
 
 
+@pytest.mark.parametrize("legacy_schema", [False, True], ids=["v5", "legacy-v4"])
 def test_startup_recovery_rejects_workspace_root_identity_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_schema: bool,
 ) -> None:
     workspace = tmp_path / "workspace"
     private = tmp_path / "private"
@@ -2097,6 +2390,15 @@ def test_startup_recovery_rejects_workspace_root_identity_replacement(
     monkeypatch.setattr(transaction_module, "_exchange_prepared_at", crash_after_exchange)
     with pytest.raises(KeyboardInterrupt):
         transaction.commit()
+    if legacy_schema:
+
+        def downgrade(payload: dict[str, object]) -> None:
+            payload["schema_version"] = 4
+            raw_identity = payload["workspace_identity"]
+            assert isinstance(raw_identity, dict)
+            raw_identity.pop("token")
+
+        _rewrite_pending_journal(private, downgrade)
     moved = tmp_path / "moved-workspace"
     workspace.rename(moved)
     workspace.mkdir()

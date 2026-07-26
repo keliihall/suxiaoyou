@@ -32,6 +32,7 @@ from app.office_validation.precommit import (
 )
 from app.schemas.agent import AgentInfo
 from app.storage.checkpoints import register_workspace_instance
+from app.storage.workspace_identity import ensure_workspace_identity
 from app.tool.builtin.office import OfficeTool
 from app.tool.context import ToolContext
 from app.tool.workspace_transaction import (
@@ -116,18 +117,22 @@ class _TemplateEnvironment:
         coordinator: Any | None = None,
         repairer: Any | None = None,
     ) -> ToolContext:
+        selected_workspace = (workspace or self.workspace).resolve()
         ctx = ToolContext(
             session_id=session_id or self.session_id,
             message_id=f"user-template-message-{suffix}",
             agent=AgentInfo(name="test", description="", mode="primary"),
             call_id=f"user-template-call-{suffix}",
             language="en",
-            workspace=str((workspace or self.workspace).resolve()),
+            workspace=str(selected_workspace),
             root_turn_id=f"user-template-root-{suffix}",
             turn_run_id=f"user-template-run-{suffix}",
             checkpoint_id=f"user-template-checkpoint-{suffix}",
             workspace_instance_id=(
                 workspace_instance_id or self.workspace_instance_id
+            ),
+            workspace_identity_token=(
+                ensure_workspace_identity(selected_workspace).durable_token
             ),
         )
         state: dict[str, object] = {

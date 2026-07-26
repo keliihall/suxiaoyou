@@ -40,6 +40,12 @@ from app.storage.file_versions import (
     FileVersionStore,
     default_file_version_storage_root,
 )
+from app.storage.workspace_identity import (
+    WorkspaceIdentityError,
+    WorkspaceIdentityState,
+    ensure_workspace_identity,
+    inspect_workspace_identity,
+)
 from app.tool.context import ToolContext
 from app.tool.sandbox import validate_workspace_private_boundary
 from app.utils.atomic_write import atomic_write_text
@@ -72,8 +78,8 @@ MAX_STAGED_ENTRIES: Final = 50_000
 _COPY_CHUNK_BYTES: Final = 1024 * 1024
 _INTERNAL_ROOT: Final = ".suxiaoyou"
 _JOURNAL_NAME: Final = "journal-v1.json"
-_JOURNAL_SCHEMA_VERSION: Final = 4
-_SUPPORTED_JOURNAL_SCHEMA_VERSIONS: Final = frozenset({1, 2, 3, 4})
+_JOURNAL_SCHEMA_VERSION: Final = 5
+_SUPPORTED_JOURNAL_SCHEMA_VERSIONS: Final = frozenset({1, 2, 3, 4, 5})
 
 
 class WorkspaceMutationError(RuntimeError):
@@ -166,6 +172,49 @@ class _WindowsWorkspaceAnchor:
     api: Win32Backend
     identity: tuple[int, int]
     held_directory_handles: list[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _JournalRecoveryIdentity:
+    """Root identity selected after validating a persisted journal owner."""
+
+    volatile_identity: tuple[int, int]
+    durable_token: str | None
+    legacy_identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRecoveryBlocker:
+    """One journal that startup preserved because recovery was not provable.
+
+    The owner fields are deliberately best-effort and are used only to defer
+    cleanup.  They never authorize a filesystem or database mutation.  When
+    ``provenance_unknown`` is true, checkpoint startup must conservatively
+    avoid cleanup whose owner could be this journal.
+    """
+
+    token: str
+    checkpoint_ids: tuple[str, ...]
+    turn_run_ids: tuple[str, ...]
+    workspace_instance_ids: tuple[str, ...]
+    provenance_unknown: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceTransactionRecoveryReport:
+    """Outcome of the non-fatal startup transaction recovery pass."""
+
+    recovered: tuple[str, ...]
+    blocked: tuple[WorkspaceRecoveryBlocker, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedCheckpointJournalScan:
+    """Valid committed journals plus entries unsafe to interpret."""
+
+    journals: tuple[tuple[str, dict[str, object]], ...]
+    blocked: tuple[WorkspaceRecoveryBlocker, ...]
 
 
 _LOCKS_GUARD = threading.Lock()
@@ -363,6 +412,7 @@ class WorkspaceMutationTransaction:
         self._baseline_hardlinks: dict[str, tuple[str, ...]] | None = None
         self._baseline_linked_paths: frozenset[str] | None = None
         self._workspace_identity: tuple[int, int] | None = None
+        self._workspace_durable_token: str | None = None
         self._targeted_scope_paths: tuple[str, ...] | None = None
         self._targeted_mutation_paths: frozenset[str] | None = None
         self._targeted_read_paths: frozenset[str] | None = None
@@ -390,6 +440,14 @@ class WorkspaceMutationTransaction:
         root_info = self.workspace.stat(follow_symlinks=False)
         if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
             raise WorkspaceMutationError("Workspace root is redirected")
+        identity = self._ensure_workspace_identity()
+        if identity.volatile_identity != _path_identity(
+            self.workspace,
+            directory=True,
+        ):
+            raise WorkspaceMutationError(
+                "Workspace root changed while its durable identity was prepared"
+            )
         baseline = _scan_workspace(self.workspace)
         baseline_hardlinks = _scan_hardlink_groups(self.workspace)
         baseline_linked_paths = _scan_multiply_linked_paths(self.workspace)
@@ -426,20 +484,24 @@ class WorkspaceMutationTransaction:
                 raise WorkspaceMutationError(
                     "Workspace hard-link topology changed while its isolated view was prepared"
                 )
+            self._assert_durable_workspace_identity()
         except Exception:
             shutil.rmtree(transaction_root, ignore_errors=True)
             if self.transaction_root == transaction_root:
                 self.transaction_root = None
+            self._workspace_identity = None
+            self._workspace_durable_token = None
             raise
 
         if self._finished:
             shutil.rmtree(transaction_root, ignore_errors=True)
+            self._workspace_identity = None
+            self._workspace_durable_token = None
             raise WorkspaceMutationError("Workspace transaction was cancelled during preparation")
         self.staged_workspace = staged
         self._baseline = baseline
         self._baseline_hardlinks = baseline_hardlinks
         self._baseline_linked_paths = baseline_linked_paths
-        self._workspace_identity = _path_identity(self.workspace, directory=True)
         self._targeted_scope_paths = None
         self._targeted_mutation_paths = None
         self._targeted_read_paths = None
@@ -492,7 +554,14 @@ class WorkspaceMutationTransaction:
         root_info = self.workspace.stat(follow_symlinks=False)
         if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
             raise WorkspaceMutationError("Workspace root is redirected")
-        self._workspace_identity = _path_identity(self.workspace, directory=True)
+        identity = self._ensure_workspace_identity()
+        if identity.volatile_identity != _path_identity(
+            self.workspace,
+            directory=True,
+        ):
+            raise WorkspaceMutationError(
+                "Workspace root changed while its durable identity was prepared"
+            )
         if sys.platform == "win32":
             _preflight_windows_targeted_parents(
                 self.workspace,
@@ -588,15 +657,19 @@ class WorkspaceMutationTransaction:
                 ):
                     os.chmod(staged / relative, mode)
                 os.chmod(staged, stat.S_IMODE(root_info.st_mode))
+                self._assert_durable_workspace_identity()
         except Exception:
             shutil.rmtree(transaction_root, ignore_errors=True)
             if self.transaction_root == transaction_root:
                 self.transaction_root = None
             self._workspace_identity = None
+            self._workspace_durable_token = None
             raise
 
         if self._finished:
             shutil.rmtree(transaction_root, ignore_errors=True)
+            self._workspace_identity = None
+            self._workspace_durable_token = None
             raise WorkspaceMutationError("Workspace transaction was cancelled during preparation")
         self.staged_workspace = staged
         # The baseline is the complete sparse view, not a recursive view of the
@@ -1078,6 +1151,7 @@ class WorkspaceMutationTransaction:
                     self.workspace,
                     expected_identity=self._workspace_identity,
                 ) as workspace_fd:
+                    self._assert_durable_workspace_identity()
                     return self._commit_with_fd(
                         workspace_fd,
                         office_seal=office_seal,
@@ -1169,6 +1243,7 @@ class WorkspaceMutationTransaction:
         store = FileVersionStore(
             self.workspace,
             expected_workspace_identity=self._workspace_identity,
+            expected_durable_workspace_identity=self._workspace_durable_token,
         )
         try:
             versions = store.capture_batch_before_mutation(
@@ -1181,6 +1256,7 @@ class WorkspaceMutationTransaction:
         except FileVersionError as exc:
             raise WorkspaceMutationError(str(exc)) from exc
         _assert_workspace_path_identity(self.workspace, self._workspace_identity)
+        self._assert_durable_workspace_identity()
         version_by_path = {version.relative_path: version for version in versions}
         if (
             len(versions) != len(versioned_existing)
@@ -1431,8 +1507,10 @@ class WorkspaceMutationTransaction:
                         )
                 self._assert_targeted_read_dependencies(workspace_fd)
                 _assert_workspace_path_identity(self.workspace, self._workspace_identity)
+                self._assert_durable_workspace_identity()
                 self._write_journal_state("committed")
                 _assert_workspace_path_identity(self.workspace, self._workspace_identity)
+                self._assert_durable_workspace_identity()
         except Exception as exc:
             if not attempted_writes and prepared and not self._preserve_for_recovery:
                 # A sealed create may have provisionally created missing
@@ -1730,6 +1808,8 @@ class WorkspaceMutationTransaction:
             self._office_precommit_root_identity = None
             self._office_precommit_generation = None
             self._journal_payload = None
+            self._workspace_identity = None
+            self._workspace_durable_token = None
         self._finished = True
 
     def _checkpoint_journal_token(self) -> str:
@@ -1769,6 +1849,8 @@ class WorkspaceMutationTransaction:
         self._office_precommit_root_identity = None
         self._office_precommit_generation = None
         self._journal_payload = None
+        self._workspace_identity = None
+        self._workspace_durable_token = None
         self._finished = True
 
     def _write_prepared_journal(
@@ -1783,6 +1865,13 @@ class WorkspaceMutationTransaction:
         root = self.transaction_root
         if root is None:
             raise WorkspaceMutationError("Workspace transaction journal has no root")
+        if (
+            self._workspace_identity is None
+            or self._workspace_durable_token is None
+        ):
+            raise WorkspaceMutationError(
+                "Workspace transaction durable identity is unavailable"
+            )
         version_by_path = {version.relative_path: version.id for version in versions}
         existing: dict[str, object] = {}
         existing_symlinks: dict[str, object] = {}
@@ -1828,11 +1917,10 @@ class WorkspaceMutationTransaction:
             "state": "prepared",
             "workspace": str(self.workspace),
             "workspace_identity": {
+                "token": self._workspace_durable_token,
                 "dev": self._workspace_identity[0],
                 "ino": self._workspace_identity[1],
-            }
-            if self._workspace_identity is not None
-            else None,
+            },
             "operation": self.operation,
             "existing": existing,
             "existing_symlinks": existing_symlinks,
@@ -1926,6 +2014,65 @@ class WorkspaceMutationTransaction:
         payload = {**payload, "state": state}
         _persist_journal(root / _JOURNAL_NAME, payload)
         self._journal_payload = payload
+
+    def _ensure_workspace_identity(self) -> WorkspaceIdentityState:
+        """Read the admitted durable identity before creating any stage.
+
+        A checkpoint-aware context is already bound to a database-owned
+        workspace instance.  It must inspect rather than ensure here: ensuring
+        an unmarked replacement directory would mint a new identity for an
+        attacker-controlled root before discovering the mismatch.
+        """
+
+        try:
+            expected_token = self.ctx.workspace_identity_token
+            if self.ctx.workspace_instance_id is not None:
+                if not isinstance(expected_token, str) or not expected_token.strip():
+                    raise WorkspaceMutationError(
+                        "Workspace transaction is missing its admitted durable identity"
+                    )
+                identity = inspect_workspace_identity(self.workspace)
+                if identity.durable_token != expected_token:
+                    raise WorkspaceMutationError(
+                        "Workspace no longer matches its admitted durable identity"
+                    )
+            else:
+                identity = ensure_workspace_identity(self.workspace)
+        except WorkspaceIdentityError as exc:
+            raise WorkspaceMutationError(
+                "Workspace durable identity is unavailable or changed"
+            ) from exc
+        if identity.canonical_path != self.workspace:
+            raise WorkspaceMutationError(
+                "Workspace durable identity resolved to a different path"
+            )
+        self._workspace_identity = identity.volatile_identity
+        self._workspace_durable_token = identity.durable_token
+        return identity
+
+    def _assert_durable_workspace_identity(self) -> None:
+        """Reject marker or native-root replacement during a live operation."""
+
+        volatile_identity = self._workspace_identity
+        durable_token = self._workspace_durable_token
+        if volatile_identity is None or durable_token is None:
+            raise WorkspaceMutationError(
+                "Workspace transaction durable identity is unavailable"
+            )
+        try:
+            identity = inspect_workspace_identity(self.workspace)
+        except WorkspaceIdentityError as exc:
+            raise WorkspaceMutationError(
+                "Workspace durable identity changed during transaction"
+            ) from exc
+        if (
+            identity.canonical_path != self.workspace
+            or identity.volatile_identity != volatile_identity
+            or identity.durable_token != durable_token
+        ):
+            raise WorkspaceMutationError(
+                "Workspace durable identity changed during transaction"
+            )
 
     def _require_stage(self) -> Path:
         if self.staged_workspace is None:
@@ -4037,6 +4184,207 @@ def recover_pending_workspace_transactions(
     return recovered
 
 
+def describe_workspace_recovery_blocker(
+    token: str,
+    payload: dict[str, object] | None,
+    error: BaseException | str,
+    *,
+    trusted_provenance: bool = False,
+) -> WorkspaceRecoveryBlocker:
+    """Extract only conservative cleanup exclusions from an unsafe journal.
+
+    A malformed value can increase the amount of deferred cleanup, but it can
+    never grant authority to replay a journal.  Complete provenance requires
+    all database owner fields used by checkpoint/rewind recovery, and the
+    caller must separately have validated those fields against the ledger.
+    Syntactically plausible values from a blocked journal are not proof.
+    """
+
+    checkpoint_ids: list[str] = []
+    turn_run_ids: list[str] = []
+    workspace_instance_ids: list[str] = []
+    complete = False
+    if isinstance(payload, dict):
+        runtime = payload.get("runtime_checkpoint")
+        if isinstance(runtime, dict):
+            required = (
+                "session_id",
+                "checkpoint_id",
+                "workspace_instance_id",
+                "root_turn_id",
+                "turn_run_id",
+            )
+            complete = all(
+                isinstance(runtime.get(key), str) and bool(runtime[key])
+                for key in required
+            )
+            checkpoint_id = runtime.get("checkpoint_id")
+            if isinstance(checkpoint_id, str) and checkpoint_id:
+                checkpoint_ids.append(checkpoint_id)
+            turn_run_id = runtime.get("turn_run_id")
+            if isinstance(turn_run_id, str) and turn_run_id:
+                turn_run_ids.append(turn_run_id)
+            workspace_instance_id = runtime.get("workspace_instance_id")
+            if isinstance(workspace_instance_id, str) and workspace_instance_id:
+                workspace_instance_ids.append(workspace_instance_id)
+
+            action = runtime.get("action")
+            raw_rewind_ids = runtime.get("rewind_checkpoint_ids")
+            schema_version = payload.get("schema_version")
+            if isinstance(schema_version, int) and schema_version < 4:
+                action = "turn_commit"
+                raw_rewind_ids = []
+            if action not in {"turn_commit", "rewind"}:
+                complete = False
+            if not isinstance(raw_rewind_ids, list) or any(
+                not isinstance(value, str) or not value
+                for value in raw_rewind_ids
+            ):
+                complete = False
+            else:
+                checkpoint_ids.extend(str(value) for value in raw_rewind_ids)
+                if action == "rewind" and (
+                    not raw_rewind_ids or checkpoint_id not in raw_rewind_ids
+                ):
+                    complete = False
+                if action == "turn_commit" and raw_rewind_ids:
+                    complete = False
+
+    reason = str(error)
+    if not isinstance(error, str):
+        reason = f"{type(error).__name__}: {error}"
+    return WorkspaceRecoveryBlocker(
+        token=token,
+        checkpoint_ids=tuple(dict.fromkeys(checkpoint_ids)),
+        turn_run_ids=tuple(dict.fromkeys(turn_run_ids)),
+        workspace_instance_ids=tuple(dict.fromkeys(workspace_instance_ids)),
+        provenance_unknown=not (complete and trusted_provenance),
+        reason=reason,
+    )
+
+
+def recover_pending_workspace_transactions_isolated(
+    *,
+    storage_root: str | os.PathLike[str] | None = None,
+    preserve_committed_checkpoint_journals: bool = False,
+) -> WorkspaceTransactionRecoveryReport:
+    """Recover independent transactions without letting one block startup.
+
+    Unlike the strict API, every entry that cannot be proven safe is preserved
+    byte-for-byte for a later retry or diagnosis.  This is the only variant the
+    application startup path should call.
+    """
+
+    private_base = Path(
+        storage_root
+        if storage_root is not None
+        else default_file_version_storage_root().parent
+    ).expanduser()
+    root = Path(os.path.abspath(private_base)) / "execution-transactions"
+    if not root.exists():
+        return WorkspaceTransactionRecoveryReport((), ())
+
+    recovered: list[str] = []
+    blocked: list[WorkspaceRecoveryBlocker] = []
+    try:
+        _require_guarded_workspace_mutation_support()
+        if _path_is_redirected(root) or not root.is_dir():
+            raise WorkspaceMutationError(
+                f"Transaction recovery root is redirected: {root}"
+            )
+        workspace_roots = sorted(root.iterdir())
+    except Exception as exc:
+        blocker = describe_workspace_recovery_blocker("<recovery-root>", None, exc)
+        logger.error("Workspace transaction recovery root was preserved: %s", exc)
+        return WorkspaceTransactionRecoveryReport((), (blocker,))
+
+    for workspace_root in workspace_roots:
+        workspace_token = workspace_root.name
+        try:
+            if _path_is_redirected(workspace_root) or not workspace_root.is_dir():
+                raise WorkspaceMutationError(
+                    "Transaction recovery workspace root is redirected: "
+                    f"{workspace_root}"
+                )
+            transaction_roots = sorted(workspace_root.iterdir())
+        except Exception as exc:
+            blocked.append(
+                describe_workspace_recovery_blocker(workspace_token, None, exc)
+            )
+            logger.error(
+                "Workspace transaction owner was preserved during startup: %s",
+                exc,
+            )
+            continue
+
+        for transaction_root in transaction_roots:
+            token = f"{workspace_token}/{transaction_root.name}"
+            payload: dict[str, object] | None = None
+            try:
+                if _path_is_redirected(transaction_root) or not transaction_root.is_dir():
+                    raise WorkspaceMutationError(
+                        "Transaction recovery entry is redirected: "
+                        f"{transaction_root}"
+                    )
+                journal_path = transaction_root / _JOURNAL_NAME
+                if not journal_path.exists():
+                    raise WorkspaceMutationError(
+                        f"Transaction recovery entry has no journal: {transaction_root}"
+                    )
+                payload = _load_journal(journal_path)
+                state = payload.get("state")
+                if state == "committed":
+                    _cleanup_committed_journal_temporaries(
+                        payload,
+                        expected_workspace_key=workspace_token,
+                    )
+                    if (
+                        preserve_committed_checkpoint_journals
+                        and isinstance(payload.get("runtime_checkpoint"), dict)
+                    ):
+                        recovered.append(transaction_root.name)
+                        continue
+                    shutil.rmtree(transaction_root)
+                    recovered.append(transaction_root.name)
+                    continue
+                if state == "rolled_back":
+                    shutil.rmtree(transaction_root)
+                    recovered.append(transaction_root.name)
+                    continue
+                if state != "prepared":
+                    raise WorkspaceMutationError(
+                        f"Transaction journal has an invalid state: {journal_path}"
+                    )
+                _recover_prepared_journal(
+                    payload,
+                    expected_workspace_key=workspace_token,
+                )
+                shutil.rmtree(transaction_root)
+                recovered.append(transaction_root.name)
+            except Exception as exc:
+                blocked.append(
+                    describe_workspace_recovery_blocker(token, payload, exc)
+                )
+                logger.error(
+                    "Workspace transaction journal %s was preserved during startup: %s",
+                    token,
+                    exc,
+                )
+
+        try:
+            workspace_root.rmdir()
+        except OSError:
+            pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+    return WorkspaceTransactionRecoveryReport(
+        tuple(recovered),
+        tuple(blocked),
+    )
+
+
 def _load_journal(path: Path) -> dict[str, object]:
     if _path_is_redirected(path) or not path.is_file():
         raise WorkspaceMutationError(f"Transaction journal is redirected: {path}")
@@ -4100,6 +4448,93 @@ def list_committed_checkpoint_journals(
                 (f"{workspace_root.name}/{transaction_root.name}", payload)
             )
     return journals
+
+
+def scan_committed_checkpoint_journals_isolated(
+    *,
+    storage_root: str | os.PathLike[str] | None = None,
+) -> CommittedCheckpointJournalScan:
+    """List checkpoint journals while preserving and reporting bad siblings."""
+
+    private_base = Path(
+        storage_root
+        if storage_root is not None
+        else default_file_version_storage_root().parent
+    ).expanduser()
+    root = Path(os.path.abspath(private_base)) / "execution-transactions"
+    if not root.exists():
+        return CommittedCheckpointJournalScan((), ())
+
+    journals: list[tuple[str, dict[str, object]]] = []
+    blocked: list[WorkspaceRecoveryBlocker] = []
+    try:
+        if _path_is_redirected(root) or not root.is_dir():
+            raise WorkspaceMutationError(
+                f"Transaction recovery root is redirected: {root}"
+            )
+        workspace_roots = sorted(root.iterdir())
+    except Exception as exc:
+        blocker = describe_workspace_recovery_blocker("<recovery-root>", None, exc)
+        logger.error("Checkpoint journal recovery root is blocked: %s", exc)
+        return CommittedCheckpointJournalScan((), (blocker,))
+
+    for workspace_root in workspace_roots:
+        workspace_token = workspace_root.name
+        try:
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", workspace_token)
+                or _path_is_redirected(workspace_root)
+                or not workspace_root.is_dir()
+            ):
+                raise WorkspaceMutationError(
+                    f"Checkpoint journal workspace owner is invalid: {workspace_root}"
+                )
+            transaction_roots = sorted(workspace_root.iterdir())
+        except Exception as exc:
+            blocked.append(
+                describe_workspace_recovery_blocker(workspace_token, None, exc)
+            )
+            logger.error("Checkpoint journal owner is blocked: %s", exc)
+            continue
+
+        for transaction_root in transaction_roots:
+            token = f"{workspace_token}/{transaction_root.name}"
+            payload: dict[str, object] | None = None
+            try:
+                if (
+                    not re.fullmatch(r"tx-[A-Za-z0-9._-]+", transaction_root.name)
+                    or _path_is_redirected(transaction_root)
+                    or not transaction_root.is_dir()
+                ):
+                    raise WorkspaceMutationError(
+                        f"Checkpoint journal entry is invalid: {transaction_root}"
+                    )
+                journal_path = transaction_root / _JOURNAL_NAME
+                if not journal_path.exists():
+                    raise WorkspaceMutationError(
+                        f"Checkpoint journal entry has no journal: {transaction_root}"
+                    )
+                payload = _load_journal(journal_path)
+                if (
+                    payload.get("state") == "committed"
+                    and isinstance(payload.get("runtime_checkpoint"), dict)
+                ):
+                    journals.append((token, payload))
+                    continue
+                raise WorkspaceMutationError(
+                    "Retained transaction journal is not a committed checkpoint "
+                    f"bridge: {journal_path}"
+                )
+            except Exception as exc:
+                blocked.append(
+                    describe_workspace_recovery_blocker(token, payload, exc)
+                )
+                logger.error("Checkpoint journal %s is blocked: %s", token, exc)
+
+    return CommittedCheckpointJournalScan(
+        tuple(journals),
+        tuple(blocked),
+    )
 
 
 def committed_checkpoint_journal_metadata(
@@ -4271,8 +4706,9 @@ def committed_checkpoint_journal_action(
     """Validate and return the durable database action owned by a journal.
 
     Schema 1-3 journals predate rewind and are unambiguously ordinary tool
-    commits.  Schema 4 records the action explicitly so startup recovery can
-    never append reverse mutations to the forward checkpoint ledger.
+    commits.  Schema 4 and later record the action explicitly so startup
+    recovery can never append reverse mutations to the forward checkpoint
+    ledger.
     """
 
     if payload.get("state") != "committed":
@@ -4395,14 +4831,37 @@ def _recover_prepared_journal(
             "Transaction journal workspace does not match its private storage scope"
         )
 
-    expected_identity = _journal_workspace_identity(payload)
     with _workspace_commit_lock(actual_workspace_key):
+        recovery_identity = _journal_recovery_workspace_identity(payload, workspace)
         with _open_workspace_root_fd(
             workspace,
-            expected_identity=expected_identity,
+            expected_identity=recovery_identity.volatile_identity,
         ) as workspace_fd:
-            _recover_prepared_journal_with_fd(payload, workspace, workspace_fd)
-            _assert_workspace_path_identity(workspace, expected_identity)
+            if (
+                _journal_recovery_workspace_identity(payload, workspace)
+                != recovery_identity
+            ):
+                raise WorkspaceMutationError(
+                    "Workspace root changed during transaction recovery"
+                )
+            _recover_prepared_journal_with_fd(
+                payload,
+                workspace,
+                workspace_fd,
+                recovery_identity=recovery_identity,
+            )
+            _assert_workspace_path_identity(
+                workspace,
+                recovery_identity.volatile_identity,
+            )
+            current_identity = _journal_recovery_workspace_identity(
+                payload,
+                workspace,
+            )
+            if current_identity != recovery_identity:
+                raise WorkspaceMutationError(
+                    "Workspace root changed during transaction recovery"
+                )
 
 
 def _cleanup_committed_journal_temporaries(
@@ -4424,6 +4883,8 @@ def _cleanup_committed_journal_temporaries(
     new_paths = _journal_mapping(payload, "new_paths")
     temporary_paths = _journal_mapping(payload, "temporary_paths")
     if not temporary_paths:
+        with _workspace_commit_lock(actual_workspace_key):
+            _journal_recovery_workspace_identity(payload, workspace)
         return
     acceptable: dict[str, set[WorkspaceEntry]] = {}
     for relative, raw in existing.items():
@@ -4451,12 +4912,19 @@ def _cleanup_committed_journal_temporaries(
         acceptable[relative] = {_entry_from_journal(raw)}
     if set(temporary_paths) != set(acceptable):
         raise WorkspaceMutationError("Transaction journal temporary-path map is incomplete")
-    identity = _journal_workspace_identity(payload)
     with _workspace_commit_lock(actual_workspace_key):
+        recovery_identity = _journal_recovery_workspace_identity(payload, workspace)
         with _open_workspace_root_fd(
             workspace,
-            expected_identity=identity,
+            expected_identity=recovery_identity.volatile_identity,
         ) as workspace_fd:
+            if (
+                _journal_recovery_workspace_identity(payload, workspace)
+                != recovery_identity
+            ):
+                raise WorkspaceMutationError(
+                    "Workspace root changed during transaction recovery"
+                )
             for relative, raw_name in temporary_paths.items():
                 _validate_journal_temporary_name(raw_name)
                 sidecar = _PreparedPath(relative=relative, temporary_name=raw_name)
@@ -4465,12 +4933,22 @@ def _cleanup_committed_journal_temporaries(
                         "Preserving committed transaction recovery sidecar: %s",
                         _recovery_sidecar_path(workspace, sidecar),
                     )
+            current_identity = _journal_recovery_workspace_identity(
+                payload,
+                workspace,
+            )
+            if current_identity != recovery_identity:
+                raise WorkspaceMutationError(
+                    "Workspace root changed during transaction recovery"
+                )
 
 
 def _recover_prepared_journal_with_fd(
     payload: dict[str, object],
     workspace: Path,
     workspace_fd: int,
+    *,
+    recovery_identity: _JournalRecoveryIdentity,
 ) -> None:
 
     existing = _journal_mapping(payload, "existing")
@@ -4601,10 +5079,11 @@ def _recover_prepared_journal_with_fd(
                 f"it was not modified: {relative}"
             )
 
-    workspace_identity = _journal_workspace_identity(payload)
     store = FileVersionStore(
         workspace,
-        expected_workspace_identity=workspace_identity,
+        expected_workspace_identity=recovery_identity.volatile_identity,
+        expected_durable_workspace_identity=recovery_identity.durable_token,
+        legacy_workspace_identity=recovery_identity.legacy_identity,
     )
     if version_ids:
         try:
@@ -4937,11 +5416,91 @@ def _journal_workspace_identity(payload: dict[str, object]) -> tuple[int, int]:
     return dev, ino
 
 
+def _journal_durable_workspace_token(payload: dict[str, object]) -> str:
+    value = payload.get("workspace_identity")
+    if not isinstance(value, dict):
+        raise WorkspaceMutationError(
+            "Transaction journal workspace identity is invalid"
+        )
+    token = value.get("token")
+    if not isinstance(token, str) or not (
+        re.fullmatch(r"marker-v2:[0-9a-f]{64}", token)
+        or re.fullmatch(r"winfile-v2:[0-9]+:[0-9]+", token)
+    ):
+        raise WorkspaceMutationError(
+            "Transaction journal durable workspace identity is invalid"
+        )
+    return token
+
+
+def _journal_recovery_workspace_identity(
+    payload: dict[str, object],
+    workspace: Path,
+) -> _JournalRecoveryIdentity:
+    """Validate journal ownership and return a live native root identity.
+
+    Schema 5 journals are owned by the app marker.  Their persisted native
+    tuple documents the operation that wrote the journal, but is deliberately
+    not compared during startup: APFS can assign a different device number
+    after a valid reboot/remount.  The marker is checked first and the current
+    native tuple is then pinned for the recovery operation.
+
+    Schemas 1-4 have no durable marker.  Their native tuple must match exactly.
+    An inode by itself is not durable proof of ownership across a reboot,
+    remount, restore, or volume replacement, so ambiguous legacy journals are
+    preserved for diagnosis instead of being replayed automatically.
+    """
+
+    schema_version = payload.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_JOURNAL_SCHEMA_VERSIONS
+    ):
+        raise WorkspaceMutationError("Transaction journal schema is invalid")
+    journal_identity = _journal_workspace_identity(payload)
+    if schema_version == 5:
+        durable_token = _journal_durable_workspace_token(payload)
+        try:
+            current = inspect_workspace_identity(workspace)
+        except WorkspaceIdentityError as exc:
+            raise WorkspaceMutationError(
+                "Workspace root changed before transaction recovery"
+            ) from exc
+        if (
+            current.canonical_path != workspace
+            or current.durable_token != durable_token
+        ):
+            raise WorkspaceMutationError(
+                "Workspace root changed before transaction recovery"
+            )
+        return _JournalRecoveryIdentity(
+            volatile_identity=current.volatile_identity,
+            durable_token=durable_token,
+            legacy_identity=None,
+        )
+
+    current_identity = _path_identity(workspace, directory=True)
+    if current_identity != journal_identity:
+        raise WorkspaceMutationError(
+            "Workspace root changed before transaction recovery"
+        )
+    return _JournalRecoveryIdentity(
+        volatile_identity=current_identity,
+        durable_token=None,
+        legacy_identity=journal_identity,
+    )
+
+
 __all__ = [
+    "CommittedCheckpointJournalScan",
+    "WorkspaceRecoveryBlocker",
+    "WorkspaceTransactionRecoveryReport",
     "cleanup_committed_checkpoint_journal",
     "committed_checkpoint_journal_action",
     "committed_checkpoint_journal_metadata",
+    "describe_workspace_recovery_blocker",
     "list_committed_checkpoint_journals",
+    "scan_committed_checkpoint_journals_isolated",
     "WorkspaceChangeSet",
     "WorkspaceCommitResult",
     "WorkspaceMutationRecord",
@@ -4949,4 +5508,5 @@ __all__ = [
     "WorkspacePrecommitSealError",
     "WorkspaceMutationTransaction",
     "recover_pending_workspace_transactions",
+    "recover_pending_workspace_transactions_isolated",
 ]

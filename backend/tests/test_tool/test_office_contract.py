@@ -21,6 +21,7 @@ from app.tool.office_contract import (
     ("system_name", "machine_name", "expected"),
     [
         ("Windows", "AMD64", "windows-x64"),
+        ("Windows", "ARM64", "windows-arm64"),
         ("Darwin", "arm64", "macos-arm64"),
         ("Darwin", "x86_64", "macos-x64"),
         ("Linux", "aarch64", "linux-arm64"),
