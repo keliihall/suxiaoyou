@@ -453,7 +453,7 @@ jobs:
             "backend/requirements-windows-arm64-sources.json" = "7083f14d1a0f0805c1da38cba159d5de8a700d2dbc3e0392dfda3ce6d52e4fef"
             "backend/requirements-windows-arm64-tiktoken.Cargo.lock" = "0283ef6771d432d962b0ee9483c4259ac5140b4bee77cee97b700192ab52a9e3"
             "backend/requirements-windows-arm64-wheelhouse-approval.json" = "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896"
-            "backend/scripts/build_windows_arm64_wheelhouse.py" = "1c5dbeec7020e9cce5ddec2089f8ec6f524a57b644b6003ca29a9016d75e3256"
+            "backend/scripts/build_windows_arm64_wheelhouse.py" = "eafb7d5fbfb0a39d99a0a2d7a5a6fe532cbc814ee86642df81a97deb2099f57b"
           }
           foreach ($entry in $expectedHashes.GetEnumerator()) {
             if (-not (Test-Path -LiteralPath $entry.Key -PathType Leaf)) {
@@ -2510,10 +2510,15 @@ jobs:
               officeRendererProfile: "unsigned-degraded",
             },
             dataIntegrity: {
-              workspaceIdentityScheme: "stat-v1",
-              deletedDirectoryIdentifierReuse: "not-detectable",
-              mitigation:
-                "close-app-and-do-not-rewind-after-recreating-workspace-path",
+              workspaceIdentityProtocol: "v2",
+              posixDurableToken: "marker-v2",
+              posixRepresentation:
+                "directory-xattr-or-crash-safe-marker-file",
+              windowsDurableToken: "winfile-v2",
+              windowsRepresentation: "native-volume-serial-and-file-id",
+              nativeTupleRole: "operation-time-toctou-guard-only",
+              legacyMigration: "stat-v1-to-v2-idempotent-crash-resumable",
+              replacementPolicy: "durable-token-mismatch-fails-closed",
             },
             office: {
               authoritativeRenderer: "absent",
@@ -2550,6 +2555,23 @@ jobs:
           ) {
             throw new Error("invalid unsigned-degraded release identity");
           }
+          const expectedDataIntegrity = {
+            workspaceIdentityProtocol: "v2",
+            posixDurableToken: "marker-v2",
+            posixRepresentation:
+              "directory-xattr-or-crash-safe-marker-file",
+            windowsDurableToken: "winfile-v2",
+            windowsRepresentation: "native-volume-serial-and-file-id",
+            nativeTupleRole: "operation-time-toctou-guard-only",
+            legacyMigration: "stat-v1-to-v2-idempotent-crash-resumable",
+            replacementPolicy: "durable-token-mismatch-fails-closed",
+          };
+          if (
+            JSON.stringify(document.dataIntegrity) !==
+            JSON.stringify(expectedDataIntegrity)
+          ) {
+            throw new Error("invalid workspace identity v2 disclosure");
+          }
           writeFileSync(
             "DEGRADED-CAPABILITIES.json",
             `${JSON.stringify(document, null, 2)}\n`,
@@ -2570,6 +2592,7 @@ jobs:
           ## v1.1 核心能力
 
           - ACP 会话、隔离 worktree、checkpoint/rewind、Hooks 与验证 Agent 随包提供；冻结后端和原生安装包按 v1.1 `released` 门禁验证。
+          - 工作区身份已升级到 v2：POSIX 使用 `marker-v2`，Windows 使用 `winfile-v2`；旧 `stat-v1` 数据幂等、可恢复地迁移，单个损坏历史会被隔离且不会阻断其余工作区启动。
           - 八个安装包均来自同一 tag/commit，文件名带有 `UNSIGNED-DEGRADED`，避免与未来的权威签名包混淆。
 
           ## Office 降级边界
@@ -2606,7 +2629,7 @@ jobs:
           ## 已知边界
 
           - Windows Bash/Python 使用 Job Object 回收进程树，但直接作用于已批准工作区，不提供文件系统或网络隔离，失败可能留下改动；不得将其理解为 Linux/macOS 的私有事务执行。
-          - checkpoint/rewind 的 `stat-v1` 工作区身份不能识别文件系统在删除目录后立即复用同一对象标识的情况。删除并重建已选择的工作区路径前应退出应用，且不得把旧 checkpoint rewind 到重建后的目录；后续权威版本将迁移到 marker 驱动的 v2 身份。
+          - checkpoint/rewind 已使用 workspace identity v2：POSIX 使用 `marker-v2` durable token，Windows 使用 `winfile-v2` 原生目录身份；旧 `stat-v1` 数据会幂等、可恢复地迁移，durable token 不匹配时操作 fail-closed。
 
           EOF
               if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then

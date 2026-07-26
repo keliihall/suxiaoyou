@@ -295,8 +295,10 @@ def test_ambient_package_manager_and_openssl_inputs_are_removed(
         "OPENSSL_STATIC": "0",
         "VCPKG_ROOT": "C:/attacker-vcpkg",
         "DEP_OPENSSL_VERSION_NUMBER": "bad",
+        "CARGO_BUILD_JOBS": "99",
         "CARGO_ENCODED_RUSTFLAGS": "malicious",
         "CARGO_BUILD_RUSTFLAGS": "malicious",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "99",
         "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS": "malicious",
         "RUSTFLAGS": "malicious",
         "RUSTDOCFLAGS": "malicious",
@@ -438,6 +440,10 @@ def test_native_wheel_build_exposes_locked_venv_entry_points(
         output,
         cargo_home=cargo_home,
         source_date_epoch=1,
+        extra_environment={
+            "CARGO_ENCODED_RUSTFLAGS": "malicious",
+            "CARGO_INCREMENTAL": "1",
+        },
     )
 
     assert built.normalized_name == "demo"
@@ -450,12 +456,15 @@ def test_native_wheel_build_exposes_locked_venv_entry_points(
             f"{wheelhouse.REPRODUCIBLE_BUILD_ROOT}"
         ),
         "-C",
+        "codegen-units=1",
+        "-C",
         "link-arg=/Brepro",
         "-C",
         "link-arg=/PDBALTPATH:%_PDB%",
     ]
     assert captured["CL"] == wheelhouse.reproducible_msvc_cl_flags(tmp_path)
     assert captured["LINK"] == "/Brepro /PDBALTPATH:%_PDB%"
+    assert captured["CARGO_INCREMENTAL"] == "0"
     assert captured["SOURCE_DATE_EPOCH"] == "1"
 
 
@@ -674,9 +683,11 @@ def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     assert "/pathmap:" in wheelhouse.reproducible_msvc_cl_flags(
         Path("C:/private")
     )
-    assert "link-arg=/Brepro" in wheelhouse.reproducible_rust_flags(
+    rust_flags = wheelhouse.reproducible_rust_flags(
         Path("C:/private")
-    )
+    ).split("\x1f")
+    assert rust_flags.count("codegen-units=1") == 1
+    assert "link-arg=/Brepro" in rust_flags
     assert '"LINK": "/Brepro /PDBALTPATH:%_PDB%"' in source
     assert 'run_checked([nmake, "/E", "/NOLOGO", "test"]' in source
     assert "OpenSSL_version(0)" in source

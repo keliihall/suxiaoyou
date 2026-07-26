@@ -440,7 +440,7 @@ def reproducible_msvc_cl_flags(build_root: Path) -> str:
 
 
 def reproducible_rust_flags(build_root: Path) -> str:
-    """Encode rustc arguments without Windows shell quoting ambiguity."""
+    """Encode path, codegen, and linker controls without shell ambiguity."""
 
     return "\x1f".join(
         (
@@ -448,6 +448,12 @@ def reproducible_rust_flags(build_root: Path) -> str:
                 f"--remap-path-prefix={build_root.resolve()}="
                 f"{REPRODUCIBLE_BUILD_ROOT}"
             ),
+            # A large crate otherwise defaults to 16 parallel codegen units.
+            # Their COMDAT completion order can move Rust static data between
+            # otherwise identical MSVC links, changing every instruction that
+            # addresses the shifted block even when /Brepro is enabled.
+            "-C",
+            "codegen-units=1",
             "-C",
             "link-arg=/Brepro",
             "-C",

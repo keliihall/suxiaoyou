@@ -1525,7 +1525,7 @@ test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed o
     ],
     [
       "backend/scripts/build_windows_arm64_wheelhouse.py",
-      "1c5dbeec7020e9cce5ddec2089f8ec6f524a57b644b6003ca29a9016d75e3256",
+      "eafb7d5fbfb0a39d99a0a2d7a5a6fe532cbc814ee86642df81a97deb2099f57b",
     ],
   ]);
   for (const [path, digest] of sealedInputs) {
@@ -2330,21 +2330,65 @@ test("publishes reviewed v1.1 patch lines and RC iterations as synchronized unsi
   assert.match(disclosure, /draft:\s*false/);
   assert.match(disclosure, /installerCount:\s*8/);
   assert.match(disclosure, /metadataCount:\s*4/);
-  assert.match(disclosure, /workspaceIdentityScheme:\s*"stat-v1"/);
-  assert.match(disclosure, /deletedDirectoryIdentifierReuse:\s*"not-detectable"/);
+  assert.match(disclosure, /workspaceIdentityProtocol:\s*"v2"/);
+  assert.match(disclosure, /posixDurableToken:\s*"marker-v2"/);
+  assert.match(
+    disclosure,
+    /posixRepresentation:\s*\n?\s*"directory-xattr-or-crash-safe-marker-file"/,
+  );
+  assert.match(disclosure, /windowsDurableToken:\s*"winfile-v2"/);
+  assert.match(
+    disclosure,
+    /windowsRepresentation:\s*"native-volume-serial-and-file-id"/,
+  );
+  assert.match(
+    disclosure,
+    /nativeTupleRole:\s*"operation-time-toctou-guard-only"/,
+  );
+  assert.match(
+    disclosure,
+    /legacyMigration:\s*"stat-v1-to-v2-idempotent-crash-resumable"/,
+  );
+  assert.match(
+    disclosure,
+    /replacementPolicy:\s*"durable-token-mismatch-fails-closed"/,
+  );
+  assert.match(disclosure, /invalid workspace identity v2 disclosure/);
+  assert.doesNotMatch(
+    disclosure,
+    /workspaceIdentityScheme:\s*"stat-v1"|deletedDirectoryIdentifierReuse|not-detectable/,
+  );
   assert.match(disclosure, /authoritativeRenderer:\s*"absent"/);
   assert.match(disclosure, /highFidelityPreview:\s*"unavailable"/);
   assert.match(disclosure, /macosAppSignature:\s*"adhoc"/);
   assert.match(disclosure, /windowsAuthenticode:\s*false/);
 
   const trust = step(publish, "Record installer trust status");
+  const unsignedTrustStart = trust.indexOf(
+    'if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]',
+  );
+  const authoritativeTrustStart = trust.indexOf(
+    "\n            else",
+    unsignedTrustStart,
+  );
+  assert.ok(unsignedTrustStart >= 0);
+  assert.ok(authoritativeTrustStart > unsignedTrustStart);
+  const unsignedTrust = trust.slice(
+    unsignedTrustStart,
+    authoritativeTrustStart,
+  );
   assert.match(trust, /UNSIGNED-DEGRADED/);
   assert.match(trust, /不含权威 Office renderer/);
   assert.match(trust, /高保真预览、高保真编辑与视觉提交/);
   assert.match(trust, /Windows NSIS 未配置 Authenticode/);
   assert.match(trust, /macOS 应用仅使用 ad-hoc 签名/);
   assert.match(trust, /Release 公开为 prerelease/);
-  assert.match(trust, /stat-v1.*不能识别文件系统在删除目录后立即复用/u);
+  assert.match(unsignedTrust, /工作区身份已升级到 v2/u);
+  assert.match(unsignedTrust, /marker-v2/u);
+  assert.match(unsignedTrust, /winfile-v2/u);
+  assert.match(unsignedTrust, /旧 `stat-v1` 数据幂等、可恢复地迁移/u);
+  assert.match(unsignedTrust, /单个损坏历史会被隔离/u);
+  assert.doesNotMatch(trust, /stat-v1.*不能识别/u);
 
   const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /name:[^\n]*UNSIGNED-DEGRADED/);
