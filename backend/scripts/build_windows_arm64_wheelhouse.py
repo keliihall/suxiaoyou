@@ -27,6 +27,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -433,7 +434,7 @@ def reproducible_msvc_cl_flags(build_root: Path) -> str:
     """Return path-stable compiler flags for native Windows dependencies."""
 
     return (
-        "/FS /Brepro "
+        "/experimental:deterministic /FS /Brepro "
         f'/pathmap:"{build_root.resolve()}={REPRODUCIBLE_BUILD_ROOT}"'
     )
 
@@ -2130,7 +2131,28 @@ def _remove_owned_directory(path: Path, *, role: str) -> None:
         raise SupplyChainError(
             f"owned {role} path was replaced; refusing unsafe cleanup: {path}"
         )
-    shutil.rmtree(path)
+
+    root = path.absolute()
+
+    def remove_readonly(function, failed_path, error):
+        failed = Path(failed_path).absolute()
+        if not isinstance(error, PermissionError):
+            raise error
+        try:
+            failed.relative_to(root)
+        except ValueError:
+            raise error
+        if _is_link_like(failed):
+            raise error
+        os.chmod(failed, stat.S_IREAD | stat.S_IWRITE)
+        function(failed_path)
+
+    try:
+        shutil.rmtree(path, onexc=remove_readonly)
+    except OSError as exc:
+        raise SupplyChainError(
+            f"could not remove owned {role} directory {path}: {exc}"
+        ) from exc
 
 
 def _preserve_mismatch_diagnostics(
@@ -2269,6 +2291,7 @@ def build_artifact(
         staging_owned = False
         return manifest_sha256, content_sha256
     finally:
+        active_exception = sys.exception()
         cleanup_errors: list[str] = []
         for owned, path, role in (
             (staging_owned, staging, "build staging"),
@@ -2281,7 +2304,11 @@ def build_artifact(
             except SupplyChainError as exc:
                 cleanup_errors.append(str(exc))
         if cleanup_errors:
-            raise SupplyChainError("; ".join(cleanup_errors))
+            message = "cleanup errors: " + "; ".join(cleanup_errors)
+            if active_exception is not None:
+                active_exception.add_note(message)
+            else:
+                raise SupplyChainError(message)
 
 
 def create_argument_parser() -> argparse.ArgumentParser:

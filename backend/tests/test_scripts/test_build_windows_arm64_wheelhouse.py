@@ -668,7 +668,7 @@ def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     assert '"ARFLAGS": "/nologo /Brepro"' in source
     assert (
         wheelhouse.reproducible_msvc_cl_flags(Path("C:/private")).startswith(
-            "/FS /Brepro "
+            "/experimental:deterministic /FS /Brepro "
         )
     )
     assert "/pathmap:" in wheelhouse.reproducible_msvc_cl_flags(
@@ -844,6 +844,65 @@ def test_preexisting_or_linked_private_build_path_fails_closed(
             assert (target).is_dir()
         else:
             assert (work / "owner-data").read_text() == "keep"
+
+
+def test_cleanup_failure_does_not_mask_primary_build_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "wheelhouse"
+    monkeypatch.setattr(wheelhouse, "load_sources_lock", lambda: {})
+    monkeypatch.setattr(
+        wheelhouse, "preflight_native_builder", lambda _source_lock: {}
+    )
+
+    def fail_build(_staging, _work, _source_lock, _toolchain):
+        raise wheelhouse.SupplyChainError("primary build failure")
+
+    monkeypatch.setattr(wheelhouse, "build_into", fail_build)
+    monkeypatch.setattr(
+        wheelhouse,
+        "_remove_owned_directory",
+        lambda _path, *, role: (_ for _ in ()).throw(
+            wheelhouse.SupplyChainError(f"{role} cleanup failure")
+        ),
+    )
+
+    with pytest.raises(
+        wheelhouse.SupplyChainError, match="primary build failure"
+    ) as raised:
+        wheelhouse.build_artifact(
+            output,
+            expected_content_sha256=None,
+            expected_manifest_sha256=None,
+            approval_file=wheelhouse.APPROVAL_LOCK,
+            bootstrap=True,
+        )
+    assert raised.value.__notes__ == [
+        (
+            "cleanup errors: build staging cleanup failure; "
+            "build work cleanup failure"
+        )
+    ]
+
+
+def test_owned_cleanup_retries_windows_readonly_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    readonly = owned / "readonly.txt"
+    readonly.write_text("generated")
+    readonly.chmod(0o400)
+
+    def simulate_windows_rmtree(path, *, onexc):
+        onexc(os.unlink, readonly, PermissionError("readonly"))
+        os.rmdir(path)
+
+    monkeypatch.setattr(wheelhouse.shutil, "rmtree", simulate_windows_rmtree)
+    wheelhouse._remove_owned_directory(owned, role="test")
+    assert not owned.exists()
 
 
 def test_tag_style_build_fails_before_preflight_without_approval(
