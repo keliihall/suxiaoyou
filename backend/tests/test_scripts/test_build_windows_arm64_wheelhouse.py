@@ -695,10 +695,12 @@ def test_openssl_build_contract_enforces_reproducibility_and_tests() -> None:
     assert "CertificateBuilder" in source
 
 
-def test_approval_lock_requires_new_bootstrap_after_builder_contract_change(
+def test_approval_lock_matches_reproduced_builder_content(
     tmp_path: Path,
 ) -> None:
-    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) is None
+    assert wheelhouse.approved_content_sha256(wheelhouse.APPROVAL_LOCK) == (
+        "d56c0744b2ed3dda64b27519e11916e42bd5bed2d91f487da4c16bb4b3bb9d4f"
+    )
     digest = "a" * 64
     approved = tmp_path / "approval.json"
     approved.write_text(

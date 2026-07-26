@@ -1521,7 +1521,7 @@ test("Windows ARM64 wheelhouse is sealed, manual-bootstrap-only, and installed o
     ],
     [
       "backend/requirements-windows-arm64-wheelhouse-approval.json",
-      "1ed4754dfb88bfb72323e3a93dda15b13ae2eac213376bf9a8991aeec6265896",
+      "ac26fe14983890abecc10252d700b59022ae945a362cf31b3e4660af9652f3a1",
     ],
     [
       "backend/scripts/build_windows_arm64_wheelhouse.py",
