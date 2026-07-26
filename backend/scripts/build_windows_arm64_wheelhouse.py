@@ -2246,6 +2246,7 @@ def build_artifact(
 
     work_owned = False
     staging_owned = False
+    primary_exception: BaseException | None = None
     try:
         _claim_empty_directory(work, role="build work")
         work_owned = True
@@ -2290,8 +2291,10 @@ def build_artifact(
         os.replace(staging, output)
         staging_owned = False
         return manifest_sha256, content_sha256
+    except BaseException as exc:
+        primary_exception = exc
+        raise
     finally:
-        active_exception = sys.exception()
         cleanup_errors: list[str] = []
         for owned, path, role in (
             (staging_owned, staging, "build staging"),
@@ -2305,8 +2308,8 @@ def build_artifact(
                 cleanup_errors.append(str(exc))
         if cleanup_errors:
             message = "cleanup errors: " + "; ".join(cleanup_errors)
-            if active_exception is not None:
-                active_exception.add_note(message)
+            if primary_exception is not None:
+                primary_exception.add_note(message)
             else:
                 raise SupplyChainError(message)
 

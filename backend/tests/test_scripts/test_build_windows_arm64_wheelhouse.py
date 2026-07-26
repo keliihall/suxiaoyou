@@ -886,6 +886,47 @@ def test_cleanup_failure_does_not_mask_primary_build_error(
     ]
 
 
+def test_outer_exception_cannot_hide_success_path_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "wheelhouse"
+    monkeypatch.setattr(wheelhouse, "load_sources_lock", lambda: {})
+    monkeypatch.setattr(
+        wheelhouse, "preflight_native_builder", lambda _source_lock: {}
+    )
+
+    def successful_build(staging, _work, _source_lock, _toolchain):
+        (staging / "payload").write_bytes(b"built")
+        return "a" * 64, "b" * 64
+
+    monkeypatch.setattr(wheelhouse, "build_into", successful_build)
+    monkeypatch.setattr(
+        wheelhouse,
+        "_remove_owned_directory",
+        lambda _path, *, role: (_ for _ in ()).throw(
+            wheelhouse.SupplyChainError(f"{role} cleanup failure")
+        ),
+    )
+
+    outer = ValueError("outer exception")
+    try:
+        raise outer
+    except ValueError:
+        with pytest.raises(
+            wheelhouse.SupplyChainError,
+            match="build work cleanup failure",
+        ):
+            wheelhouse.build_artifact(
+                output,
+                expected_content_sha256=None,
+                expected_manifest_sha256=None,
+                approval_file=wheelhouse.APPROVAL_LOCK,
+                bootstrap=True,
+            )
+    assert not hasattr(outer, "__notes__")
+
+
 def test_owned_cleanup_retries_windows_readonly_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
