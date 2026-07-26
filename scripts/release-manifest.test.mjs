@@ -305,6 +305,42 @@ test("rejects a manifest after an installer is tampered", (t) => {
   );
 });
 
+test("rejects missing or extra manifest assets", (t) => {
+  const data = fixture(t, UNSIGNED_DEGRADED_RC_TAG, "unsigned-degraded");
+  const mutations = [
+    data.manifest.assets.slice(0, -1),
+    [
+      ...data.manifest.assets,
+      {
+        platform: "windows",
+        architecture: "x86_64",
+        format: "nsis",
+        name: "malicious-extra.exe",
+        size: 1,
+        sha256: "0".repeat(64),
+        downloadUrl: "https://attacker.invalid/payload",
+      },
+    ],
+  ];
+
+  for (const assets of mutations) {
+    writeFileSync(
+      data.manifestFile,
+      `${JSON.stringify({ ...data.manifest, assets })}\n`,
+    );
+    assert.throws(
+      () =>
+        verifyReleaseManifest({
+          ...data,
+          expectedTag: UNSIGNED_DEGRADED_RC_TAG,
+          expectedCommit: COMMIT,
+          expectedRepository: REPOSITORY,
+        }),
+      /must contain exactly 8 assets/u,
+    );
+  }
+});
+
 test("rejects automatic-update claims and mismatched release identity", (t) => {
   const data = fixture(t);
   const automatic = { ...data.manifest, updateMode: "automatic" };

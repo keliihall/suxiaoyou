@@ -2659,19 +2659,136 @@ jobs:
             cat CHECKSUMS.md
           } > RELEASE-BODY.md
 
+      - name: Refuse to mutate an existing published GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          matching_releases="$(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.id, .draft] | @tsv"
+          )"
+          while IFS=$'\t' read -r existing_release_id existing_release_draft; do
+            if [[ -z "$existing_release_id" ]]; then
+              continue
+            fi
+            if [[
+              ! "$existing_release_id" =~ ^[1-9][0-9]*$ ||
+              "$existing_release_draft" != "true"
+            ]]; then
+              echo "::error::refusing to mutate an existing published or invalid GitHub Release for $GITHUB_REF_NAME"
+              exit 1
+            fi
+          done <<< "$matching_releases"
+
       - name: Prepare GitHub Release
+        id: github_release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           name: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' && format('suyo {0} UNSIGNED-DEGRADED', needs.validate-release.outputs.release_version) || format('suyo {0}', needs.validate-release.outputs.release_version) }}
-          draft: ${{ needs.validate-release.outputs.release_profile != 'unsigned-degraded' }}
+          draft: true
           prerelease: ${{ needs.validate-release.outputs.release_profile == 'unsigned-degraded' || needs.validate-release.outputs.release_channel == 'prerelease' }}
           make_latest: false
           generate_release_notes: true
           body_path: RELEASE-BODY.md
           append_body: true
+          fail_on_unmatched_files: true
           files: |
             release-assets/*
             CHECKSUMS.md
             release-manifest.json
             ${{ env.OFFICE_COMPATIBILITY_ASSET }}
             ${{ env.RELEASE_CAPABILITIES_ASSET }}
+
+      - name: Verify exact GitHub Release asset set and publish reviewed profile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_RELEASE_ID: ${{ steps.github_release.outputs.id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PUBLISHED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release action did not return a valid numeric release ID"
+            exit 1
+          fi
+
+          expected_assets=(
+            CHECKSUMS.md
+            release-manifest.json
+            "$OFFICE_COMPATIBILITY_ASSET"
+            "$RELEASE_CAPABILITIES_ASSET"
+          )
+          for asset in release-assets/*; do
+            if [[ ! -f "$asset" ]]; then
+              echo "::error::local release asset is not a regular file: $asset"
+              exit 1
+            fi
+            expected_assets+=("${asset##*/}")
+          done
+          expected_assets_output="$(
+            printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort
+          )"
+          mapfile -t expected_assets <<< "$expected_assets_output"
+          if [[ ${#expected_assets[@]} -ne 12 ]]; then
+            echo "::error::expected exactly 12 local release assets, found ${#expected_assets[@]}"
+            exit 1
+          fi
+
+          release_endpoint="repos/$GITHUB_REPOSITORY/releases/$PUBLISHED_RELEASE_ID"
+          verify_exact_assets() {
+            local published_assets_output
+            local -a published_assets
+            published_assets_output="$(
+              gh api "$release_endpoint" --jq '.assets[].name' |
+                LC_ALL=C sort
+            )"
+            mapfile -t published_assets <<< "$published_assets_output"
+            if [[ ${#published_assets[@]} -ne 12 ]] || ! diff -u \
+              <(printf '%s\n' "${expected_assets[@]}") \
+              <(printf '%s\n' "${published_assets[@]}")
+            then
+              echo "::error::GitHub Release asset set is not the exact reviewed 12-file set"
+              exit 1
+            fi
+          }
+          verify_exact_assets
+
+          expected_prerelease="false"
+          if [[ "$RELEASE_PROFILE" == "unsigned-degraded" || "$RELEASE_CHANNEL" == "prerelease" ]]; then
+            expected_prerelease="true"
+          fi
+          staged_state="$(
+            gh api "$release_endpoint" \
+              --jq '[.tag_name, .draft, .prerelease] | @tsv'
+          )"
+          IFS=$'\t' read -r staged_tag staged_draft staged_prerelease \
+            <<< "$staged_state"
+          if [[
+            "$staged_tag" != "$GITHUB_REF_NAME" ||
+            "$staged_draft" != "true" ||
+            "$staged_prerelease" != "$expected_prerelease"
+          ]]; then
+            echo "::error::staged GitHub Release state does not match the reviewed profile"
+            exit 1
+          fi
+
+          if [[ "$RELEASE_PROFILE" == "unsigned-degraded" ]]; then
+            published_state="$(
+              gh api --method PATCH "$release_endpoint" \
+                -F draft=false \
+                -F prerelease=true \
+                -f make_latest=false \
+                --jq '[.tag_name, .draft, .prerelease] | @tsv'
+            )"
+            IFS=$'\t' read -r published_tag published_draft published_prerelease \
+              <<< "$published_state"
+            if [[
+              "$published_tag" != "$GITHUB_REF_NAME" ||
+              "$published_draft" != "false" ||
+              "$published_prerelease" != "true"
+            ]]; then
+              echo "::error::published GitHub Release state does not match the reviewed profile"
+              exit 1
+            fi
+            verify_exact_assets
+          fi

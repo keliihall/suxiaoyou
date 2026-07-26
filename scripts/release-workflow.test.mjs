@@ -2031,7 +2031,7 @@ test("publishes a dynamically validated cargo-audit category disclosure", () => 
   assert.match(step(publish, "Record installer trust status"), /cat RUST-AUDIT\.md/);
   assert.match(
     step(publish, "Prepare GitHub Release"),
-    /draft:\s*\$\{\{ needs\.validate-release\.outputs\.release_profile != 'unsigned-degraded' \}\}/,
+    /draft:\s*true/,
   );
 });
 
@@ -2391,8 +2391,9 @@ test("publishes reviewed v1.1 patch lines and RC iterations as synchronized unsi
   assert.doesNotMatch(trust, /stat-v1.*不能识别/u);
 
   const release = step(publish, "Prepare GitHub Release");
+  assert.match(release, /id:\s*github_release/);
   assert.match(release, /name:[^\n]*UNSIGNED-DEGRADED/);
-  assert.match(release, /draft:[^\n]*release_profile != 'unsigned-degraded'/);
+  assert.match(release, /draft:\s*true/);
   assert.match(release, /prerelease:[^\n]*release_profile == 'unsigned-degraded'/);
   assert.match(release, /make_latest:\s*false/);
 });
@@ -2433,11 +2434,30 @@ test("verifies eight installers and publishes profile-aware eight-plus-four asse
   assert.match(publish, /generate-checksums\.mjs release-assets CHECKSUMS\.md/);
   assert.match(publish, /wc -l \| tr -d ' '\)" == "8"/);
 
+  const immutablePublicRelease = step(
+    publish,
+    "Refuse to mutate an existing published GitHub Release",
+  );
+  assert.match(immutablePublicRelease, /GH_TOKEN:\s*\$\{\{ github\.token \}\}/);
+  assert.match(immutablePublicRelease, /gh api --paginate/);
+  assert.match(immutablePublicRelease, /releases\?per_page=100/);
+  assert.match(immutablePublicRelease, /\.tag_name == \\"\$GITHUB_REF_NAME\\"/);
+  assert.match(immutablePublicRelease, /\$existing_release_draft" != "true"/);
+  assert.match(
+    immutablePublicRelease,
+    /refusing to mutate an existing published or invalid GitHub Release/,
+  );
+  assert.ok(
+    publish.indexOf("- name: Refuse to mutate an existing published GitHub Release") <
+      publish.indexOf("- name: Prepare GitHub Release"),
+  );
+
   const release = step(publish, "Prepare GitHub Release");
   assert.match(release, /name:[^\n]*UNSIGNED-DEGRADED/);
-  assert.match(release, /draft:[^\n]*release_profile != 'unsigned-degraded'/);
+  assert.match(release, /draft:\s*true/);
   assert.match(release, /prerelease:[^\n]*release_profile == 'unsigned-degraded'[^\n]*release_channel == 'prerelease'/);
   assert.match(release, /make_latest:\s*false/);
+  assert.match(release, /fail_on_unmatched_files:\s*true/);
   assert.match(release, /body_path:\s*RELEASE-BODY\.md/);
   assert.match(release, /files:[\s\S]*CHECKSUMS\.md/);
   assert.match(release, /files:[\s\S]*release-manifest\.json/);
@@ -2456,6 +2476,33 @@ test("verifies eight installers and publishes profile-aware eight-plus-four asse
       "${{ env.RELEASE_CAPABILITIES_ASSET }}",
     ],
   );
+  const published = step(
+    publish,
+    "Verify exact GitHub Release asset set and publish reviewed profile",
+  );
+  assert.match(published, /GH_TOKEN:\s*\$\{\{ github\.token \}\}/);
+  assert.match(
+    published,
+    /PUBLISHED_RELEASE_ID:\s*\$\{\{ steps\.github_release\.outputs\.id \}\}/,
+  );
+  assert.match(published, /\^\[1-9\]\[0-9\]\*\$/);
+  assert.match(published, /\$\{#expected_assets\[@\]\} -ne 12/);
+  assert.match(published, /\$\{#published_assets\[@\]\} -ne 12/);
+  assert.match(
+    published,
+    /release_endpoint="repos\/\$GITHUB_REPOSITORY\/releases\/\$PUBLISHED_RELEASE_ID"/,
+  );
+  assert.match(published, /gh api "\$release_endpoint" --jq '\.assets\[\]\.name'/);
+  assert.match(published, /verify_exact_assets/);
+  assert.match(published, /diff -u/);
+  assert.match(published, /\[\.tag_name, \.draft, \.prerelease\] \| @tsv/);
+  assert.match(published, /\$staged_draft" != "true"/);
+  assert.match(published, /gh api --method PATCH "\$release_endpoint"/);
+  assert.match(published, /-F draft=false/);
+  assert.match(published, /-F prerelease=true/);
+  assert.match(published, /-f make_latest=false/);
+  assert.match(published, /\$published_draft" != "false"/);
+  assert.match(published, /GitHub Release asset set is not the exact reviewed 12-file set/);
 
   const trust = step(publish, "Record installer trust status");
   assert.match(trust, /Developer ID/);
