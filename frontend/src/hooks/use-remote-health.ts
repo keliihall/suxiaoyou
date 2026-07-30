@@ -18,6 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import i18n from "@/i18n/config";
 import { getRemoteConfig, isRemoteMode } from "@/lib/remote-connection";
 
 export type RemoteHealthStatus = "connected" | "limited" | "disconnected" | "unknown";
@@ -42,11 +43,17 @@ export function useRemoteHealth() {
     // Only toast on bad transitions (skip initial "unknown" → anything)
     if (prev === "unknown") return;
     if (prev === "connected" && next === "disconnected") {
-      toast.error("Connection lost to desktop");
+      toast.error(i18n.t("remoteConnectionLost", { ns: "common" }), {
+        id: "remote-health:disconnected",
+      });
     } else if (prev === "connected" && next === "limited") {
-      toast.warning("Authentication failed — token may have been rotated");
+      toast.warning(i18n.t("remoteAuthenticationFailed", { ns: "common" }), {
+        id: "remote-health:limited",
+      });
     } else if (prev !== "connected" && next === "connected") {
-      toast.success("Reconnected to desktop");
+      toast.success(i18n.t("remoteReconnected", { ns: "common" }), {
+        id: "remote-health:connected",
+      });
     }
   };
 

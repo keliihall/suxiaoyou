@@ -17,6 +17,7 @@ from app.agent.permission import (
     serialize_permission_snapshot,
     tighten_permission_snapshot,
 )
+from app.i18n import localize
 from app.provider.registry import ProviderRegistry
 from app.schemas.chat import PromptRequest, TaskBatchRequest, TaskBatchTask
 from app.session.manager import create_message, create_part, create_session, get_session
@@ -156,9 +157,9 @@ async def resolve_task_batch_workspace(
     return workspace
 
 
-def _extract_child_output(child_job: GenerationJob) -> tuple[str, str | None]:
+def _extract_child_output(child_job: GenerationJob) -> tuple[str, bool]:
     output_parts: list[str] = []
-    error_parts: list[str] = []
+    failed = False
     tool_results: list[str] = []
 
     for event in child_job.events:
@@ -172,35 +173,41 @@ def _extract_child_output(child_job: GenerationJob) -> tuple[str, str | None]:
                     tool_output = tool_output[:2000] + "... [truncated]"
                 tool_results.append(f"[{tool_name}] {tool_output}")
         elif event.event in {"agent-error", "error"}:
-            error_parts.append(str(event.data.get("error_message") or event.data.get("message") or "error"))
+            failed = True
 
     output = "".join(output_parts)
     if tool_results:
         output += "\n\n--- Key tool results ---\n"
         output += "\n\n".join(tool_results[-5:])
 
-    error = "; ".join(part for part in error_parts if part) or None
     if not output.strip():
         output = "(subagent produced no text output)"
-    return output, error
+    return output, failed
 
 
-def _format_aggregate(states: list[BatchTaskState]) -> str:
+def _format_aggregate(
+    states: list[BatchTaskState],
+    *,
+    language: str,
+) -> str:
     completed = [state for state in states if state.status == "completed"]
     failed = [state for state in states if state.status == "failed"]
     cancelled = [state for state in states if state.status == "cancelled"]
 
-    lines = ["Multi-agent task batch finished."]
+    lines = [localize(language, "多智能体任务已完成。", "Multi-agent task batch finished.")]
     if completed:
-        lines.append("\nCompleted tasks:")
+        lines.append(localize(language, "\n已完成任务：", "\nCompleted tasks:"))
         for state in completed:
             lines.append(f"- {state.title}: {state.output.strip()}")
     if failed:
-        lines.append("\nFailed tasks:")
+        lines.append(localize(language, "\n失败任务：", "\nFailed tasks:"))
         for state in failed:
-            lines.append(f"- {state.title}: {state.error or 'Unknown error'}")
+            lines.append(
+                f"- {state.title}: "
+                + localize(language, "子任务执行失败。", "The child task failed.")
+            )
     if cancelled:
-        lines.append("\nCancelled tasks:")
+        lines.append(localize(language, "\n已取消任务：", "\nCancelled tasks:"))
         for state in cancelled:
             lines.append(f"- {state.title}")
     return "\n".join(lines)
@@ -411,19 +418,27 @@ async def run_task_batch(
                     tool_registry=tool_registry,
                     index_manager=index_manager,
                 )
-                output, child_error = _extract_child_output(child_job)
+                output, child_failed = _extract_child_output(child_job)
                 state.output = output
                 if job.abort_event.is_set():
                     state.status = "cancelled"
-                elif child_error:
+                elif child_failed:
                     state.status = "failed"
-                    state.error = child_error
+                    state.error = localize(
+                        body.language,
+                        "子任务执行失败。",
+                        "The child task failed.",
+                    )
                 else:
                     state.status = "completed"
-            except Exception as exc:
+            except Exception:
                 logger.exception("Task batch child task failed: %s", state.title)
                 state.status = "failed"
-                state.error = str(exc)
+                state.error = localize(
+                    body.language,
+                    "子任务执行失败。",
+                    "The child task failed.",
+                )
             finally:
                 job.publish(SSEEvent(TASK_BATCH_UPDATE, _snapshot(batch_id, body.mode, states)))
 
@@ -445,7 +460,7 @@ async def run_task_batch(
         else:
             await asyncio.gather(*(run_one(state) for state in states))
 
-        aggregate = _format_aggregate(states)
+        aggregate = _format_aggregate(states, language=body.language)
         await _persist_assistant_result(
             session_factory=session_factory,
             session_id=job.session_id,
@@ -470,9 +485,25 @@ async def run_task_batch(
         TaskBatchWorkspaceRequired,
     ) as exc:
         logger.warning("Task batch workspace rejected for stream %s: %s", job.stream_id, exc)
-        job.publish(SSEEvent(AGENT_ERROR, {"error_message": str(exc)}))
+        job.publish(SSEEvent(AGENT_ERROR, {
+            "error_type": "task_batch_workspace_rejected",
+            "code": "task_batch_workspace_rejected",
+            "error_message": localize(
+                job.language,
+                "多任务工作区不符合安全要求。",
+                "The task batch workspace does not satisfy the safety requirements.",
+            ),
+        }))
     except Exception:
         logger.exception("Task batch failed for stream %s", job.stream_id)
-        job.publish(SSEEvent(AGENT_ERROR, {"error_message": "Task batch failed. Please try again."}))
+        job.publish(SSEEvent(AGENT_ERROR, {
+            "error_type": "task_batch_failed",
+            "code": "task_batch_failed",
+            "error_message": localize(
+                job.language,
+                "多任务执行失败，请稍后重试。",
+                "The task batch failed. Try again shortly.",
+            ),
+        }))
     finally:
         job.complete()

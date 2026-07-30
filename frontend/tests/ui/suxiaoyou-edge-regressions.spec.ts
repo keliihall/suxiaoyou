@@ -96,6 +96,104 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await expect(page).toHaveURL(/\/c\/session-beta$/);
   });
 
+  test("a terminal raw stream error is localized once and cannot be reattached", async ({
+    page,
+  }) => {
+    await setupMockedApp(
+      page,
+      {
+        activeJobs: [
+          {
+            stream_id: "stream-raw-terminal-error",
+            session_id: "session-alpha",
+          },
+        ],
+      },
+      { force: true, language: "zh" },
+    );
+
+    const raw =
+      "peer closed connection without sending complete message body (incomplete chunked read)";
+    let streamRequests = 0;
+    await page.route(
+      "**/api/chat/stream/stream-raw-terminal-error**",
+      async (route) => {
+        streamRequests += 1;
+        await route.fulfill({
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          },
+          body: [
+            "id: 1",
+            "event: agent-error",
+            `data: ${JSON.stringify({
+              code: "internal_error",
+              error_type: "internal_error",
+              error_message: raw,
+            })}`,
+            "",
+            "",
+          ].join("\n"),
+        });
+      },
+    );
+
+    await page.goto("/c/session-alpha");
+    await expect(
+      page.getByText(
+        "模型服务连接中断，已自动重试但仍未恢复，请稍后再试。",
+        { exact: true },
+      ),
+    ).toHaveCount(1);
+    await expect(page.getByText(raw, { exact: true })).toHaveCount(0);
+
+    // Remote-generation polling runs every five seconds. The backend still
+    // reports this terminal job as active during cleanup, but the tombstone
+    // must prevent a second subscription and duplicate toast.
+    await page.waitForTimeout(5_500);
+    expect(streamRequests).toBe(1);
+  });
+
+  test("a stale mobile stream URL is consumed without replaying a completed job", async ({
+    page,
+  }) => {
+    await setupMockedApp(page, { activeJobs: [] });
+    let streamRequests = 0;
+    await page.route(
+      "**/api/chat/stream/stream-stale-terminal**",
+      async (route) => {
+        streamRequests += 1;
+        await route.fulfill({
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          },
+          body: [
+            "id: 1",
+            "event: agent-error",
+            `data: ${JSON.stringify({
+              error_message: "stale completed stream should not replay",
+            })}`,
+            "",
+            "",
+          ].join("\n"),
+        });
+      },
+    );
+
+    await page.goto(
+      "/m/task/session-alpha?stream_id=stream-stale-terminal",
+    );
+    await expect(page).toHaveURL(/\/m\/task\/session-alpha$/);
+    expect(streamRequests).toBe(0);
+    await expect(
+      page.getByText("stale completed stream should not replay"),
+    ).toHaveCount(0);
+  });
+
   test("a background stream cannot project its todos, files, tasks, or artifact into the focused session", async ({
     page,
   }) => {
@@ -320,7 +418,10 @@ test.describe("苏小有 edge-state GUI regressions", () => {
     await page.getByRole("button", { name: /Send message/i }).click();
     await failedPrompt;
 
-    await expect(page.getByText(/Session expired|API 401/i)).toBeVisible();
+    await expect(
+      page.getByText("Could not send the message. Check the connection and try again."),
+    ).toBeVisible();
+    await expect(page.getByText(/Session expired|API 401/i)).toHaveCount(0);
     await expect(
       page.getByPlaceholder(/Describe the result you want/i),
     ).toBeVisible();

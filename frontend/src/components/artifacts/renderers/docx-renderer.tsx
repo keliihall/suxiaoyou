@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { ChevronLeft, ChevronRight, Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { api, apiErrorMessage } from "@/lib/api";
+import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { base64ToArrayBuffer, downloadBlob } from "@/lib/browser-files";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -83,7 +83,8 @@ export function DocxRenderer({ filePath }: DocxRendererProps) {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(apiErrorMessage(err, t("failedRenderDocument")));
+          console.warn("DOCX preview failed:", err);
+          setError(t("failedRenderDocument"));
         }
       } finally {
         if (!cancelled) setLoading(false);

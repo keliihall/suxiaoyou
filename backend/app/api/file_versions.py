@@ -6,10 +6,11 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.dependencies import SessionFactoryDep
+from app.i18n import Language, localize, request_language
 from app.session.manager import get_session
 from app.session.managed_workspace import managed_workspace_for_session
 from app.storage.file_versions import (
@@ -32,6 +33,8 @@ class RestoreFileVersionRequest(BaseModel):
 async def _session_workspace(
     session_factory: SessionFactoryDep,
     session_id: str,
+    *,
+    language: Language,
 ) -> Path:
     async with session_factory() as db:
         session = await get_session(db, session_id)
@@ -41,7 +44,17 @@ async def _session_workspace(
             else None
         )
     if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "file_version_session_not_found",
+                "message": localize(
+                    language,
+                    "未找到对应的对话。",
+                    "The conversation was not found.",
+                ),
+            },
+        )
     managed = not session.directory or session.directory == "."
     workspace = (
         managed_workspace_for_session(session.id, create=False)
@@ -65,14 +78,35 @@ async def _session_workspace(
             ),
         )
     except WorkspaceBoundaryViolation as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_version_workspace_invalid",
+                "message": localize(
+                    language,
+                    "当前文件夹不符合版本恢复的安全要求。",
+                    "The current folder does not satisfy the recovery safety requirements.",
+                ),
+            },
+        ) from exc
     if not workspace.is_dir():
-        raise HTTPException(status_code=409, detail="Session workspace is unavailable")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_version_workspace_unavailable",
+                "message": localize(
+                    language,
+                    "当前文件夹暂不可用。",
+                    "The current folder is unavailable.",
+                ),
+            },
+        )
     return workspace
 
 
 @router.get("")
 async def list_file_versions(
+    request: Request,
     session_factory: SessionFactoryDep,
     session_id: str = Query(min_length=1),
     file_path: str | None = None,
@@ -80,7 +114,12 @@ async def list_file_versions(
 ) -> dict[str, Any]:
     """List persistent pre-mutation versions for a session's workspace."""
 
-    workspace = await _session_workspace(session_factory, session_id)
+    language = request_language(request)
+    workspace = await _session_workspace(
+        session_factory,
+        session_id,
+        language=language,
+    )
     try:
         versions = await asyncio.to_thread(
             FileVersionStore(workspace).list_versions,
@@ -88,7 +127,17 @@ async def list_file_versions(
             limit=limit,
         )
     except FileVersionError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "file_version_list_failed",
+                "message": localize(
+                    language,
+                    "无法读取文件版本历史。",
+                    "The file version history could not be loaded.",
+                ),
+            },
+        ) from exc
     return {
         "workspace": str(workspace),
         "versions": [version.public_dict() for version in versions],
@@ -97,13 +146,19 @@ async def list_file_versions(
 
 @router.post("/{version_id}/restore")
 async def restore_file_version(
+    request: Request,
     version_id: str,
     body: RestoreFileVersionRequest,
     session_factory: SessionFactoryDep,
 ) -> dict[str, Any]:
     """Restore one version, preserving the displaced file as a new version."""
 
-    workspace = await _session_workspace(session_factory, body.session_id)
+    language = request_language(request)
+    workspace = await _session_workspace(
+        session_factory,
+        body.session_id,
+        language=language,
+    )
     try:
         restored, recovery, target = await asyncio.to_thread(
             FileVersionStore(workspace).restore,
@@ -112,9 +167,29 @@ async def restore_file_version(
             call_id="api.restore_file_version",
         )
     except FileVersionNotFound as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "file_version_not_found",
+                "message": localize(
+                    language,
+                    "未找到这个文件版本。",
+                    "The file version was not found.",
+                ),
+            },
+        ) from exc
     except FileVersionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_version_restore_failed",
+                "message": localize(
+                    language,
+                    "无法安全恢复这个文件版本。",
+                    "The file version could not be restored safely.",
+                ),
+            },
+        ) from exc
     return {
         "file_path": str(target),
         "restored_version": restored.public_dict(),

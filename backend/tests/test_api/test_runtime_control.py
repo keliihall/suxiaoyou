@@ -350,6 +350,17 @@ async def test_runtime_context_resolves_folderless_managed_workspace(
     assert response.json()["worktree_creation_available"] is False
     assert response.json()["worktree_creation_reason"] == "workspace_not_supported"
 
+    checkpoints = await app_client.get(
+        "/api/runtime/checkpoints",
+        params={
+            "session_id": "managed-session",
+            "workspace_instance_id": "managed-workspace",
+        },
+    )
+
+    assert checkpoints.status_code == 200
+    assert checkpoints.json()["checkpoints"] == []
+
 
 async def test_runtime_context_hides_uninitialized_folderless_workspace(
     app_client,

@@ -958,7 +958,7 @@ export function ChatForm({
                     </span>
                     <span
                       className="min-w-0 flex-1 truncate text-[var(--text-primary)]"
-                      title={item.error_message ? `${summary}\n${item.error_message}` : summary}
+                      title={summary}
                     >
                       {summary}
                     </span>

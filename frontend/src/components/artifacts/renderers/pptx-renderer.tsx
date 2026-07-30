@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { ApiError, api, apiErrorMessage } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { base64ToBlob, downloadBlob } from "@/lib/browser-files";
 import { API, IS_DESKTOP } from "@/lib/constants";
 import { isRemoteMode } from "@/lib/remote-connection";
@@ -800,7 +800,8 @@ export function PptxRenderer({ filePath }: PptxRendererProps) {
                 : code?.startsWith("pptx_invalid") || code === "pptx_parse_failed"
                   ? "pptxInvalidFile"
                   : null;
-        setError(key ? t(key) : apiErrorMessage(cause, t("pptxLoadFailed")));
+        if (!key) console.warn("PPTX preview failed:", cause);
+        setError(key ? t(key) : t("pptxLoadFailed"));
       } finally {
         if (!cancelled) setLoading(false);
       }

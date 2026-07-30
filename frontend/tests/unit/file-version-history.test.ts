@@ -29,4 +29,7 @@ test("file cards expose durable backend history only for authorized local sessio
   assert.match(card, /<FileVersionHistoryDialog/);
   assert.match(dialog, /result\.recovery_version/);
   assert.match(dialog, /fileVersionRestoreConfirm/);
+  assert.match(dialog, /t\("fileVersionLoadFailed"\)/);
+  assert.match(dialog, /t\("fileVersionRestoreFailed"\)/);
+  assert.doesNotMatch(dialog, /apiErrorMessage/);
 });

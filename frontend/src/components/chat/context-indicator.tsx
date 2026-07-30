@@ -8,7 +8,6 @@ import { useTranslation } from 'react-i18next';
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
-import { errorToMessage } from "@/lib/errors";
 import { API, queryKeys } from "@/lib/constants";
 import { useMessageStats } from "@/hooks/use-message-stats";
 import { useModels } from "@/hooks/use-models";
@@ -113,7 +112,10 @@ export function ContextIndicator({ sessionId, compact = false }: ContextIndicato
         queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all }),
       ]);
     } catch (error) {
-      toast.error(errorToMessage(error, t('contextCompactError')));
+      console.warn("Manual context compaction could not start:", error);
+      toast.error(t("contextCompactError"), {
+        id: `compaction-start:${sessionId}`,
+      });
     } finally {
       setIsStartingCompact(false);
     }

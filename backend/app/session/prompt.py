@@ -423,7 +423,12 @@ class SessionPrompt:
         if security_stopped:
             self.job.publish(SSEEvent(AGENT_ERROR, {
                 "error_type": "security_emergency_stop",
-                "error_message": "Security emergency stop is active.",
+                "code": "security_emergency_stop",
+                "error_message": localize(
+                    self.job.language,
+                    "安全紧急停止已启用，请先在设置中恢复。",
+                    "Security emergency stop is active. Resume it in Settings first.",
+                ),
             }))
             # Autonomous Goal controllers span multiple SessionPrompt slices
             # and own the one terminal DONE/complete boundary for the shared
@@ -540,7 +545,15 @@ class SessionPrompt:
             except Exception:
                 pass
         if not resolved:
-            self.job.publish(SSEEvent(AGENT_ERROR, {"error_message": f"Model not found: {model_id}"}))
+            self.job.publish(SSEEvent(AGENT_ERROR, {
+                "error_type": "model_not_found",
+                "code": "model_not_found",
+                "error_message": localize(
+                    self.job.language,
+                    "未找到所选模型，请检查模型服务设置。",
+                    "The selected model was not found. Check the model service settings.",
+                ),
+            }))
             raise RuntimeError(f"Model not found: {model_id}")
 
         self.provider, self.model_info = resolved
@@ -1674,7 +1687,15 @@ class SessionPrompt:
                 self.job.publish(
                     SSEEvent(
                         INPUT_FAILED,
-                        {"input_id": item.id, "error": str(exc)},
+                        {
+                            "input_id": item.id,
+                            "code": "queued_input_execution_failed",
+                            "error": localize(
+                                self.job.language,
+                                "排队输入执行失败，请重新提交。",
+                                "The queued follow-up failed. Submit it again.",
+                            ),
+                        },
                     )
                 )
                 continue
@@ -2045,9 +2066,15 @@ class SessionPrompt:
                 )
                 if self._consecutive_compact_failures >= self._MAX_CONSECUTIVE_COMPACT_FAILURES:
                     self.job.publish(SSEEvent(AGENT_ERROR, {
-                        "error_message": (
-                            "Context compression failed repeatedly. "
-                            "Please start a new conversation."
+                        "error_type": "compaction_failed",
+                        "code": "compaction_failed",
+                        "error_message": localize(
+                            self.job.language,
+                            "上下文连续压缩失败，请新建对话后继续。",
+                            (
+                                "Context compression failed repeatedly. "
+                                "Start a new conversation."
+                            ),
                         ),
                     }))
                     await self._dispatch_required_hook(

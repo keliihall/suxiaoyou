@@ -162,7 +162,7 @@ async def test_sequential_task_batch_cancels_pending_after_failure(
     ]
 
     updates = [event for event in job.events if event.event == TASK_BATCH_UPDATE]
-    assert updates[-1].data["tasks"][1]["error"] == "child failed"
+    assert updates[-1].data["tasks"][1]["error"] == "子任务执行失败。"
 
 
 async def test_task_batch_without_workspace_fails_before_creating_children(
@@ -188,7 +188,11 @@ async def test_task_batch_without_workspace_fails_before_creating_children(
 
     run_generation.assert_not_called()
     assert job.events[-1].event == "agent-error"
-    assert "Select a workspace" in job.events[-1].data["error_message"]
+    assert job.events[-1].data == {
+        "error_type": "task_batch_workspace_rejected",
+        "code": "task_batch_workspace_rejected",
+        "error_message": "多任务工作区不符合安全要求。",
+    }
     async with session_factory() as db:
         rows = (await db.execute(Session.__table__.select())).mappings().all()
     assert [row for row in rows if row["id"] == "parent-1"] == []
@@ -260,7 +264,7 @@ async def test_existing_parent_rejects_conflicting_batch_workspace(
 
     run_generation = MagicMock()
     monkeypatch.setattr("app.session.task_batch.run_generation", run_generation)
-    job = GenerationJob("stream-1", "parent-1")
+    job = GenerationJob("stream-1", "parent-1", language="en")
     body = TaskBatchRequest(
         session_id="parent-1",
         tasks=[_task("One", "must not run")],
@@ -278,7 +282,13 @@ async def test_existing_parent_rejects_conflicting_batch_workspace(
 
     run_generation.assert_not_called()
     assert job.events[-1].event == "agent-error"
-    assert "conflicts" in job.events[-1].data["error_message"]
+    assert job.events[-1].data == {
+        "error_type": "task_batch_workspace_rejected",
+        "code": "task_batch_workspace_rejected",
+        "error_message": (
+            "The task batch workspace does not satisfy the safety requirements."
+        ),
+    }
     async with session_factory() as db:
         rows = (await db.execute(Session.__table__.select())).mappings().all()
     assert [row for row in rows if row["parent_id"] == "parent-1"] == []
@@ -475,6 +485,4 @@ async def test_legacy_permission_and_forged_allow_fall_back_to_headless_ask(
     assert observed == {"action": "ask", "interactive": False}
     finish = next(event for event in job.events if event.event == TASK_BATCH_FINISH)
     assert finish.data["tasks"][0]["status"] == "failed"
-    assert "non-interactive tasks cannot grant permissions" in (
-        finish.data["tasks"][0]["error"]
-    )
+    assert finish.data["tasks"][0]["error"] == "子任务执行失败。"

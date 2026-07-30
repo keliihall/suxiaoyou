@@ -102,8 +102,20 @@ async def test_api_rejects_path_escape_and_unknown_session(
     missing = await app_client.get(
         "/api/file-versions",
         params={"session_id": "does-not-exist"},
+        headers={"Accept-Language": "zh-CN"},
     )
     assert missing.status_code == 404
+    assert missing.json()["detail"] == {
+        "code": "file_version_session_not_found",
+        "message": "未找到对应的对话。",
+    }
+
+    missing_en = await app_client.get(
+        "/api/file-versions",
+        params={"session_id": "does-not-exist"},
+        headers={"Accept-Language": "en-US"},
+    )
+    assert missing_en.json()["detail"]["message"] == "The conversation was not found."
 
 
 async def test_api_accepts_inherited_folderless_managed_workspace(

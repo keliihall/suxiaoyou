@@ -29,7 +29,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ApiError, api, apiErrorMessage, apiFetch } from "@/lib/api";
+import { ApiError, api, apiFetch } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 
@@ -115,9 +115,19 @@ function isFeatureUnavailable(error: unknown): boolean {
   if (error.status === 404) return true;
   if (!error.body || typeof error.body !== "object") return false;
   const code = (error.body as { code?: unknown }).code;
-  return code === "user_office_template_runtime_unavailable" ||
-    code === "user_office_template_provenance_mismatch" ||
-    code === "runtime_workspace_provenance_mismatch";
+  return (
+    code === "user_office_template_runtime_unavailable" ||
+    code === "runtime_workspace_not_found" ||
+    code === "runtime_workspace_provenance_mismatch" ||
+    code === "user_office_template_provenance_mismatch"
+  );
+}
+
+function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null;
+  if (!error.body || typeof error.body !== "object") return null;
+  const code = (error.body as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
 }
 
 async function responseBody(response: Response): Promise<unknown> {
@@ -173,6 +183,34 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
   const [previewFailure, setPreviewFailure] = useState<string | null>(null);
   const [previewAttempt, setPreviewAttempt] = useState(0);
 
+  const templateErrorMessage = useCallback(
+    (error: unknown, fallback: string): string => {
+      switch (apiErrorCode(error)) {
+        case "runtime_workspace_not_found":
+        case "runtime_workspace_provenance_mismatch":
+        case "user_office_template_provenance_mismatch":
+          return t("userOfficeTemplateWorkspaceMismatch");
+        case "user_office_template_audit_unavailable":
+        case "user_office_template_runtime_unavailable":
+        case "user_office_template_internal_error":
+          return t("userOfficeTemplateTemporarilyUnavailable");
+        case "user_office_template_not_found":
+          return t("userOfficeTemplateNotFound");
+        case "user_office_template_conflict":
+          return t("userOfficeTemplateConflict");
+        case "user_office_template_invalid":
+          return t("userOfficeTemplateInvalid");
+        case "user_office_template_unsafe":
+          return t("userOfficeTemplateUnsafe");
+        case "user_office_template_evidence_invalid":
+          return t("userOfficeTemplateEvidenceInvalid");
+        default:
+          return fallback;
+      }
+    },
+    [t],
+  );
+
   const load = useCallback(
     async (signal?: AbortSignal) => {
       if (!sessionId) return;
@@ -202,13 +240,15 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
           setUnavailable(true);
           setFailure(null);
         } else {
-          setFailure(apiErrorMessage(error, t("userOfficeTemplateLoadFailed")));
+          setFailure(
+            templateErrorMessage(error, t("userOfficeTemplateLoadFailed")),
+          );
         }
       } finally {
         if (!signal?.aborted) setLoading(false);
       }
     },
-    [sessionId, t],
+    [sessionId, t, templateErrorMessage],
   );
 
   useEffect(() => {
@@ -279,7 +319,7 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
       .catch((error: unknown) => {
         if (!active || controller.signal.aborted) return;
         setPreviewFailure(
-          apiErrorMessage(error, t("userOfficeTemplatePreviewFailed")),
+          templateErrorMessage(error, t("userOfficeTemplatePreviewFailed")),
         );
       })
       .finally(() => {
@@ -297,6 +337,7 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
     selectedPreviewTemplate,
     sessionId,
     t,
+    templateErrorMessage,
   ]);
 
   useEffect(
@@ -379,7 +420,9 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
         setShowImport(false);
         toast.success(t("userOfficeTemplateImported"));
       } catch (error) {
-        toast.error(apiErrorMessage(error, t("userOfficeTemplateImportFailed")));
+        toast.error(
+          templateErrorMessage(error, t("userOfficeTemplateImportFailed")),
+        );
       } finally {
         setBusyAction(null);
       }
@@ -392,6 +435,7 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
       selectedFile,
       sessionId,
       t,
+      templateErrorMessage,
       upsertTemplate,
     ],
   );
@@ -423,12 +467,14 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
         upsertTemplate(result.template);
         toast.success(t("userOfficeTemplateApproved"));
       } catch (error) {
-        toast.error(apiErrorMessage(error, t("userOfficeTemplateApproveFailed")));
+        toast.error(
+          templateErrorMessage(error, t("userOfficeTemplateApproveFailed")),
+        );
       } finally {
         setBusyAction(null);
       }
     },
-    [context, sessionId, t, upsertTemplate],
+    [context, sessionId, t, templateErrorMessage, upsertTemplate],
   );
 
   const deleteTemplate = useCallback(
@@ -468,12 +514,14 @@ export function UserOfficeTemplateCard({ sessionId }: { sessionId: string | null
         );
         toast.success(t("userOfficeTemplateDeleted"));
       } catch (error) {
-        toast.error(apiErrorMessage(error, t("userOfficeTemplateDeleteFailed")));
+        toast.error(
+          templateErrorMessage(error, t("userOfficeTemplateDeleteFailed")),
+        );
       } finally {
         setBusyAction(null);
       }
     },
-    [context, sessionId, t],
+    [context, sessionId, t, templateErrorMessage],
   );
 
   const copyReference = useCallback(

@@ -97,6 +97,98 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_STREAM_CONNECTION_MARKERS = (
+    "peer closed connection",
+    "incomplete chunked read",
+    "remoteprotocolerror",
+    "server disconnected",
+    "connection reset",
+    "connection closed",
+    "econnreset",
+    "econnrefused",
+)
+
+
+class _ProviderReportedStreamError(RuntimeError):
+    """A provider adapter converted its stream exception into an error chunk."""
+
+
+def _localized_provider_stream_error(
+    error: Exception | str,
+    language: Language | str,
+) -> tuple[str, str]:
+    """Classify raw provider diagnostics without exposing them to the UI."""
+
+    detail = str(error).strip()
+    lowered = detail.lower()
+    if is_context_overflow(RuntimeError(detail)):
+        return (
+            "model_context_too_long",
+            localize(
+                language,
+                "当前对话内容过长，请新建对话或精简上下文后重试。",
+                (
+                    "This conversation is too long. Start a new chat or shorten "
+                    "the context and try again."
+                ),
+            ),
+        )
+    if (
+        "429" in lowered
+        or "rate limit" in lowered
+        or "too_many_requests" in lowered
+    ):
+        return (
+            "model_rate_limited",
+            localize(
+                language,
+                "模型服务当前请求过多，请稍后重试。",
+                "The model service is receiving too many requests. Try again shortly.",
+            ),
+        )
+    if (
+        "401" in lowered
+        or "unauthorized" in lowered
+        or "authentication failed" in lowered
+    ):
+        return (
+            "model_authentication_failed",
+            localize(
+                language,
+                "模型服务认证失败，请检查模型服务配置。",
+                "Model service authentication failed. Check the model service configuration.",
+            ),
+        )
+    if "timeout" in lowered or "timed out" in lowered:
+        return (
+            "model_timeout",
+            localize(
+                language,
+                "模型服务响应超时，请稍后重试。",
+                "The model service timed out. Try again shortly.",
+            ),
+        )
+    if any(marker in lowered for marker in _STREAM_CONNECTION_MARKERS):
+        return (
+            "model_connection_interrupted",
+            localize(
+                language,
+                "模型服务连接中断，已自动重试但仍未恢复，请稍后再试。",
+                (
+                    "The model service connection was interrupted and did not "
+                    "recover after automatic retries. Try again shortly."
+                ),
+            ),
+        )
+    return (
+        "model_service_error",
+        localize(
+            language,
+            "模型服务暂时不可用，请稍后重试。",
+            "The model service is temporarily unavailable. Try again shortly.",
+        ),
+    )
+
 
 def _office_repair_admission_factory(prompt: SessionPrompt) -> object | None:
     """Bind repair inference to the same Goal execution and budget gate."""
@@ -1297,7 +1389,9 @@ class SessionProcessor:
                                 attempt=attempt + 1,
                             )
                             provider_finished = True
-                            return await self._handle_stream_error_chunk(chunk)
+                            raise _ProviderReportedStreamError(
+                                str(chunk.data.get("message") or "LLM error")
+                            )
 
                 await _audit_provider_event(
                     sp.session_factory,
@@ -1354,9 +1448,22 @@ class SessionProcessor:
                 self._stream_error = e
                 retry_reason = is_retryable(e)
                 effective_max = max_retries_for_error(e)
+                if isinstance(e, _ProviderReportedStreamError) and (
+                    self._accumulated_text
+                    or self._accumulated_reasoning
+                    or self._has_tool_calls
+                ):
+                    # Replaying a partially delivered response could duplicate
+                    # visible text or a tool side effect. Fail once at the
+                    # current safe boundary instead of retrying that step.
+                    retry_reason = None
 
                 if retry_reason and attempt < effective_max:
                     delay = retry_delay(attempt, e)
+                    error_code, error_message = _localized_provider_stream_error(
+                        e,
+                        job.language,
+                    )
                     logger.warning(
                         "LLM stream error (attempt %d/%d, %s), retrying in %.1fs: %s",
                         attempt + 1,
@@ -1370,7 +1477,8 @@ class SessionProcessor:
                         "max_retries": MAX_RETRIES,
                         "delay": delay,
                         "reason": retry_reason,
-                        "message": str(e),
+                        "code": error_code,
+                        "message": error_message,
                     }))
                     self._reset_stream_accumulators()
                     aborted = await sleep_with_abort(delay, job.abort_event)
@@ -2872,10 +2980,20 @@ class SessionProcessor:
                         session_id=job.session_id,
                         data={"type": "text", "text": self._accumulated_text},
                     )
-        job.publish(SSEEvent(
-            AGENT_ERROR,
-            {"error_message": chunk.data.get("message", "LLM error")},
-        ))
+        error_code, error_message = _localized_provider_stream_error(
+            str(chunk.data.get("message") or "LLM error"),
+            job.language,
+        )
+        job.publish(
+            SSEEvent(
+                AGENT_ERROR,
+                {
+                    "error_type": error_code,
+                    "code": error_code,
+                    "error_message": error_message,
+                },
+            )
+        )
         await _delete_empty_assistant_messages(sp.session_factory, job.session_id)
         return "stop"
 
@@ -2934,10 +3052,20 @@ class SessionProcessor:
                 },
             ))
         await _delete_empty_assistant_messages(sp.session_factory, job.session_id)
-        job.publish(SSEEvent(
-            AGENT_ERROR,
-            {"error_message": f"LLM stream error: {self._stream_error}"},
-        ))
+        error_code, error_message = _localized_provider_stream_error(
+            self._stream_error,
+            job.language,
+        )
+        job.publish(
+            SSEEvent(
+                AGENT_ERROR,
+                {
+                    "error_type": error_code,
+                    "code": error_code,
+                    "error_message": error_message,
+                },
+            )
+        )
         return "stop"
 
     async def _handle_empty_output_after_retries(self) -> bool:

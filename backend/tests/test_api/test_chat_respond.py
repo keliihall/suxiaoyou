@@ -41,6 +41,17 @@ async def test_respond_reports_missing_unknown_and_expired_calls(
     )
     assert missing.status_code == 404
     assert missing.json()["detail"]["code"] == "job_not_found"
+    assert missing.json()["detail"]["message"] == "任务已结束，无法再提交回复。"
+
+    missing_en = await app_client.post(
+        "/api/chat/respond",
+        headers={"Accept-Language": "en"},
+        json={"stream_id": "missing-en", "call_id": "call-1", "response": "yes"},
+    )
+    assert missing_en.status_code == 404
+    assert missing_en.json()["detail"]["message"] == (
+        "The generation job no longer exists."
+    )
 
     job = stream_manager.create_job("stream-1", "session-1")
     unknown = await app_client.post(
@@ -49,6 +60,7 @@ async def test_respond_reports_missing_unknown_and_expired_calls(
     )
     assert unknown.status_code == 409
     assert unknown.json()["detail"]["code"] == "not_pending"
+    assert unknown.json()["detail"]["message"] == "此请求当前不等待回复。"
 
     job.register_response_request(
         "expired",
@@ -63,6 +75,7 @@ async def test_respond_reports_missing_unknown_and_expired_calls(
     )
     assert expired.status_code == 409
     assert expired.json()["detail"]["code"] == "expired"
+    assert expired.json()["detail"]["message"] == "此请求已过期。"
 
 
 @pytest.mark.asyncio

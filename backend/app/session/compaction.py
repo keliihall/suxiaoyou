@@ -482,7 +482,12 @@ async def _phase2_summarize(
         logger.warning("Failed to generate compaction summary: %s", e)
         job.publish(SSEEvent(COMPACTION_ERROR, {
             "session_id": session_id,
-            "message": "Context compression failed. Consider starting a new chat.",
+            "code": "compaction_failed",
+            "error_message": localize(
+                job.language,
+                "上下文压缩失败，请稍后重试。",
+                "Context compression failed. Try again shortly.",
+            ),
         }))
         return None
 

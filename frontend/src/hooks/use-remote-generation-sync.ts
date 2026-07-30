@@ -8,6 +8,7 @@ import { useChatStore } from "@/stores/chat-store";
 import {
   getActiveStreamGeneration,
   getActiveStreamId,
+  isKnownTerminalStream,
   startStream,
 } from "@/lib/session-stream-registry";
 import {
@@ -69,6 +70,14 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
         const bucket = chatState.sessions[sessionId];
 
         if (match) {
+          // DONE/agent-error can beat backend job cleanup by one polling tick.
+          // Never reattach that exact terminal stream: doing so replays its
+          // terminal event and can produce an unbounded stack of error toasts.
+          if (isKnownTerminalStream(sessionId, match.stream_id)) {
+            knownStreamIdRef.current = match.stream_id;
+            return;
+          }
+
           const activeStreamId = getActiveStreamId(sessionId);
           if (!needsRemoteStreamAttach(match.stream_id, activeStreamId)) {
             // Update the hint only after the registry proves that this exact
@@ -102,6 +111,10 @@ export function useRemoteGenerationSync(sessionId: string | undefined) {
               after,
             })) {
               nextDelay = STALE_REPOLL_DELAY;
+              return;
+            }
+            if (isKnownTerminalStream(sessionId, match.stream_id)) {
+              knownStreamIdRef.current = match.stream_id;
               return;
             }
 

@@ -125,6 +125,87 @@ test("registry gates setup and disconnect recovery instead of forcing completion
   );
 });
 
+test("remote polling cannot reattach a stream that already ended locally", () => {
+  const registry = readFileSync("src/lib/session-stream-registry.ts", "utf8");
+  const hook = readFileSync("src/hooks/use-remote-generation-sync.ts", "utf8");
+  const hydration = readFileSync(
+    "src/components/providers/stream-registry-hydration.tsx",
+    "utf8",
+  );
+  const mobileTask = readFileSync(
+    "src/app/(mobile)/m/task/[id]/task-client.tsx",
+    "utf8",
+  );
+
+  assert.match(registry, /const terminalStreamIds = new Map<string, string>\(\)/);
+  assert.equal(
+    [...registry.matchAll(/markKnownTerminalStream\(sessionId, streamId\)/g)]
+      .length,
+    2,
+  );
+  const startStream = registry.slice(
+    registry.indexOf("export async function startStream"),
+    registry.indexOf("function installHandlers"),
+  );
+  assert.match(
+    startStream,
+    /if \(isKnownTerminalStream\(sessionId, streamId\)\) return;/,
+  );
+  assert.equal(
+    [...startStream.matchAll(/isKnownTerminalStream\(sessionId, streamId\)/g)]
+      .length,
+    2,
+  );
+  assert.equal(
+    [...hook.matchAll(/isKnownTerminalStream\(sessionId, match\.stream_id\)/g)]
+      .length,
+    2,
+  );
+  assert.match(
+    hook,
+    /if \(isKnownTerminalStream\(sessionId, match\.stream_id\)\)[\s\S]*return;/,
+  );
+  assert.doesNotMatch(hook, /clearKnownTerminalStream/);
+  assert.match(
+    hydration,
+    /isKnownTerminalStream\(job\.session_id, job\.stream_id\)/,
+  );
+  assert.match(
+    mobileTask,
+    /isKnownTerminalStream\(resolvedId, streamIdParam\)/,
+  );
+  assert.match(mobileTask, /API\.CHAT\.ACTIVE/);
+  assert.match(mobileTask, /next\.delete\("stream_id"\)/);
+  assert.match(
+    mobileTask,
+    /job\.session_id === resolvedId[\s\S]*job\.stream_id === streamIdParam/,
+  );
+});
+
+test("remote fetch SSE requires a real event before resetting retry budget", () => {
+  const source = readFileSync("src/lib/sse.ts", "utf8");
+  const dispatch = source.slice(
+    source.indexOf("private dispatchEvent"),
+    source.indexOf("private doConnectFetch"),
+  );
+  const fetchConnect = source.slice(
+    source.indexOf("private doConnectFetch"),
+    source.indexOf("private doConnectEventSource"),
+  );
+
+  assert.match(dispatch, /this\.retryCount = 0;/);
+  assert.doesNotMatch(fetchConnect, /this\.retryCount = 0;/);
+  assert.match(fetchConnect, /if \(!this\.closed\) \{\s*this\.scheduleReconnect\(\);/);
+  assert.match(
+    source,
+    /private resetHeartbeat[\s\S]*abortController\?\.abort\(\)[\s\S]*this\.scheduleReconnect\(\)/,
+  );
+  assert.match(
+    source,
+    /private startStaleCheck[\s\S]*!this\.abortController[\s\S]*abortController\?\.abort\(\)/,
+  );
+});
+
 test("background streams cannot write global workspace or artifact projections", () => {
   const source = readFileSync("src/lib/session-stream-registry.ts", "utf8");
 

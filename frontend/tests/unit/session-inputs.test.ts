@@ -83,8 +83,14 @@ test("execution failures are visible instead of disappearing silently", () => {
   const en = JSON.parse(readFileSync("src/i18n/locales/en/chat.json", "utf8"));
 
   assert.match(registry, /INPUT_FAILED[\s\S]*toast\.error/);
-  assert.match(zh.inputExecutionFailedWithReason, /执行失败/);
-  assert.match(en.inputExecutionFailedWithReason, /failed/);
+  const handler = registry.slice(
+    registry.indexOf("onCurrent(SSE_EVENTS.INPUT_FAILED"),
+    registry.indexOf('onCurrent("heartbeat"'),
+  );
+  assert.match(handler, /i18n\.t\("inputExecutionFailed"/);
+  assert.doesNotMatch(handler, /reason:\s*data\.error/);
+  assert.match(zh.inputExecutionFailed, /未能完成/);
+  assert.match(en.inputExecutionFailed, /could not be completed/);
 });
 
 test("an existing folderless conversation never inherits the last global project", () => {

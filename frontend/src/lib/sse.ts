@@ -110,9 +110,11 @@ export class SSEClient {
    *  Used after desktop wake/visibility restoration. */
   checkHealth(): void {
     if (this.closed) return;
+    const fetchActive =
+      this.abortController !== null && !this.abortController.signal.aborted;
     if (
-      !this.eventSource ||
-      this.eventSource.readyState === EventSource.CLOSED
+      (!this.eventSource && !fetchActive) ||
+      this.eventSource?.readyState === EventSource.CLOSED
     ) {
       // Connection is dead — force reconnect
       this.doConnect();
@@ -203,6 +205,10 @@ export class SSEClient {
     }
 
     this.nativeReconnectCount = 0;
+    // A successful HTTP response is not enough to prove a remote SSE stream
+    // is healthy: tunnels can repeatedly return 200 and then EOF immediately.
+    // Reset the bounded retry budget only after a valid event is received.
+    this.retryCount = 0;
     this.lastEventTime = Date.now();
     this.resetHeartbeat();
     this.options.onEvent?.(eventType);
@@ -240,7 +246,6 @@ export class SSEClient {
           throw new Error(`SSE fetch failed: ${res.status}`);
         }
 
-        this.retryCount = 0;
         this.lastEventTime = Date.now();
         this.resetHeartbeat();
         this.options.onStatusChange?.("connected");
@@ -340,10 +345,15 @@ export class SSEClient {
     if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
     this.heartbeatTimer = setTimeout(() => {
       // No heartbeat received — server may be dead
-      if (this.eventSource && !this.closed) {
-        this.eventSource.close();
-        this.scheduleReconnect();
-      }
+      if (this.closed) return;
+      const eventSource = this.eventSource;
+      const abortController = this.abortController;
+      if (!eventSource && !abortController) return;
+      this.eventSource = null;
+      this.abortController = null;
+      eventSource?.close();
+      abortController?.abort();
+      this.scheduleReconnect();
     }, SSE_HEARTBEAT_TIMEOUT);
   }
 
@@ -385,12 +395,21 @@ export class SSEClient {
   private startStaleCheck(): void {
     if (this.staleCheckInterval) clearInterval(this.staleCheckInterval);
     this.staleCheckInterval = setInterval(() => {
-      if (this.closed || !this.eventSource) return;
+      if (
+        this.closed ||
+        (!this.eventSource && !this.abortController)
+      ) {
+        return;
+      }
       const staleMs = Date.now() - this.lastEventTime;
       if (staleMs > SSE_HEARTBEAT_TIMEOUT) {
         // Connection is stale — force reconnect
-        this.eventSource.close();
+        const eventSource = this.eventSource;
+        const abortController = this.abortController;
         this.eventSource = null;
+        this.abortController = null;
+        eventSource?.close();
+        abortController?.abort();
         this.scheduleReconnect();
       }
     }, 15_000);

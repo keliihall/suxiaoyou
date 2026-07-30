@@ -397,8 +397,8 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
 
     await page.goto("/c/session-artifacts");
     await openArtifactFile(page, "missing-report.xlsx");
-    await expect(page.getByText("File not found:", { exact: false })).toBeVisible();
-    await expect(page.getByText("missing-report.xlsx", { exact: false }).first()).toBeVisible();
+    await expect(page.getByText("Failed to render spreadsheet")).toBeVisible();
+    await expect(page.getByText("File not found:", { exact: false })).toHaveCount(0);
     await expectNoAppCrash(page);
   });
 
@@ -434,7 +434,9 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     );
     await page.getByRole("button", { name: /Send message/i }).click();
     await rateLimitResponse;
-    await expect(page.getByText(/Failed to send message|API 429/i)).toBeVisible();
+    await expect(
+      page.getByText("Could not send the message. Check the connection and try again."),
+    ).toBeVisible();
 
     await page.getByPlaceholder(/Describe the result you want/i).fill("payment required gate");
     const paymentRequiredResponse = page.waitForResponse((res) =>
@@ -442,7 +444,14 @@ test.describe("苏小有 Office artifact and error-state GUI workflows", () => {
     );
     await page.getByRole("button", { name: /Send message/i }).click();
     await paymentRequiredResponse;
-    await expect(page.getByText(/Failed to send message|API 402/i)).toBeVisible();
+    await expect(
+      page
+        .getByText(
+          "Could not send the message. Check the connection and try again.",
+        )
+        .last(),
+    ).toBeVisible();
+    await expect(page.getByText(/Rate limit exceeded|Payment required/)).toHaveCount(0);
     await expectNoAppCrash(page);
   });
 
