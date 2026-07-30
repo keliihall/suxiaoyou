@@ -119,6 +119,7 @@ export interface 苏小有MockOptions {
 
 export interface 苏小有SeedOptions {
   hasCompletedOnboarding?: boolean;
+  language?: "zh" | "en";
   savedPermissions?: Array<{
     tool: string;
     allow: boolean;
@@ -1227,7 +1228,7 @@ function seededSettings(options: 苏小有SeedOptions = {}) {
       savedPermissions: options.savedPermissions ?? [],
       workspaceDirectory: null,
       hasSeenHints: true,
-      language: "en",
+      language: options.language ?? "en",
       activeProvider: "byok",
     },
     version: 5,
@@ -1251,7 +1252,7 @@ export async function seed苏小有Storage(
       };
 
       setValue("suxiaoyou-settings", JSON.stringify(settings));
-      setValue("suxiaoyou-language", "en");
+      setValue("suxiaoyou-language", settings.state.language);
       setValue(
         "suxiaoyou_remote_config",
         JSON.stringify({ url: window.location.origin, token: "remote-token" }),

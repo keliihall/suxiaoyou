@@ -46,6 +46,8 @@ test("optional workspace surfaces handle unavailable and provenance states", () 
     officeSource,
     /code === "runtime_workspace_provenance_mismatch"/,
   );
+  assert.match(officeSource, /code === "runtime_workspace_not_found"/);
+  assert.doesNotMatch(officeSource, /apiErrorMessage/);
   assert.match(
     panelSource,
     /const activeWorkspacePath = useWorkspaceStore\(\(state\) => state\.activeWorkspacePath\)/,
@@ -82,6 +84,10 @@ test("optional workspace surfaces handle unavailable and provenance states", () 
   assert.equal(zh.runtimeControlTitle, "版本与恢复");
   assert.equal(zh.runtimeCheckpointLabel, "版本 {{sequence}}");
   assert.equal(zh.runtimeRewind, "恢复到这里");
+  assert.equal(
+    zh.userOfficeTemplateWorkspaceMismatch,
+    "当前文件夹尚未确认或已发生变化，请重新选择文件夹后重试。",
+  );
   const visibleRuntimeChinese = Object.entries(zh)
     .filter(([key]) => key.startsWith("runtime"))
     .map(([, value]) => String(value))

@@ -6,7 +6,11 @@ import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { getChatRoute } from "@/lib/routes";
 import { useChatStore } from "@/stores/chat-store";
-import { startStream, isStreamActive } from "@/lib/session-stream-registry";
+import {
+  isKnownTerminalStream,
+  isStreamActive,
+  startStream,
+} from "@/lib/session-stream-registry";
 import { NAVIGATE_TO_SESSION_EVENT, type NavigateToSessionDetail } from "@/lib/background-notify";
 
 /**
@@ -32,7 +36,12 @@ export function StreamRegistryHydration() {
         if (cancelled) return;
         const chatState = useChatStore.getState();
         for (const job of jobs) {
-          if (isStreamActive(job.session_id)) continue;
+          if (
+            isStreamActive(job.session_id) ||
+            isKnownTerminalStream(job.session_id, job.stream_id)
+          ) {
+            continue;
+          }
           chatState.startGeneration(job.session_id, job.stream_id);
           void startStream(job.session_id, job.stream_id);
         }

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { api, apiErrorMessage } from "@/lib/api";
+import { api } from "@/lib/api";
 import { base64ToBlob, downloadBlob } from "@/lib/browser-files";
 import { API } from "@/lib/constants";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -80,7 +80,10 @@ export function MediaRenderer({ filePath, kind }: MediaRendererProps) {
         setFileName(response.name || filePath.split(/[/\\]/).pop() || kind);
         setMediaUrl(objectUrl);
       } catch (cause) {
-        if (!cancelled) setError(apiErrorMessage(cause, t("failedLoadMedia")));
+        if (!cancelled) {
+          console.warn("Media preview failed:", cause);
+          setError(t("failedLoadMedia"));
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }

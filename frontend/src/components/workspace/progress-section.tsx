@@ -108,7 +108,7 @@ function AgentTaskItem({ task }: { task: WorkspaceAgentTask }) {
           {task.title}
         </p>
         <p className="mt-0.5 truncate text-[11px] text-[var(--text-tertiary)]">
-          {task.error || meta || statusLabel}
+          {task.status === "failed" ? statusLabel : meta || statusLabel}
         </p>
       </div>
       {task.session_id && (

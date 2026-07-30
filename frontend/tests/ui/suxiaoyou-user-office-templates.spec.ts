@@ -168,6 +168,34 @@ test("feature-gate 404 hides the user Office template surface completely", async
   await expect(page.getByTestId("user-office-template-card")).toHaveCount(0);
 });
 
+test("workspace provenance mismatch hides the duplicate Office warning and raw backend detail", async ({
+  page,
+}) => {
+  const rawDetail = "The request is not bound to the current verified workspace";
+  let listCalls = 0;
+  await page.route("**/api/office-v2/user-templates**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/office-v2/user-templates") {
+      listCalls += 1;
+      expectListBinding(route.request());
+      return fulfillJson(
+        route,
+        {
+          code: "user_office_template_provenance_mismatch",
+          detail: rawDetail,
+        },
+        409,
+      );
+    }
+    return fulfillJson(route, { detail: "Unexpected template request" }, 404);
+  });
+
+  await page.goto(`/c/${SESSION_ID}`);
+  await expect.poll(() => listCalls).toBeGreaterThan(0);
+  await expect(page.getByTestId("user-office-template-card")).toHaveCount(0);
+  await expect(page.getByText(rawDetail)).toHaveCount(0);
+});
+
 test("imports an authoritative template, previews it, approves exact evidence, and copies its opaque reference", async ({
   page,
 }) => {

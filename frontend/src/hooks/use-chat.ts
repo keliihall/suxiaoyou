@@ -72,7 +72,6 @@ import type { GoalStartRequest, SessionGoal } from "@/types/goal";
 
 const MODEL_DOES_NOT_SUPPORT_IMAGES = "MODEL_DOES_NOT_SUPPORT_IMAGES";
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
-const VISION_MODEL_REQUIRED_MESSAGE = "The selected model does not support images. Choose a vision model and try again.";
 
 function queuedInputFingerprint(
   sessionId: string,
@@ -363,7 +362,7 @@ export function useChat(currentSessionId?: string) {
             settingsState.selectedProviderId,
           )
         ) {
-          toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+          toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
           return false;
         }
         const presets = settingsState.permissionPresets;
@@ -564,7 +563,7 @@ export function useChat(currentSessionId?: string) {
           settingsState.selectedProviderId,
         )
       ) {
-        toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+        toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
         return false;
       }
 
@@ -690,14 +689,18 @@ export function useChat(currentSessionId?: string) {
 
         if (err instanceof ApiError) {
           if (isUnsupportedImagesError(err)) {
-            toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+            toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
             return false;
           }
-          toast.error(err.message, { duration: 8000 });
+          toast.error(i18n.t("messageSendFailed", { ns: "chat" }), {
+            duration: 8000,
+          });
           return false;
         }
 
-        toast.error("Failed to send message", { duration: 8000 });
+        toast.error(i18n.t("messageSendFailed", { ns: "chat" }), {
+          duration: 8000,
+        });
         return false;
       }
     },
@@ -811,11 +814,15 @@ export function useChat(currentSessionId?: string) {
         chatState.resetSession(targetSessionId);
 
         if (err instanceof ApiError) {
-          toast.error(err.message, { duration: 8000 });
+          toast.error(i18n.t("taskBatchStartFailed", { ns: "chat" }), {
+            duration: 8000,
+          });
           return false;
         }
 
-        toast.error("Failed to start task batch", { duration: 8000 });
+        toast.error(i18n.t("taskBatchStartFailed", { ns: "chat" }), {
+          duration: 8000,
+        });
         return false;
       }
     },
@@ -841,7 +848,7 @@ export function useChat(currentSessionId?: string) {
           settingsState.selectedProviderId,
         )
       ) {
-        toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+        toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
         return false;
       }
 
@@ -885,14 +892,7 @@ export function useChat(currentSessionId?: string) {
           (old) => upsertSessionInput(old, queued),
         );
         if (queued.status === "failed" || queued.status === "cancelled") {
-          toast.error(
-            queued.error_message
-              ? i18n.t("inputExecutionFailedWithReason", {
-                  ns: "chat",
-                  reason: queued.error_message,
-                })
-              : i18n.t("inputExecutionFailed", { ns: "chat" }),
-          );
+          toast.error(i18n.t("inputExecutionFailed", { ns: "chat" }));
           // The idempotent replay found a terminal failure. Restore the
           // composer so an explicit next click can submit a fresh request id.
           return false;
@@ -1244,7 +1244,13 @@ export function useChat(currentSessionId?: string) {
         }
         console.error("Failed to respond to permission:", err);
         toast.error(
-          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+          i18n.t(
+            detail?.code === "response_conflict"
+              ? "interactionResponseConflict"
+              : "interactionResponseFailed",
+            { ns: "chat" },
+          ),
+          { id: `interaction-response:${targetSessionId}:${perm.callId}` },
         );
       }
     },
@@ -1266,7 +1272,7 @@ export function useChat(currentSessionId?: string) {
           settingsState.selectedProviderId,
         )
       ) {
-        toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+        toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
         return { status: "failed" };
       }
 
@@ -1462,14 +1468,14 @@ export function useChat(currentSessionId?: string) {
 
         if (err instanceof ApiError) {
           if (isUnsupportedImagesError(err)) {
-            toast.error(VISION_MODEL_REQUIRED_MESSAGE);
+            toast.error(i18n.t("visionModelRequired", { ns: "chat" }));
             return { status: "failed" };
           }
-          toast.error(err.message);
+          toast.error(i18n.t("conversationEditFailed", { ns: "chat" }));
           return { status: "failed" };
         }
 
-        toast.error("Failed to edit message");
+        toast.error(i18n.t("conversationEditFailed", { ns: "chat" }));
         return { status: "failed" };
       }
     },
@@ -1541,7 +1547,13 @@ export function useChat(currentSessionId?: string) {
         }
         console.error("Failed to respond to question:", err);
         toast.error(
-          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+          i18n.t(
+            detail?.code === "response_conflict"
+              ? "interactionResponseConflict"
+              : "interactionResponseFailed",
+            { ns: "chat" },
+          ),
+          { id: `interaction-response:${targetSessionId}:${question.callId}` },
         );
       }
     },
@@ -1626,7 +1638,13 @@ export function useChat(currentSessionId?: string) {
         }
         console.error("Failed to respond to plan review:", err);
         toast.error(
-          typeof detail?.message === "string" ? detail.message : "Failed to respond",
+          i18n.t(
+            detail?.code === "response_conflict"
+              ? "interactionResponseConflict"
+              : "interactionResponseFailed",
+            { ns: "chat" },
+          ),
+          { id: `interaction-response:${targetSessionId}:${review.callId}` },
         );
       }
     },

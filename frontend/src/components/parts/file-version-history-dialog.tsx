@@ -12,7 +12,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useFileVersions, useRestoreFileVersion } from "@/hooks/use-file-versions";
-import { apiErrorMessage } from "@/lib/api";
 import { formatFileVersionSize } from "@/lib/file-version";
 import type { FileVersion } from "@/types/file-version";
 
@@ -100,7 +99,8 @@ export function FileVersionHistoryDialog({
           : t("fileVersionRestored"),
       );
     } catch (error) {
-      toast.error(apiErrorMessage(error, t("fileVersionRestoreFailed")));
+      console.warn("File version restore failed:", error);
+      toast.error(t("fileVersionRestoreFailed"));
     }
   };
 
@@ -126,7 +126,7 @@ export function FileVersionHistoryDialog({
           </div>
         ) : versionsQuery.isError ? (
           <div className="space-y-3 rounded-lg border border-[var(--color-destructive)]/30 p-4 text-sm text-[var(--text-secondary)]">
-            <p>{apiErrorMessage(versionsQuery.error, t("fileVersionLoadFailed"))}</p>
+            <p>{t("fileVersionLoadFailed")}</p>
             <Button type="button" size="sm" variant="outline" onClick={() => void versionsQuery.refetch()}>
               {t("retry")}
             </Button>

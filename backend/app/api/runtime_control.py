@@ -389,9 +389,32 @@ async def _require_current_checkpoint_workspace(
         instance = await db.get(WorkspaceInstance, workspace_instance_id)
     if session is None or instance is None:
         raise RewindNotFoundError("Session or workspace instance not found")
+    uses_managed_workspace = not session.directory or session.directory == "."
+    if uses_managed_workspace:
+        try:
+            expected_root = str(
+                managed_workspace_for_session(session.id, create=False).resolve(
+                    strict=True
+                )
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RewindProvenanceError(
+                "Managed session workspace is unavailable"
+            ) from exc
+        managed_binding_valid = (
+            instance.kind == "managed"
+            and instance.created_by_session_id == session.id
+            and instance.project_id == session.project_id
+            and isinstance(instance.details, dict)
+            and instance.details.get("managed") is True
+        )
+    else:
+        expected_root = session.directory
+        managed_binding_valid = True
     if (
         instance.status != "active"
-        or not _same_resolved_path(session.directory, instance.root_path)
+        or not managed_binding_valid
+        or not _same_resolved_path(expected_root, instance.root_path)
         or (
             session.project_id is not None
             and instance.project_id is not None

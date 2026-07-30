@@ -26,6 +26,10 @@ import {
 } from "@/lib/stream-progress";
 import { StreamLeaseRegistry, type StreamLease } from "@/lib/stream-lifecycle";
 import {
+  streamErrorToastId,
+  streamErrorTranslationKey,
+} from "@/lib/stream-error";
+import {
   canMarkInteractionContinuing,
   INTERACTION_CONTINUATION_GRACE_MS,
   INTERACTION_RECOVERY_VERIFY_MS,
@@ -147,6 +151,11 @@ interface InteractionRecoveryWatch {
 
 const instances = new Map<string, StreamInstance>();
 const streamLeases = new StreamLeaseRegistry();
+// A terminal SSE event can arrive a fraction earlier than the backend removes
+// the job from /chat/active. Remember that exact stream during the cleanup
+// window so remote-generation polling cannot attach it again and replay the
+// same DONE/error event (and toast) in a loop.
+const terminalStreamIds = new Map<string, string>();
 
 let queryClientRef: QueryClient | null = null;
 let globalListenersInstalled = false;
@@ -175,6 +184,18 @@ export function getActiveStreamId(sessionId: string): string | null {
 /** Lease generation changes even if a future backend reuses a stream id. */
 export function getActiveStreamGeneration(sessionId: string): number | null {
   return instances.get(sessionId)?.lease.generation ?? null;
+}
+
+/** Has this exact backend stream already delivered a terminal event locally? */
+export function isKnownTerminalStream(
+  sessionId: string,
+  streamId: string,
+): boolean {
+  return terminalStreamIds.get(sessionId) === streamId;
+}
+
+function markKnownTerminalStream(sessionId: string, streamId: string): void {
+  terminalStreamIds.set(sessionId, streamId);
 }
 
 /** User-requested reconnect; business progress time intentionally stays put. */
@@ -267,6 +288,8 @@ function resetDisconnectedRecovery(instance: StreamInstance): void {
  * for an already-active session closes the old stream first.
  */
 export async function startStream(sessionId: string, streamId: string): Promise<void> {
+  if (isKnownTerminalStream(sessionId, streamId)) return;
+
   const existing = instances.get(sessionId);
   if (
     existing?.streamId === streamId
@@ -293,6 +316,10 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     }
   }
   if (!streamLeases.isCurrent(lease)) return;
+  if (isKnownTerminalStream(sessionId, streamId)) {
+    streamLeases.clear(sessionId, lease);
+    return;
+  }
 
   ensureGlobalListeners();
 
@@ -508,7 +535,9 @@ export async function startStream(sessionId: string, streamId: string): Promise<
       if (status === "disconnected") {
         if (!instance.disconnectNotified) {
           instance.disconnectNotified = true;
-          toast.error("Connection lost. Reconnecting while the task continues.");
+          toast.error(i18n.t("streamConnectionLost", { ns: "chat" }), {
+            id: `stream-disconnected:${sessionId}`,
+          });
         }
         void recoverDisconnectedStream();
       }
@@ -1026,7 +1055,15 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   onCurrent(SSE_EVENTS.TOOL_ERROR, (data) => {
     cancelPendingStepFinish();
     if (data.call_id) {
-      store.getState().setToolError(sessionId, data.call_id, data.output ?? data.error_message ?? "Error");
+      console.warn(
+        "Tool execution failed:",
+        data.error ?? data.output ?? data.error_message,
+      );
+      store.getState().setToolError(
+        sessionId,
+        data.call_id,
+        i18n.t("statusError", { ns: "chat" }),
+      );
       markToolContinuation(data.call_id);
     }
   });
@@ -1105,7 +1142,9 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   });
   onCurrent(SSE_EVENTS.COMPACTED, (data) => {
     store.getState().addCompaction(sessionId, true);
-    if (data.summary_created) toast.success("Context compacted");
+    if (data.summary_created) {
+      toast.success(i18n.t("contextCompactSuccess", { ns: "chat" }));
+    }
   });
 
   onCurrent(SSE_EVENTS.PERMISSION_REQUEST, (data) => {
@@ -1249,14 +1288,10 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   onCurrent(SSE_EVENTS.INPUT_APPLIED, refreshPendingInputs);
   onCurrent(SSE_EVENTS.INPUT_FAILED, (data) => {
     refreshPendingInputs();
-    toast.error(
-      data.error
-        ? i18n.t("inputExecutionFailedWithReason", {
-            ns: "chat",
-            reason: data.error,
-          })
-        : i18n.t("inputExecutionFailed", { ns: "chat" }),
-    );
+    console.warn("Queued input execution failed:", data.error ?? data.code);
+    toast.error(i18n.t("inputExecutionFailed", { ns: "chat" }), {
+      id: `input-execution-failed:${sessionId}`,
+    });
   });
 
   onCurrent("heartbeat", () => {
@@ -1272,7 +1307,13 @@ export async function startStream(sessionId: string, streamId: string): Promise<
   });
 
   onCurrent(SSE_EVENTS.COMPACTION_ERROR, (data) => {
-    toast.warning(data.error_message || "Context compression failed. Consider starting a new chat.");
+    console.warn(
+      "SSE compaction error:",
+      data.error_message ?? data.message ?? "unknown",
+    );
+    toast.warning(i18n.t("contextCompactError", { ns: "chat" }), {
+      id: `compaction-error:${sessionId}`,
+    });
   });
 
   onCurrent(SSE_EVENTS.DONE, () => {
@@ -1280,6 +1321,7 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     // EventSource must not schedule a reconnect to a job
     // that is already complete (→ a spurious "Job not found").
     client.close();
+    markKnownTerminalStream(sessionId, streamId);
     cancelPendingStepFinish();
     textBuffer.flush();
     reasoningBuffer.flush();
@@ -1303,27 +1345,41 @@ export async function startStream(sessionId: string, streamId: string): Promise<
     stopCurrentStream();
   });
 
-  const handleAgentError = (data: { error_message?: string | null; code?: string | null }) => {
+  const handleAgentError = (data: {
+    error_message?: string | null;
+    error_type?: string | null;
+    code?: string | null;
+  }) => {
     // Close the dead connection synchronously. The server ends the response
     // right after this single error event, so the
     // EventSource would otherwise fire onerror mid-await and schedule a
     // reconnect to a stream the backend no longer has.
     client.close();
+    markKnownTerminalStream(sessionId, streamId);
 
-    const message = data.error_message ?? "Unknown stream error";
+    const rawMessage = data.error_message ?? "";
+    const translationKey = streamErrorTranslationKey(data);
+    const message = translationKey
+      ? i18n.t(translationKey, { ns: "chat" })
+      : i18n.t("streamErrorGeneric", { ns: "chat" });
     // A missing job almost always means the local backend restarted out from
     // under an in-flight generation. The conversation is safe in the DB, so
     // recover quietly rather than alarming the user with an opaque toast.
-    const streamGone = data.code === "JOB_NOT_FOUND" || message === "Job not found";
-    const contextLimitError = /maximum context length|requested about/i.test(message);
+    const streamGone =
+      data.code === "JOB_NOT_FOUND" || rawMessage === "Job not found";
+    const contextLimitError = translationKey === "streamErrorContextTooLong";
     if (streamGone) {
       // Silent — recovered from the DB below.
     } else if (contextLimitError) {
-      toast.error("Context too long for this model. Start a new chat or shorten the conversation.");
+      toast.error(message, {
+        id: streamErrorToastId(sessionId, data, translationKey),
+      });
     } else {
-      toast.error(message);
+      toast.error(message, {
+        id: streamErrorToastId(sessionId, data, translationKey),
+      });
     }
-    console.warn("SSE agent error:", message);
+    console.warn("SSE agent error:", rawMessage || message);
     textBuffer.flush();
     reasoningBuffer.flush();
     finishCurrentGeneration();
@@ -1594,13 +1650,21 @@ function maybeNotifyFinish(sessionId: string, kind: "done" | "error", errorMessa
   }
   const qc = queryClientRef;
   const session = qc?.getQueryData<SessionResponse>(queryKeys.sessions.detail(sessionId));
-  const sessionTitle = session?.title?.trim() || "Background task";
+  const sessionTitle =
+    session?.title?.trim() ||
+    i18n.t("backgroundTask", { ns: "chat" });
   const title = kind === "done"
-    ? `${sessionTitle} finished`
-    : `${sessionTitle} stopped`;
+    ? i18n.t("backgroundTaskFinished", {
+        ns: "chat",
+        title: sessionTitle,
+      })
+    : i18n.t("backgroundTaskStopped", {
+        ns: "chat",
+        title: sessionTitle,
+      });
   const body = kind === "done"
-    ? "Click to open the conversation."
-    : (errorMessage ?? "Click to open the conversation.");
+    ? i18n.t("backgroundTaskOpen", { ns: "chat" })
+    : (errorMessage ?? i18n.t("backgroundTaskOpen", { ns: "chat" }));
   void notifyBackgroundFinish({ sessionId, title, body, kind });
 }
 
@@ -1609,6 +1673,7 @@ export function disposeAllStreams(): void {
   for (const inst of instances.values()) disposeInstance(inst);
   instances.clear();
   streamLeases.clearAll();
+  terminalStreamIds.clear();
   unlistenBackendRestarting?.();
   unlistenBackendRestarted?.();
   unlistenVisibilityChange?.();

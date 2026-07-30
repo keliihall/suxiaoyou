@@ -88,11 +88,16 @@ _HEARTBEAT_INTERVAL = 15.0
 def _ensure_security_not_stopped(request: Request) -> None:
     control = getattr(request.app.state, "security_control", None)
     if control is not None and control.emergency_stop:
+        language = request_language(request)
         raise HTTPException(
             status_code=423,
             detail={
                 "code": "security_emergency_stop",
-                "message": "Security emergency stop is active. Resume from Settings before starting a task.",
+                "message": localize(
+                    language,
+                    "安全紧急停止已启用，请先在设置中恢复。",
+                    "Security emergency stop is active. Resume from Settings before starting a task.",
+                ),
             },
         )
 
@@ -177,7 +182,15 @@ def _on_task_done(task: asyncio.Task[None], *, job: GenerationJob) -> None:
     if exc is not None:
         logger.error("Unhandled exception in generation task %s: %s", task.get_name(), exc, exc_info=exc)
         try:
-            job.publish(SSEEvent(AGENT_ERROR, {"error_message": "An internal error occurred. Please try again."}))
+            job.publish(SSEEvent(AGENT_ERROR, {
+                "error_type": "internal_error",
+                "code": "internal_error",
+                "error_message": localize(
+                    job.language,
+                    "任务发生内部错误，请稍后重试。",
+                    "The task encountered an internal error. Try again shortly.",
+                ),
+            }))
         except Exception:
             logger.exception("Failed to publish AGENT_ERROR for task %s", task.get_name())
         finally:
@@ -211,7 +224,15 @@ async def _run_with_semaphore(
                         "Failed to persist admission rejection for stream %s",
                         job.stream_id,
                     )
-        job.publish(SSEEvent(AGENT_ERROR, {"error_message": "Server is busy. Please try again shortly."}))
+        job.publish(SSEEvent(AGENT_ERROR, {
+            "error_type": "server_busy",
+            "code": "server_busy",
+            "error_message": localize(
+                job.language,
+                "本地服务当前繁忙，请稍后重试。",
+                "The local service is busy. Try again shortly.",
+            ),
+        }))
         job.complete()
         return
     except BaseException:
@@ -607,11 +628,22 @@ async def start_compaction(
 ) -> PromptResponse:
     """Start a manual compaction stream. Reuses the normal SSE/abort lifecycle."""
     _ensure_security_not_stopped(request)
+    language = request_language(request)
     async with session_factory() as db:
         async with db.begin():
             session = await get_session(db, body.session_id)
             if session is None:
-                raise HTTPException(status_code=404, detail="Session not found")
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "compaction_session_not_found",
+                        "message": localize(
+                            language,
+                            "未找到对应的对话。",
+                            "The conversation was not found.",
+                        ),
+                    },
+                )
 
     usage_ratio = await _get_session_context_usage_ratio(
         session_factory,
@@ -622,14 +654,32 @@ async def start_compaction(
     if usage_ratio is not None and usage_ratio < _MANUAL_COMPACTION_MIN_USAGE_RATIO:
         raise HTTPException(
             status_code=409,
-            detail="Manual compaction is available only after context usage reaches 50%",
+            detail={
+                "code": "compaction_threshold_not_met",
+                "message": localize(
+                    language,
+                    "上下文使用达到 50% 后才能手动压缩。",
+                    "Manual compaction is available after context usage reaches 50%.",
+                ),
+            },
         )
 
     if any(job.session_id == body.session_id and not job.completed for job in sm._jobs.values()):
-        raise HTTPException(status_code=409, detail="Session is currently busy")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "compaction_session_busy",
+                "message": localize(
+                    language,
+                    "当前对话正在执行其他任务，请稍后重试。",
+                    "The conversation is currently busy. Try again shortly.",
+                ),
+            },
+        )
 
     stream_id = generate_ulid()
     job = _create_session_job(sm, stream_id=stream_id, session_id=body.session_id)
+    job.language = language
     job.close_session_input_admission()
 
     async def _run_compaction_job() -> None:
@@ -652,12 +702,33 @@ async def start_compaction(
 
             if not job.abort_event.is_set():
                 if not result.summary and result.pruned_parts == 0:
-                    job.publish(SSEEvent(COMPACTION_ERROR, {"error_message": "Nothing to compact yet"}))
+                    job.publish(SSEEvent(COMPACTION_ERROR, {
+                        "code": "compaction_nothing_to_compact",
+                        "error_message": localize(
+                            job.language,
+                            "当前还没有可压缩的内容。",
+                            "There is nothing to compact yet.",
+                        ),
+                    }))
                 elif not result.summary:
-                    job.publish(SSEEvent(COMPACTION_ERROR, {"error_message": "Compaction stopped before an AI summary was produced"}))
+                    job.publish(SSEEvent(COMPACTION_ERROR, {
+                        "code": "compaction_summary_missing",
+                        "error_message": localize(
+                            job.language,
+                            "压缩已停止，但未生成摘要。",
+                            "Compaction stopped before an AI summary was produced.",
+                        ),
+                    }))
         except Exception:
             logger.exception("Compaction error for stream %s", job.stream_id)
-            job.publish(SSEEvent(COMPACTION_ERROR, {"error_message": "Context compaction failed. Please try again."}))
+            job.publish(SSEEvent(COMPACTION_ERROR, {
+                "code": "compaction_failed",
+                "error_message": localize(
+                    job.language,
+                    "上下文压缩失败，请稍后重试。",
+                    "Context compaction failed. Try again shortly.",
+                ),
+            }))
         finally:
             async with session_factory() as db:
                 async with db.begin():
@@ -992,13 +1063,16 @@ def _raise_interaction_conflict(
     stream_id: str,
     call_id: str,
     stored: dict[str, Any],
+    language: Language,
 ) -> None:
     raise HTTPException(
         status_code=409,
         detail={
             "code": "response_conflict",
-            "message": (
-                "This interaction was already resolved with a different response."
+            "message": localize(
+                language,
+                "此请求已使用其他回复处理。",
+                "This interaction was already resolved with a different response.",
             ),
             "stream_id": stream_id,
             "call_id": call_id,
@@ -1041,6 +1115,7 @@ def _replay_interaction_resolution(
     request_hash: str,
     body: RespondRequest,
     job: GenerationJob | None,
+    language: Language,
 ) -> dict[str, Any]:
     stored = dict(record.response or {})
     if record.request_hash != request_hash:
@@ -1048,6 +1123,7 @@ def _replay_interaction_resolution(
             stream_id=body.stream_id,
             call_id=body.call_id,
             stored=stored,
+            language=language,
         )
 
     # A retry can arrive after the DB commit but before the original handler
@@ -1066,6 +1142,7 @@ def _replay_interaction_resolution(
                 stream_id=body.stream_id,
                 call_id=body.call_id,
                 stored=stored,
+                language=language,
             )
 
     return _interaction_public_payload(
@@ -1083,6 +1160,7 @@ async def respond_to_prompt(
     body: RespondRequest,
 ) -> dict:
     """User responds to question tool or permission request."""
+    language = request_language(request)
     job = sm.get_job(body.stream_id)
     if job is None:
         durable = await _load_interaction_resolution(
@@ -1096,12 +1174,17 @@ async def respond_to_prompt(
                 request_hash=canonical_request_hash({"response": body.response}),
                 body=body,
                 job=None,
+                language=language,
             )
         raise HTTPException(
             status_code=404,
             detail={
                 "code": "job_not_found",
-                "message": "The generation job no longer exists.",
+                "message": localize(
+                    language,
+                    "任务已结束，无法再提交回复。",
+                    "The generation job no longer exists.",
+                ),
                 "stream_id": body.stream_id,
                 "call_id": body.call_id,
             },
@@ -1121,15 +1204,26 @@ async def respond_to_prompt(
                 request_hash=request_hash,
                 body=body,
                 job=job,
+                language=language,
             )
 
         result = job.preview_response(body.call_id, body.response)
         if result.status in {"not_pending", "expired", "conflict"}:
             messages = {
-                "not_pending": "This interaction is not awaiting a response.",
-                "expired": "This interaction has expired.",
-                "conflict": (
-                    "This interaction was already resolved with a different response."
+                "not_pending": localize(
+                    language,
+                    "此请求当前不等待回复。",
+                    "This interaction is not awaiting a response.",
+                ),
+                "expired": localize(
+                    language,
+                    "此请求已过期。",
+                    "This interaction has expired.",
+                ),
+                "conflict": localize(
+                    language,
+                    "此请求已使用其他回复处理。",
+                    "This interaction was already resolved with a different response.",
                 ),
             }
             codes = {
@@ -1210,6 +1304,7 @@ async def respond_to_prompt(
                 request_hash=request_hash,
                 body=body,
                 job=job,
+                language=language,
             )
 
         applied = job.apply_durable_response(

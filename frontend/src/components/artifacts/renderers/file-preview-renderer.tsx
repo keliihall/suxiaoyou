@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { Loader2 } from "lucide-react";
-import { api, apiErrorMessage } from "@/lib/api";
+import { useTranslation } from "react-i18next";
+import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { artifactTypeFromExtension, languageFromExtension } from "@/lib/artifacts";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -45,6 +46,7 @@ function BinaryFilePreview({ filePath }: { filePath?: string }) {
 }
 
 export function FilePreviewRenderer({ filePath, content: initialContent, language }: FilePreviewRendererProps) {
+  const { t } = useTranslation("chat");
   // Check if this is a binary format that handles its own fetching
   const artifactType = filePath ? artifactTypeFromExtension(filePath) : null;
   const isBinary =
@@ -91,7 +93,7 @@ export function FilePreviewRenderer({ filePath, content: initialContent, languag
       .catch((err) => {
         if (cancelled) return;
         console.error("[FilePreview] Error:", err);
-        setError(apiErrorMessage(err, "Failed to load file"));
+        setError(t("failedLoadFile"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -100,7 +102,7 @@ export function FilePreviewRenderer({ filePath, content: initialContent, languag
     return () => {
       cancelled = true;
     };
-  }, [filePath, initialContent, isBinary, workspace]);
+  }, [filePath, initialContent, isBinary, t, workspace]);
 
   // Binary formats delegate to their own renderers
   if (isBinary) {

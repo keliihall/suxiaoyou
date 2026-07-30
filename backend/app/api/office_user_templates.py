@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.local import require_local_session
 from app.dependencies import SessionFactoryDep
+from app.i18n import localize, request_language
 from app.models.office_user_template import OfficeUserTemplate
 from app.models.session import Session
 from app.models.workspace_instance import WorkspaceInstance
@@ -627,54 +628,83 @@ async def _discard_candidate(
         pass
 
 
-def _api_error(exc: Exception) -> JSONResponse:
+def _api_error(request: Request, exc: Exception) -> JSONResponse:
+    language = request_language(request)
+
+    def message(zh: str, en: str) -> str:
+        return localize(language, zh, en)
+
     if isinstance(exc, AuditPersistenceError):
         return _error(
             503,
             "user_office_template_audit_unavailable",
-            "The required pre-action audit record could not be persisted",
+            message(
+                "操作审计暂时不可用，Office 模板操作已安全停止。",
+                "The required pre-action audit record could not be persisted",
+            ),
         )
     if isinstance(exc, UserTemplateFeatureDisabledError):
         return _error(
             404,
             "v11_user_office_templates_not_available",
-            "User Office templates are not available in this release",
+            message(
+                "当前版本尚未提供用户 Office 模板功能。",
+                "User Office templates are not available in this release",
+            ),
         )
     if isinstance(exc, _UserTemplateRuntimeUnavailable):
         return _error(
             503,
             "user_office_template_runtime_unavailable",
-            "The approved local Office template runtime is unavailable",
+            message(
+                "本地 Office 模板服务暂时不可用。",
+                "The approved local Office template runtime is unavailable",
+            ),
         )
     if isinstance(exc, _UserTemplateNotFound):
         return _error(
             404,
             "user_office_template_not_found",
-            "The user Office template resource was not found",
+            message(
+                "未找到这个用户 Office 模板。",
+                "The user Office template resource was not found",
+            ),
         )
     if isinstance(exc, _UserTemplateProvenance):
         return _error(
             409,
             "user_office_template_provenance_mismatch",
-            "The request is not bound to the current verified workspace",
+            message(
+                "当前文件夹尚未确认或已发生变化，请重新选择文件夹后重试。",
+                "The request is not bound to the current verified workspace",
+            ),
         )
     if isinstance(exc, _UserTemplateConflict):
         return _error(
             409,
             "user_office_template_conflict",
-            "The user Office template state or request identity changed",
+            message(
+                "用户 Office 模板状态已发生变化，请刷新后重试。",
+                "The user Office template state or request identity changed",
+            ),
         )
     if isinstance(exc, (TemplateContractError, UserTemplateReopenError)):
         return _error(
             422,
             "user_office_template_invalid",
-            "The Office template does not satisfy the required safe contract",
+            message(
+                "Office 模板不符合安全格式要求。",
+                "The Office template does not satisfy the required safe contract",
+            ),
         )
     if isinstance(exc, TemplateSecurityError):
         return _error(
             422,
             "user_office_template_unsafe",
-            "The Office template contains unsupported or unsafe package content",
+            message(
+                "Office 模板包含不支持或不安全的内容。",
+                "The Office template contains unsupported or unsafe package content",
+            ),
         )
     if isinstance(
         exc,
@@ -683,19 +713,28 @@ def _api_error(exc: Exception) -> JSONResponse:
         return _error(
             409,
             "user_office_template_evidence_invalid",
-            "The Office template evidence could not be verified",
+            message(
+                "无法验证 Office 模板的预览校验信息。",
+                "The Office template evidence could not be verified",
+            ),
         )
     if isinstance(exc, OfficeTemplateError):
         return _error(
             409,
             "user_office_template_failed",
-            "The Office template operation failed safely",
+            message(
+                "Office 模板操作已安全停止，请重试。",
+                "The Office template operation failed safely",
+            ),
         )
     logger.exception("User Office template operation failed unexpectedly")
     return _error(
         500,
         "user_office_template_internal_error",
-        "The Office template operation failed safely",
+        message(
+            "Office 模板服务暂时不可用，请稍后重试。",
+            "The Office template operation failed safely",
+        ),
     )
 
 
@@ -749,7 +788,7 @@ async def list_user_office_templates(
                 "beta": True,
             }
     except Exception as exc:
-        return _api_error(exc)
+        return _api_error(request, exc)
     return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
 
 
@@ -936,7 +975,7 @@ async def import_user_office_template(
             details=audit,
         )
         if isinstance(exc, Exception):
-            return _api_error(exc)
+            return _api_error(request, exc)
         raise
     finally:
         await file.close()
@@ -1078,7 +1117,7 @@ async def user_office_template_page(
         ):
             raise _UserTemplateConflict
     except Exception as exc:
-        return _api_error(exc)
+        return _api_error(request, exc)
     return _private_template_png(page, page_number=page_number)
 
 
@@ -1271,7 +1310,7 @@ async def approve_user_office_template(
             details=audit,
         )
         if isinstance(exc, Exception):
-            return _api_error(exc)
+            return _api_error(request, exc)
         raise
 
 
@@ -1375,7 +1414,7 @@ async def delete_user_office_template(
             details=audit,
         )
         if isinstance(exc, Exception):
-            return _api_error(exc)
+            return _api_error(request, exc)
         raise
 
 

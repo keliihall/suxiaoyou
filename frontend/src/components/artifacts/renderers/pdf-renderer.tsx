@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { api, apiErrorMessage } from "@/lib/api";
+import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { base64ToUint8Array, downloadBlob } from "@/lib/browser-files";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -80,7 +80,8 @@ export function PdfRenderer({ filePath }: PdfRendererProps) {
         setPdfData(bytes);
       } catch (err) {
         if (!cancelled) {
-          setError(apiErrorMessage(err, t("failedLoadPdf")));
+          console.warn("PDF preview failed:", err);
+          setError(t("failedLoadPdf"));
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -148,7 +149,10 @@ export function PdfRenderer({ filePath }: PdfRendererProps) {
             file={documentFile}
             options={PDF_DOCUMENT_OPTIONS}
             onLoadSuccess={onDocumentLoadSuccess}
-            onLoadError={(err: Error) => setError(err.message)}
+            onLoadError={(err: Error) => {
+              console.warn("PDF document load failed:", err);
+              setError(t("failedLoadPdf"));
+            }}
             loading=""
           >
             <div className="flex flex-col items-center gap-4 py-4">

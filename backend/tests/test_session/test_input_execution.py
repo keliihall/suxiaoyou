@@ -383,6 +383,11 @@ async def test_failed_steer_rolls_back_the_entire_message(
 
     assert applied == 0
     assert [event.event for event in job.events] == [INPUT_FAILED]
+    assert job.events[-1].data == {
+        "input_id": item.id,
+        "code": "queued_input_execution_failed",
+        "error": "排队输入执行失败，请重新提交。",
+    }
     async with execution_db() as db:
         stored = await db.get(SessionInput, item.id)
         messages = list((await db.execute(select(Message))).scalars().all())

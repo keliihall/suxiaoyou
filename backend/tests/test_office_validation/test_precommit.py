@@ -228,7 +228,8 @@ async def test_request_identity_cannot_be_mixed_with_another_transaction_view(
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
     target = workspace / "report.docx"
-    target.write_bytes(make_docx_template())
+    original = make_docx_template()
+    target.write_bytes(original)
     transaction = WorkspaceMutationTransaction(
         workspace,
         _context(workspace),
@@ -258,7 +259,7 @@ async def test_request_identity_cannot_be_mixed_with_another_transaction_view(
     with pytest.raises(OfficePrecommitRejectedError, match="runtime identity"):
         await coordinator.begin(request=request, view=view)
     transaction.abort()
-    assert target.read_bytes() == make_docx_template()
+    assert target.read_bytes() == original
 
 
 async def test_invalid_transaction_validation_generation_is_rejected_early(

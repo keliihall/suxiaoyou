@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { api, apiErrorMessage } from "@/lib/api";
+import { api } from "@/lib/api";
 import { API } from "@/lib/constants";
 import { base64ToArrayBuffer, downloadBlob } from "@/lib/browser-files";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -71,7 +71,8 @@ export function XlsxRenderer({ filePath }: XlsxRendererProps) {
         setActiveSheet(0);
       } catch (err) {
         if (!cancelled) {
-          setError(apiErrorMessage(err, t("failedRenderSpreadsheet")));
+          console.warn("XLSX preview failed:", err);
+          setError(t("failedRenderSpreadsheet"));
         }
       } finally {
         if (!cancelled) setLoading(false);
